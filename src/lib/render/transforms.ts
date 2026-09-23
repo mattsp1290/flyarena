@@ -24,19 +24,16 @@ export interface Vec3Like {
 const TRAIL_POSITION_STRIDE = 3;
 
 /**
- * Egocentric forward direction for a world heading, using the same
- * convention as `arena/sensors.ts` (`dx = Math.sin(angle)`,
- * `dz = Math.cos(angle)`; heading 0 points along +z). Three.js rotates a
+ * Map one interpolated agent snapshot to a scene transform. Pure, no
+ * mutation.
+ *
+ * The heading passes straight through as `rotationY`: this uses the same
+ * egocentric convention as `arena/sensors.ts` (`dx = Math.sin(angle)`,
+ * `dz = Math.cos(angle)`; heading 0 points along +z), and Three.js rotates a
  * local +Z axis to exactly `(sin(rotationY), cos(rotationY))` under a plain
- * Y-axis rotation, so an agent mesh whose nose points along local +Z can be
- * oriented with `group.rotation.y = heading` directly — no axis remapping.
+ * Y-axis rotation — so an agent mesh whose nose points along local +Z can be
+ * oriented with `group.rotation.y = heading` directly, no axis remapping.
  */
-export const agentForwardVector = (heading: number): { x: number; z: number } => ({
-  x: Math.sin(heading),
-  z: Math.cos(heading)
-});
-
-/** Map one interpolated agent snapshot to a scene transform. Pure, no mutation. */
 export const agentTransform = (
   agent: Readonly<RenderAgentSnapshot>,
   liftY: number

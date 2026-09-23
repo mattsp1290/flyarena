@@ -104,10 +104,19 @@ export interface RenderHazardSnapshot {
   radius: number;
 }
 
-export interface ArenaSnapshot {
+interface ArenaSnapshotShape {
   tick: number;
   timeSeconds: number;
   agents: RenderAgentSnapshot[];
   foods: FoodState[];
   hazards: RenderHazardSnapshot[];
 }
+
+/**
+ * Deep-readonly at the render boundary: `ArenaScene` (and any other
+ * consumer) can only ever read a snapshot, never mutate it or anything it
+ * points to — enforced by the compiler, not just by convention. See
+ * `arena/world.ts#createSnapshot`, the only producer, which always builds
+ * fresh objects/arrays per call.
+ */
+export type ArenaSnapshot = DeepReadonly<ArenaSnapshotShape>;

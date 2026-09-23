@@ -19,8 +19,11 @@ describe('renderer snapshots', () => {
     expect(createSnapshot(world, 9).agents[0].position).toEqual(agent.position);
     expect(JSON.stringify(world)).toBe(before);
 
-    halfway.agents[0].position.x = 999;
-    expect(world.agents[0].position.x).toBe(2);
+    // `ArenaSnapshot` is deep-readonly (types.ts), so detachment from world
+    // state is verified by reference identity rather than by mutating the
+    // (compiler-enforced read-only) snapshot and checking for no effect.
+    expect(halfway.agents[0].position).not.toBe(world.agents[0].position);
+    expect(halfway.agents[0].position).not.toBe(world.agents[0].previousPosition);
   });
 
   it('normalizes both heading endpoints and takes the shortest path across the pi seam', () => {
@@ -51,16 +54,14 @@ describe('renderer snapshots', () => {
 
   it('deeply detaches food and hazard positions from simulation state', () => {
     const world = createWorld(5);
-    const foodPosition = { ...world.foods[0].position };
-    const hazardPosition = { ...world.hazards[0].position };
     const snapshot = createSnapshot(world, 1);
 
-    snapshot.foods[0].position.x = 999;
-    snapshot.foods[0].position.z = 998;
-    snapshot.hazards[0].position.x = 997;
-    snapshot.hazards[0].position.z = 996;
-
-    expect(world.foods[0].position).toEqual(foodPosition);
-    expect(world.hazards[0].position).toEqual(hazardPosition);
+    // `ArenaSnapshot` is deep-readonly (types.ts), so detachment is verified
+    // by reference identity rather than by mutating the (compiler-enforced
+    // read-only) snapshot and checking simulation state for no effect.
+    expect(snapshot.foods[0].position).not.toBe(world.foods[0].position);
+    expect(snapshot.foods[0].position).toEqual(world.foods[0].position);
+    expect(snapshot.hazards[0].position).not.toBe(world.hazards[0].position);
+    expect(snapshot.hazards[0].position).toEqual(world.hazards[0].position);
   });
 });

@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { ARENA_CONFIG, type ArenaConfig } from '../arena/config';
-import type { AgentId, ArenaSnapshot, FoodState } from '../arena/types';
+import type { AgentId, ArenaSnapshot, FoodState, Vec2 } from '../arena/types';
 import { disposeObject3D, disposeRenderer } from './dispose';
 import {
   agentTransform,
@@ -235,7 +235,7 @@ const buildEffectPool = (): PooledEffect[] => {
 export class ArenaScene {
   private readonly options: ArenaSceneOptions;
   private readonly config: RenderArenaConfig;
-  private readonly reducedMotion: boolean;
+  private reducedMotion: boolean;
 
   private readonly scene = new THREE.Scene();
   private readonly camera: THREE.PerspectiveCamera;
@@ -417,6 +417,19 @@ export class ArenaScene {
     this.resizeObserver.observe(this.container);
   }
 
+  /**
+   * Mirror a live `prefers-reduced-motion` change: toggles camera damping
+   * immediately, and gates hazard spin / trail sampling / effect growth
+   * animation from the next `update()` call on. The host is responsible for
+   * subscribing to the media query's `change` event (see `App.svelte`) —
+   * this class only reacts to the value it's given.
+   */
+  setReducedMotion(value: boolean): void {
+    if (this.disposed || this.reducedMotion === value) return;
+    this.reducedMotion = value;
+    this.controls.enableDamping = !value;
+  }
+
   /** Explicit resize hook, also used internally by the `ResizeObserver` callback. */
   resize(width: number, height: number): void {
     if (this.disposed) return;
@@ -439,6 +452,33 @@ export class ArenaScene {
       mesh.visible = false;
       group.add(mesh);
       pool.push(mesh);
+    }
+  }
+
+  /**
+   * Place and scale every active pooled mesh at `entities[index]`'s
+   * position — lifted onto the floor by, and scaled relative to, that
+   * entity's own `radius` — and hide every remaining pool slot past
+   * `entities.length`. `ensurePoolSize` already extracts the *growth* half
+   * of pooling; this is the matching *sync* half `applyFood`/`applyHazards`
+   * otherwise duplicate. Callers needing a per-mesh extra (e.g. hazard
+   * spin) do it in their own follow-up `for` loop rather than a callback
+   * here, so this stays allocation-free with no closure created per frame.
+   */
+  private syncPool<T extends { readonly position: Readonly<Vec2>; readonly radius: number }>(
+    pool: readonly THREE.Mesh[],
+    entities: readonly T[],
+    baseRadius: number
+  ): void {
+    for (let index = 0; index < entities.length; index += 1) {
+      const entity = entities[index];
+      const mesh = pool[index];
+      mesh.visible = true;
+      mesh.scale.setScalar(entity.radius / baseRadius);
+      mesh.position.set(entity.position.x, entity.radius, entity.position.z);
+    }
+    for (let index = entities.length; index < pool.length; index += 1) {
+      pool[index].visible = false;
     }
   }
 
@@ -482,21 +522,26 @@ export class ArenaScene {
 
   private applyFood(foods: readonly FoodState[]): void {
     this.ensurePoolSize(this.foodPool, this.foodGroup, this.foodGeometry, this.foodMaterial, foods.length);
-    foods.forEach((food, index) => {
-      const mesh = this.foodPool[index];
-      mesh.visible = true;
-      mesh.scale.setScalar(food.radius / this.config.foodRadius);
-      mesh.position.set(food.position.x, food.radius, food.position.z);
-    });
-    for (let index = foods.length; index < this.foodPool.length; index += 1) {
-      this.foodPool[index].visible = false;
-    }
+    this.syncPool(this.foodPool, foods, this.config.foodRadius);
 
     for (const event of detectFoodPickups(this.hasAppliedFood ? this.lastFoodRespawns : undefined, foods)) {
       this.spawnEffect({ x: event.position.x, y: this.config.foodRadius, z: event.position.z }, FOOD_EFFECT_COLOR);
     }
+    // Mutate each existing record in place rather than replacing it: food
+    // ids are fixed for the lifetime of a world (arena/world.ts creates
+    // exactly `foodCount` foods up front and never adds/removes one — a
+    // respawn only moves an existing id), so after the first frame this
+    // loop allocates nothing at all instead of two objects per food, every
+    // render frame.
     for (const food of foods) {
-      this.lastFoodRespawns.set(food.id, { respawns: food.respawns, position: { ...food.position } });
+      const record = this.lastFoodRespawns.get(food.id);
+      if (record) {
+        record.respawns = food.respawns;
+        record.position.x = food.position.x;
+        record.position.z = food.position.z;
+      } else {
+        this.lastFoodRespawns.set(food.id, { respawns: food.respawns, position: { ...food.position } });
+      }
     }
     this.hasAppliedFood = true;
   }
@@ -510,17 +555,13 @@ export class ArenaScene {
       this.hazardMaterial,
       hazards.length
     );
-    hazards.forEach((hazard, index) => {
-      const mesh = this.hazardPool[index];
-      mesh.visible = true;
-      mesh.scale.setScalar(hazard.radius / this.config.hazardRadius);
-      mesh.position.set(hazard.position.x, hazard.radius, hazard.position.z);
-      if (!this.reducedMotion) {
-        mesh.rotation.y = (mesh.rotation.y + (frameMs / 1000) * HAZARD_SPIN_RADIANS_PER_SECOND) % TWO_PI;
+    this.syncPool(this.hazardPool, hazards, this.config.hazardRadius);
+    if (!this.reducedMotion) {
+      const spinStep = (frameMs / 1000) * HAZARD_SPIN_RADIANS_PER_SECOND;
+      for (let index = 0; index < hazards.length; index += 1) {
+        const mesh = this.hazardPool[index];
+        mesh.rotation.y = (mesh.rotation.y + spinStep) % TWO_PI;
       }
-    });
-    for (let index = hazards.length; index < this.hazardPool.length; index += 1) {
-      this.hazardPool[index].visible = false;
     }
 
     // Both agents and hazards must come from the *same* snapshot: comparing
@@ -545,9 +586,18 @@ export class ArenaScene {
 
   /** Trigger a pooled burst effect. Reuses the oldest slot; never allocates a sprite/material. */
   private spawnEffect(position: { x: number; y: number; z: number }, color: THREE.Color): void {
-    let target = this.effectPool.find((effect) => effect.life <= 0);
+    let target: PooledEffect | undefined;
+    for (let index = 0; index < this.effectPool.length; index += 1) {
+      if (this.effectPool[index].life <= 0) {
+        target = this.effectPool[index];
+        break;
+      }
+    }
     if (!target) {
-      target = this.effectPool.reduce((oldest, effect) => (effect.life < oldest.life ? effect : oldest));
+      target = this.effectPool[0];
+      for (let index = 1; index < this.effectPool.length; index += 1) {
+        if (this.effectPool[index].life < target.life) target = this.effectPool[index];
+      }
     }
     target.material.color.copy(color);
     target.sprite.position.set(position.x, position.y, position.z);

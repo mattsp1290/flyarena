@@ -1,8 +1,6 @@
-import { Vector3 } from 'three';
 import { describe, expect, it } from 'vitest';
 import type { AgentId, FoodState, RenderAgentSnapshot, RenderHazardSnapshot } from '../../src/lib/arena/types';
 import {
-  agentForwardVector,
   agentTransform,
   detectFoodPickups,
   detectHazardContacts,
@@ -57,26 +55,6 @@ describe('pushTrailPoint', () => {
   it('is a no-op for zero capacity', () => {
     const positions = new Float32Array(0);
     expect(pushTrailPoint(positions, 0, 0, { x: 1, y: 1, z: 1 })).toBe(0);
-  });
-});
-
-describe('agentForwardVector', () => {
-  it('matches the sensors.ts egocentric convention: heading 0 points along +z', () => {
-    expect(agentForwardVector(0)).toEqual({ x: 0, z: 1 });
-  });
-
-  it('matches Three.js itself: applying a Y-axis rotation to the local +z axis', () => {
-    // This is the convention `ArenaScene` actually depends on
-    // (`group.rotation.y = heading` with a nose pointing along local +Z).
-    // Exercising three's own `applyAxisAngle` here — rather than
-    // recomputing sin/cos the same way the implementation does — protects
-    // against a future sign-convention regression in either place.
-    for (const heading of [0.3, -1.2, 2.7, -Math.PI + 0.01, Math.PI / 2]) {
-      const forward = agentForwardVector(heading);
-      const rotated = new Vector3(0, 0, 1).applyAxisAngle(new Vector3(0, 1, 0), heading);
-      expect(forward.x).toBeCloseTo(rotated.x, 10);
-      expect(forward.z).toBeCloseTo(rotated.z, 10);
-    }
   });
 });
 

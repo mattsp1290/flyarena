@@ -3,11 +3,20 @@
   import { ARENA_CONFIG } from './lib/arena/config';
   import type { ActionsByAgent } from './lib/arena/types';
   import { createSnapshot, createWorld, stepWorld } from './lib/arena/world';
-  import { ArenaScene, ArenaSceneUnavailableError, type FrameTelemetry } from './lib/render/ArenaScene';
+  // Type-only: `three`/OrbitControls are large enough to warrant their own
+  // chunk (see docs/architecture.md's load-budget note), so the actual
+  // `./lib/render/ArenaScene` module is loaded via a dynamic `import()`
+  // inside `onMount` below instead of statically here.
+  import type { ArenaScene as ArenaSceneInstance, FrameTelemetry } from './lib/render/ArenaScene';
 
   let canvasEl: HTMLCanvasElement | undefined;
-  let scene: ArenaScene | undefined;
+  let scene: ArenaSceneInstance | undefined;
   let rafId: number | undefined;
+  // Set the instant the component unmounts, so the dynamic `import()` race
+  // in `onMount` can't construct a scene (or write component state) after
+  // teardown has already run.
+  let destroyed = false;
+  let reducedMotionQuery: MediaQueryList | undefined;
 
   let fps = $state(0);
   let rendererError = $state<string | undefined>(undefined);
@@ -68,42 +77,70 @@
     rafId = requestAnimationFrame(frame);
   };
 
+  const handleReducedMotionChange = (event: MediaQueryListEvent): void => {
+    scene?.setReducedMotion(event.matches);
+  };
+
   onMount(() => {
     if (!canvasEl) return;
-    const reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false;
+    reducedMotionQuery = window.matchMedia?.('(prefers-reduced-motion: reduce)');
+    const reducedMotion = reducedMotionQuery?.matches ?? false;
+    reducedMotionQuery?.addEventListener('change', handleReducedMotionChange);
 
-    try {
-      scene = new ArenaScene({
-        canvas: canvasEl,
-        arenaConfig: world.config,
-        reducedMotion,
-        onFrame: (telemetry: FrameTelemetry) => {
-          fps = telemetry.fps;
-        },
-        onContextLost: () => {
-          rendererError = 'The WebGL context was lost.';
-          if (rafId !== undefined) cancelAnimationFrame(rafId);
-          rafId = undefined;
-          const lost = scene;
-          scene = undefined;
-          // Defer so disposal never runs from inside the renderer's own
-          // 'webglcontextlost' event dispatch.
-          queueMicrotask(() => lost?.dispose());
-        }
-      });
-    } catch (error) {
-      console.error('FlyArena renderer failed to start', error);
-      rendererError =
-        error instanceof ArenaSceneUnavailableError
-          ? error.message
-          : `The 3D renderer failed to start (${error instanceof Error ? error.message : String(error)}).`;
-      return;
-    }
+    const start = async (): Promise<void> => {
+      let renderModule: typeof import('./lib/render/ArenaScene');
+      try {
+        renderModule = await import('./lib/render/ArenaScene');
+      } catch (error) {
+        if (destroyed) return;
+        console.error('FlyArena renderer module failed to load', error);
+        rendererError = `The 3D renderer failed to load (${error instanceof Error ? error.message : String(error)}).`;
+        return;
+      }
+      // The component may have unmounted while the chunk was in flight —
+      // never construct a scene (or touch `canvasEl`, which may already be
+      // torn down) after that.
+      if (destroyed || !canvasEl) return;
 
-    rafId = requestAnimationFrame(frame);
+      const { ArenaScene, ArenaSceneUnavailableError } = renderModule;
+      try {
+        scene = new ArenaScene({
+          canvas: canvasEl,
+          arenaConfig: world.config,
+          reducedMotion,
+          onFrame: (telemetry: FrameTelemetry) => {
+            fps = telemetry.fps;
+          },
+          onContextLost: () => {
+            rendererError = 'The WebGL context was lost.';
+            if (rafId !== undefined) cancelAnimationFrame(rafId);
+            rafId = undefined;
+            const lost = scene;
+            scene = undefined;
+            // Defer so disposal never runs from inside the renderer's own
+            // 'webglcontextlost' event dispatch.
+            queueMicrotask(() => lost?.dispose());
+          }
+        });
+      } catch (error) {
+        console.error('FlyArena renderer failed to start', error);
+        rendererError =
+          error instanceof ArenaSceneUnavailableError
+            ? error.message
+            : `The 3D renderer failed to start (${error instanceof Error ? error.message : String(error)}).`;
+        return;
+      }
+
+      rafId = requestAnimationFrame(frame);
+    };
+
+    void start();
   });
 
   onDestroy(() => {
+    destroyed = true;
+    reducedMotionQuery?.removeEventListener('change', handleReducedMotionChange);
+    reducedMotionQuery = undefined;
     if (rafId !== undefined) cancelAnimationFrame(rafId);
     rafId = undefined;
     scene?.dispose();
@@ -123,7 +160,7 @@
     <p class="eyebrow">Connectome experiment · proof of concept</p>
     <h1>FlyArena</h1>
   </div>
-  <span class="status" aria-label="Experiment status: scaffold">Scaffold</span>
+  <span class="status" aria-label="Experiment status: renderer and demo loop live, neural runtime not yet wired in">Renderer live</span>
 </header>
 
 <main>
@@ -168,7 +205,7 @@
     <section class="panel" aria-labelledby="telemetry-heading">
       <div class="section-heading">
         <h2 id="telemetry-heading">Telemetry</h2>
-        <span>Awaiting runtime</span>
+        <span>Renderer live · neural pending</span>
       </div>
       <dl>
         <div><dt>Simulation</dt><dd>Demo motion (scripted placeholder)</dd></div>
