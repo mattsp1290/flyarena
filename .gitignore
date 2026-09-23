@@ -23,3 +23,8 @@ __pycache__/
 # URLs in download.py; only the compiled, small artifact under
 # public/data/ is committed.
 data/raw/
+
+# scripts/training/export-traces.ts output for non-default (--graph/
+# --substeps/--include-world) runs: never committed, see the exporter's
+# doc comment and its --out overwrite guard.
+training/runs/

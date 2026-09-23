@@ -119,6 +119,92 @@ describe('readoutForward', () => {
     expect(out[1]).toBe(1);
     expect(out[2]).toBe(0);
   });
+
+  it('matches an analytically computed forward pass with a non-square, asymmetric w1/w2 (D = 2, H = 3)', () => {
+    // Both prior cases in this describe block use an identity (or
+    // zero-hidden-contribution) w1/w2 -- an identity matrix is its own
+    // transpose, so those tests cannot distinguish `w1[h * inputSize + d]`
+    // (the documented, actual row-major layout, readout.ts:147-149) from a
+    // column-major `w1[d * hiddenSize + h]` bug. Every cell here is a
+    // distinct, non-symmetric value, so reading the wrong layout reads a
+    // different weight for almost every (h, d) pair and produces a visibly
+    // wrong result. D != H (2 vs 3) also rules out a bug that only swaps
+    // square-matrix axes without changing which values are read.
+    const inputSize = 2;
+    const hiddenSize = 3;
+    const weights: ReadoutWeights = {
+      inputSize,
+      hiddenSize,
+      w1: Float32Array.from([0.5, -0.25, -0.75, 0.1, 0.2, 0.9]),
+      b1: Float32Array.from([0.05, -0.02, 0.1]),
+      w2: Float32Array.from([0.4, -0.6, 0.15, -0.3, 0.55, -0.2, 0.25, 0.1, -0.45]),
+      b2: Float32Array.from([0.02, -0.01, 0.03])
+    };
+    const rate = Float32Array.from([0.3, -0.4]);
+    const indices = Int32Array.from([0, 1]);
+    const scratch = createReadoutScratch(hiddenSize);
+    const out = createReadoutOutput();
+
+    readoutForward(weights, rate, indices, scratch, out);
+
+    const hidden0 = Math.tanh(weights.b1[0] + weights.w1[0] * rate[0] + weights.w1[1] * rate[1]);
+    const hidden1 = Math.tanh(weights.b1[1] + weights.w1[2] * rate[0] + weights.w1[3] * rate[1]);
+    const hidden2 = Math.tanh(weights.b1[2] + weights.w1[4] * rate[0] + weights.w1[5] * rate[1]);
+
+    const thrustPre =
+      weights.b2[0] + weights.w2[0] * hidden0 + weights.w2[1] * hidden1 + weights.w2[2] * hidden2;
+    const yawPre =
+      weights.b2[1] + weights.w2[3] * hidden0 + weights.w2[4] * hidden1 + weights.w2[5] * hidden2;
+    const brakePre =
+      weights.b2[2] + weights.w2[6] * hidden0 + weights.w2[7] * hidden1 + weights.w2[8] * hidden2;
+
+    expect(out[0]).toBeCloseTo(Math.tanh(thrustPre), 6);
+    expect(out[1]).toBeCloseTo(Math.tanh(yawPre), 6);
+    expect(out[2]).toBeCloseTo(1 / (1 + Math.exp(-brakePre)), 6);
+  });
+
+  it('fails if yaw and brake activations were swapped (yaw is tanh-shaped, brake is sigmoid-shaped)', () => {
+    // D = 1, H = 2. w1/w2 are chosen so the two hidden units' w2
+    // contributions to both yaw's and brake's pre-activation exactly cancel
+    // (coefficients +1/-1 against hidden values that are the tanh of +x/-x,
+    // i.e. -hidden0), leaving both pre-activations at exactly `0.5`
+    // regardless of tanh's precise value. That isolates the one thing this
+    // test cares about: out[yaw] = tanh(0.5) and out[brake] = sigmoid(0.5)
+    // are the *same* pre-activation fed through two different activations
+    // (readout.ts:160's `output === OUTPUT_POPULATION.brake ? sigmoid :
+    // tanh`). If yaw/brake's activation assignment were swapped, out[1] and
+    // out[2] below would swap too -- and the final assertion confirms the
+    // two expected values are far enough apart (~0.16) for that swap to
+    // actually fail the `toBeCloseTo` checks, not pass by coincidence.
+    const inputSize = 1;
+    const hiddenSize = 2;
+    const weights: ReadoutWeights = {
+      inputSize,
+      hiddenSize,
+      w1: Float32Array.from([1, -1]),
+      b1: Float32Array.from([0, 0]),
+      w2: Float32Array.from([1, -1, 1, 1, 1, 1]),
+      b2: Float32Array.from([0, 0.5, 0.5])
+    };
+    const rate = Float32Array.from([0.7]);
+    const indices = Int32Array.from([0]);
+    const scratch = createReadoutScratch(hiddenSize);
+    const out = createReadoutOutput();
+
+    readoutForward(weights, rate, indices, scratch, out);
+
+    const hidden0 = Math.tanh(1 * rate[0]);
+    const hidden1 = Math.tanh(-1 * rate[0]);
+    const sharedPre = hidden0 + hidden1 + 0.5;
+    expect(sharedPre).toBeCloseTo(0.5, 10);
+
+    const expectedYaw = Math.tanh(sharedPre);
+    const expectedBrake = 1 / (1 + Math.exp(-sharedPre));
+    expect(Math.abs(expectedYaw - expectedBrake)).toBeGreaterThan(0.1);
+
+    expect(out[1]).toBeCloseTo(expectedYaw, 7);
+    expect(out[2]).toBeCloseTo(expectedBrake, 7);
+  });
 });
 
 describe('validateReadoutWeights', () => {

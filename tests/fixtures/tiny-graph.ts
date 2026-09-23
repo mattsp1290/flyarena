@@ -1,5 +1,6 @@
 import type { ConnectomeGraph, GraphMetadata } from '../../src/lib/connectome/format';
 import { SUPPORTED_FORMAT_VERSION } from '../../src/lib/connectome/format';
+import { mulberry32 } from '../../src/lib/random/mulberry32';
 
 /**
  * Shared connectome fixtures. `createTinyGraph` is small enough that every
@@ -50,18 +51,6 @@ export const createTinyGraph = (
   outputPopulationIndex: Int32Array.from([-1, -1, 0, 1]),
   outputWeight: Float32Array.from([0, 0, 1, 1])
 });
-
-/** Deterministic mulberry32 PRNG, independent of the arena's own RNG. */
-const mulberry32 = (seed: number): (() => number) => {
-  let state = seed >>> 0;
-  return () => {
-    state = (state + 0x6d2b79f5) >>> 0;
-    let t = state;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-};
 
 export interface RandomGraphOptions {
   neuronCount?: number;

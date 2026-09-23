@@ -1,6 +1,7 @@
 import { fileURLToPath } from 'node:url';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { basename, dirname, extname, resolve } from 'node:path';
+import { gunzipSync } from 'node:zlib';
 
 import { decodeAction } from '../../src/lib/arena/actions';
 import { observeAgent } from '../../src/lib/arena/sensors';
@@ -25,7 +26,8 @@ import {
   validateReadoutWeights,
   type ReadoutWeights
 } from '../../src/lib/connectome/readout';
-import { createTraceGraph, mulberry32 } from '../../tests/fixtures/trace-graph';
+import { mulberry32 } from '../../src/lib/random/mulberry32';
+import { createTraceGraph } from '../../tests/fixtures/trace-graph';
 
 /**
  * Exports deterministic golden traces from the existing TypeScript arena +
@@ -41,6 +43,25 @@ import { createTraceGraph, mulberry32 } from '../../tests/fixtures/trace-graph';
  * traces from a real compiled graph artifact at the real closed-loop
  * substep count, written outside this directory (e.g.
  * `training/runs/traces/`) rather than overwriting the committed fixtures.
+ * `--graph` accepts either a raw `.bin` graph or a gzip-compressed one
+ * (detected by the gzip magic bytes, not the filename) — the one real
+ * artifact currently in this repo, `public/data/malecns-arena-v1.bin.gz`, is
+ * gzip-compressed.
+ *
+ * `--include-world` adds a per-tick `worldAfter` column (full post-step
+ * world state: agent pose/velocity, foods, hazards, hazard-contact state,
+ * and score) to every seed file, at full round-trip double precision. This
+ * is what WP2's PyTorch parity port needs to teacher-force `step_world` and
+ * check food/hazard contact events exactly
+ * (`.agents/plans/trained-readout/02-gpu-port-and-parity.md`'s "Parity
+ * tolerances" table) — `initialWorld` alone (tick 0 only) cannot satisfy
+ * that table for ticks 1..N. It is off by default: the committed fixtures
+ * under `tests/fixtures/golden/` stay within the ≤ 200 KB budget precisely
+ * by *not* recording a per-tick world column (see `TRACE_TICKS`'s comment).
+ * WP2 must generate its own full-coverage trace on demand, uncommitted:
+ * `npm run training:traces -- --include-world --out training/runs/<dir>`
+ * (or any other gitignored `--out` path) — never into
+ * `tests/fixtures/golden/`, which the overwrite guard below refuses.
  *
  * Golden files are written as compact (non-indented) JSON: the per-tick
  * arrays dominate file size, and the ≤ 200 KB committed budget
@@ -84,12 +105,13 @@ const DEFAULT_OUT_DIR = 'tests/fixtures/golden';
 /** `graphId` used for the committed fixtures; exported so tests reuse it instead of a copied literal. */
 export const DEFAULT_GRAPH_ID = 'trace-graph';
 
-interface CliArgs {
+export interface CliArgs {
   graphPath?: string;
   substeps: number;
   outDir: string;
   /** True only when `--out` was actually passed, not merely defaulted. */
   outDirExplicit: boolean;
+  includeWorld: boolean;
 }
 
 /** A missing option value must not silently consume the next flag instead. */
@@ -100,12 +122,30 @@ const requireValue = (flag: string, value: string | undefined): string => {
   return value;
 };
 
-const parseArgs = (argv: readonly string[]): CliArgs => {
+/**
+ * Canonicalize a path for the overwrite-guard comparison below: `resolve()`
+ * always, plus `realpathSync` when the path already exists (so a symlink or
+ * a `..`-laden alias that resolves to the same directory as
+ * `DEFAULT_OUT_DIR` is still caught, not just a textually-identical path). A
+ * not-yet-existing `--out` directory can't be realpath'd, so `resolve()`'s
+ * normalization is what's compared for it.
+ */
+const canonicalizePath = (path: string): string => {
+  const resolved = resolve(process.cwd(), path);
+  try {
+    return realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+};
+
+export const parseArgs = (argv: readonly string[]): CliArgs => {
   let graphPath: string | undefined;
   let substeps = TRACE_SUBSTEPS;
   let outDir = DEFAULT_OUT_DIR;
   let outDirExplicit = false;
   let substepsExplicit = false;
+  let includeWorld = false;
 
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
@@ -125,27 +165,52 @@ const parseArgs = (argv: readonly string[]): CliArgs => {
       outDir = requireValue(flag, argv[index + 1]);
       outDirExplicit = true;
       index += 1;
+    } else if (flag === '--include-world') {
+      includeWorld = true;
     } else {
       throw new Error(`Unknown argument: ${flag}`);
     }
   }
 
-  // A non-default graph or substep count producing output that lands in the
-  // committed fixture directory by accident (no --out given) would silently
-  // corrupt tests/fixtures/golden/ with non-canonical data.
-  if ((graphPath !== undefined || substepsExplicit) && !outDirExplicit) {
-    throw new Error(
-      '--graph/--substeps change what gets exported; pass --out explicitly so the result ' +
-        `cannot land in the committed ${DEFAULT_OUT_DIR}/ directory by accident`
-    );
+  // A non-default graph, substep count, or world-state column producing
+  // output that lands in the committed fixture directory (by accident, with
+  // no --out, or on purpose, with an --out that still resolves to it) would
+  // silently corrupt tests/fixtures/golden/ with non-canonical data.
+  const nonDefaultExport = graphPath !== undefined || substepsExplicit || includeWorld;
+  if (nonDefaultExport) {
+    if (!outDirExplicit) {
+      throw new Error(
+        '--graph/--substeps/--include-world change what gets exported; pass --out explicitly so ' +
+          `the result cannot land in the committed ${DEFAULT_OUT_DIR}/ directory by accident`
+      );
+    }
+    if (canonicalizePath(outDir) === canonicalizePath(DEFAULT_OUT_DIR)) {
+      throw new Error(
+        '--graph/--substeps/--include-world change what gets exported; --out ' +
+          `("${outDir}") resolves to the committed ${DEFAULT_OUT_DIR}/ directory, which would ` +
+          'overwrite the committed golden fixtures with non-canonical data. Pass a different ' +
+          '--out path (e.g. a gitignored directory such as training/runs/).'
+      );
+    }
   }
 
-  return { graphPath, substeps, outDir, outDirExplicit };
+  return { graphPath, substeps, outDir, outDirExplicit, includeWorld };
 };
 
-/** Read a binary graph artifact from disk, matching format.ts's expected ArrayBuffer input. */
-const loadGraphArtifact = (path: string): ConnectomeGraph => {
-  const buffer = readFileSync(path);
+const GZIP_MAGIC = [0x1f, 0x8b];
+const isGzip = (buffer: Readonly<Buffer>): boolean =>
+  buffer.length >= 2 && buffer[0] === GZIP_MAGIC[0] && buffer[1] === GZIP_MAGIC[1];
+
+/**
+ * Read a binary graph artifact from disk, matching format.ts's expected
+ * ArrayBuffer input. Detects a gzip-compressed artifact by its magic bytes
+ * (not the filename) and decompresses it first: `public/data/*.bin.gz`
+ * (produced by `scripts/data/compile.py`'s `binfmt.write_gzip_deterministic`)
+ * is gzip, not a raw `.bin`.
+ */
+export const loadGraphArtifact = (path: string): ConnectomeGraph => {
+  const raw = readFileSync(path);
+  const buffer = isGzip(raw) ? gunzipSync(raw) : raw;
   const arrayBuffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
   return parseGraphBinary(arrayBuffer);
 };
@@ -234,6 +299,28 @@ const serializeWorld = (world: Readonly<WorldState>): SerializedWorld => ({
   hazardVelocities: world.hazards.map((hazard) => [hazard.velocity.x, hazard.velocity.z])
 });
 
+/**
+ * Per-tick (post-`stepWorld`) world state, used only by the opt-in
+ * `worldAfter` column below (`buildSeedTrace`'s `includeWorld` option) — not
+ * by `initialWorld`, which stays exactly `SerializedWorld` so the committed
+ * fixtures' bytes are unaffected by this type existing. Extends
+ * `SerializedWorld` with `agentActiveHazardIds`: unlike `initialWorld`
+ * (always tick 0, where `activeHazardIds` is always `[]` by construction —
+ * see `SerializedWorld`'s comment), a post-step tick can have non-empty
+ * `activeHazardIds`, and `world.ts`'s `processContacts` reads the
+ * *previous* tick's value to detect a new contact. Omitting it here would
+ * leave WP2 unable to reproduce hazard-contact events exactly when
+ * teacher-forcing from a recorded prior tick rather than tick 0.
+ */
+interface SerializedWorldTick extends SerializedWorld {
+  agentActiveHazardIds: string[][];
+}
+
+const serializeWorldTick = (world: Readonly<WorldState>): SerializedWorldTick => ({
+  ...serializeWorld(world),
+  agentActiveHazardIds: world.agents.map((agent) => [...agent.activeHazardIds])
+});
+
 interface SeedTraceFile {
   formatVersion: 1;
   /** `${graphId}.json` (next to this file) is the one serialized graph every seed file shares. */
@@ -277,6 +364,20 @@ interface SeedTraceFile {
   ratesAfter: number[][];
   outputs: number[][];
   actions: number[][];
+  /**
+   * Post-step world state for every tick (row `i` is the state *after*
+   * tick `i`'s `stepWorld` call), present only when `buildSeedTrace` is
+   * called with `{ includeWorld: true }`. Absent (not merely `undefined`)
+   * in the committed default export, so the committed fixtures' bytes are
+   * unaffected by this field's existence. See this file's doc comment for
+   * why and how WP2 should generate this.
+   */
+  worldAfter?: SerializedWorldTick[];
+}
+
+export interface BuildSeedTraceOptions {
+  /** Record a per-tick `worldAfter` column. Default `false` (budget). */
+  includeWorld?: boolean;
 }
 
 /**
@@ -289,8 +390,10 @@ export const buildSeedTrace = (
   graphId: string,
   seed: number,
   ticks: number,
-  substeps: number
+  substeps: number,
+  options: BuildSeedTraceOptions = {}
 ): SeedTraceFile => {
+  const includeWorld = options.includeWorld ?? false;
   let world = createWorld(seed);
   const configFingerprint = world.configFingerprint;
   const initialWorld = serializeWorld(world);
@@ -303,6 +406,7 @@ export const buildSeedTrace = (
   const ratesAfter: number[][] = [];
   const outputColumns: number[][] = [];
   const actions: number[][] = [];
+  const worldAfter: SerializedWorldTick[] = [];
 
   for (let tick = 0; tick < ticks; tick += 1) {
     const observation = observeAgent(world, 'left');
@@ -318,6 +422,8 @@ export const buildSeedTrace = (
       left: [decodedAction.thrust, decodedAction.yaw, decodedAction.brake],
       right: [0, 0, 0]
     });
+
+    if (includeWorld) worldAfter.push(serializeWorldTick(world));
   }
 
   return {
@@ -331,7 +437,8 @@ export const buildSeedTrace = (
     observations,
     ratesAfter,
     outputs: outputColumns,
-    actions
+    actions,
+    ...(includeWorld ? { worldAfter } : {})
   };
 };
 
@@ -419,8 +526,13 @@ const buildReadoutCase = (
   };
 };
 
-/** One golden file: its committed-relative filename and the value that becomes its JSON contents. */
-export interface GoldenFile {
+/**
+ * One golden file: its committed-relative filename and the value that
+ * becomes its JSON contents. Not exported: nothing imports it by name
+ * (`buildGoldenFiles`'s return type is inferred structurally at its one
+ * call site, `tests/unit/golden-traces.test.ts`).
+ */
+interface GoldenFile {
   fileName: string;
   value: unknown;
 }
@@ -435,9 +547,12 @@ export interface GoldenFile {
 export const buildGoldenFiles = (
   graph: Readonly<ConnectomeGraph>,
   graphId: string,
-  substeps: number
+  substeps: number,
+  options: BuildSeedTraceOptions = {}
 ): GoldenFile[] => {
-  const traces = TRACE_SEEDS.map((seed) => buildSeedTrace(graph, graphId, seed, TRACE_TICKS, substeps));
+  const traces = TRACE_SEEDS.map((seed) =>
+    buildSeedTrace(graph, graphId, seed, TRACE_TICKS, substeps, options)
+  );
   // Scoped to the first committed seed (1), the same one golden-traces.test.ts regenerates.
   const readoutCase = buildReadoutCase(graph, graphId, traces[0]);
 
@@ -465,7 +580,7 @@ const main = (): void => {
     : DEFAULT_GRAPH_ID;
 
   const outDir = resolve(process.cwd(), args.outDir);
-  const files = buildGoldenFiles(graph, graphId, args.substeps);
+  const files = buildGoldenFiles(graph, graphId, args.substeps, { includeWorld: args.includeWorld });
 
   let totalBytes = 0;
   for (const { fileName, value } of files) {

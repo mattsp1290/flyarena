@@ -74,6 +74,11 @@ describe('golden trace regeneration', () => {
       (sum, name) => sum + statSync(resolve(GOLDEN_DIR, name)).size,
       0
     );
-    expect(totalBytes).toBeLessThanOrEqual(GOLDEN_BUDGET_BYTES);
+    expect(
+      totalBytes,
+      `Committed golden fixtures are ${totalBytes} bytes, over the ${GOLDEN_BUDGET_BYTES}-byte ` +
+        'budget. See TRACE_TICKS\'s doc comment in scripts/training/export-traces.ts for how to ' +
+        'free budget (e.g. reduce TRACE_TICKS or TRACE_SEEDS) before regenerating and committing.'
+    ).toBeLessThanOrEqual(GOLDEN_BUDGET_BYTES);
   });
 });

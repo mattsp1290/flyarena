@@ -1,5 +1,6 @@
 import type { ConnectomeGraph, GraphMetadata } from '../../src/lib/connectome/format';
 import { SUPPORTED_FORMAT_VERSION } from '../../src/lib/connectome/format';
+import { mulberry32 } from '../../src/lib/random/mulberry32';
 
 /**
  * Deterministic trace-export graph for `scripts/training/export-traces.ts`
@@ -47,23 +48,6 @@ export const TRACE_GRAPH_OUTPUT_NEURONS: readonly (readonly [number, number])[] 
 export const TRACE_GRAPH_OUTPUT_NEURON_INDICES = Int32Array.from(
   TRACE_GRAPH_OUTPUT_NEURONS.flat()
 );
-
-/**
- * Deterministic mulberry32 PRNG; same algorithm as `tiny-graph.ts`'s
- * `createRandomGraph`. Exported so `scripts/training/export-traces.ts` can
- * reuse it (for its own, differently-seeded weight generator) instead of
- * carrying a third copy.
- */
-export const mulberry32 = (seed: number): (() => number) => {
-  let state = seed >>> 0;
-  return () => {
-    state = (state + 0x6d2b79f5) >>> 0;
-    let t = state;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-};
 
 /**
  * This fixture is deterministic for any seed value (same value in, same
