@@ -24,6 +24,7 @@
         "edgeCount": 46311,
         "rejectedDegenerate": 2605,
         "rejectedDuplicate": 157046,
+        "rejectedSameIndex": 16,
         "rejectedSelfLoop": 2213,
         "seed": 0
       }

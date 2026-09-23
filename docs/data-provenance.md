@@ -259,7 +259,8 @@ artifact's rewiring run.
 
 For seed 0: 926,220 attempted swaps (20x the edge count) over 46,311 edges,
 764,340 accepted (the rest rejected for would-be duplicates, would-be
-self-loops, or being a degenerate same-source/same-target pick). See
+self-loops, being a degenerate same-source/same-target pick, or drawing the
+same edge index twice). See
 `malecns-arena-v1.manifest.json`'s `rewiredArms.seed0.swapStats` for the
 exact counts.
 

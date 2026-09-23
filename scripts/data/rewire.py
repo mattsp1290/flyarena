@@ -76,6 +76,10 @@ def decode_graph_binary(buffer: bytes) -> binfmt.GraphArrays:
     sufficient for round-tripping this compiler's own output. Assumes
     `buffer` was produced by `encode_graph_binary`/is already valid; use
     `binfmt.validate_graph` on the result if that's not guaranteed."""
+    if len(buffer) < binfmt.HEADER_BYTES:
+        raise binfmt.InvalidGraphError(
+            f"buffer is smaller than the fixed header ({len(buffer)} < {binfmt.HEADER_BYTES} bytes)"
+        )
     header = binfmt._HEADER_STRUCT.unpack_from(buffer, 0)
     magic, format_version, neuron_count, edge_count, input_channel_count, output_population_count, \
         timestep_seconds, leak_rate, rate_min, rate_max, input_clamp_min, input_clamp_max, global_gain, flags = header
@@ -83,6 +87,10 @@ def decode_graph_binary(buffer: bytes) -> binfmt.GraphArrays:
         raise binfmt.InvalidGraphError(f"bad magic {magic!r}")
 
     layout = binfmt.compute_graph_layout(neuron_count, edge_count)
+    if len(buffer) < layout.total_bytes:
+        raise binfmt.InvalidGraphError(
+            f"buffer is truncated ({len(buffer)} bytes, expected at least {layout.total_bytes})"
+        )
 
     def read(section, dtype, count):
         return np.frombuffer(
@@ -147,12 +155,14 @@ def rewire_graph(
     rejected_self_loop = 0
     rejected_duplicate = 0
     rejected_degenerate = 0
+    rejected_same_index = 0
 
     for _ in range(attempts):
         if edge_count < 2:
             break
         i, j = rng.integers(0, edge_count, size=2)
         if i == j:
+            rejected_same_index += 1
             continue
         pre_i, post_i = int(pre_of_edge[i]), int(post_of_edge[i])
         pre_j, post_j = int(pre_of_edge[j]), int(post_of_edge[j])
@@ -213,6 +223,7 @@ def rewire_graph(
         "rejectedSelfLoop": rejected_self_loop,
         "rejectedDuplicate": rejected_duplicate,
         "rejectedDegenerate": rejected_degenerate,
+        "rejectedSameIndex": rejected_same_index,
         "allowSelfLoops": allow_self_loops,
     }
     return rewired, stats

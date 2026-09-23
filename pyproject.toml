@@ -7,7 +7,6 @@ dependencies = [
   "numpy>=1.26,<3",
   "pandas>=2.2,<3",
   "pyarrow>=17.0,<21",
-  "requests>=2.31,<3",
 ]
 
 [dependency-groups]

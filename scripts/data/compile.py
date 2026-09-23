@@ -110,11 +110,14 @@ SYNAPSE_THRESHOLD = 3
 #:     (ionotropic glutamate-gated chloride receptors are the dominant
 #:     glutamate receptor class in the fly CNS), following the same
 #:     convention used in prior connectome-constrained rate-model work.
-#:   - anything else (dopamine, octopamine, serotonin, "unclear", or a body
-#:     with no neurotransmitter-table row at all) -> defaulted to
-#:     excitatory (+1) and counted separately as `unknownTransmitterCount`
-#:     in the ledger, since these are neuromodulatory or low-confidence
-#:     calls this POC does not attempt to model directionally.
+#:   - anything else (dopamine, octopamine, serotonin, histamine, "unclear",
+#:     a row whose `consensus_nt` is missing/NaN, or a body with no
+#:     neurotransmitter-table row at all) -> defaulted to excitatory (+1)
+#:     and counted separately (by label) in `unknownTransmitters` in the
+#:     ledger, since these are neuromodulatory or low-confidence calls this
+#:     POC does not attempt to model directionally. `assign_signs` further
+#:     splits "no row at all" (`missing`) from "row present but
+#:     `consensus_nt` is NaN" (`missing_value`) rather than conflating them.
 SIGN_BY_TRANSMITTER: Mapping[str, int] = {
     "acetylcholine": 1,
     "gaba": -1,
@@ -212,8 +215,14 @@ def compile_graph(
 
     # Aggregate duplicate (pre, post) rows by summing their magnitudes (see
     # docs/graph-format.md's "Canonical row ordering and duplicate edges").
+    # Sort primarily by pair_key and secondarily by weight value (not input
+    # row order): floating-point addition is not associative, so summing a
+    # duplicate group in input order would make the result depend on which
+    # order the *source rows* happened to arrive in. Sorting each group's
+    # weights ascending before reduceat makes the summation order -- and
+    # therefore the output bytes -- a function of the edge set alone.
     pair_key = pre_idx.astype(np.int64) * neuron_count + post_idx.astype(np.int64)
-    order = np.argsort(pair_key, kind="stable")
+    order = np.lexsort((weight, pair_key))
     pair_key_sorted = pair_key[order]
     weight_sorted = weight[order]
     unique_keys, start_positions, counts = np.unique(
@@ -355,6 +364,14 @@ def select_subgraph(annotations: pd.DataFrame, weights: pd.DataFrame) -> dict:
     documented above. Returns a dict with `sensory_ids`, `descending_ids`,
     `bridge_ids`, `node_ids` (their union, deduplicated) and the before/
     after candidate counts the ledger records."""
+    duplicate_body_ids = annotations.loc[annotations["bodyId"].duplicated(keep=False), "bodyId"].unique()
+    if len(duplicate_body_ids) > 0:
+        raise ValueError(
+            "body-annotations table has duplicate bodyId(s), expected exactly one row per "
+            f"neuron: {sorted(duplicate_body_ids.tolist())[:10]}"
+            + (" ..." if len(duplicate_body_ids) > 10 else "")
+        )
+
     traced = annotations[annotations["status"] == ELIGIBLE_STATUS].copy()
 
     sensory_candidates = traced[
@@ -438,15 +455,38 @@ def select_edges(weights: pd.DataFrame, node_ids: Sequence[int]) -> pd.DataFrame
 
 
 def assign_signs(node_ids: Sequence[int], neurotransmitters: pd.DataFrame) -> "tuple[dict, dict]":
+    """Returns `(signs, unknown_by_label)`. `unknown_by_label` distinguishes
+    `"missing"` (no row at all for that body in the neurotransmitters table)
+    from `"missing_value"` (a row exists but `consensus_nt` is NaN/empty) --
+    docs/data-provenance.md's policy section defines "missing" as the former
+    only, so the two must not be folded together even though both currently
+    default to the same excitatory sign.
+    """
+    duplicate_bodies = neurotransmitters.loc[
+        neurotransmitters["body"].duplicated(keep=False), "body"
+    ].unique()
+    if len(duplicate_bodies) > 0:
+        raise ValueError(
+            "body-neurotransmitters table has duplicate body id(s), expected exactly one row "
+            f"per neuron: {sorted(duplicate_bodies.tolist())[:10]}"
+            + (" ..." if len(duplicate_bodies) > 10 else "")
+        )
+
     nt_by_body = neurotransmitters.set_index("body")["consensus_nt"]
+    has_row = set(nt_by_body.index.tolist())
     signs: dict[int, int] = {}
     unknown_by_label: dict[str, int] = {}
     for body in node_ids:
-        label = nt_by_body.get(body)
+        label = nt_by_body.get(body) if body in has_row else None
         sign = SIGN_BY_TRANSMITTER.get(label)
         if sign is None:
             signs[body] = 1
-            key = str(label) if label is not None and not pd.isna(label) else "missing"
+            if body not in has_row:
+                key = "missing"
+            elif label is None or pd.isna(label):
+                key = "missing_value"
+            else:
+                key = str(label)
             unknown_by_label[key] = unknown_by_label.get(key, 0) + 1
         else:
             signs[body] = sign
@@ -462,8 +502,20 @@ def assign_channels(
     deterministic, fully documented assignment -- see docs/data-provenance.md
     -- not a claim that a given real neuron "is" e.g. the food-bearing
     sensor.
+
+    `sensory_ids`/`descending_ids` are deduplicated before partitioning
+    (defense in depth: `select_subgraph` should never produce duplicates
+    itself, since annotation `bodyId` is asserted unique there, but a
+    duplicate slipping through here would otherwise silently consume two
+    partition slots for one body and skew the channel/population boundary
+    math for every neuron after it).
     """
-    sensory_sorted = sorted(sensory_ids)
+    if len(sensory_ids) == 0:
+        raise ValueError("assign_channels: sensory_ids must be non-empty")
+    if len(descending_ids) == 0:
+        raise ValueError("assign_channels: descending_ids must be non-empty")
+
+    sensory_sorted = sorted(set(sensory_ids))
     input_assignment: dict[int, "tuple[int, float]"] = {}
     for position, body in enumerate(sensory_sorted):
         # Contiguous equal-ish blocks: body at sorted position p goes to
@@ -473,7 +525,7 @@ def assign_channels(
         )
         input_assignment[body] = (channel, INPUT_WEIGHT)
 
-    descending_sorted = sorted(descending_ids)
+    descending_sorted = sorted(set(descending_ids))
     output_assignment: dict[int, "tuple[int, float]"] = {}
     counts_per_population = [0] * OUTPUT_POPULATION_COUNT
     populations = []
@@ -504,6 +556,8 @@ def calibrate_global_gain(edges: pd.DataFrame) -> float:
     This keeps the bulk of the network's recurrent drive within a bounded,
     non-saturating range without hand-picking a magic constant.
     """
+    if len(edges) == 0:
+        raise ValueError("calibrate_global_gain: edges must be non-empty")
     out_sum = edges.groupby("pre")["weight"].sum()
     percentile_value = float(np.percentile(out_sum.to_numpy(), GLOBAL_GAIN_PERCENTILE))
     if percentile_value <= 0:

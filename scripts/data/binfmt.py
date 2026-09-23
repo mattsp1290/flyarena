@@ -153,6 +153,12 @@ def validate_graph(graph: GraphArrays) -> GraphArrays:
 
     for label in ("neuronCount", "edgeCount", "inputChannelCount", "outputPopulationCount"):
         value = meta[label]
+        # Intentionally stricter than format.ts's `Number.isInteger(value)`,
+        # which accepts a float64 like 5.0 (JS has no separate integer
+        # type). Every count this compiler ever produces is a genuine
+        # Python int, so requiring `isinstance(value, (int, np.integer))`
+        # only ever rejects inputs TS would also treat as suspicious to
+        # construct by hand; it never rejects anything this module emits.
         if not (isinstance(value, (int, np.integer)) and value >= 0):
             _invalid(f"{label} must be a non-negative integer")
 
@@ -200,12 +206,14 @@ def validate_graph(graph: GraphArrays) -> GraphArrays:
         if actual != expected:
             _invalid(f"{label} length {actual} does not match expected length {expected}")
 
+    # The length check above already guarantees len(offsets) == neuron_count
+    # + 1 >= 1, so offsets[0] and offsets[neuron_count] are always in range
+    # here; no separate emptiness guard is needed.
     offsets = graph.presynaptic_offsets
-    if neuron_count > 0 or edge_count > 0 or len(offsets) > 0:
-        if len(offsets) == 0 or int(offsets[0]) != 0:
-            _invalid("presynapticOffsets must start at 0")
-        if int(offsets[neuron_count]) != edge_count:
-            _invalid("presynapticOffsets must end at edgeCount")
+    if int(offsets[0]) != 0:
+        _invalid("presynapticOffsets must start at 0")
+    if int(offsets[neuron_count]) != edge_count:
+        _invalid("presynapticOffsets must end at edgeCount")
 
     post = graph.postsynaptic_indices
     magnitudes = graph.contact_magnitudes
@@ -311,7 +319,17 @@ def write_gzip_deterministic(data: bytes, path: Path) -> None:
     """Write gzip bytes with a fixed mtime (0) and no filename in the header
     so the compressed file is byte-identical across runs (gzip embeds the
     source mtime and filename by default, which would otherwise make
-    `.bin.gz` output non-reproducible run-to-run)."""
+    `.bin.gz` output non-reproducible run-to-run).
+
+    This makes the *gzip container* (header fields) deterministic; the
+    compressed payload itself is deterministic across runs of the same
+    Python/zlib version because DEFLATE compression is a pure function of
+    its input bytes and compression level (CPython's `gzip` module doesn't
+    vary these by OS or time). It is not a guarantee that two different
+    zlib versions/vendors always choose bit-identical DEFLATE encodings for
+    the same input -- if that ever needs to be pinned exactly across
+    machines, pin the Python/zlib version used to build `public/data/`.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "wb") as fh:
         with gzip.GzipFile(filename="", mode="wb", fileobj=fh, mtime=0) as gz:

@@ -421,3 +421,141 @@ def test_rewire_round_trips_through_binary_encoding():
     assert np.array_equal(decoded.biological_ids, rewired.biological_ids)
     assert np.array_equal(decoded.postsynaptic_indices, rewired.postsynaptic_indices)
     assert np.array_equal(decoded.contact_magnitudes, rewired.contact_magnitudes)
+
+
+def test_rewire_swap_stat_buckets_sum_to_attempts():
+    """Every attempted (i, j) draw must land in exactly one counted bucket:
+    accepted, or one of the four rejection reasons (including the
+    same-index draw, which an earlier version of this compiler silently
+    `continue`d past without counting)."""
+    graph = _synthetic_graph_for_rewiring()
+    _, stats = rewire.rewire_graph(graph, seed=5)
+    bucket_sum = (
+        stats["acceptedSwaps"]
+        + stats["rejectedSelfLoop"]
+        + stats["rejectedDuplicate"]
+        + stats["rejectedDegenerate"]
+        + stats["rejectedSameIndex"]
+    )
+    assert bucket_sum == stats["attempts"]
+
+
+def test_decode_graph_binary_rejects_truncated_buffer():
+    graph, _ = _compile_fixture("tiny_nodes.csv", "tiny_edges.csv")
+    binary = binfmt.encode_graph_binary(graph)
+    with pytest.raises(binfmt.InvalidGraphError):
+        rewire.decode_graph_binary(binary[:-1])
+    with pytest.raises(binfmt.InvalidGraphError):
+        rewire.decode_graph_binary(binary[:10])  # shorter than the fixed header
+
+
+# ---------------------------------------------------------------------------
+# assign_signs: duplicate-body-id crash and missing/missing_value
+# distinction (review findings from both reviewers on
+# feat/qyxw-malecns-graph -- see reviews/feat-qyxw-malecns-graph-*/).
+# ---------------------------------------------------------------------------
+
+
+def test_assign_signs_rejects_duplicate_body_in_neurotransmitter_table():
+    nt = pd.DataFrame(
+        {"body": [1, 1, 2], "consensus_nt": ["acetylcholine", "gaba", "gaba"]}
+    )
+    with pytest.raises(ValueError, match="duplicate body"):
+        compiler.assign_signs([1, 2], nt)
+
+
+def test_assign_signs_distinguishes_missing_row_from_missing_value():
+    # body 3: no row at all. body 4: a row exists but consensus_nt is NaN.
+    nt = pd.DataFrame(
+        {
+            "body": [1, 2, 4, 5],
+            "consensus_nt": ["acetylcholine", "gaba", float("nan"), "unclear"],
+        }
+    )
+    signs, unknown_by_label = compiler.assign_signs([1, 2, 3, 4, 5], nt)
+
+    assert signs == {1: 1, 2: -1, 3: 1, 4: 1, 5: 1}
+    assert unknown_by_label == {"missing": 1, "missing_value": 1, "unclear": 1}
+
+
+def test_select_subgraph_rejects_duplicate_body_id_in_annotations():
+    annotations = pd.DataFrame(
+        {
+            "bodyId": [1, 1, 2],
+            "status": ["Traced", "Traced", "Traced"],
+            "superclass": ["vnc_sensory", "vnc_sensory", "descending_neuron"],
+            "class": ["mechanosensory_tactile", "mechanosensory_tactile", None],
+        }
+    )
+    weights = pd.DataFrame({"body_pre": [1], "body_post": [2], "weight": [5]})
+    with pytest.raises(ValueError, match="duplicate bodyId"):
+        compiler.select_subgraph(annotations, weights)
+
+
+# ---------------------------------------------------------------------------
+# assign_channels: dedup, empty-input guards, and the boundary case where
+# the candidate count is not evenly divisible (or is smaller than) the
+# channel/population count.
+# ---------------------------------------------------------------------------
+
+
+def test_assign_channels_dedupes_input_ids():
+    # A duplicate id (e.g. from an upstream data-quality issue) must not
+    # consume two partition slots for the same body.
+    input_assignment, output_assignment = compiler.assign_channels(
+        sensory_ids=[10, 10, 20, 30, 40, 50, 60, 70],
+        descending_ids=[100, 100, 200, 300],
+    )
+    assert set(input_assignment.keys()) == {10, 20, 30, 40, 50, 60, 70}
+    assert set(output_assignment.keys()) == {100, 200, 300}
+
+
+def test_assign_channels_rejects_empty_candidate_lists():
+    with pytest.raises(ValueError):
+        compiler.assign_channels(sensory_ids=[], descending_ids=[1, 2, 3])
+    with pytest.raises(ValueError):
+        compiler.assign_channels(sensory_ids=[1, 2, 3], descending_ids=[])
+
+
+def test_assign_channels_handles_fewer_candidates_than_channels():
+    # 3 sensory neurons, 8 input channels: every neuron gets a channel, no
+    # crash, and every assigned channel index is in range.
+    input_assignment, _ = compiler.assign_channels(sensory_ids=[1, 2, 3], descending_ids=[100])
+    assert len(input_assignment) == 3
+    for channel, _weight in input_assignment.values():
+        assert 0 <= channel < compiler.INPUT_CHANNEL_COUNT
+
+
+def test_calibrate_global_gain_rejects_empty_edges():
+    with pytest.raises(ValueError):
+        compiler.calibrate_global_gain(pd.DataFrame({"pre": [], "post": [], "weight": []}))
+
+
+# ---------------------------------------------------------------------------
+# Duplicate aggregation determinism under 3+-way ties (a 2-way tie is
+# commutative regardless of summation order and cannot exercise this).
+# ---------------------------------------------------------------------------
+
+
+def test_three_way_duplicate_aggregation_is_order_independent():
+    node_ids = [1, 2]
+    signs = {1: 1, 2: 1}
+    input_assignment = {1: (0, 1.0)}
+    output_assignment = {2: (0, 1.0)}
+    metadata_params = DEFAULT_METADATA_PARAMS
+
+    # Three rows for the same (pre=1, post=2) pair, with magnitudes spanning
+    # enough orders of magnitude that float64 summation order could
+    # plausibly matter, in two different input orders.
+    weights = [1e-8, 1.0, 1e8]
+    import itertools
+
+    results = set()
+    for permutation in itertools.permutations(weights):
+        edges = pd.DataFrame({"pre": [1, 1, 1], "post": [2, 2, 2], "weight": list(permutation)})
+        graph, _ = compiler.compile_graph(
+            node_ids, edges, signs, input_assignment, output_assignment, 1, 1, metadata_params
+        )
+        results.add(binfmt.encode_graph_binary(graph))
+
+    assert len(results) == 1, "aggregation order must not depend on input row order"
