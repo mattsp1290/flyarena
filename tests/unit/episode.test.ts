@@ -1,0 +1,159 @@
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { describe, expect, it } from 'vitest';
+
+import { decodeAction } from '../../src/lib/arena/actions';
+import { createWorld, stepWorld } from '../../src/lib/arena/world';
+import type { AgentScore } from '../../src/lib/arena/types';
+import {
+  createReadoutOutput,
+  createReadoutScratch,
+  outputNeuronIndices,
+  readoutForward,
+  type ReadoutWeights
+} from '../../src/lib/connectome/readout';
+import { DEFAULT_GRAPH_ID, TRACE_SEEDS, TRACE_SUBSTEPS, TRACE_TICKS } from '../../scripts/training/export-traces';
+import { runEpisode } from '../../scripts/training/episode';
+import { createTraceGraph } from '../fixtures/trace-graph';
+
+const GOLDEN_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '../fixtures/golden');
+
+/**
+ * The committed golden trace files (`tests/fixtures/golden/`) do not record
+ * a per-tick score column (see `export-traces.ts`'s `SeedTraceFile` doc
+ * comment): they record `initialWorld` (tick 0) and, per tick, the exact
+ * decoded `actions` fed into `stepWorld`. Replaying those actions through
+ * `stepWorld`, starting from a fresh `createWorld(seed)` (which is exactly
+ * what produced the committed `initialWorld` — see `buildSeedTrace`), is
+ * therefore the independent ground truth for "the golden trace's score at
+ * the final recorded tick": it uses only `stepWorld` directly on the
+ * committed action record, never `episode.ts`'s own observe/model/decode
+ * computation.
+ */
+const goldenFinalLeftScore = (seed: number): AgentScore => {
+  const trace = JSON.parse(
+    readFileSync(resolve(GOLDEN_DIR, `${DEFAULT_GRAPH_ID}-seed-${seed}.json`), 'utf8')
+  ) as { actions: number[][] };
+  let world = createWorld(seed);
+  for (const action of trace.actions) {
+    world = stepWorld(world, { left: action, right: [0, 0, 0] });
+  }
+  const left = world.agents.find((agent) => agent.id === 'left');
+  if (!left) throw new Error('missing left agent');
+  return left.score;
+};
+
+describe('runEpisode: authored decoder vs golden traces', () => {
+  it.each(TRACE_SEEDS)(
+    'reproduces the golden trace score at the final recorded tick (%d) exactly, seed %d',
+    (seed) => {
+      const graph = createTraceGraph();
+      const result = runEpisode({
+        seed,
+        ticks: TRACE_TICKS,
+        substeps: TRACE_SUBSTEPS,
+        left: { decoder: 'authored', graph },
+        right: { decoder: 'parked' }
+      });
+
+      expect(result.ticks).toBe(TRACE_TICKS);
+      expect(result.left).toEqual(goldenFinalLeftScore(seed));
+    }
+  );
+});
+
+describe('runEpisode: decoder behavior', () => {
+  it('parked never accelerates: the parked agent needs no graph and its score stays at its spawn defaults', () => {
+    const graph = createTraceGraph();
+    const result = runEpisode({
+      seed: 1,
+      ticks: 30,
+      substeps: TRACE_SUBSTEPS,
+      left: { decoder: 'authored', graph },
+      right: { decoder: 'parked' }
+    });
+    // A parked agent that never moves cannot accumulate movement score or
+    // pick up food; only a spawn-time hazard overlap (not the case for this
+    // seed/config) could change hazardContacts before it ever accelerates.
+    expect(result.right.movementScore).toBe(0);
+    expect(result.right.foodPickups).toBe(0);
+  });
+
+  it('rejects a non-parked agent with no graph', () => {
+    expect(() =>
+      runEpisode({
+        seed: 1,
+        ticks: 1,
+        substeps: TRACE_SUBSTEPS,
+        left: { decoder: 'authored' },
+        right: { decoder: 'parked' }
+      })
+    ).toThrow(/requires a graph/);
+  });
+
+  it('rejects a trained/silenced agent with no weights', () => {
+    const graph = createTraceGraph();
+    expect(() =>
+      runEpisode({
+        seed: 1,
+        ticks: 1,
+        substeps: TRACE_SUBSTEPS,
+        left: { decoder: 'trained', graph },
+        right: { decoder: 'parked' }
+      })
+    ).toThrow(/requires weights/);
+  });
+
+  it('silenced decodes the same constant action every tick (readoutForward on an all-zero input)', () => {
+    // episode.ts's 'silenced' decoder feeds readoutForward an all-zero
+    // gathered input every tick regardless of the network's real state, so
+    // hidden = tanh(b1) and the decoded action are constant across ticks —
+    // this is what makes it a circuit-silenced control rather than a
+    // relabeling of 'trained'. Verified directly here (not just by
+    // determinism): manually compute the one constant decoded action via
+    // readoutForward on a zero rate vector, replay it through stepWorld by
+    // hand for every tick, and confirm that matches runEpisode's 'silenced'
+    // result exactly.
+    const graph = createTraceGraph();
+    const indices = outputNeuronIndices(graph);
+    const D = indices.length;
+    const H = 4;
+    const weights: ReadoutWeights = {
+      inputSize: D,
+      hiddenSize: H,
+      w1: Float32Array.from({ length: H * D }, (_, i) => 0.05 * ((i % 5) - 2)),
+      b1: Float32Array.from({ length: H }, (_, i) => 0.1 * (i - 1)),
+      w2: Float32Array.from({ length: 3 * H }, (_, i) => 0.05 * ((i % 3) - 1)),
+      b2: Float32Array.from([0.2, -0.1, 0.05])
+    };
+
+    const zeroRate = new Float32Array(graph.metadata.neuronCount);
+    const scratch = createReadoutScratch(H);
+    const out = createReadoutOutput();
+    readoutForward(weights, zeroRate, indices, scratch, out);
+    const decoded = decodeAction(Array.from(out));
+    const constantAction: readonly [number, number, number] = [decoded.thrust, decoded.yaw, decoded.brake];
+    // A non-trivial constant action: the test is meaningless if it happens
+    // to decode to the zero action.
+    expect(constantAction.some((value) => value !== 0)).toBe(true);
+
+    const ticks = 8;
+    let world = createWorld(7);
+    for (let tick = 0; tick < ticks; tick += 1) {
+      world = stepWorld(world, { left: constantAction, right: [0, 0, 0] });
+    }
+    const expectedLeft = world.agents.find((agent) => agent.id === 'left');
+    if (!expectedLeft) throw new Error('missing left agent');
+
+    const result = runEpisode({
+      seed: 7,
+      ticks,
+      substeps: TRACE_SUBSTEPS,
+      left: { decoder: 'silenced', graph, weights },
+      right: { decoder: 'parked' }
+    });
+
+    expect(result.left).toEqual(expectedLeft.score);
+  });
+});
