@@ -1,10 +1,11 @@
+import type { GraphMode } from '../connectome/format';
 import {
   ARENA_CONFIG,
   retainArenaConfig,
   validateRetainedArenaConfig,
   type ArenaConfig
 } from './config';
-import type { ActionsByAgent, ReadonlyWorldState, WorldState } from './types';
+import type { ActionsByAgent, AgentId, ReadonlyWorldState, WorldState } from './types';
 import { createWorld, stepWorld } from './world';
 
 export interface ReplayAgentSummary {
@@ -156,4 +157,63 @@ export const runReplay = (
   const summary = createReplaySummary(world);
   const serialized = serializeReplaySummary(summary);
   return { summary, serialized, hash: hashReplaySummary(summary) };
+};
+
+/** One tick's worth of per-agent score-trace data, recorded by `src/lib/experiment/runner.ts`. */
+export interface ExperimentTraceEntry {
+  tick: number;
+  timeSeconds: number;
+  agents: Record<
+    AgentId,
+    {
+      foodPickups: number;
+      hazardContacts: number;
+      distanceTravelled: number;
+      movementScore: number;
+    }
+  >;
+}
+
+/**
+ * The deterministic, downloadable record of one closed-loop experiment run:
+ * configuration (seed, config fingerprint, per-agent topology) and score
+ * traces only. This deliberately contains nothing shaped like a
+ * `ConnectomeGraph` (no `biologicalIds`/CSR arrays/weights) — the point of a
+ * replay download is to let someone reproduce or audit a run's *outcome*
+ * from its declared inputs, never to re-distribute the connectome asset
+ * itself. `tests/unit/replay-export.test.ts` asserts this shape directly.
+ */
+export interface ExperimentReplayExport {
+  schemaVersion: 1;
+  seed: number;
+  configFingerprint: string;
+  topology: Record<AgentId, GraphMode>;
+  substepsPerTick: number;
+  totalTicks: number;
+  finalSummary: ReplaySummary;
+  finalHash: string;
+  trace: readonly ExperimentTraceEntry[];
+}
+
+export const createExperimentReplayExport = (
+  world: Readonly<WorldState>,
+  options: {
+    topology: Record<AgentId, GraphMode>;
+    substepsPerTick: number;
+    totalTicks: number;
+    trace: readonly ExperimentTraceEntry[];
+  }
+): ExperimentReplayExport => {
+  const finalSummary = createReplaySummary(world);
+  return {
+    schemaVersion: 1,
+    seed: world.seed,
+    configFingerprint: world.configFingerprint,
+    topology: { ...options.topology },
+    substepsPerTick: options.substepsPerTick,
+    totalTicks: options.totalTicks,
+    finalSummary,
+    finalHash: hashReplaySummary(finalSummary),
+    trace: options.trace
+  };
 };

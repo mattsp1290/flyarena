@@ -372,6 +372,34 @@ export const parseGraphBinary = (buffer: ArrayBuffer): ConnectomeGraph => {
 };
 
 /**
+ * Build the disconnected negative control from a validated graph: same
+ * neuron set, same `biologicalIds`/`presynapticSigns`, and the exact same
+ * input/output channel-to-neuron mapping (so encoder/decoder contact points
+ * are unchanged) — but with every recurrent edge removed (`edgeCount = 0`).
+ * This is the "same graph with edgeCount 0" negative control described in
+ * the plan: it is built at runtime from an already-loaded arm rather than
+ * shipped as its own binary artifact, since it carries no information the
+ * source arm didn't already have. `presynapticOffsets` becomes all zeros
+ * (every row empty); every other array keeps its neuron-indexed values.
+ */
+export const createDisconnectedGraph = (graph: Readonly<ConnectomeGraph>): ConnectomeGraph => {
+  const { metadata, neuronCount } = { metadata: graph.metadata, neuronCount: graph.metadata.neuronCount };
+  const disconnected: ConnectomeGraph = {
+    metadata: { ...metadata, edgeCount: 0 },
+    biologicalIds: graph.biologicalIds.slice(),
+    presynapticOffsets: new Uint32Array(neuronCount + 1),
+    postsynapticIndices: new Uint32Array(0),
+    contactMagnitudes: new Float32Array(0),
+    presynapticSigns: graph.presynapticSigns.slice(),
+    inputChannelIndex: graph.inputChannelIndex.slice(),
+    inputWeight: graph.inputWeight.slice(),
+    outputPopulationIndex: graph.outputPopulationIndex.slice(),
+    outputWeight: graph.outputWeight.slice()
+  };
+  return validateGraph(disconnected);
+};
+
+/**
  * Encode a validated graph into the binary format described by
  * docs/graph-format.md. Primarily a test/tooling counterpart to
  * `parseGraphBinary`: the production artifact is emitted by the offline

@@ -1,25 +1,18 @@
-import { cleanup, render, screen, waitFor } from '@testing-library/svelte';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ARENA_CONFIG } from '../src/lib/arena/config';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // `vi.mock` calls are hoisted above imports by Vitest's transform, so this
 // static import below receives the mocked module even though it is
 // declared after the vi.mock() call in source order.
 import App from '../src/App.svelte';
+import { createPublicDataFetch, FakeNeuralWorker } from './helpers/fake-worker';
 
 /**
  * jsdom has no WebGL, so a real `ArenaScene` always fails to construct
  * (see tests/App.test.ts's fallback-message test) — which means no test
  * using the real class can ever exercise App.svelte's cleanup paths
- * (dispose-on-unmount, dispose-on-context-loss). Both of those paths had
- * real bugs during this bean's review (the context-loss handler dropped
- * the scene without disposing it). Mock the module so those paths can
- * actually be driven and asserted on.
- *
- * `App.svelte` loads this module via a dynamic `import()` (so `three`
- * lands in its own bundle chunk, see ArenaScene.ts's WP7 note) rather than
- * a static import; Vitest's `vi.mock` intercepts dynamic imports the same
- * way it intercepts static ones, but every test below still has to wait a
- * tick for that import to resolve before `instances` is populated.
+ * (dispose-on-unmount, dispose-on-context-loss). Mock the module so those
+ * paths can actually be driven and asserted on, same approach as before
+ * this bean replaced the placeholder demo loop with the closed-loop runner.
  */
 interface MockArenaSceneOptions {
   onContextLost?: (info: { reason: string }) => void;
@@ -48,22 +41,6 @@ vi.mock('../src/lib/render/ArenaScene', () => {
   return { ArenaScene, ArenaSceneUnavailableError };
 });
 
-/**
- * `App.svelte`'s demo loop calls the real `stepWorld` (deterministic game
- * logic we want exercised, not stubbed) but the frame-loop tests below need
- * to observe *how many times* it ran per animation frame, and occasionally
- * make it throw. Wrap the real implementation in a `vi.fn` rather than
- * replacing it, so ticking behavior stays identical to production.
- */
-vi.mock('../src/lib/arena/world', async () => {
-  const actual = await vi.importActual<typeof import('../src/lib/arena/world')>('../src/lib/arena/world');
-  return { ...actual, stepWorld: vi.fn(actual.stepWorld) };
-});
-
-import { stepWorld } from '../src/lib/arena/world';
-
-const stepWorldMock = vi.mocked(stepWorld);
-
 /** Minimal `MediaQueryListEvent` stand-in: jsdom implements neither `matchMedia` nor this event type. */
 class FakeMediaQueryListEvent extends Event {
   constructor(public readonly matches: boolean) {
@@ -81,10 +58,16 @@ class FakeMediaQueryList extends EventTarget {
   }
 }
 
+beforeEach(() => {
+  vi.stubGlobal('fetch', createPublicDataFetch());
+  vi.stubGlobal('Worker', FakeNeuralWorker as unknown as typeof Worker);
+});
+
 afterEach(() => {
   cleanup();
   instances.length = 0;
   vi.clearAllMocks();
+  vi.unstubAllGlobals();
 });
 
 /** Wait for the dynamically-imported `ArenaScene` to have been constructed, then return the mock instance. */
@@ -92,6 +75,12 @@ const mountAndAwaitScene = async (): Promise<(typeof instances)[number]> => {
   render(App);
   await waitFor(() => expect(instances).toHaveLength(1));
   return instances[0];
+};
+
+const waitForReady = async (): Promise<void> => {
+  await waitFor(() => expect(screen.getByLabelText(/experiment status: ready/i)).toBeInTheDocument(), {
+    timeout: 5000
+  });
 };
 
 describe('App renderer lifecycle (ArenaScene mocked)', () => {
@@ -126,10 +115,6 @@ describe('App renderer lifecycle (ArenaScene mocked)', () => {
 });
 
 describe('App reduced-motion handling', () => {
-  afterEach(() => {
-    vi.unstubAllGlobals();
-  });
-
   it('subscribes to prefers-reduced-motion and forwards changes to the scene, unsubscribing on unmount', async () => {
     const mql = new FakeMediaQueryList('(prefers-reduced-motion: reduce)', false);
     vi.stubGlobal(
@@ -153,7 +138,7 @@ describe('App reduced-motion handling', () => {
   });
 });
 
-describe('App demo-loop frame() behavior', () => {
+describe('App frame loop (interpolation only, no stepping on the render thread)', () => {
   let rafCallback: FrameRequestCallback | undefined;
   let rafSpy: ReturnType<typeof vi.spyOn>;
   let cafSpy: ReturnType<typeof vi.spyOn>;
@@ -164,12 +149,6 @@ describe('App demo-loop frame() behavior', () => {
     callback?.(nowMs);
   };
 
-  afterEach(() => {
-    rafSpy?.mockRestore();
-    cafSpy?.mockRestore();
-    rafCallback = undefined;
-  });
-
   const stubRaf = (): void => {
     rafSpy = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb) => {
       rafCallback = cb;
@@ -178,59 +157,75 @@ describe('App demo-loop frame() behavior', () => {
     cafSpy = vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => {});
   };
 
-  it('steps once for a normal frame gap, then clamps a huge frame gap to at most MAX_CATCHUP_SECONDS worth of fixed steps', async () => {
-    stubRaf();
-    await mountAndAwaitScene();
-    expect(rafCallback).toBeTypeOf('function');
-
-    // First callback only seeds `lastFrameTimeMs` — App.svelte never steps
-    // on the frame that establishes the clock baseline.
-    pump(1000);
-    expect(stepWorldMock).not.toHaveBeenCalled();
-    expect(rafCallback).toBeTypeOf('function');
-
-    // A gap just over one fixed-delta steps the world exactly once — the
-    // ordinary, non-clamped path. (+1ms clears the fixedDeltaSeconds
-    // threshold with margin: `fixedDeltaSeconds * 1000 / 1000` does not
-    // round-trip back to exactly `fixedDeltaSeconds` in IEEE754.)
-    const secondFrameMs = 1000 + ARENA_CONFIG.fixedDeltaSeconds * 1000 + 1;
-    pump(secondFrameMs);
-    expect(stepWorldMock).toHaveBeenCalledTimes(1);
-
-    // A huge (10 real second) gap must not replay ~300 fixed steps: the
-    // accumulator clamps to MAX_CATCHUP_SECONDS (5 fixed steps) before the
-    // catch-up `while` loop runs, on top of the 1 step already taken above.
-    const maxCatchupSteps = 5;
-    pump(secondFrameMs + 10_000);
-    expect(stepWorldMock).toHaveBeenCalledTimes(1 + maxCatchupSteps);
+  afterEach(() => {
+    rafSpy?.mockRestore();
+    cafSpy?.mockRestore();
+    rafCallback = undefined;
   });
 
-  it('stops the loop, reports the error, and disposes the scene when stepWorld throws mid-frame', async () => {
+  it('calls scene.update with a valid arena snapshot on every animation frame, both before and after the experiment becomes ready', async () => {
     stubRaf();
     const instance = await mountAndAwaitScene();
-    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(rafCallback).toBeTypeOf('function');
 
-    pump(1000); // seed lastFrameTimeMs, no step
-    const rafCallCountBeforeThrow = rafSpy.mock.calls.length;
+    // The very first frame renders whatever is available yet — either the
+    // idle placeholder world (if the asset/Worker pipeline hasn't resolved
+    // yet) or the freshly-constructed runner's own world (tick 0 either
+    // way): frame() never steps anything itself, it only interpolates.
+    pump(1000);
+    expect(instance.update).toHaveBeenCalledTimes(1);
+    const [firstSnapshot] = instance.update.mock.calls[0];
+    expect(firstSnapshot.tick).toBe(0);
+    expect(firstSnapshot.agents).toHaveLength(2);
 
-    stepWorldMock.mockImplementationOnce(() => {
-      throw new Error('boom');
+    await waitForReady();
+    pump(1016);
+    expect(instance.update).toHaveBeenCalledTimes(2);
+    const [secondSnapshot] = instance.update.mock.calls[1];
+    expect(secondSnapshot.agents).toHaveLength(2);
+    expect(secondSnapshot.foods.length).toBeGreaterThan(0);
+  });
+
+  it('does not throw or stop the loop across many frames while idle', async () => {
+    stubRaf();
+    await mountAndAwaitScene();
+    for (let frameIndex = 0; frameIndex < 20; frameIndex += 1) {
+      pump(1000 + frameIndex * 16);
+    }
+    expect(rafCallback).toBeTypeOf('function');
+  });
+});
+
+describe('App experiment controls wiring', () => {
+  it('Start moves the status to running, Pause stops it, and Reset returns to ready', async () => {
+    await mountAndAwaitScene();
+    await waitForReady();
+
+    const startButton = screen.getByRole('button', { name: /^start$/i });
+    await fireEvent.click(startButton);
+
+    await waitFor(() => expect(screen.getByLabelText(/experiment status: running/i)).toBeInTheDocument(), {
+      timeout: 5000
     });
-    // +1ms clears the fixedDeltaSeconds threshold with margin — see the
-    // frame-gap test above for why an exact multiple doesn't round-trip.
-    pump(1000 + ARENA_CONFIG.fixedDeltaSeconds * 1000 + 1);
 
-    expect(instance.dispose).toHaveBeenCalledTimes(1);
-    // The throwing frame must return before reaching its own
-    // `requestAnimationFrame(frame)` call — the loop stops, it does not
-    // reschedule itself.
-    expect(rafSpy.mock.calls.length).toBe(rafCallCountBeforeThrow);
-    expect(rafCallback).toBeUndefined();
+    const pauseButton = screen.getByRole('button', { name: /^pause$/i });
+    await fireEvent.click(pauseButton);
+    await waitFor(() => expect(screen.getByLabelText(/experiment status: paused/i)).toBeInTheDocument(), {
+      timeout: 5000
+    });
 
-    const fallback = await screen.findByRole('img', { name: /arena canvas unavailable/i });
-    expect(fallback).toHaveTextContent(/arena stopped/i);
-    expect(fallback).toHaveTextContent(/boom/i);
+    const resetButton = screen.getByRole('button', { name: /^reset$/i });
+    await fireEvent.click(resetButton);
+    await waitFor(() => expect(screen.getByLabelText(/experiment status: ready/i)).toBeInTheDocument());
+  });
 
-    consoleErrorSpy.mockRestore();
+  it('changing the seed input resets the world seed shown in telemetry', async () => {
+    await mountAndAwaitScene();
+    await waitForReady();
+
+    const seedInput = screen.getByLabelText(/^seed$/i) as HTMLInputElement;
+    await fireEvent.input(seedInput, { target: { value: '4242' } });
+
+    await waitFor(() => expect(screen.getAllByText('4242').length).toBeGreaterThan(0));
   });
 });

@@ -1,0 +1,61 @@
+/**
+ * Explicit, pure state machine for the closed-loop arena experiment (WP6
+ * item 1). Deliberately has no async/timer/Worker dependency at all — every
+ * transition is a plain function of `(state, event) -> state`, so it is
+ * unit-testable independent of timing, fetch, or Worker plumbing. See
+ * `tests/unit/experiment-state.test.ts`.
+ *
+ * `ExperimentRunner` (`./runner.ts`) is the only production caller: it owns
+ * the actual async work (asset loading, ticking) and calls `transition` to
+ * decide its own next `status` after each step.
+ */
+
+export type ExperimentStatus = 'loading' | 'ready' | 'running' | 'paused' | 'finished' | 'error';
+
+export type ExperimentEvent =
+  /** Both graph artifacts fetched, integrity-checked, and parsed. */
+  | { type: 'assetsReady' }
+  /** Fetch failure, hash mismatch, or a malformed graph buffer. */
+  | { type: 'assetsFailed' }
+  | { type: 'start' }
+  | { type: 'pause' }
+  | { type: 'resume' }
+  /** Returns to `ready` with a fresh world and zeroed neural state; the already-validated graphs are reused. */
+  | { type: 'reset' }
+  | { type: 'tickCompleted'; tick: number; totalTicks: number }
+  /** A Worker/oracle step (or any other runtime) failure while running or paused. */
+  | { type: 'runtimeError' };
+
+/**
+ * The single authoritative transition table. An event with no listed
+ * transition for the current state is a no-op (returns `state` unchanged)
+ * rather than a throw: callers (e.g. a stray double-click on Start) should
+ * not have to guard every dispatch, and an unreachable transition is not a
+ * bug worth crashing the experiment over.
+ */
+const TRANSITIONS: Readonly<Record<ExperimentStatus, Partial<Record<ExperimentEvent['type'], ExperimentStatus>>>> = {
+  loading: { assetsReady: 'ready', assetsFailed: 'error' },
+  ready: { start: 'running', reset: 'ready' },
+  running: { pause: 'paused', reset: 'ready', runtimeError: 'error' },
+  paused: { resume: 'running', reset: 'ready', runtimeError: 'error' },
+  finished: { reset: 'ready' },
+  error: {}
+};
+
+export const transition = (state: ExperimentStatus, event: ExperimentEvent): ExperimentStatus => {
+  if (event.type === 'tickCompleted') {
+    // Only a 'running' tick can finish the run; a tick result arriving after
+    // a pause/reset raced it (see runner.ts's in-flight-tick handling) must
+    // not resurrect 'running' or fast-forward into 'finished'.
+    if (state !== 'running') return state;
+    return event.tick >= event.totalTicks ? 'finished' : 'running';
+  }
+  return TRANSITIONS[state][event.type] ?? state;
+};
+
+/** True once graphs are validated and idle at the start line — only 'ready' accepts Start; 'finished' requires an explicit Reset first. */
+export const canStart = (state: ExperimentStatus): boolean => state === 'ready';
+export const canPause = (state: ExperimentStatus): boolean => state === 'running';
+export const canResume = (state: ExperimentStatus): boolean => state === 'paused';
+export const canReset = (state: ExperimentStatus): boolean =>
+  state === 'ready' || state === 'running' || state === 'paused' || state === 'finished';
