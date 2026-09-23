@@ -101,9 +101,47 @@ main {
   margin-bottom: 1rem;
 }
 
+.canvas-region {
+  position: relative;
+  /* A definite height, not min-height: a replaced element's percentage
+     height only resolves against a definite parent height. Without this,
+     `.arena-canvas`'s `height: 100%` falls back to `auto`, which is driven
+     by the canvas's own width/height *attributes* — and ArenaScene.resize()
+     sets those attributes from this element's own measured size. That loop
+     let the canvas grow taller on every narrow-then-wide resize and never
+     shrink back (confirmed in a real browser during review). */
+  height: 31rem;
+  overflow: hidden;
+  border-radius: 0.55rem;
+}
+
+.arena-canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: 0.55rem;
+}
+
+.fps-overlay {
+  position: absolute;
+  top: 0.6rem;
+  right: 0.6rem;
+  padding: 0.25rem 0.55rem;
+  border: 1px solid #2b4354;
+  border-radius: 0.4rem;
+  color: #79d8d0;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  font-size: 0.72rem;
+  background: rgb(7 11 19 / 72%);
+  pointer-events: none;
+}
+
 .canvas-placeholder {
+  position: absolute;
+  inset: 0;
   display: grid;
-  min-height: 31rem;
   place-items: center;
   border: 1px dashed #315066;
   border-radius: 0.55rem;
@@ -191,7 +229,7 @@ dd,
     min-height: 24rem;
   }
 
-  .canvas-placeholder {
-    min-height: 19rem;
+  .canvas-region {
+    height: 19rem;
   }
 }
