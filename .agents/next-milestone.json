@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "project": {
+    "id": "flyarena",
+    "name": "FlyArena",
+    "vision": "Let a visitor see a connectome demo that never overstates itself, with every measured, annotated, authored, and calibrated component labeled in-product.",
+    "repository_identity": {
+      "kind": "remote-url",
+      "value": "https://github.com/mattsp1290/flyarena"
+    }
+  },
+  "comparators": [
+    {
+      "name": "DOOM-x-Fly",
+      "official_sources": [
+        "https://github.com/Aur1ety/DOOM-x-Fly"
+      ],
+      "relevance": "It states plainly that its eye model and eight-button decision layer are engineered rather than biological, and it publishes scrambled-frame, blind-replay, and random-action controls, which is the boundary-declaration standard FlyArena's ledger must meet or beat."
+    },
+    {
+      "name": "flybrain",
+      "official_sources": [
+        "https://github.com/snedea/flybrain"
+      ],
+      "relevance": "It runs a whole FlyWire graph in a browser Web Worker and claims behavior emerges from measured connectivity, so it shows both the client-only runtime shape FlyArena targets and the overclaiming failure mode FlyArena's labeling exists to avoid."
+    },
+    {
+      "name": "FlyDoom",
+      "official_sources": [
+        "https://github.com/eganeganegan/flydoom"
+      ],
+      "relevance": "It trains one seed across real_connectome, degree_rewired, erdos_renyi, and conventional recurrent baselines, which is the matched-control comparison discipline FlyArena's biological-versus-rewired arms depend on."
+    },
+    {
+      "name": "Fly Dino",
+      "official_sources": [
+        "https://github.com/cobanov/flyjump"
+      ],
+      "relevance": "It selects an 80-cell MaleCNS subset by anatomy alone, trains only a small readout, and reports held-out and circuit-silencing negative controls, showing how a small honest circuit plus declared controls can carry a credible claim."
+    }
+  ],
+  "evaluation_lenses": [
+    {
+      "name": "Provenance labeling",
+      "question": "Does the running product label every measured, annotated, authored, and calibrated component where the visitor sees it?"
+    },
+    {
+      "name": "Dataset traceability",
+      "question": "Can a visitor trace a displayed claim to a pinned dataset artifact, its hash, its inclusion rules, and its license?"
+    },
+    {
+      "name": "Measured topology in the loop",
+      "question": "Does measured connectome topology actually propagate state that determines what the agents do?"
+    },
+    {
+      "name": "Matched controls",
+      "question": "Can a visitor compare the biological arm against a degree-preserving rewired arm and a disconnected arm under identical dynamics, encoder, and decoder?"
+    },
+    {
+      "name": "Deterministic reproducibility",
+      "question": "Can a fixed seed reproduce a run's scores independently of render frame timing?"
+    },
+    {
+      "name": "Client-only inspectability",
+      "question": "Can a visitor run and inspect the whole experiment in a browser with no backend, account, or credential?"
+    }
+  ],
+  "acceptance_journey": "A visitor opens the model ledger, follows one displayed claim to the pinned dataset manifest and its hash, and returns to a running arena.",
+  "non_goals": [
+  ],
+  "ecosystem": {
+    "related_repositories": []
+  }
+}
