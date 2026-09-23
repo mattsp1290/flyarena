@@ -15,6 +15,7 @@ describe('ExperimentPanel accessibility and wiring', () => {
     seed: 1234,
     topology: { left: 'biological' as const, right: 'rewired' as const },
     controlsLocked: false,
+    topologyControlsLocked: false,
     onStart: vi.fn(),
     onPause: vi.fn(),
     onReset: vi.fn(),
@@ -77,24 +78,65 @@ describe('ExperimentPanel accessibility and wiring', () => {
     expect(props.onDownloadReplay).toHaveBeenCalledTimes(1);
   });
 
-  it('calls onSeedInput with a parsed integer and onTopologyChange with the agent id and mode', async () => {
+  it('commits the seed on change (not every keystroke) with a parsed, unsigned-normalized integer, and ignores an empty commit', async () => {
     const props = baseProps();
     render(ExperimentPanel, props);
+    const seedInput = screen.getByLabelText(/^seed$/i);
 
-    await fireEvent.input(screen.getByLabelText(/^seed$/i), { target: { value: '99' } });
+    // typing alone (input events) must not commit — only change/blur does.
+    await fireEvent.input(seedInput, { target: { value: '99' } });
+    expect(props.onSeedInput).not.toHaveBeenCalled();
+
+    await fireEvent.change(seedInput, { target: { value: '99' } });
     expect(props.onSeedInput).toHaveBeenCalledWith(99);
+
+    await fireEvent.change(seedInput, { target: { value: '-1' } });
+    // Normalized the same way `arena/world.ts` normalizes a seed (`>>> 0`),
+    // so the displayed value always matches what actually drives the run.
+    expect(props.onSeedInput).toHaveBeenCalledWith(4294967295);
+
+    props.onSeedInput.mockClear();
+    await fireEvent.change(seedInput, { target: { value: '' } });
+    expect(props.onSeedInput).not.toHaveBeenCalled();
+  });
+
+  it('calls onTopologyChange with the agent id and mode', async () => {
+    const props = baseProps();
+    render(ExperimentPanel, props);
 
     await fireEvent.change(screen.getByLabelText(/left arm topology/i), { target: { value: 'disconnected' } });
     expect(props.onTopologyChange).toHaveBeenCalledWith('left', 'disconnected');
   });
 
-  it('shows the error message as an alert only in the error state', () => {
+  it('shows the error message with recovery guidance as an alert only in the error state', () => {
     const { unmount } = render(ExperimentPanel, { ...baseProps(), status: 'error', errorMessage: 'boom' });
-    expect(screen.getByRole('alert')).toHaveTextContent('boom');
+    const alert = screen.getByRole('alert');
+    expect(alert).toHaveTextContent('boom');
+    expect(alert).toHaveTextContent(/reload the page/i);
     unmount();
 
     render(ExperimentPanel, { ...baseProps(), status: 'ready', errorMessage: 'boom' });
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('controlsLocked disables Start/Pause/Reset/Seed even when their own status would otherwise allow them', () => {
+    render(ExperimentPanel, { ...baseProps(), status: 'paused', controlsLocked: true });
+    expect(screen.getByRole('button', { name: /^resume$/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /^reset$/i })).toBeDisabled();
+    expect(screen.getByLabelText(/^seed$/i)).toBeDisabled();
+  });
+
+  it('topologyControlsLocked disables only the topology selectors, independent of controlsLocked', () => {
+    render(ExperimentPanel, {
+      ...baseProps(),
+      status: 'ready',
+      controlsLocked: false,
+      topologyControlsLocked: true
+    });
+    expect(screen.getByLabelText(/left arm topology/i)).toBeDisabled();
+    expect(screen.getByLabelText(/right arm topology/i)).toBeDisabled();
+    // Start etc. are still governed by controlsLocked/status, not this flag.
+    expect(screen.getByRole('button', { name: /^start$/i })).toBeEnabled();
   });
 });
 

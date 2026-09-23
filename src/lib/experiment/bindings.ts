@@ -60,25 +60,53 @@ export interface CreateOracleBindingOptions {
   simulatedLatencyMs?: () => number;
 }
 
-/** Build an `AgentBinding` that steps the synchronous CPU oracle (`connectome/model.ts`) directly, wrapped in a resolved Promise. */
+/**
+ * Build an `AgentBinding` that steps the synchronous CPU oracle
+ * (`connectome/model.ts`) directly, wrapped in a resolved Promise.
+ *
+ * `AgentBinding#reset` must apply strictly after any previously-issued
+ * `step` has settled (FIFO), leaving the arm's neural state exactly as
+ * freshly initialized — `ExperimentRunner#reset()` relies on this to zero
+ * neural state deterministically regardless of what was in flight when
+ * `reset()` was called. A real Worker gets this for free from
+ * `postMessage`'s FIFO delivery order; this in-thread binding has no
+ * transport to rely on; and `options.simulatedLatencyMs` (test-only) means
+ * a `step` call can still be pending its artificial delay when `reset` is
+ * requested. Serialize every call — `step` and `reset` alike — through one
+ * promise chain so a call is only ever handled after every earlier one has
+ * fully finished.
+ */
 export const createOracleAgentBinding = (options: CreateOracleBindingOptions): AgentBinding => {
   const graph: ConnectomeGraph = parseGraphBinary(options.graphBuffer);
   const state = createModelState(graph);
   const scratch = createStepScratch(graph);
   const outputs = createOutputBuffer(graph);
 
-  const step = async (input: AgentStepInput): Promise<AgentStepResult> => {
-    const latency = options.simulatedLatencyMs?.();
-    if (latency && latency > 0) {
-      await new Promise<void>((resolve) => setTimeout(resolve, latency));
-    }
-    runSubsteps(graph, state, scratch, input.channelValues, input.substeps, outputs);
-    return { actionFeatures: Array.from(outputs), telemetry: computeTelemetry(state) };
+  let queue: Promise<unknown> = Promise.resolve();
+  /** Chain `fn` after every earlier queued call; a rejection never stalls the queue for later callers. */
+  const serialize = <T>(fn: () => Promise<T>): Promise<T> => {
+    const result = queue.then(fn);
+    queue = result.then(
+      () => undefined,
+      () => undefined
+    );
+    return result;
   };
 
-  const reset = async (): Promise<void> => {
-    resetModelState(state);
-  };
+  const step = (input: AgentStepInput): Promise<AgentStepResult> =>
+    serialize(async () => {
+      const latency = options.simulatedLatencyMs?.();
+      if (latency && latency > 0) {
+        await new Promise<void>((resolve) => setTimeout(resolve, latency));
+      }
+      runSubsteps(graph, state, scratch, input.channelValues, input.substeps, outputs);
+      return { actionFeatures: Array.from(outputs), telemetry: computeTelemetry(state) };
+    });
+
+  const reset = (): Promise<void> =>
+    serialize(async () => {
+      resetModelState(state);
+    });
 
   return {
     step,

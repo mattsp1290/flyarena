@@ -23,9 +23,17 @@ describe('experiment state machine', () => {
     expect(transition('paused', { type: 'resume' })).toBe('running');
   });
 
-  it('moves running -> error and paused -> error on runtimeError', () => {
-    expect(transition('running', { type: 'runtimeError' })).toBe('error');
-    expect(transition('paused', { type: 'runtimeError' })).toBe('error');
+  it('moves every live (non-loading) state to error on runtimeError', () => {
+    // Not just running/paused: a failed topology switch or a failed
+    // post-reset rebind can happen while sitting at ready/finished between
+    // runs (see ExperimentRunner#fail()), and must still be reportable.
+    for (const state of ['ready', 'running', 'paused', 'finished'] as const) {
+      expect(transition(state, { type: 'runtimeError' })).toBe('error');
+    }
+  });
+
+  it('loading does not accept runtimeError (only assetsFailed reaches error from loading)', () => {
+    expect(transition('loading', { type: 'runtimeError' })).toBe('loading');
   });
 
   it('reset returns to ready from ready, running, paused, and finished', () => {

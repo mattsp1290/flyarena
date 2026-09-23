@@ -224,8 +224,47 @@ describe('App experiment controls wiring', () => {
     await waitForReady();
 
     const seedInput = screen.getByLabelText(/^seed$/i) as HTMLInputElement;
-    await fireEvent.input(seedInput, { target: { value: '4242' } });
+    await fireEvent.change(seedInput, { target: { value: '4242' } });
 
     await waitFor(() => expect(screen.getAllByText('4242').length).toBeGreaterThan(0));
+  });
+});
+
+describe('App topology-switch race safety (regression for a prior review finding)', () => {
+  it('two rapid topology changes on the same arm never reach the error state, and settle on the last selection', async () => {
+    await mountAndAwaitScene();
+    await waitForReady();
+
+    const leftSelect = screen.getByLabelText(/left arm topology/i) as HTMLSelectElement;
+    // Fire both change events back to back, synchronously, before either
+    // async dispose()/init() sequence has a chance to complete — this is
+    // the same interleaving rapid keyboard <select> navigation produces.
+    await fireEvent.change(leftSelect, { target: { value: 'disconnected' } });
+    await fireEvent.change(leftSelect, { target: { value: 'rewired' } });
+
+    // While the switch is in flight, the topology selects must be locked.
+    expect(leftSelect).toBeDisabled();
+
+    await waitFor(() => expect(leftSelect).toBeEnabled(), { timeout: 5000 });
+    expect(screen.queryByLabelText(/experiment status: error/i)).not.toBeInTheDocument();
+    expect(screen.getByLabelText(/experiment status: ready/i)).toBeInTheDocument();
+    expect(leftSelect.value).toBe('rewired');
+  });
+
+  it('Start/Reset are disabled while a topology switch is pending, and re-enabled once it settles, without ever erroring', async () => {
+    await mountAndAwaitScene();
+    await waitForReady();
+
+    const leftSelect = screen.getByLabelText(/left arm topology/i) as HTMLSelectElement;
+    await fireEvent.change(leftSelect, { target: { value: 'disconnected' } });
+
+    const startButton = screen.getByRole('button', { name: /^start$/i });
+    const resetButton = screen.getByRole('button', { name: /^reset$/i });
+    expect(startButton).toBeDisabled();
+    expect(resetButton).toBeDisabled();
+
+    await waitFor(() => expect(startButton).toBeEnabled(), { timeout: 5000 });
+    expect(resetButton).toBeEnabled();
+    expect(screen.queryByLabelText(/experiment status: error/i)).not.toBeInTheDocument();
   });
 });

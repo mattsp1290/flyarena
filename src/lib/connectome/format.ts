@@ -383,7 +383,8 @@ export const parseGraphBinary = (buffer: ArrayBuffer): ConnectomeGraph => {
  * (every row empty); every other array keeps its neuron-indexed values.
  */
 export const createDisconnectedGraph = (graph: Readonly<ConnectomeGraph>): ConnectomeGraph => {
-  const { metadata, neuronCount } = { metadata: graph.metadata, neuronCount: graph.metadata.neuronCount };
+  const { metadata } = graph;
+  const { neuronCount } = metadata;
   const disconnected: ConnectomeGraph = {
     metadata: { ...metadata, edgeCount: 0 },
     biologicalIds: graph.biologicalIds.slice(),

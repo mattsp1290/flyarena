@@ -64,4 +64,70 @@ describe('createWorkerClient', () => {
 
     await expect(client.step([0, 0], 1)).rejects.toThrow('terminated');
   });
+
+  it('resolves each in-flight request with its own response even when the worker delivers them out of order', async () => {
+    // A distinct fake from FakeNeuralWorker: this test needs to control
+    // delivery order directly rather than have responses land in
+    // submission order, to prove routing is by requestId and not by
+    // arrival order (three distinct requestIds alone would pass even for a
+    // client that routed responses to the wrong callers, as long as
+    // delivery happened to match submission order).
+    const sentRequestIds: string[] = [];
+    const listeners = new Set<(event: MessageEvent) => void>();
+    const worker = {
+      postMessage: (message: { requestId: string }) => {
+        sentRequestIds.push(message.requestId);
+      },
+      addEventListener: (type: string, listener: (event: MessageEvent) => void) => {
+        if (type === 'message') listeners.add(listener);
+      },
+      removeEventListener: (type: string, listener: (event: MessageEvent) => void) => {
+        listeners.delete(listener);
+      }
+    };
+    const client = createWorkerClient(worker as never);
+
+    const p1 = client.reset();
+    const p2 = client.reset();
+    const p3 = client.reset();
+    expect(sentRequestIds).toHaveLength(3);
+
+    const deliver = (index: number): void => {
+      const event = { data: { type: 'reset', requestId: sentRequestIds[index], ok: true } } as unknown as MessageEvent;
+      for (const listener of listeners) listener(event);
+    };
+    // Reverse delivery order: the 3rd request's response arrives first.
+    deliver(2);
+    deliver(0);
+    deliver(1);
+
+    const [r1, r2, r3] = await Promise.all([p1, p2, p3]);
+    expect(r1.requestId).toBe(sentRequestIds[0]);
+    expect(r2.requestId).toBe(sentRequestIds[1]);
+    expect(r3.requestId).toBe(sentRequestIds[2]);
+  });
+
+  it('marks the client failed after a Worker error event: every later request rejects immediately instead of hanging forever', async () => {
+    const listeners = new Map<string, Set<(event: Event) => void>>();
+    const worker = {
+      postMessage: () => {},
+      addEventListener: (type: string, listener: (event: Event) => void) => {
+        let set = listeners.get(type);
+        if (!set) {
+          set = new Set();
+          listeners.set(type, set);
+        }
+        set.add(listener);
+      },
+      removeEventListener: () => {}
+    };
+    const client = createWorkerClient(worker as never);
+
+    const pendingBeforeError = client.step([0, 0], 1);
+    const errorEvent = new ErrorEvent('error', { message: 'module evaluation failed' });
+    for (const listener of listeners.get('error') ?? []) listener(errorEvent);
+
+    await expect(pendingBeforeError).rejects.toThrow(/module evaluation failed/);
+    await expect(client.step([0, 0], 1)).rejects.toThrow(/previously failed/);
+  });
 });

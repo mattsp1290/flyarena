@@ -198,6 +198,87 @@ describe('ExperimentRunner backpressure', () => {
     // Every tick must still have actually run to completion (1..totalTicks reached, not skipped).
     expect(runner.getWorld().tick).toBe(3);
   });
+
+  it('reports each arm’s own step latency independently, not the slower arm’s time for both', async () => {
+    const graph = createRandomGraph(0x21, { neuronCount: 16, inputChannelCount: 8, outputPopulationCount: 3 });
+    const buffer = encodeGraphBinary(graph);
+    const slowLeft = createOracleAgentBinding({ graphBuffer: buffer.slice(0), mode: 'biological', simulatedLatencyMs: () => 25 });
+    const fastRight = createOracleAgentBinding({ graphBuffer: buffer.slice(0), mode: 'biological', simulatedLatencyMs: () => 1 });
+
+    const runner = new ExperimentRunner({
+      seed: 1,
+      totalTicks: 5,
+      agents: { left: slowLeft, right: fastRight },
+      targetTickIntervalMs: 0
+    });
+    await runToFinished(runner);
+
+    const telemetry = runner.getTelemetry();
+    // Each arm's own median must reflect its own artificial delay, not the
+    // other arm's — a bug previously timed both arms from the same start
+    // to the same `Promise.all` settlement, so both always reported the
+    // slower arm's latency.
+    expect(telemetry.agents.left.medianStepLatencyMs).toBeGreaterThan(15);
+    expect(telemetry.agents.right.medianStepLatencyMs).toBeLessThan(15);
+    expect(telemetry.agents.left.medianStepLatencyMs).toBeGreaterThan(telemetry.agents.right.medianStepLatencyMs);
+  });
+});
+
+describe('ExperimentRunner setAgentBinding', () => {
+  it('throws when the run is active (running/paused), and succeeds from ready/finished', async () => {
+    const graph = createRandomGraph(0x33, { neuronCount: 16, inputChannelCount: 8, outputPopulationCount: 3 });
+    const buffer = encodeGraphBinary(graph);
+    const makeBinding = (): AgentBinding =>
+      createOracleAgentBinding({ graphBuffer: buffer.slice(0), mode: 'biological', simulatedLatencyMs: () => 1 });
+
+    const runner = new ExperimentRunner({
+      seed: 1,
+      totalTicks: 500,
+      agents: { left: makeBinding(), right: makeBinding() },
+      targetTickIntervalMs: 0
+    });
+
+    // ready: allowed.
+    expect(() => runner.setAgentBinding('left', makeBinding())).not.toThrow();
+    expect(runner.getStatus()).toBe('ready');
+
+    runner.start();
+    await new Promise<void>((resolveWait) => {
+      const poll = setInterval(() => {
+        if (runner.getStatus() === 'running') {
+          clearInterval(poll);
+          resolveWait();
+        }
+      }, 1);
+    });
+    expect(() => runner.setAgentBinding('left', makeBinding())).toThrow(/ready\/finished/);
+
+    runner.pause();
+    expect(() => runner.setAgentBinding('left', makeBinding())).toThrow(/ready\/finished/);
+
+    runner.reset();
+    expect(runner.getStatus()).toBe('ready');
+    expect(() => runner.setAgentBinding('left', makeBinding())).not.toThrow();
+  });
+
+  it('implies a reset: switching a binding mid-way through a finished run resets the world and telemetry', async () => {
+    const graph = createRandomGraph(0x44, { neuronCount: 16, inputChannelCount: 8, outputPopulationCount: 3 });
+    const buffer = encodeGraphBinary(graph);
+    const makeBinding = (): AgentBinding => createOracleAgentBinding({ graphBuffer: buffer.slice(0), mode: 'biological' });
+
+    const runner = new ExperimentRunner({
+      seed: 5,
+      totalTicks: 10,
+      agents: { left: makeBinding(), right: makeBinding() },
+      targetTickIntervalMs: 0
+    });
+    await runToFinished(runner);
+    expect(runner.getWorld().tick).toBe(10);
+
+    runner.setAgentBinding('left', makeBinding());
+    expect(runner.getStatus()).toBe('ready');
+    expect(runner.getWorld().tick).toBe(0);
+  });
 });
 
 describe('ExperimentRunner disconnected vs biological (real MaleCNS artifact)', () => {
@@ -325,5 +406,97 @@ describe('ExperimentRunner pause/resume/reset', () => {
     await new Promise((r) => setTimeout(r, 60));
     expect(runner.getStatus()).toBe('ready');
     expect(runner.getWorld().tick).toBe(0);
+  });
+
+  it('a run started after a mid-flight reset produces the same final hash as a clean, uninterrupted run — the interrupted binding’s neural state is truly zeroed, not left dirty by a late-arriving stale step', async () => {
+    // The oracle binding's `step` await (via `simulatedLatencyMs`) can still
+    // be pending when `reset()` synchronously zeroes neural state; without
+    // serializing `step`/`reset` on the binding itself (see
+    // bindings.ts#createOracleAgentBinding), that stale step would run
+    // `runSubsteps` *after* the reset and leave a nonzero rate behind, even
+    // though the runner correctly discards the stale *tick*.
+    const graph = createRandomGraph(0x6, { neuronCount: 16, inputChannelCount: 8, outputPopulationCount: 3 });
+    const buffer = encodeGraphBinary(graph);
+    const seed = 12345;
+
+    const runInterrupted = async (): Promise<string> => {
+      const left = createOracleAgentBinding({
+        graphBuffer: buffer.slice(0),
+        mode: 'biological',
+        simulatedLatencyMs: () => 15
+      });
+      const right = createOracleAgentBinding({ graphBuffer: buffer.slice(0), mode: 'biological' });
+      const runner = new ExperimentRunner({
+        seed,
+        totalTicks: 60,
+        agents: { left, right },
+        targetTickIntervalMs: 0
+      });
+      runner.start();
+      await new Promise((r) => setTimeout(r, 3)); // interrupt mid-flight
+      runner.reset(seed);
+      await new Promise((r) => setTimeout(r, 30)); // let the stale step (if any) fully settle
+      await runToFinished(runner);
+      return runner.getReplayExport().finalHash;
+    };
+
+    const runClean = async (): Promise<string> => {
+      const left = createOracleAgentBinding({ graphBuffer: buffer.slice(0), mode: 'biological' });
+      const right = createOracleAgentBinding({ graphBuffer: buffer.slice(0), mode: 'biological' });
+      const runner = new ExperimentRunner({ seed, totalTicks: 60, agents: { left, right }, targetTickIntervalMs: 0 });
+      await runToFinished(runner);
+      return runner.getReplayExport().finalHash;
+    };
+
+    const [interrupted, clean] = await Promise.all([runInterrupted(), runClean()]);
+    expect(interrupted).toBe(clean);
+  });
+
+  it('a step that rejects from a superseded (pre-reset) generation does not fail the new run started after reset', async () => {
+    const graph = createRandomGraph(0x7, { neuronCount: 16, inputChannelCount: 8, outputPopulationCount: 3 });
+    const buffer = encodeGraphBinary(graph);
+    const base = createOracleAgentBinding({ graphBuffer: buffer.slice(0), mode: 'biological' });
+
+    // Rejects (simulating a disposed/terminated Worker) on its first call,
+    // and succeeds normally afterward — modeling a Worker that failed mid
+    // topology-switch/reset but is healthy again once reinitialized.
+    let callCount = 0;
+    const flaky: AgentBinding = {
+      ...base,
+      step: async (input) => {
+        callCount += 1;
+        if (callCount === 1) {
+          await new Promise((r) => setTimeout(r, 15));
+          throw new Error('simulated stale Worker failure');
+        }
+        return base.step(input);
+      }
+    };
+    const right = createOracleAgentBinding({ graphBuffer: buffer.slice(0), mode: 'biological' });
+
+    const statuses: string[] = [];
+    const runner = new ExperimentRunner({
+      seed: 3,
+      totalTicks: 30,
+      agents: { left: flaky, right },
+      targetTickIntervalMs: 0,
+      onStatusChange: (next) => statuses.push(next)
+    });
+    runner.start();
+    // Reset before the flaky first step rejects, so its eventual rejection
+    // is from a superseded generation.
+    await new Promise((r) => setTimeout(r, 3));
+    runner.reset(3);
+    // Let the stale rejection land.
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(runner.getStatus()).toBe('ready');
+    expect(statuses).not.toContain('error');
+
+    // The new run (using the now-healthy `flaky` binding on its 2nd+ calls)
+    // must still be able to reach finished.
+    runner.start();
+    await runToFinished(runner);
+    expect(runner.getStatus()).toBe('finished');
   });
 });

@@ -42,8 +42,19 @@
   let seed = $state(DEFAULT_SEED);
   let topology = $state<Record<AgentId, GraphMode>>({ left: 'biological', right: 'rewired' });
   let telemetry = $state<ExperimentTelemetry | undefined>(undefined);
+  /**
+   * Number of in-flight (queued or running) topology-switch operations per
+   * arm — see `handleTopologyChange`. A count rather than a boolean: a
+   * second switch for the same arm can be queued behind a first one that
+   * is still running, and the first's own `finally` must not clear the
+   * "busy" flag out from under the still-pending second one.
+   */
+  let topologySwitchCount = $state<Record<AgentId, number>>({ left: 0, right: 0 });
+  const topologySwitchPending = $derived(topologySwitchCount.left > 0 || topologySwitchCount.right > 0);
 
-  const controlsLocked = $derived(status === 'running' || status === 'loading');
+  const controlsLocked = $derived(status === 'running' || status === 'loading' || topologySwitchPending);
+  /** Topology selectors additionally require `ready`/`finished` — a switch is never allowed mid-run (see `ExperimentRunner#setAgentBinding`), including while merely `paused`. */
+  const topologyControlsLocked = $derived(controlsLocked || (status !== 'ready' && status !== 'finished'));
 
   // Plain (non-reactive) orchestration handles: the runner/worker clients own
   // their own internal state and only ever reach the UI through the $state
@@ -64,6 +75,13 @@
    * against the manifest before anything is allowed to start. WP6 item 3:
    * one dedicated Worker per arm (see `docs/architecture.md`), initialized
    * with the default biological (left) vs rewired (right) topology.
+   *
+   * This function calls `transition()` directly (rather than through
+   * `ExperimentRunner#fail()`) because `runner` does not exist yet during
+   * this phase — there is nothing for the runner to own until the graphs
+   * are loaded and both Worker bindings exist. Every failure path *after*
+   * `runner` is constructed goes through `runner.fail()` instead, so the
+   * UI and the runner's own status can never disagree once a run exists.
    */
   const initializeExperiment = async (): Promise<void> => {
     let artifacts: Awaited<ReturnType<typeof loadArenaArtifacts>>;
@@ -135,34 +153,69 @@
     if (runner) telemetry = runner.getTelemetry();
   };
 
+  /**
+   * Only auto-applies immediately when the run is idle at `ready` (nothing
+   * to lose). While `paused`/`finished`, the new seed is just stored — it
+   * takes effect the next time the user presses Reset (`handleReset` below
+   * always resets with the current `seed`) — rather than silently
+   * discarding a paused run or a finished run's not-yet-downloaded replay.
+   */
   const handleSeedInput = (nextSeed: number): void => {
     seed = nextSeed;
-    if (runner && runner.getStatus() !== 'running') {
+    if (runner && runner.getStatus() === 'ready') {
       runner.reset(nextSeed);
       telemetry = runner.getTelemetry();
     }
   };
 
-  /** Re-initializes just one arm's Worker with a freshly derived graph buffer for the chosen topology; disallowed while running (enforced both here and by `ExperimentPanel`'s disabled selects). */
+  /**
+   * Per-arm serialization for topology switches. `handleTopologyChange`
+   * chains each switch behind any earlier one for the *same* arm via
+   * `topologySwitchChains[agentId]`, so `dispose()`/`init()` calls against
+   * that arm's `WorkerClient` can never interleave — the Worker protocol
+   * only allows one `init` per `dispose` (see `neural.worker.ts`), and two
+   * overlapping switches previously raced it straight into the terminal
+   * `error` state. `topologySwitchCount` (rendered as `controlsLocked`/
+   * `topologyControlsLocked` above) keeps every other control disabled for
+   * the same window, since `runner.setAgentBinding` only accepts a swap
+   * from `ready`/`finished` and a run that raced in via Start/Resume/Reset
+   * during the swap would hit the same failure.
+   */
+  let topologySwitchChains: Record<AgentId, Promise<unknown>> = { left: Promise.resolve(), right: Promise.resolve() };
+
+  /** Re-initializes just one arm's Worker with a freshly derived graph buffer for the chosen topology; only valid from `ready`/`finished` (enforced here, by `ExperimentRunner#setAgentBinding`, and by `ExperimentPanel`'s disabled selects). Always implies a reset — see `setAgentBinding`'s doc comment. */
   const handleTopologyChange = (agentId: AgentId, mode: GraphMode): void => {
     if (!runner || !workerClients || !biologicalGraphBuffer || !rewiredGraphBuffer) return;
-    if (runner.getStatus() === 'running') return;
+    const currentStatus = runner.getStatus();
+    if (currentStatus !== 'ready' && currentStatus !== 'finished') return;
+
     topology = { ...topology, [agentId]: mode };
     const client = workerClients[agentId];
     const buffer = buildGraphBufferForMode(biologicalGraphBuffer, rewiredGraphBuffer, mode);
-    void (async () => {
-      try {
-        await client.dispose();
-        const binding = await createWorkerAgentBinding(client, buffer, mode);
-        if (destroyed || !runner) return;
-        runner.setAgentBinding(agentId, binding);
-        telemetry = runner.getTelemetry();
-      } catch (error) {
-        if (destroyed) return;
-        errorMessage = error instanceof Error ? error.message : String(error);
-        status = 'error';
-      }
-    })();
+    topologySwitchCount = { ...topologySwitchCount, [agentId]: topologySwitchCount[agentId] + 1 };
+
+    topologySwitchChains[agentId] = topologySwitchChains[agentId]
+      .then(async () => {
+        try {
+          await client.dispose();
+          if (destroyed || !runner) return;
+          const binding = await createWorkerAgentBinding(client, buffer, mode);
+          if (destroyed || !runner) return;
+          runner.setAgentBinding(agentId, binding);
+          telemetry = runner.getTelemetry();
+        } catch (error) {
+          if (destroyed) return;
+          // Route through the runner so the UI and the runner's own status
+          // can never disagree (see docs/architecture.md's state-machine
+          // note) — never write `status` directly here.
+          runner?.fail(error);
+        }
+      })
+      .finally(() => {
+        if (!destroyed) {
+          topologySwitchCount = { ...topologySwitchCount, [agentId]: topologySwitchCount[agentId] - 1 };
+        }
+      });
   };
 
   const handleDownloadReplay = (): void => {
@@ -176,7 +229,10 @@
     document.body.appendChild(anchor);
     anchor.click();
     anchor.remove();
-    URL.revokeObjectURL(url);
+    // Deferred rather than revoked synchronously: some browsers (older
+    // Safari/Firefox) cancel an in-flight download if the object URL is
+    // revoked in the same tick as the triggering click.
+    setTimeout(() => URL.revokeObjectURL(url), 0);
   };
 
   const frame = (nowMs: number): void => {
@@ -281,7 +337,10 @@
     <p class="eyebrow">Connectome experiment · proof of concept</p>
     <h1>FlyArena</h1>
   </div>
-  <span class="status" aria-label={`Experiment status: ${status}`}>{status}</span>
+  <!-- `role="status"` before `aria-label`: ARIA prohibits naming a plain
+       generic element (a bare `<span>`'s implicit role), so without it the
+       label would be silently ignored by assistive tech. -->
+  <span class="status" role="status" aria-label={`Experiment status: ${status}`}>{status}</span>
 </header>
 
 <main>
@@ -317,6 +376,7 @@
       {seed}
       {topology}
       {controlsLocked}
+      {topologyControlsLocked}
       onStart={handleStart}
       onPause={handlePause}
       onReset={handleReset}

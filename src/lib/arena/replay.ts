@@ -214,6 +214,10 @@ export const createExperimentReplayExport = (
     totalTicks: options.totalTicks,
     finalSummary,
     finalHash: hashReplaySummary(finalSummary),
-    trace: options.trace
+    // A defensive copy: the caller's `trace` array (e.g. ExperimentRunner's
+    // own live buffer) keeps growing after this export is built if the run
+    // resumes, and this export must stay a frozen snapshot rather than
+    // alias state that changes out from under whoever holds it.
+    trace: options.trace.slice()
   };
 };

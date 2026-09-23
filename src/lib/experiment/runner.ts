@@ -63,7 +63,16 @@ export interface AgentRunnerInfo {
 
 export interface AgentBinding {
   step: AgentStepFn;
-  /** Zero the arm's neural state; called on `reset()`. */
+  /**
+   * Zero the arm's neural state; called on `reset()`. Must apply strictly
+   * after any previously-issued `step` has settled (FIFO) and must leave
+   * the arm's neural state exactly as freshly initialized — a `step` that
+   * is still in flight when `reset` is called must not run (or must not
+   * observably affect state) after `reset` takes effect. A real Worker
+   * satisfies this for free via `postMessage`'s FIFO delivery order; an
+   * in-thread binding must serialize its own calls to satisfy it (see
+   * `bindings.ts#createOracleAgentBinding`).
+   */
   reset: () => Promise<void>;
   info: AgentRunnerInfo;
 }
@@ -227,16 +236,29 @@ export class ExperimentRunner {
     });
   }
 
-  /** Swap an arm's binding (e.g. a topology change) while idle. Throws if the run is currently active. */
+  /**
+   * Swap an arm's binding (e.g. a topology change) between runs. Only valid
+   * from `ready`/`finished` — not `running` or `paused` — and always
+   * implies a `reset()`: a topology change mid-run would otherwise leave a
+   * hybrid run (part of it under the old topology, part under the new one)
+   * whose replay export and telemetry could only report one topology for
+   * the whole run. Throws if the run is currently active or paused, or if
+   * the runner has been disposed.
+   */
   setAgentBinding(agentId: AgentId, binding: AgentBinding): void {
-    if (this.status === 'running') {
-      throw new Error('ExperimentRunner: cannot change an agent binding while running; pause or reset first');
+    if (this.disposed) throw new Error('ExperimentRunner: disposed');
+    if (this.status !== 'ready' && this.status !== 'finished') {
+      throw new Error(
+        `ExperimentRunner: agent bindings can only change from ready/finished (was ${this.status}); pause and reset first`
+      );
     }
     this.agents = { ...this.agents, [agentId]: binding };
+    this.reset(this.seed);
   }
 
-  /** Starts a fresh run from `ready`, or resumes from `paused`. No-op otherwise. */
+  /** Starts a fresh run from `ready`, or resumes from `paused`. No-op otherwise, or once disposed. */
   start(): void {
+    if (this.disposed) return;
     if (canStart(this.status)) {
       this.setStatus(transition(this.status, { type: 'start' }));
     } else if (canResume(this.status)) {
@@ -248,14 +270,17 @@ export class ExperimentRunner {
   }
 
   pause(): void {
+    if (this.disposed) return;
     if (!canPause(this.status)) return;
     this.setStatus(transition(this.status, { type: 'pause' }));
   }
 
-  /** Fresh world (optionally a new seed) and zeroed neural state for both arms. Discards any in-flight tick's result. */
+  /** Fresh world (optionally a new seed) and zeroed neural state for both arms. Discards any in-flight tick's result. No-op once disposed. */
   reset(seed?: number): void {
+    if (this.disposed) return;
     if (!canReset(this.status)) return;
     this.generation += 1;
+    const resetGeneration = this.generation;
     this.pendingDelayFinish?.();
     this.seed = seed ?? this.seed;
     this.world = createWorld(this.seed, this.arenaConfig);
@@ -268,9 +293,26 @@ export class ExperimentRunner {
     this.setStatus(transition(this.status, { type: 'reset' }));
     const bindings = this.agents;
     void Promise.all([bindings.left.reset(), bindings.right.reset()]).catch((error: unknown) => {
-      this.setStatus('error');
-      this.options.onError?.(error instanceof Error ? error : new Error(String(error)));
+      // A stale reset (superseded by a later reset(), or the runner was
+      // disposed while this was in flight) must not fail a run that has
+      // already moved on — only report against the generation that issued
+      // this particular reset.
+      if (this.disposed || resetGeneration !== this.generation) return;
+      this.fail(error);
     });
+  }
+
+  /**
+   * Report a runtime failure and move to `error`. The one path every
+   * failure — a bad tick, a failed reset, a failed topology switch — is
+   * expected to go through, so the state machine (`./state.ts`) never gets
+   * bypassed and `onError`/`onStatusChange` always agree. No-op once
+   * disposed: a disposed runner has nothing left to report to.
+   */
+  fail(error: unknown): void {
+    if (this.disposed) return;
+    this.setStatus(transition(this.status, { type: 'runtimeError' }));
+    this.options.onError?.(error instanceof Error ? error : new Error(String(error)));
   }
 
   /** Stop the loop and stop accepting further transitions. Idempotent; does not touch agent Workers (the caller owns their lifecycle). */
@@ -322,11 +364,23 @@ export class ExperimentRunner {
     });
   }
 
+  /** Times one arm's `step` call independently, so per-arm latency telemetry reflects that arm's own round trip rather than whichever arm happened to settle last. */
+  private async timedStep(
+    agentId: AgentId,
+    input: AgentStepInput
+  ): Promise<{ result: AgentStepResult; latencyMs: number }> {
+    const start = performance.now();
+    const result = await this.agents[agentId].step(input);
+    return { result, latencyMs: performance.now() - start };
+  }
+
   /**
-   * One observe -> step (both arms, concurrently) -> decode -> `stepWorld`
-   * round trip. Returns `discarded: true` (and leaves `this.world` alone) if
-   * a `reset()`/`dispose()` happened while this call's `Promise.all` was in
-   * flight — see the class doc comment.
+   * One observe -> step (both arms, concurrently, timed independently) ->
+   * decode -> `stepWorld` round trip. Returns `discarded: true` (and leaves
+   * `this.world` alone) if a `reset()`/`dispose()` happened while this
+   * call's step requests were in flight — whether they ultimately resolved
+   * or rejected — see the class doc comment. A rejection from the *current*
+   * generation is rethrown so `runLoop` can report it.
    */
   private async runOneTick(): Promise<{ tick: number; discarded: boolean }> {
     const generationAtStart = this.generation;
@@ -335,25 +389,38 @@ export class ExperimentRunner {
       left: observeAgent(world, 'left', this.arenaConfig),
       right: observeAgent(world, 'right', this.arenaConfig)
     };
-    const stepStart: Record<AgentId, number> = { left: performance.now(), right: performance.now() };
-    const [leftResult, rightResult] = await Promise.all([
-      this.agents.left.step({ channelValues: channelValues.left, substeps: this.substepsPerTick }),
-      this.agents.right.step({ channelValues: channelValues.right, substeps: this.substepsPerTick })
-    ]);
+
+    let left: { result: AgentStepResult; latencyMs: number };
+    let right: { result: AgentStepResult; latencyMs: number };
+    try {
+      [left, right] = await Promise.all([
+        this.timedStep('left', { channelValues: channelValues.left, substeps: this.substepsPerTick }),
+        this.timedStep('right', { channelValues: channelValues.right, substeps: this.substepsPerTick })
+      ]);
+    } catch (error) {
+      // A step can reject instead of resolving (e.g. the Worker was
+      // disposed mid-switch, or terminated). If a reset()/dispose() already
+      // superseded this tick, that rejection is expected and not a failure
+      // of the *current* run — swallow it the same way a late resolution
+      // would be discarded. Otherwise it is a real failure; propagate it.
+      if (generationAtStart !== this.generation || this.disposed) {
+        return { tick: this.world.tick, discarded: true };
+      }
+      throw error;
+    }
     if (generationAtStart !== this.generation || this.disposed) {
       return { tick: this.world.tick, discarded: true };
     }
-    const nowMs = performance.now();
-    this.recordLatency('left', nowMs - stepStart.left);
-    this.recordLatency('right', nowMs - stepStart.right);
+    this.recordLatency('left', left.latencyMs);
+    this.recordLatency('right', right.latencyMs);
 
     const actions: ActionsByAgent = {
-      left: decodeAction(leftResult.actionFeatures),
-      right: decodeAction(rightResult.actionFeatures)
+      left: decodeAction(left.result.actionFeatures),
+      right: decodeAction(right.result.actionFeatures)
     };
     this.world = stepWorld(world, actions, this.arenaConfig);
-    this.lastNeuralTelemetry = { left: leftResult.telemetry, right: rightResult.telemetry };
-    this.lastTickWallClockMs = nowMs;
+    this.lastNeuralTelemetry = { left: left.result.telemetry, right: right.result.telemetry };
+    this.lastTickWallClockMs = performance.now();
     this.pushTrace();
     return { tick: this.world.tick, discarded: false };
   }
@@ -367,8 +434,7 @@ export class ExperimentRunner {
       try {
         result = await this.runOneTick();
       } catch (error) {
-        this.setStatus(transition(this.status, { type: 'runtimeError' }));
-        this.options.onError?.(error instanceof Error ? error : new Error(String(error)));
+        if (!this.disposed) this.fail(error);
         break;
       }
       if (this.disposed) break;

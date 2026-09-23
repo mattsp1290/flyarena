@@ -75,6 +75,16 @@ const nextRequestId = (): string => {
 export const createWorkerClient = (worker: WorkerLike): WorkerClient => {
   const pending = new Map<string, PendingRequest>();
   let terminated = false;
+  /**
+   * Set once the underlying Worker reports an `error`/`messageerror` event
+   * (e.g. an uncaught exception during module evaluation). Without this, a
+   * Worker that has actually died still looks "usable": every later `send`
+   * would create a pending entry that can never be resolved (no more
+   * messages are coming), so callers would hang forever instead of seeing
+   * a rejection. Distinct from `terminated`, which is this client's own
+   * deliberate shutdown rather than something the Worker reported.
+   */
+  let failedReason: string | undefined;
 
   const failAllPending = (message: string): void => {
     for (const { reject } of pending.values()) reject(new WorkerClientError(message));
@@ -96,6 +106,7 @@ export const createWorkerClient = (worker: WorkerLike): WorkerClient => {
 
   const handleError = (event: Event): void => {
     const message = event instanceof ErrorEvent ? event.message : 'worker error event';
+    failedReason = message;
     failAllPending(`Neural worker error: ${message}`);
   };
 
@@ -108,6 +119,9 @@ export const createWorkerClient = (worker: WorkerLike): WorkerClient => {
     transfer?: Transferable[]
   ): Promise<T> => {
     if (terminated) return Promise.reject(new WorkerClientError('Worker client has been terminated'));
+    if (failedReason !== undefined) {
+      return Promise.reject(new WorkerClientError(`Neural worker previously failed: ${failedReason}`));
+    }
     return new Promise<T>((resolve, reject) => {
       pending.set(request.requestId, { resolve: resolve as PendingRequest['resolve'], reject });
       try {

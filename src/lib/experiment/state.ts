@@ -23,7 +23,14 @@ export type ExperimentEvent =
   /** Returns to `ready` with a fresh world and zeroed neural state; the already-validated graphs are reused. */
   | { type: 'reset' }
   | { type: 'tickCompleted'; tick: number; totalTicks: number }
-  /** A Worker/oracle step (or any other runtime) failure while running or paused. */
+  /**
+   * A Worker/oracle failure, or any other runtime failure the app routes
+   * through `ExperimentRunner#fail()` — including a failed topology switch
+   * (`App.svelte`'s `handleTopologyChange`) and a failed post-reset rebind.
+   * Every live (non-`loading`) state accepts this, not just `running`/
+   * `paused`: a topology switch or a stale reset can fail while the runner
+   * is sitting at `ready`/`finished` between runs.
+   */
   | { type: 'runtimeError' };
 
 /**
@@ -35,10 +42,10 @@ export type ExperimentEvent =
  */
 const TRANSITIONS: Readonly<Record<ExperimentStatus, Partial<Record<ExperimentEvent['type'], ExperimentStatus>>>> = {
   loading: { assetsReady: 'ready', assetsFailed: 'error' },
-  ready: { start: 'running', reset: 'ready' },
+  ready: { start: 'running', reset: 'ready', runtimeError: 'error' },
   running: { pause: 'paused', reset: 'ready', runtimeError: 'error' },
   paused: { resume: 'running', reset: 'ready', runtimeError: 'error' },
-  finished: { reset: 'ready' },
+  finished: { reset: 'ready', runtimeError: 'error' },
   error: {}
 };
 

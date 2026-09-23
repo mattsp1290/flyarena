@@ -23,7 +23,10 @@
     errorMessage?: string;
     seed: number;
     topology: Record<AgentId, GraphMode>;
+    /** True while running/loading, or while any topology switch is in flight — locks Start/Pause/Reset/Seed. */
     controlsLocked: boolean;
+    /** `controlsLocked`, plus true whenever the run isn't idle at `ready`/`finished` — a topology switch is never allowed mid-run, including merely `paused`. */
+    topologyControlsLocked: boolean;
     onStart: () => void;
     onPause: () => void;
     onReset: () => void;
@@ -38,6 +41,7 @@
     seed,
     topology,
     controlsLocked,
+    topologyControlsLocked,
     onStart,
     onPause,
     onReset,
@@ -69,9 +73,19 @@
     error: 'Error'
   };
 
-  const handleSeedInput = (event: Event): void => {
-    const value = Number((event.currentTarget as HTMLInputElement).value);
-    if (Number.isFinite(value)) onSeedInput(Math.trunc(value));
+  /**
+   * Commits on `change` (blur, or Enter), not `oninput`: applying every
+   * keystroke would silently reset a paused or finished run mid-edit
+   * before its replay could be downloaded. Ignores an empty field rather
+   * than treating it as `0`, and normalizes with the same `>>> 0` the
+   * world itself applies (`arena/world.ts`'s `normalizeSeed`), so the
+   * value displayed here always matches the seed actually driving the run.
+   */
+  const handleSeedCommit = (event: Event): void => {
+    const raw = (event.currentTarget as HTMLInputElement).value.trim();
+    if (raw === '') return;
+    const value = Number(raw);
+    if (Number.isFinite(value)) onSeedInput(Math.trunc(value) >>> 0);
   };
 
   const handleTopologyChange = (agentId: AgentId) => (event: Event): void => {
@@ -86,15 +100,15 @@
   </div>
 
   {#if status === 'error' && errorMessage}
-    <p class="error-message" role="alert">{errorMessage}</p>
+    <p class="error-message" role="alert">{errorMessage} Reload the page to try again.</p>
   {/if}
 
   <div class="button-row">
     <button type="button" onclick={onStart} disabled={!canStartOrResume || controlsLocked}>
       {startLabel}
     </button>
-    <button type="button" onclick={onPause} disabled={!canPauseNow}>Pause</button>
-    <button type="button" onclick={onReset} disabled={!canResetNow}>Reset</button>
+    <button type="button" onclick={onPause} disabled={!canPauseNow || controlsLocked}>Pause</button>
+    <button type="button" onclick={onReset} disabled={!canResetNow || controlsLocked}>Reset</button>
   </div>
 
   <div class="field">
@@ -106,7 +120,7 @@
       step="1"
       value={seed}
       disabled={controlsLocked}
-      oninput={handleSeedInput}
+      onchange={handleSeedCommit}
     />
   </div>
 
@@ -116,7 +130,7 @@
       id="topology-left"
       name="topology-left"
       value={topology.left}
-      disabled={controlsLocked}
+      disabled={topologyControlsLocked}
       onchange={handleTopologyChange('left')}
     >
       {#each TOPOLOGY_OPTIONS as option (option.value)}
@@ -131,7 +145,7 @@
       id="topology-right"
       name="topology-right"
       value={topology.right}
-      disabled={controlsLocked}
+      disabled={topologyControlsLocked}
       onchange={handleTopologyChange('right')}
     >
       {#each TOPOLOGY_OPTIONS as option (option.value)}
