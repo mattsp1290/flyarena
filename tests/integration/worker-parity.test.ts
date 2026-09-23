@@ -15,7 +15,7 @@ import {
   createWorkerRuntime,
   handleWorkerRequest
 } from '../../src/lib/worker/neural.worker';
-import type { WorkerResponse } from '../../src/lib/worker/protocol';
+import { MAX_SUBSTEPS_PER_TICK, type WorkerResponse } from '../../src/lib/worker/protocol';
 import { createRandomGraph } from '../fixtures/tiny-graph';
 
 /**
@@ -341,6 +341,48 @@ describe('Worker request validation', () => {
 
     expect(response.ok).toBe(false);
     if (!response.ok) expect(response.error.code).toBe('invalid-graph');
+  });
+
+  it('echoes InitWorkerRequest.mode back on InitWorkerSuccess', () => {
+    const withMode = handleWorkerRequest(runtime, {
+      type: 'init',
+      requestId: 'i-mode',
+      graphBuffer: structuredClone(buffer),
+      mode: 'rewired'
+    });
+    expect(withMode.ok).toBe(true);
+    if (withMode.ok && withMode.type === 'init') expect(withMode.mode).toBe('rewired');
+
+    handleWorkerRequest(runtime, { type: 'dispose', requestId: 'd-mode' });
+
+    const withoutMode = handleWorkerRequest(runtime, {
+      type: 'init',
+      requestId: 'i-no-mode',
+      graphBuffer: structuredClone(buffer)
+    });
+    expect(withoutMode.ok).toBe(true);
+    if (withoutMode.ok && withoutMode.type === 'init') expect(withoutMode.mode).toBeUndefined();
+  });
+
+  it('rejects a substeps value above MAX_SUBSTEPS_PER_TICK', () => {
+    handleWorkerRequest(runtime, { type: 'init', requestId: 'i1', graphBuffer: structuredClone(buffer) });
+    const response = handleWorkerRequest(runtime, {
+      type: 'step',
+      requestId: 's1',
+      channelValues: [0, 0],
+      substeps: MAX_SUBSTEPS_PER_TICK + 1
+    });
+    expect(response.ok).toBe(false);
+    if (!response.ok) expect(response.error.code).toBe('invalid-request');
+
+    // The bound itself must still be accepted.
+    const atBound = handleWorkerRequest(runtime, {
+      type: 'step',
+      requestId: 's2',
+      channelValues: [0, 0],
+      substeps: MAX_SUBSTEPS_PER_TICK
+    });
+    expect(atBound.ok).toBe(true);
   });
 
   it('allows re-initializing after dispose', () => {

@@ -15,6 +15,16 @@ export type WorkerErrorCode =
   | 'invalid-graph'
   | 'internal-error';
 
+/**
+ * Upper bound on `StepWorkerRequest.substeps`. A request above this runs
+ * synchronously inside the Worker for that many iterations before it can
+ * respond to anything else, so this caps how long a single malformed/
+ * malicious request can hang the Worker; 64 is generous headroom over the
+ * POC's actual per-tick substep count (single digits) while still bounding
+ * worst-case latency to a few milliseconds.
+ */
+export const MAX_SUBSTEPS_PER_TICK = 64;
+
 export interface WorkerError {
   code: WorkerErrorCode;
   message: string;
@@ -42,9 +52,16 @@ export interface ResetWorkerRequest {
 export interface StepWorkerRequest {
   type: 'step';
   requestId: string;
-  /** Must have length equal to the initialized graph's `inputChannelCount`. */
-  channelValues: readonly number[];
-  /** Number of `stepModel` substeps to run before aggregating outputs. */
+  /**
+   * Must have length equal to the initialized graph's `inputChannelCount`.
+   * `ArrayLike<number>` (rather than `readonly number[]`) so a caller
+   * holding sensor readings in a `Float32Array` can send it directly;
+   * `stepModel` already accepts anything array-like, and both a plain
+   * array and a typed array structured-clone across the Worker boundary
+   * without conversion.
+   */
+  channelValues: ArrayLike<number>;
+  /** Number of `stepModel` substeps to run before aggregating outputs. Must not exceed `MAX_SUBSTEPS_PER_TICK`. */
   substeps: number;
 }
 
@@ -68,6 +85,8 @@ export interface InitWorkerSuccess {
   edgeCount: number;
   inputChannelCount: number;
   outputPopulationCount: number;
+  /** Echoes `InitWorkerRequest.mode`, so a caller can confirm which arm the Worker actually initialized. */
+  mode?: GraphMode;
 }
 
 export interface ResetWorkerSuccess {
@@ -80,7 +99,10 @@ export interface StepWorkerSuccess {
   type: 'step';
   requestId: string;
   ok: true;
-  /** Length `outputPopulationCount`; population 0/1/2 conventionally map to thrust/yaw/brake. */
+  /**
+   * Length `outputPopulationCount`; population index conventionally maps to
+   * thrust/yaw/brake per `OUTPUT_POPULATION` in `src/lib/arena/actions.ts`.
+   */
   actionFeatures: readonly number[];
   telemetry: NeuralTelemetry;
 }

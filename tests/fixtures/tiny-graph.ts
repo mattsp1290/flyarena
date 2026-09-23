@@ -162,6 +162,25 @@ export const createRandomGraph = (
     }
   }
 
+  // The graph format requires each presynaptic row's postsynaptic indices
+  // to be strictly increasing (see "Canonical row ordering and duplicate
+  // edges" in docs/graph-format.md): duplicate (pre, post) pairs are
+  // invalid and must be aggregated into one edge with summed contact
+  // magnitude, and rows must be sorted. The random draws above (plus the
+  // guaranteed input->output edges just added, which can coincide with a
+  // random edge to the same target) can produce duplicate targets within a
+  // row, so aggregate and sort every row here before it is ever laid out
+  // into CSR arrays.
+  for (let pre = 0; pre < neuronCount; pre += 1) {
+    const byPost = new Map<number, number>();
+    for (const { post, magnitude } of edgesByPre[pre]) {
+      byPost.set(post, (byPost.get(post) ?? 0) + magnitude);
+    }
+    edgesByPre[pre] = Array.from(byPost.entries())
+      .sort(([a], [b]) => a - b)
+      .map(([post, magnitude]) => ({ post, magnitude }));
+  }
+
   const presynapticOffsets = new Uint32Array(neuronCount + 1);
   let edgeCount = 0;
   for (let pre = 0; pre < neuronCount; pre += 1) {

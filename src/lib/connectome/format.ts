@@ -25,8 +25,13 @@ export const SUPPORTED_FORMAT_VERSION = 1;
 /** Fixed header size in bytes; see docs/graph-format.md for the field table. */
 const HEADER_BYTES = 56;
 
-/** Round a byte offset up to the next multiple of 8 (the widest section element). */
-const alignTo8 = (offset: number): number => (offset + 7) & ~7;
+/**
+ * Round a byte offset up to the next multiple of 8 (the widest section
+ * element). Uses `Math.ceil` rather than the equivalent `(offset + 7) & ~7`
+ * bit trick: the bitwise form operates on 32-bit signed integers and wraps
+ * negative past `2**31` bytes, whereas `Math.ceil` has no such ceiling.
+ */
+const alignTo8 = (offset: number): number => Math.ceil(offset / 8) * 8;
 
 export type GraphMode = 'biological' | 'rewired' | 'disconnected';
 
@@ -192,6 +197,9 @@ export const validateGraph = (graph: ConnectomeGraph): ConnectomeGraph => {
   if (metadata.inputClampMin > metadata.inputClampMax) {
     invalidGraph('inputClampMin must not exceed inputClampMax');
   }
+  // Sign lives entirely in `presynapticSigns`; a negative globalGain would
+  // silently invert every edge's Dale's-law sign network-wide.
+  if (metadata.globalGain < 0) invalidGraph('globalGain must be non-negative');
 
   const { neuronCount, edgeCount, inputChannelCount, outputPopulationCount } = metadata;
   const lengthChecks: ReadonlyArray<readonly [string, number, number]> = [
@@ -215,20 +223,36 @@ export const validateGraph = (graph: ConnectomeGraph): ConnectomeGraph => {
   if (graph.presynapticOffsets[neuronCount] !== edgeCount) {
     invalidGraph('presynapticOffsets must end at edgeCount');
   }
+  // Every presynaptic row's `postsynapticIndices` must be strictly
+  // increasing (see docs/graph-format.md's "canonical row ordering"
+  // requirement). This is a single linear scan that both catches a
+  // duplicate `(pre, post)` edge (the compiler must aggregate duplicates
+  // into one edge with summed contact magnitude before emitting the file)
+  // and, as a side effect, makes compiler output byte-for-byte
+  // deterministic instead of merely accepting any order. Self-loops
+  // (`pre === post`) are permitted by the format (biological autapses);
+  // whether a rewiring policy keeps them is a compiler-level concern.
   for (let pre = 0; pre < neuronCount; pre += 1) {
     const start = graph.presynapticOffsets[pre];
     const end = graph.presynapticOffsets[pre + 1];
     if (end < start) invalidGraph(`presynapticOffsets must be non-decreasing at row ${pre}`);
-  }
-
-  for (let edge = 0; edge < edgeCount; edge += 1) {
-    const post = graph.postsynapticIndices[edge];
-    if (!Number.isInteger(post) || post < 0 || post >= neuronCount) {
-      invalidGraph(`postsynapticIndices[${edge}] is out of range`);
-    }
-    const magnitude = graph.contactMagnitudes[edge];
-    if (!Number.isFinite(magnitude) || magnitude <= 0) {
-      invalidGraph(`contactMagnitudes[${edge}] must be finite and positive`);
+    let previousPost = -1;
+    for (let edge = start; edge < end; edge += 1) {
+      const post = graph.postsynapticIndices[edge];
+      if (!Number.isInteger(post) || post < 0 || post >= neuronCount) {
+        invalidGraph(`postsynapticIndices[${edge}] is out of range`);
+      }
+      if (post <= previousPost) {
+        invalidGraph(
+          `postsynapticIndices must be strictly increasing within row ${pre} (duplicate or ` +
+            `out-of-order postsynaptic index ${post} at edge ${edge})`
+        );
+      }
+      previousPost = post;
+      const magnitude = graph.contactMagnitudes[edge];
+      if (!Number.isFinite(magnitude) || magnitude <= 0) {
+        invalidGraph(`contactMagnitudes[${edge}] must be finite and positive`);
+      }
     }
   }
 

@@ -108,9 +108,10 @@ export const stepModel = (
  * neuron assigned to that population. `outputs` must have length
  * `graph.metadata.outputPopulationCount`; it is overwritten, not accumulated.
  *
- * By convention output population 0/1/2 map to thrust/yaw/brake to match
- * `src/lib/arena/actions.ts`'s `decodeAction` order, but this function and
- * the graph format are agnostic to population count and meaning.
+ * By convention output population index maps to thrust/yaw/brake per
+ * `OUTPUT_POPULATION` in `src/lib/arena/actions.ts` (which `decodeAction`
+ * also indexes by), but this function and the graph format are agnostic to
+ * population count and meaning.
  */
 export const aggregateOutputs = (
   graph: Readonly<ConnectomeGraph>,

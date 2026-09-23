@@ -174,4 +174,51 @@ describe('connectome graph binary format', () => {
       validateGraph(createTinyGraph({ inputClampMin: 1, inputClampMax: -1 }))
     ).toThrow(/inputClampMin/);
   });
+
+  it('rejects a negative globalGain (sign belongs to presynapticSigns, not globalGain)', () => {
+    expect(() => validateGraph(createTinyGraph({ globalGain: -1 }))).toThrow(/globalGain/);
+  });
+
+  it('accepts a zero globalGain', () => {
+    expect(() => validateGraph(createTinyGraph({ globalGain: 0 }))).not.toThrow();
+  });
+
+  it('rejects a duplicate (pre, post) edge within a presynaptic row', () => {
+    const graph = createTinyGraph();
+    const malformed: ConnectomeGraph = {
+      ...graph,
+      // Row 0 now has two edges, both targeting neuron 2.
+      presynapticOffsets: Uint32Array.from([0, 2, 2, 2, 2]),
+      postsynapticIndices: Uint32Array.from([2, 2]),
+      contactMagnitudes: Float32Array.from([1, 1])
+    };
+
+    expect(() => validateGraph(malformed)).toThrow(/strictly increasing/);
+  });
+
+  it('rejects an out-of-order (non-ascending) postsynaptic index within a row', () => {
+    const graph = createTinyGraph();
+    const malformed: ConnectomeGraph = {
+      ...graph,
+      // Row 0 has two edges, descending: 3 then 2.
+      presynapticOffsets: Uint32Array.from([0, 2, 2, 2, 2]),
+      postsynapticIndices: Uint32Array.from([3, 2]),
+      contactMagnitudes: Float32Array.from([1, 1])
+    };
+
+    expect(() => validateGraph(malformed)).toThrow(/strictly increasing/);
+  });
+
+  it('permits a self-loop (pre === post) as an ordinary single-entry row', () => {
+    const graph = createTinyGraph({ edgeCount: 1 });
+    const selfLoop: ConnectomeGraph = {
+      ...graph,
+      // Row 0 has one edge targeting neuron 0 itself.
+      presynapticOffsets: Uint32Array.from([0, 1, 1, 1, 1]),
+      postsynapticIndices: Uint32Array.from([0]),
+      contactMagnitudes: Float32Array.from([1])
+    };
+
+    expect(() => validateGraph(selfLoop)).not.toThrow();
+  });
 });

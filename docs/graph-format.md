@@ -39,14 +39,14 @@ not a spec to follow — but they must always agree, and any real change is a
 | 8      | 4    | uint32  | `neuronCount`            | Number of nodes, N. |
 | 12     | 4    | uint32  | `edgeCount`              | Number of directed synaptic entries, E (CSR non-zero count). |
 | 16     | 4    | uint32  | `inputChannelCount`      | Number of external observation channels (see `src/lib/arena/sensors.ts`'s 8-channel contract for the canonical POC input; this field is not hardcoded to 8). |
-| 20     | 4    | uint32  | `outputPopulationCount`  | Number of output populations. Convention: population 0/1/2 map to thrust/yaw/brake to match `decodeAction` in `src/lib/arena/actions.ts`, but the format itself is agnostic. |
+| 20     | 4    | uint32  | `outputPopulationCount`  | Number of output populations. Convention: population index maps to thrust/yaw/brake per `OUTPUT_POPULATION` in `src/lib/arena/actions.ts` (which `decodeAction` indexes by), but the format itself is agnostic. |
 | 24     | 4    | float32 | `timestepSeconds`        | Simulated seconds integrated per neural substep (`dt`). Must be > 0. |
 | 28     | 4    | float32 | `leakRate`               | **Continuous-time** leak/decay rate in units of 1/second, not a per-substep fraction — see [Dynamics](#dynamics-consumed-by-this-format-informative) below for the exact equation. The actual per-substep decay fraction is `leakRate * timestepSeconds`, which should stay `<= 1` for the leak term to decay monotonically toward zero rather than overshoot; values above `2` oscillate between `rateMin`/`rateMax` every substep. Must be >= 0. |
 | 32     | 4    | float32 | `rateMin`                | Lower bound every neuron's rate is clamped to. |
 | 36     | 4    | float32 | `rateMax`                | Upper bound every neuron's rate is clamped to. Must be >= `rateMin`. |
 | 40     | 4    | float32 | `inputClampMin`          | Lower bound applied to a raw channel value before it is injected as external drive. |
 | 44     | 4    | float32 | `inputClampMax`          | Upper bound for the same. Must be >= `inputClampMin`. |
-| 48     | 4    | float32 | `globalGain`             | Global multiplier applied to every recurrent synaptic contribution (see [Dynamics](#dynamics-consumed-by-this-format-informative)). **Not** applied to external channel drive. Calibrated, not measured. |
+| 48     | 4    | float32 | `globalGain`             | Global multiplier applied to every recurrent synaptic contribution (see [Dynamics](#dynamics-consumed-by-this-format-informative)). **Not** applied to external channel drive. Calibrated, not measured. Must be finite and `>= 0`; sign lives entirely in `presynapticSigns`, so a negative `globalGain` would invert every edge's Dale's-law sign network-wide and is rejected. |
 | 52     | 4    | uint32  | `flags`                  | Reserved for future use. Writers must set this to `0`; readers must not reject a nonzero value on the strength of this field alone (forward-compatible reserve), but no flag bits are defined in format version 1. |
 
 Total header size: 56 bytes (already a multiple of 8; no header padding is
@@ -99,7 +99,9 @@ outputs[population] = sum over neurons i where outputPopulationIndex[i] == popul
 
 ## Section layout
 
-Let `align8(x) = (x + 7) & ~7` (round up to the next multiple of 8).
+Let `align8(x) = Math.ceil(x / 8) * 8` (round up to the next multiple of 8;
+not the equivalent `(x + 7) & ~7` bitwise form, which wraps as a 32-bit
+signed integer past `2**31` bytes).
 
 Starting at `cursor = 56` (the end of the header), sections appear in this
 exact order. Each section's byte length is `elementSize * count`; after
@@ -111,7 +113,7 @@ placing the next section (i.e. pad with zero bytes up to the next multiple of
 |---|--------------------------|--------------|--------------:|---------------|---------|
 | 1 | `biologicalIds`          | uint64       | 8             | `neuronCount` | Opaque per-neuron source-dataset identifier (e.g. a MaleCNS body ID), indexed by internal neuron index `0..neuronCount-1`. |
 | 2 | `presynapticOffsets`     | uint32       | 4             | `neuronCount + 1` | CSR row pointers. Row `pre`'s outgoing edges are the half-open range `[presynapticOffsets[pre], presynapticOffsets[pre+1])` into sections 3/4. `presynapticOffsets[0]` must be `0`; `presynapticOffsets[neuronCount]` must equal `edgeCount`; the sequence must be non-decreasing. |
-| 3 | `postsynapticIndices`    | uint32       | 4             | `edgeCount`   | Postsynaptic neuron index per edge (CSR column indices). Every value must be `< neuronCount`. |
+| 3 | `postsynapticIndices`    | uint32       | 4             | `edgeCount`   | Postsynaptic neuron index per edge (CSR column indices). Every value must be `< neuronCount`. **Within each presynaptic row, values must be strictly increasing** (see [Canonical row ordering and duplicate edges](#canonical-row-ordering-and-duplicate-edges) below); a self-loop (`post == pre`) is a single ordinary entry in its row like any other and is permitted. |
 | 4 | `contactMagnitudes`      | float32      | 4             | `edgeCount`   | Positive contact-count magnitude per edge (unsigned; sign is applied per presynaptic neuron, see section 5). Every value must be `> 0` and finite. |
 | 5 | `presynapticSigns`       | int8         | 1             | `neuronCount` | Dale's-law sign applied to every edge leaving that neuron. Every value must be exactly `-1` or `1` (never `0`). |
 | 6 | `inputChannelIndex`      | int32        | 4             | `neuronCount` | Observation channel index (`0..inputChannelCount-1`) a neuron receives external drive from, or `-1` if the neuron is not an input neuron. |
@@ -142,12 +144,44 @@ For `neuronCount = 4`, `edgeCount = 2`:
 
 Total file length: 200 bytes.
 
+### Canonical row ordering and duplicate edges
+
+Within each presynaptic row (the half-open range
+`[presynapticOffsets[pre], presynapticOffsets[pre+1])` into
+`postsynapticIndices`/`contactMagnitudes`), postsynaptic indices **must be
+strictly increasing**. This single requirement has two consequences:
+
+- **Duplicate `(pre, post)` edges are invalid.** A row cannot contain the
+  same postsynaptic index twice — strictly increasing forbids `post ==
+  previousPost`, not merely out-of-order values. If the source data has
+  multiple contacts between the same pair of neurons, the compiler must
+  aggregate them into a single edge whose `contactMagnitudes` entry is the
+  **sum** of the individual contact magnitudes before emitting the file;
+  the wire format has no way to represent two edges between the same
+  ordered pair.
+- **Compiler output is deterministic.** Because a valid row has exactly one
+  legal order (ascending by postsynaptic index), two independent compiler
+  runs over the same source graph and the same aggregation rule always
+  produce byte-identical `postsynapticIndices`/`contactMagnitudes` sections,
+  with no separate "which order did the compiler choose" degree of freedom
+  to document or test against.
+
+**Self-loops (`post == pre`) are permitted.** A self-loop is an ordinary
+single entry in its own row like any other postsynaptic index; the format
+does not distinguish it. Biological connectomes contain real autapses, so
+this format does not forbid them. Whether a *rewiring* compiler pass keeps,
+drops, or redistributes self-loops when constructing the "rewired" control
+arm is a policy decision for that compiler, not a constraint this format
+imposes — this document takes no position on it.
+
 ## Validation a reader must perform before stepping the model
 
 In addition to the structural checks implied by the table above (lengths,
 `presynapticOffsets` monotonicity/endpoints, index ranges, sign values,
 positive magnitudes, finite floats, `rateMin <= rateMax`,
-`inputClampMin <= inputClampMax`, `timestepSeconds > 0`, `leakRate >= 0`),
+`inputClampMin <= inputClampMax`, `timestepSeconds > 0`, `leakRate >= 0`,
+`globalGain >= 0`, strictly-increasing postsynaptic indices within every row
+per [Canonical row ordering and duplicate edges](#canonical-row-ordering-and-duplicate-edges)),
 a reader must reject any `formatVersion` other than the one it implements.
 `src/lib/connectome/format.ts`'s `validateGraph` is the executable version of
 this checklist; `tests/unit/format.test.ts` exercises each failure mode.

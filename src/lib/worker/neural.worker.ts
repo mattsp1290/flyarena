@@ -1,4 +1,4 @@
-import { parseGraphBinary, type ConnectomeGraph } from '../connectome/format';
+import { parseGraphBinary, type ConnectomeGraph, type GraphMode } from '../connectome/format';
 import {
   createModelState,
   createOutputBuffer,
@@ -9,7 +9,8 @@ import {
   type StepScratch
 } from '../connectome/model';
 import { computeTelemetry } from '../connectome/telemetry';
-import type { WorkerFailure, WorkerRequest, WorkerResponse } from './protocol';
+import { MAX_SUBSTEPS_PER_TICK } from './protocol';
+import type { WorkerErrorCode, WorkerFailure, WorkerRequest, WorkerResponse } from './protocol';
 
 /**
  * The dedicated Web Worker for stepping the sparse connectome oracle off the
@@ -22,14 +23,41 @@ import type { WorkerFailure, WorkerRequest, WorkerResponse } from './protocol';
  * instead of relying on a real browser Worker.
  */
 
+/**
+ * The Worker's own state, as a tagged union: either not yet initialized
+ * (`idle`) or holding a fully-initialized graph/state/scratch/outputs quad
+ * (`ready`). The four `ready` fields are never independently present —
+ * `init` produces all four together, `dispose` clears all four together,
+ * and every other handler only ever needs to know "is the runtime ready,"
+ * not which of four fields happen to be set. A tagged union makes that
+ * atomicity a type-level fact instead of a convention enforced only by a
+ * four-way `&&`/`||` check that a future added field could be left out of.
+ */
+type RuntimeState =
+  | { status: 'idle' }
+  | {
+      status: 'ready';
+      graph: ConnectomeGraph;
+      state: NeuralModelState;
+      scratch: StepScratch;
+      outputs: Float32Array;
+      /** Echoes the `InitWorkerRequest.mode` the graph was initialized with, if any. */
+      mode?: GraphMode;
+    };
+
+/**
+ * Mutable box holding the current `RuntimeState`. `handleWorkerRequest`
+ * reassigns `current` wholesale on every state transition (rather than
+ * mutating fields in place), so a transition can never leave a
+ * partially-updated mix of old and new fields; the box itself is what
+ * callers hold onto so the same identity keeps reflecting the latest state
+ * across successive calls.
+ */
 interface WorkerRuntime {
-  graph?: ConnectomeGraph;
-  state?: NeuralModelState;
-  scratch?: StepScratch;
-  outputs?: Float32Array;
+  current: RuntimeState;
 }
 
-export const createWorkerRuntime = (): WorkerRuntime => ({});
+export const createWorkerRuntime = (): WorkerRuntime => ({ current: { status: 'idle' } });
 
 const failure = (
   type: WorkerFailure['type'],
@@ -43,6 +71,10 @@ const isRequestEnvelope = (value: unknown): value is { type: unknown; requestId:
   typeof value === 'object' &&
   value !== null &&
   typeof (value as { requestId?: unknown }).requestId === 'string';
+
+/** True for a plain array or any typed-array view (but not a `DataView`) of numbers. */
+const isNumericArrayLike = (value: unknown): value is ArrayLike<number> =>
+  Array.isArray(value) || (ArrayBuffer.isView(value) && !(value instanceof DataView));
 
 /** Handle one request against `runtime`, mutating it in place as needed. */
 export const handleWorkerRequest = (
@@ -61,7 +93,7 @@ export const handleWorkerRequest = (
   try {
     switch (request.type) {
       case 'init': {
-        if (runtime.graph) {
+        if (runtime.current.status === 'ready') {
           return failure(
             'init',
             request.requestId,
@@ -70,10 +102,14 @@ export const handleWorkerRequest = (
           );
         }
         const graph = parseGraphBinary(request.graphBuffer);
-        runtime.graph = graph;
-        runtime.state = createModelState(graph);
-        runtime.scratch = createStepScratch(graph);
-        runtime.outputs = createOutputBuffer(graph);
+        runtime.current = {
+          status: 'ready',
+          graph,
+          state: createModelState(graph),
+          scratch: createStepScratch(graph),
+          outputs: createOutputBuffer(graph),
+          mode: request.mode
+        };
         return {
           type: 'init',
           requestId: request.requestId,
@@ -81,12 +117,13 @@ export const handleWorkerRequest = (
           neuronCount: graph.metadata.neuronCount,
           edgeCount: graph.metadata.edgeCount,
           inputChannelCount: graph.metadata.inputChannelCount,
-          outputPopulationCount: graph.metadata.outputPopulationCount
+          outputPopulationCount: graph.metadata.outputPopulationCount,
+          mode: request.mode
         };
       }
 
       case 'reset': {
-        if (!runtime.state) {
+        if (runtime.current.status !== 'ready') {
           return failure(
             'reset',
             request.requestId,
@@ -94,70 +131,57 @@ export const handleWorkerRequest = (
             'Neural worker has not been initialized'
           );
         }
-        resetModelState(runtime.state);
+        resetModelState(runtime.current.state);
         return { type: 'reset', requestId: request.requestId, ok: true };
       }
 
       case 'step': {
-        if (!runtime.graph || !runtime.state || !runtime.scratch || !runtime.outputs) {
-          return failure(
-            'step',
-            request.requestId,
-            'not-initialized',
-            'Neural worker has not been initialized'
-          );
+        const stepFailure = (code: WorkerErrorCode, message: string): WorkerFailure =>
+          failure('step', request.requestId, code, message);
+
+        if (runtime.current.status !== 'ready') {
+          return stepFailure('not-initialized', 'Neural worker has not been initialized');
         }
+        const { graph, state, scratch, outputs } = runtime.current;
+
         if (!Number.isInteger(request.substeps) || request.substeps <= 0) {
-          return failure(
-            'step',
-            request.requestId,
+          return stepFailure('invalid-request', 'substeps must be a positive integer');
+        }
+        if (request.substeps > MAX_SUBSTEPS_PER_TICK) {
+          return stepFailure(
             'invalid-request',
-            'substeps must be a positive integer'
+            `substeps must not exceed MAX_SUBSTEPS_PER_TICK (${MAX_SUBSTEPS_PER_TICK}), received ${request.substeps}`
           );
         }
-        if (!Array.isArray(request.channelValues)) {
-          return failure('step', request.requestId, 'invalid-request', 'channelValues must be an array');
+        if (!isNumericArrayLike(request.channelValues)) {
+          return stepFailure('invalid-request', 'channelValues must be an array or typed array');
         }
-        if (request.channelValues.length !== runtime.graph.metadata.inputChannelCount) {
-          return failure(
-            'step',
-            request.requestId,
+        if (request.channelValues.length !== graph.metadata.inputChannelCount) {
+          return stepFailure(
             'invalid-request',
-            `channelValues must have length ${runtime.graph.metadata.inputChannelCount}, received ${request.channelValues.length}`
+            `channelValues must have length ${graph.metadata.inputChannelCount}, received ${request.channelValues.length}`
           );
         }
         for (let channel = 0; channel < request.channelValues.length; channel += 1) {
           if (!Number.isFinite(request.channelValues[channel])) {
-            return failure(
-              'step',
-              request.requestId,
+            return stepFailure(
               'invalid-request',
               `channelValues[${channel}] must be a finite number, received ${String(request.channelValues[channel])}`
             );
           }
         }
-        runSubsteps(
-          runtime.graph,
-          runtime.state,
-          runtime.scratch,
-          request.channelValues,
-          request.substeps,
-          runtime.outputs
-        );
+        runSubsteps(graph, state, scratch, request.channelValues, request.substeps, outputs);
         return {
           type: 'step',
           requestId: request.requestId,
           ok: true,
-          actionFeatures: Array.from(runtime.outputs),
-          telemetry: computeTelemetry(runtime.state)
+          actionFeatures: Array.from(outputs),
+          telemetry: computeTelemetry(state)
         };
       }
 
       case 'dispose': {
-        runtime.graph = undefined;
-        runtime.state = undefined;
-        runtime.scratch = undefined;
-        runtime.outputs = undefined;
+        runtime.current = { status: 'idle' };
         return { type: 'dispose', requestId: request.requestId, ok: true };
       }
 
