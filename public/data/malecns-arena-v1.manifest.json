@@ -2,6 +2,7 @@
   "artifact": "malecns-arena-v1.bin.gz",
   "binaryBytes": 399792,
   "binarySha256": "f1a0f982ffdfba12ecb2206d064c3dc1ceaae7cffa06a22049093d69a79098f7",
+  "compilerSourceSha256": "5236ebca01f643aeb9d3581eb0d945f74be0736f86b9d321ac48c067baf68a70",
   "edgeCount": 46311,
   "formatVersion": 1,
   "gzipBytes": 107391,

@@ -22,6 +22,7 @@ Two halves:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -162,6 +163,14 @@ INPUT_WEIGHT = 1.0
 
 
 def git_revision() -> str:
+    """`git rev-parse HEAD` *at compile time* -- purely informational. This
+    is inherently self-referential (the commit that ships the regenerated
+    artifact necessarily comes after the commit this function reads, since
+    the artifact's own bytes can't be part of the commit that produced
+    them), so it should never be treated as "the commit whose code produced
+    this artifact" -- use `compiler_source_sha256()` for that. Recorded in
+    the ledger as `compiledFromGitRevision`, documented there as informational.
+    """
     try:
         return (
             subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO_ROOT)
@@ -172,10 +181,92 @@ def git_revision() -> str:
         return "unknown"
 
 
+#: Directory containing this compiler's own Python source, hashed by
+#: `compiler_source_sha256()`. A plain module-level constant (rather than
+#: always deriving it from `__file__` inline) so tests can assert against
+#: the same value the real pipeline uses.
+COMPILER_SOURCE_DIR = Path(__file__).resolve().parent
+
+
+def compiler_source_sha256(source_dir: Path = COMPILER_SOURCE_DIR) -> str:
+    """sha256 over this compiler's own Python source (`scripts/data/*.py`:
+    `binfmt.py`, `compile.py`, `download.py`, `rewire.py` -- not the
+    generated `__pycache__`), recorded as `compilerSourceSha256` in both the
+    manifest and the ledger.
+
+    Unlike `git_revision()`'s self-referential git SHA (see its docstring),
+    this value is derived directly from the code that ran: recompiling
+    after *any* change to these files -- even one that happens not to
+    change the compiled bytes -- changes this hash. That makes "did the
+    committed artifact get regenerated after this code change" a
+    mechanically checkable property (see
+    `tests_python/test_compile.py::test_compiler_source_sha256_matches_committed_ledger_and_manifest`
+    and `tests/unit/malecns-artifact.test.ts`'s TypeScript equivalent)
+    instead of something that can silently drift, which is exactly the
+    class of bug a self-referential git SHA field had.
+
+    Scheme (must exactly match the TypeScript recomputation in
+    `tests/unit/malecns-artifact.test.ts`): list `*.py` files directly in
+    `source_dir`, sort by filename, and for each file in that order feed
+    one sha256 hasher: the filename (UTF-8 bytes), then a single NUL byte,
+    then the file's raw bytes. Including the filename means two files
+    swapping content is not an accidental collision; the NUL byte gives an
+    unambiguous filename/content boundary.
+    """
+    hasher = hashlib.sha256()
+    for path in sorted(source_dir.glob("*.py"), key=lambda p: p.name):
+        hasher.update(path.name.encode("utf-8"))
+        hasher.update(b"\0")
+        hasher.update(path.read_bytes())
+    return hasher.hexdigest()
+
+
 # ---------------------------------------------------------------------------
 # Format-level core: reusable by both the real pipeline and
 # tests_python/test_compile.py's tiny CSV fixture.
 # ---------------------------------------------------------------------------
+
+
+def _aggregate_duplicate_edges(
+    pre_idx: np.ndarray, post_idx: np.ndarray, weight: np.ndarray, neuron_count: int
+) -> "tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]":
+    """Aggregate duplicate `(pre, post)` rows by summing their magnitudes
+    (see docs/graph-format.md's "Canonical row ordering and duplicate
+    edges") and build the presynaptic CSR offsets from the same sorted
+    order, since the `pair_key`-ascending order this function establishes
+    (pre-major, post-minor) is already exactly the CSR order the format
+    requires -- no separate re-sort is needed downstream.
+
+    Sorts primarily by `pair_key` and secondarily by weight value (not
+    input row order): floating-point addition is not associative, so
+    summing a duplicate group in input order would make the result depend
+    on which order the *source rows* happened to arrive in. Sorting each
+    group's weights ascending before `reduceat` makes the summation order
+    -- and therefore the output bytes -- a function of the edge set alone.
+
+    Returns `(agg_pre, agg_post, aggregated_weight, presynaptic_offsets,
+    duplicate_aggregated_count)`.
+    """
+    kept_row_count = len(pre_idx)
+    pair_key = pre_idx.astype(np.int64) * neuron_count + post_idx.astype(np.int64)
+    order = np.lexsort((weight, pair_key))
+    pair_key_sorted = pair_key[order]
+    weight_sorted = weight[order]
+    unique_keys, start_positions = np.unique(pair_key_sorted, return_index=True)
+    aggregated_weight = np.add.reduceat(weight_sorted, start_positions)
+    duplicate_aggregated_count = int(kept_row_count - len(unique_keys))
+
+    agg_pre = (unique_keys // neuron_count).astype(np.uint32)
+    agg_post = (unique_keys % neuron_count).astype(np.uint32)
+
+    # unique_keys is already sorted ascending, and since post = key % N for a
+    # fixed pre (key // N), rows for the same pre are already
+    # post-ascending too -- exactly the CSR order the format requires.
+    presynaptic_offsets = np.zeros(neuron_count + 1, dtype=np.uint32)
+    row_counts = np.bincount(agg_pre.astype(np.int64), minlength=neuron_count)
+    presynaptic_offsets[1:] = np.cumsum(row_counts)
+
+    return agg_pre, agg_post, aggregated_weight, presynaptic_offsets, duplicate_aggregated_count
 
 
 def compile_graph(
@@ -210,37 +301,12 @@ def compile_graph(
     post_idx = np.array([index_of[p] for p in post_raw[in_node_set].tolist()], dtype=np.int64)
     weight = weight_raw[in_node_set]
 
-    kept_row_count = len(pre_idx)
     self_loop_count = int((pre_idx == post_idx).sum())
 
-    # Aggregate duplicate (pre, post) rows by summing their magnitudes (see
-    # docs/graph-format.md's "Canonical row ordering and duplicate edges").
-    # Sort primarily by pair_key and secondarily by weight value (not input
-    # row order): floating-point addition is not associative, so summing a
-    # duplicate group in input order would make the result depend on which
-    # order the *source rows* happened to arrive in. Sorting each group's
-    # weights ascending before reduceat makes the summation order -- and
-    # therefore the output bytes -- a function of the edge set alone.
-    pair_key = pre_idx.astype(np.int64) * neuron_count + post_idx.astype(np.int64)
-    order = np.lexsort((weight, pair_key))
-    pair_key_sorted = pair_key[order]
-    weight_sorted = weight[order]
-    unique_keys, start_positions, counts = np.unique(
-        pair_key_sorted, return_index=True, return_counts=True
+    agg_pre, agg_post, aggregated_weight, presynaptic_offsets, duplicate_aggregated_count = (
+        _aggregate_duplicate_edges(pre_idx, post_idx, weight, neuron_count)
     )
-    aggregated_weight = np.add.reduceat(weight_sorted, start_positions)
-    duplicate_aggregated_count = int(kept_row_count - len(unique_keys))
-
-    agg_pre = (unique_keys // neuron_count).astype(np.uint32)
-    agg_post = (unique_keys % neuron_count).astype(np.uint32)
-
-    # unique_keys is already sorted ascending, and since post = key % N for a
-    # fixed pre (key // N), rows for the same pre are already
-    # post-ascending too -- exactly the CSR order the format requires.
-    edge_count = len(unique_keys)
-    presynaptic_offsets = np.zeros(neuron_count + 1, dtype=np.uint32)
-    row_counts = np.bincount(agg_pre.astype(np.int64), minlength=neuron_count)
-    presynaptic_offsets[1:] = np.cumsum(row_counts)
+    edge_count = len(agg_pre)
 
     biological_ids = np.array(node_order, dtype=np.uint64)
     presynaptic_signs = np.array(
@@ -359,6 +425,20 @@ def _build_adjacency(weights: pd.DataFrame):
     return forward_neighbors, backward_neighbors
 
 
+def _rank_by_degree(candidates: pd.DataFrame, degree: pd.Series) -> pd.DataFrame:
+    """Rank `candidates` (a DataFrame with a `bodyId` column) by total
+    measured degree descending, breaking ties by ascending `bodyId` for a
+    fully deterministic, ledger-reproducible order. Shared by all three of
+    `select_subgraph`'s rankings (sensory, descending, bridge) so a re-pin
+    to different source data can never produce an undocumented tie-break
+    that depends on an implementation-detail sort algorithm's stability
+    rather than an explicit rule.
+    """
+    return candidates.assign(
+        degree=candidates["bodyId"].map(degree).fillna(0)
+    ).sort_values(["degree", "bodyId"], ascending=[False, True])
+
+
 def select_subgraph(annotations: pd.DataFrame, weights: pd.DataFrame) -> dict:
     """Implements the SENSORY_* / DESCENDING_* / BRIDGE_TARGET policy
     documented above. Returns a dict with `sensory_ids`, `descending_ids`,
@@ -392,12 +472,8 @@ def select_subgraph(annotations: pd.DataFrame, weights: pd.DataFrame) -> dict:
         ]
     ).groupby(level=0).sum()
 
-    sensory_ranked = sensory_candidates.assign(
-        degree=sensory_candidates["bodyId"].map(degree).fillna(0)
-    ).sort_values(["degree", "bodyId"], ascending=[False, True])
-    descending_ranked = descending_candidates.assign(
-        degree=descending_candidates["bodyId"].map(degree).fillna(0)
-    ).sort_values(["degree", "bodyId"], ascending=[False, True])
+    sensory_ranked = _rank_by_degree(sensory_candidates, degree)
+    descending_ranked = _rank_by_degree(descending_candidates, degree)
 
     sensory_ids = sensory_ranked["bodyId"].head(SENSORY_TARGET).astype(np.int64).tolist()
     descending_ids = descending_ranked["bodyId"].head(DESCENDING_TARGET).astype(np.int64).tolist()
@@ -417,10 +493,9 @@ def select_subgraph(annotations: pd.DataFrame, weights: pd.DataFrame) -> dict:
         (forward_from_sensory & backward_from_descending) - set(sensory_ids) - set(descending_ids)
     )
 
-    bridge_arr = np.array(sorted(bridge_candidates), dtype=np.int64)
-    bridge_degree = pd.Series(bridge_arr).map(degree).fillna(0)
-    bridge_ranked = bridge_arr[bridge_degree.sort_values(ascending=False).index.to_numpy()]
-    bridge_ids = bridge_ranked[:BRIDGE_TARGET].tolist()
+    bridge_frame = pd.DataFrame({"bodyId": sorted(bridge_candidates)})
+    bridge_ranked = _rank_by_degree(bridge_frame, degree)
+    bridge_ids = bridge_ranked["bodyId"].head(BRIDGE_TARGET).astype(np.int64).tolist()
 
     node_ids = sorted(set(sensory_ids) | set(descending_ids) | set(bridge_ids))
 
@@ -574,6 +649,7 @@ def build_manifest_and_ledger(
     binary_gzip_sha256: str,
     binary_gzip_size: int,
     binary_size: int,
+    compiler_source_sha256_value: str,
 ) -> "tuple[dict, dict]":
     from download import SOURCE_FILES  # local import to avoid a hard dependency for fixture tests
 
@@ -591,11 +667,30 @@ def build_manifest_and_ledger(
         "gzipBytes": binary_gzip_size,
         "license": "CC-BY-4.0",
         "sourceDataset": "male-cns:v1.0 (Janelia FlyEM Male CNS connectome)",
+        # sha256 over scripts/data/*.py at compile time -- see
+        # compiler_source_sha256()'s docstring. Echoed into the ledger too
+        # (below) so either file alone proves which compiler code produced
+        # this artifact.
+        "compilerSourceSha256": compiler_source_sha256_value,
     }
 
     ledger = {
         "artifact": f"{ARTIFACT_NAME}.bin.gz",
-        "compilerRevision": git_revision(),
+        # sha256 over scripts/data/*.py (binfmt.py, compile.py, download.py,
+        # rewire.py) at compile time -- see compiler_source_sha256()'s
+        # docstring in scripts/data/compile.py. Unlike compiledFromGitRevision
+        # below, this is derived directly from the code that ran, so it
+        # cannot go stale the way a self-referential git SHA can.
+        "compilerSourceSha256": compiler_source_sha256_value,
+        # Informational only: `git rev-parse HEAD` *at compile time*. This is
+        # inherently self-referential -- the commit that ships this
+        # regenerated ledger necessarily comes after the commit this field
+        # names, since the artifact's own bytes can't be part of the commit
+        # that produced them -- so it may predate (and never equals) the
+        # commit that actually ships this file. Do not use it to answer
+        # "which commit's compiler produced this artifact"; use
+        # `compilerSourceSha256` for that.
+        "compiledFromGitRevision": git_revision(),
         "sourceDataset": {
             "name": "Male CNS Connectome",
             "version": "v1.0",
@@ -708,6 +803,9 @@ def main(argv: list[str] | None = None) -> int:
     gzip_bytes = bin_gz_path.read_bytes()
     gzip_sha256 = binfmt.sha256_hex(gzip_bytes)
 
+    compiler_source_sha256_value = compiler_source_sha256()
+    print(f"compiler source sha256: {compiler_source_sha256_value}")
+
     manifest, ledger = build_manifest_and_ledger(
         graph=graph,
         stats=stats,
@@ -717,6 +815,7 @@ def main(argv: list[str] | None = None) -> int:
         binary_gzip_sha256=gzip_sha256,
         binary_gzip_size=len(gzip_bytes),
         binary_size=len(binary),
+        compiler_source_sha256_value=compiler_source_sha256_value,
     )
 
     (args.out_dir / f"{ARTIFACT_NAME}.manifest.json").write_text(

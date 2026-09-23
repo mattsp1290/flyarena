@@ -18,6 +18,7 @@ Covers:
 from __future__ import annotations
 
 import csv
+import json
 import sys
 from pathlib import Path
 
@@ -559,3 +560,119 @@ def test_three_way_duplicate_aggregation_is_order_independent():
         results.add(binfmt.encode_graph_binary(graph))
 
     assert len(results) == 1, "aggregation order must not depend on input row order"
+
+
+# ---------------------------------------------------------------------------
+# _aggregate_duplicate_edges: direct unit test for the extracted
+# duplicate-aggregation + CSR-construction block (thermo-maintainability
+# review suggestion #3 -- see reviews/feat-qyxw-malecns-graph-thermo-*/).
+# ---------------------------------------------------------------------------
+
+
+def test_aggregate_duplicate_edges_builds_csr_and_sums_duplicates():
+    # (pre=0, post=1) appears twice (1.0 + 2.0 = 3.0, a duplicate); (pre=1,
+    # post=0) and (pre=2, post=1) are unique.
+    pre_idx = np.array([0, 0, 1, 2], dtype=np.int64)
+    post_idx = np.array([1, 1, 0, 1], dtype=np.int64)
+    weight = np.array([1.0, 2.0, 5.0, 3.0], dtype=np.float64)
+
+    agg_pre, agg_post, aggregated_weight, presynaptic_offsets, duplicate_aggregated_count = (
+        compiler._aggregate_duplicate_edges(pre_idx, post_idx, weight, neuron_count=3)
+    )
+
+    assert duplicate_aggregated_count == 1
+    assert agg_pre.tolist() == [0, 1, 2]
+    assert agg_post.tolist() == [1, 0, 1]
+    assert aggregated_weight.tolist() == pytest.approx([3.0, 5.0, 3.0])
+    # neuron 0 has 1 row (offset 0->1), neuron 1 has 1 row (1->2), neuron 2
+    # has 1 row (2->3).
+    assert presynaptic_offsets.tolist() == [0, 1, 2, 3]
+
+
+def test_aggregate_duplicate_edges_is_order_independent_for_the_summation():
+    """Same duplicate-weight order-independence property
+    `test_three_way_duplicate_aggregation_is_order_independent` verifies
+    end-to-end through `compile_graph`, exercised directly against the
+    extracted helper."""
+    pre_idx = np.array([0, 0, 0], dtype=np.int64)
+    post_idx = np.array([1, 1, 1], dtype=np.int64)
+
+    results = set()
+    for permutation in ((1e-8, 1.0, 1e8), (1e8, 1.0, 1e-8), (1.0, 1e8, 1e-8)):
+        weight = np.array(permutation, dtype=np.float64)
+        _, _, aggregated_weight, _, _ = compiler._aggregate_duplicate_edges(
+            pre_idx, post_idx, weight, neuron_count=2
+        )
+        results.add(float(aggregated_weight[0]))
+
+    assert len(results) == 1
+
+
+# ---------------------------------------------------------------------------
+# _rank_by_degree / select_subgraph bridge ranking: deterministic tie-break
+# (thermo-architecture review finding -- bridge_ranked previously had no
+# documented tie-break, unlike the sibling sensory/descending rankings; see
+# reviews/feat-qyxw-malecns-graph-thermo-*/).
+# ---------------------------------------------------------------------------
+
+
+def test_rank_by_degree_breaks_ties_by_ascending_body_id():
+    candidates = pd.DataFrame({"bodyId": [30, 10, 20, 40]})
+    degree = pd.Series({30: 5.0, 10: 5.0, 20: 5.0, 40: 1.0})
+
+    ranked = compiler._rank_by_degree(candidates, degree)
+
+    assert ranked["bodyId"].tolist() == [10, 20, 30, 40]
+
+
+def test_select_subgraph_bridge_ranking_breaks_degree_ties_by_ascending_body_id(monkeypatch):
+    # One sensory neuron (1) and one descending neuron (2), bridged by three
+    # candidates (100, 101, 102) that are all tied at the same measured
+    # degree (10). With BRIDGE_TARGET forced to 2, the selection must always
+    # be the two *smallest* body ids among the tie, deterministically --
+    # not whichever two a non-stable sort happens to keep.
+    annotations = pd.DataFrame(
+        {
+            "bodyId": [1, 2, 100, 101, 102],
+            "status": ["Traced"] * 5,
+            "superclass": ["vnc_sensory", "descending_neuron", "other", "other", "other"],
+            "class": ["mechanosensory_tactile", None, None, None, None],
+        }
+    )
+    weights = pd.DataFrame(
+        {
+            "body_pre": [1, 1, 1, 100, 101, 102],
+            "body_post": [100, 101, 102, 2, 2, 2],
+            "weight": [5, 5, 5, 5, 5, 5],
+        }
+    )
+
+    monkeypatch.setattr(compiler, "BRIDGE_TARGET", 2)
+    selection = compiler.select_subgraph(annotations, weights)
+
+    assert selection["bridge_ids"] == [100, 101]
+
+
+# ---------------------------------------------------------------------------
+# compiler_source_sha256: guards the "code changed but nobody recompiled"
+# gap the prior review flagged in the self-referential compilerRevision git
+# SHA (see reviews/feat-qyxw-malecns-graph-thermo-*/thermo-architecture/).
+# ---------------------------------------------------------------------------
+
+
+def test_compiler_source_sha256_matches_committed_ledger_and_manifest():
+    """Recomputes the source hash from the actual working-tree
+    scripts/data/*.py files and asserts it equals the value already
+    committed in the real, pinned artifact's ledger and manifest. A code
+    change to any of those files with no accompanying `compile.py` re-run
+    (and recommit of the artifact) makes this fail -- exactly the class of
+    silent drift the prior `compilerRevision` field allowed."""
+    ledger_path = REPO_ROOT / "public" / "data" / "malecns-arena-v1.ledger.json"
+    manifest_path = REPO_ROOT / "public" / "data" / "malecns-arena-v1.manifest.json"
+    ledger = json.loads(ledger_path.read_text())
+    manifest = json.loads(manifest_path.read_text())
+
+    recomputed = compiler.compiler_source_sha256()
+
+    assert recomputed == ledger["compilerSourceSha256"]
+    assert recomputed == manifest["compilerSourceSha256"]

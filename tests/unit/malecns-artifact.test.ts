@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -17,8 +17,31 @@ import { parseGraphBinary, validateGraph } from '../../src/lib/connectome/format
 
 const here = dirname(fileURLToPath(import.meta.url));
 const publicDataDir = resolve(here, '../../public/data');
+const compilerSourceDir = resolve(here, '../../scripts/data');
 
 const sha256Hex = (data: Uint8Array): string => createHash('sha256').update(data).digest('hex');
+
+/**
+ * Recomputes `compilerSourceSha256` from the working tree: must exactly
+ * match `compiler_source_sha256()` in scripts/data/compile.py (sorted
+ * `*.py` filenames, each contributing filename + NUL byte + raw bytes into
+ * one sha256 hasher). Kept in lockstep with the Python implementation by
+ * `test_compiler_source_sha256_matches_committed_ledger_and_manifest` in
+ * tests_python/test_compile.py, which performs the same check from the
+ * Python side.
+ */
+const computeCompilerSourceSha256 = (): string => {
+  const filenames = readdirSync(compilerSourceDir)
+    .filter((name) => name.endsWith('.py'))
+    .sort();
+  const hash = createHash('sha256');
+  for (const name of filenames) {
+    hash.update(name, 'utf-8');
+    hash.update(Buffer.from([0]));
+    hash.update(readFileSync(resolve(compilerSourceDir, name)));
+  }
+  return hash.digest('hex');
+};
 
 interface Manifest {
   formatVersion: number;
@@ -31,6 +54,7 @@ interface Manifest {
   gzipSha256: string;
   gzipBytes: number;
   license: string;
+  compilerSourceSha256: string;
   rewiredArms?: Record<
     string,
     { artifact: string; binarySha256: string; binaryBytes: number; gzipSha256: string; gzipBytes: number }
@@ -124,5 +148,20 @@ describe('malecns-arena-v1 artifact (real, pinned MaleCNS-derived graph)', () =>
     const biologicalGraph = parseGraphBinary(biologicalArrayBuffer);
     expect(Array.from(graph.biologicalIds)).toEqual(Array.from(biologicalGraph.biologicalIds));
     expect(graph.metadata.edgeCount).toBe(biologicalGraph.metadata.edgeCount);
+  });
+
+  it('compilerSourceSha256, recomputed from the working-tree scripts/data/*.py files, matches the committed manifest and ledger', () => {
+    // Guards against the class of bug a prior review flagged in the
+    // now-removed self-referential compilerRevision git SHA: a code change
+    // to the compiler with no accompanying recompile/recommit of the
+    // artifact. See docs/data-provenance.md's "Compiler provenance" section.
+    const ledger = JSON.parse(
+      readFileSync(resolve(publicDataDir, 'malecns-arena-v1.ledger.json'), 'utf-8')
+    ) as { compilerSourceSha256: string };
+
+    const recomputed = computeCompilerSourceSha256();
+
+    expect(recomputed).toBe(manifest.compilerSourceSha256);
+    expect(recomputed).toBe(ledger.compilerSourceSha256);
   });
 });

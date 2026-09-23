@@ -162,6 +162,23 @@ alone is enough to reproduce this section's numbers.
 | Self-loops retained | 0 |
 | Isolated nodes | 0 |
 
+`malecns-arena-v1.ledger.json`'s `selectionCounts` block (`sensorySelectedCount`,
+`descendingSelectedCount`, `bridgeSelectedCount`, ...) records *counts* only,
+not the selected `bodyId` lists themselves. The actual selected identities
+are still fully recoverable, just from combining the ledger with the
+committed binary rather than from the ledger alone: decode
+`malecns-arena-v1.bin.gz`'s `biologicalIds` array and cross-reference it
+against `inputChannelIndex`/`outputPopulationIndex` (`assign_channels` only
+ever assigns those two arrays' entries for sensory/descending bodies -- see
+"Input/output channel mapping" below) -- a neuron with `inputChannelIndex
+>= 0` is a selected sensory body, one with `outputPopulationIndex >= 0` is a
+selected descending body, and every remaining neuron (both indices `-1`) is
+a selected bridge body. This is a deliberate split -- the counts alone are
+reproducible from the ledger, and ledger + binary together fully
+reconstruct the identity list -- not an omission, so a future reader
+shouldn't go looking for a body-ID list that was never meant to live in the
+JSON.
+
 ## Input/output channel mapping (authored)
 
 `src/lib/arena/sensors.ts` declares 8 input channels
@@ -182,6 +199,25 @@ normalized by `sensors.ts` before this weight is applied); `outputWeight`
 is `1 / (population size)` so a population's aggregated output magnitude
 does not scale with how many neurons happen to land in it.
 
+**This input/output weighting is intentionally asymmetric, not an
+oversight.** `outputWeight`'s `1/(population size)` normalization exists
+because the arena directly consumes each population's *aggregated* output
+as a control signal, so that aggregate must not scale with how the 48
+descending neurons happened to partition across 3 populations.
+`inputWeight` is left flat because each *channel's* input magnitude is
+already normalized externally, per-channel, by `sensors.ts` before it ever
+reaches this weight -- there is no equivalent "aggregate across the
+channel" step on the input side for population-size skew to leak into.
+Today `SENSORY_TARGET / INPUT_CHANNEL_COUNT = 160 / 8 = 20` divides evenly,
+so every channel gets exactly 20 neurons and the asymmetry has no visible
+effect; if a future re-tuning of `SENSORY_TARGET`/`INPUT_CHANNEL_COUNT`
+stops dividing evenly, channels with more assigned neurons would inject
+more total external drive than channels with fewer, for the same declared
+per-channel input magnitude. This is a known, currently-latent authored
+choice (matching `assign_channels`' block-partition rule, which has the
+same non-even-division caveat) rather than a bug -- flagged here so a
+future constant change is a conscious decision, not a silent regression.
+
 ## Presynaptic sign policy (Dale's law)
 
 The wire format applies one `+1`/`-1` sign per presynaptic neuron to every
@@ -197,9 +233,9 @@ per-neuron transmitter prediction), via an **authored** mapping:
   dominant glutamate receptor class in the fly CNS is the ionotropic
   glutamate-gated chloride channel), matching the convention used in prior
   connectome-constrained rate-model work.
-- Anything else -- `dopamine`, `octopamine`, `serotonin`, `"unclear"`, or a
-  body with no neurotransmitter-table row at all -- is **defaulted to
-  excitatory (`+1`)** and counted separately, since these are
+- Anything else -- `dopamine`, `octopamine`, `serotonin`, `histamine`,
+  `"unclear"`, or a body with no neurotransmitter-table row at all -- is
+  **defaulted to excitatory (`+1`)** and counted separately, since these are
   neuromodulatory or low-confidence calls this POC does not attempt to
   model directionally.
 
@@ -278,5 +314,35 @@ $ uv run pytest tests_python                    # compiler invariants, no raw da
 files reproduces byte-identical `.bin`/`.bin.gz` output (verified directly
 -- see `tests_python/test_compile.py`'s determinism tests, and this was
 also checked by running the real pipeline twice during development).
-`malecns-arena-v1.ledger.json`'s `compilerRevision` field records the git
-SHA of this repository at compile time.
+
+### Compiler provenance: `compilerSourceSha256` vs. `compiledFromGitRevision`
+
+Both `malecns-arena-v1.manifest.json` and `malecns-arena-v1.ledger.json`
+carry a `compilerSourceSha256` field: a sha256 over this compiler's own
+Python source (`scripts/data/*.py` -- `binfmt.py`, `compile.py`,
+`download.py`, `rewire.py`, not the generated `__pycache__`), sorted by
+filename, each file contributing its filename (UTF-8) + a single NUL byte +
+its raw bytes into one hasher (see `compiler_source_sha256()` in
+`scripts/data/compile.py` for the exact scheme). Because this is derived
+directly from the code that ran rather than from a commit reference, it is
+self-consistent: re-running the pipeline after *any* change to those files
+-- even one that doesn't happen to change the compiled bytes, as with the
+tie-break fix in this same change -- changes this hash. That makes "did the
+committed artifact get regenerated after this code change" a mechanically
+checkable property: `tests_python/test_compile.py`'s
+`test_compiler_source_sha256_matches_committed_ledger_and_manifest` and
+`tests/unit/malecns-artifact.test.ts`'s TypeScript equivalent both
+recompute this hash from the working tree and fail CI if it no longer
+matches the committed manifest/ledger value.
+
+The ledger additionally carries `compiledFromGitRevision`: `git rev-parse
+HEAD` at compile time, kept as **purely informational** context (e.g. "what
+was being worked on around the time this was compiled"), not as a claim
+about which commit's compiler produced these bytes. That claim is
+inherently unstable for a git SHA: the commit that ships a freshly
+regenerated ledger necessarily comes *after* the commit `compiledFromGitRevision`
+names, since the artifact's own bytes cannot be part of the commit that
+produced them -- so this field will always name an ancestor of, never the
+same commit as, whatever commit actually ships that exact ledger file. Use
+`compilerSourceSha256`, not `compiledFromGitRevision`, to answer "which
+compiler code produced this artifact."
