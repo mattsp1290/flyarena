@@ -42,7 +42,14 @@ export interface GraphMetadata {
   outputPopulationCount: number;
   /** Seconds of simulated time integrated per neural substep. */
   timestepSeconds: number;
-  /** Leak (decay-to-zero) rate applied to every neuron's rate each substep. */
+  /**
+   * Continuous-time leak (decay-to-zero) rate in units of 1/second, NOT a
+   * per-substep fraction: the per-substep decay is `leakRate * timestepSeconds`
+   * (see docs/graph-format.md's "Dynamics" section for the full update
+   * equation). Should satisfy `leakRate * timestepSeconds <= 1` for the leak
+   * term to decay monotonically rather than overshoot toward the opposite
+   * rate bound.
+   */
   leakRate: number;
   rateMin: number;
   rateMax: number;

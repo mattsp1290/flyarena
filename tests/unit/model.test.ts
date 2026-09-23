@@ -66,6 +66,24 @@ describe('bounded leaky rate network', () => {
     expect(state.rate[2]).toBeCloseTo(0.4, 5); // 0.8 + 1 * (-0.5 * 0.8 + 0)
   });
 
+  it('scales both the leak term and the drive term by timestepSeconds, not just one of them', () => {
+    // Every other case in this file uses timestepSeconds: 1, where `dt * x`
+    // and `x` are indistinguishable. A missing `dt` factor anywhere in the
+    // update, or one applied to only the leak or only the drive, would still
+    // pass every one of those cases; this one would not.
+    const graph = createTinyGraph({ timestepSeconds: 0.25, leakRate: 2 });
+    const state = createModelState(graph);
+    const scratch = createStepScratch(graph);
+    state.rate[2] = 0.8; // pre-existing rate on an otherwise-undriven neuron this step
+
+    stepModel(graph, state, scratch, [0.4, 0]);
+
+    // neuron 0 (drive-only, channel 0 = 0.4): 0 + 0.25 * (-2*0 + 1*0.4) = 0.1
+    expect(state.rate[0]).toBeCloseTo(0.1, 5);
+    // neuron 2 (leak-only this step: rate[0] was 0 pre-step): 0.8 + 0.25 * (-2*0.8 + 0) = 0.4
+    expect(state.rate[2]).toBeCloseTo(0.4, 5);
+  });
+
   it('clamps external channel input to [inputClampMin, inputClampMax] before injecting it', () => {
     const highClamp = createTinyGraph({ inputClampMax: 0.2 });
     const highState = createModelState(highClamp);

@@ -9,7 +9,37 @@ import {
 import { createTinyGraph } from '../fixtures/tiny-graph';
 
 describe('connectome graph binary format', () => {
-  it('round-trips a graph through encodeGraphBinary/parseGraphBinary byte-for-byte equivalent', () => {
+  it('matches the documented worked offset example in docs/graph-format.md exactly', () => {
+    // Pins the byte layout, not just decoded values: encodeGraphBinary and
+    // parseGraphBinary share one `computeGraphLayout`, so a round-trip test
+    // alone could not detect the two drifting from docs/graph-format.md's
+    // documented offsets together. neuronCount=4, edgeCount=2 (createTinyGraph).
+    const buffer = encodeGraphBinary(createTinyGraph());
+    const view = new DataView(buffer);
+
+    expect(buffer.byteLength).toBe(200);
+    expect(String.fromCharCode(...new Uint8Array(buffer, 0, 4))).toBe('FANG');
+    expect(view.getUint32(4, true)).toBe(SUPPORTED_FORMAT_VERSION);
+    expect(view.getUint32(52, true)).toBe(0); // reserved flags
+
+    expect(Array.from(new BigUint64Array(buffer, 56, 4))).toEqual([1n, 2n, 3n, 4n]); // biologicalIds @56
+    expect(Array.from(new Uint32Array(buffer, 88, 5))).toEqual([0, 1, 2, 2, 2]); // presynapticOffsets @88
+    expect(Array.from(new Uint32Array(buffer, 112, 2))).toEqual([2, 3]); // postsynapticIndices @112
+    expect(Array.from(new Float32Array(buffer, 120, 2))).toEqual([2, 1.5]); // contactMagnitudes @120
+    expect(Array.from(new Int8Array(buffer, 128, 4))).toEqual([1, -1, 1, 1]); // presynapticSigns @128
+    expect(Array.from(new Int32Array(buffer, 136, 4))).toEqual([0, 1, -1, -1]); // inputChannelIndex @136
+    expect(Array.from(new Float32Array(buffer, 152, 4))).toEqual([1, 1, 0, 0]); // inputWeight @152
+    expect(Array.from(new Int32Array(buffer, 168, 4))).toEqual([-1, -1, 0, 1]); // outputPopulationIndex @168
+    expect(Array.from(new Float32Array(buffer, 184, 4))).toEqual([0, 0, 1, 1]); // outputWeight @184
+
+    // Every padding gap the doc's worked example declares (rounding each
+    // section up to the next 8-byte boundary) must be zero-filled, not
+    // leftover/uninitialized bytes.
+    expect(Array.from(new Uint8Array(buffer, 108, 4))).toEqual([0, 0, 0, 0]); // 108..112
+    expect(Array.from(new Uint8Array(buffer, 132, 4))).toEqual([0, 0, 0, 0]); // 132..136
+  });
+
+  it('round-trips every section value through encodeGraphBinary/parseGraphBinary', () => {
     const original = createTinyGraph();
 
     const parsed = parseGraphBinary(encodeGraphBinary(original));

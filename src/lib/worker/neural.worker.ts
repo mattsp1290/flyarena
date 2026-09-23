@@ -32,17 +32,32 @@ interface WorkerRuntime {
 export const createWorkerRuntime = (): WorkerRuntime => ({});
 
 const failure = (
-  type: WorkerRequest['type'],
+  type: WorkerFailure['type'],
   requestId: string,
   code: WorkerFailure['error']['code'],
   message: string
 ): WorkerFailure => ({ type, requestId, ok: false, error: { code, message } });
+
+/** True for a plausible request envelope: an object with a string `requestId`. */
+const isRequestEnvelope = (value: unknown): value is { type: unknown; requestId: string } =>
+  typeof value === 'object' &&
+  value !== null &&
+  typeof (value as { requestId?: unknown }).requestId === 'string';
 
 /** Handle one request against `runtime`, mutating it in place as needed. */
 export const handleWorkerRequest = (
   runtime: WorkerRuntime,
   request: WorkerRequest
 ): WorkerResponse => {
+  // `request` crosses a structured-clone boundary in production, so it is
+  // not actually guaranteed to match `WorkerRequest` at runtime. Reject a
+  // malformed envelope before touching `request.type` so this function can
+  // never throw: a throw here would leave the caller's `requestId` with no
+  // matching response at all.
+  if (!isRequestEnvelope(request)) {
+    return failure('unknown', '', 'invalid-request', 'Worker message must be an object with a string requestId');
+  }
+
   try {
     switch (request.type) {
       case 'init': {
@@ -100,6 +115,9 @@ export const handleWorkerRequest = (
             'substeps must be a positive integer'
           );
         }
+        if (!Array.isArray(request.channelValues)) {
+          return failure('step', request.requestId, 'invalid-request', 'channelValues must be an array');
+        }
         if (request.channelValues.length !== runtime.graph.metadata.inputChannelCount) {
           return failure(
             'step',
@@ -107,6 +125,16 @@ export const handleWorkerRequest = (
             'invalid-request',
             `channelValues must have length ${runtime.graph.metadata.inputChannelCount}, received ${request.channelValues.length}`
           );
+        }
+        for (let channel = 0; channel < request.channelValues.length; channel += 1) {
+          if (!Number.isFinite(request.channelValues[channel])) {
+            return failure(
+              'step',
+              request.requestId,
+              'invalid-request',
+              `channelValues[${channel}] must be a finite number, received ${String(request.channelValues[channel])}`
+            );
+          }
         }
         runSubsteps(
           runtime.graph,
@@ -136,16 +164,20 @@ export const handleWorkerRequest = (
       default: {
         const unreachable: never = request;
         return failure(
-          (unreachable as WorkerRequest).type,
+          'unknown',
           (unreachable as WorkerRequest).requestId,
           'invalid-request',
-          'Unknown worker request type'
+          `Unknown worker request type: ${String((unreachable as WorkerRequest).type)}`
         );
       }
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    return failure(request.type, request.requestId, 'invalid-graph', message);
+    // `init` failures are almost always a malformed graph buffer; every other
+    // request type only reaches `catch` for an unexpected runtime bug, since
+    // its own inputs are validated above before touching the model.
+    const code = request.type === 'init' ? 'invalid-graph' : 'internal-error';
+    return failure(request.type, request.requestId, code, message);
   }
 };
 

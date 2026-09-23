@@ -74,11 +74,15 @@ export interface RandomGraphOptions {
 
 /**
  * A larger seeded random sparse graph for stress/parity testing. Every
- * neuron gets a fixed Dale's-law sign; a subset are wired to input channels
- * and a subset to output populations; recurrent edges are random but grouped
- * into valid presynaptic CSR rows. Bounded rate clamps mean the network
- * cannot diverge regardless of `globalGain`, so this stays safe to run for
- * many steps.
+ * neuron gets a fixed Dale's-law sign; each input channel and each output
+ * population is assigned its own distinct neuron (via a seeded shuffle, so
+ * none are dropped to a collision), and every input neuron gets a direct
+ * edge to every output neuron so no output population can end up starved of
+ * drive. Remaining recurrent edges are random but grouped into valid
+ * presynaptic CSR rows. Bounded rate clamps mean the network cannot diverge
+ * regardless of `globalGain`, so this stays safe to run for many steps.
+ * Throws if `neuronCount` is too small to give every channel/population its
+ * own neuron.
  */
 export const createRandomGraph = (
   seed: number,
@@ -89,6 +93,13 @@ export const createRandomGraph = (
   const outputPopulationCount = options.outputPopulationCount ?? 3;
   const edgeDensity = options.edgeDensity ?? 4;
   const random = mulberry32(seed);
+
+  if (inputChannelCount + outputPopulationCount > neuronCount) {
+    throw new Error(
+      'createRandomGraph: neuronCount must be at least inputChannelCount + outputPopulationCount ' +
+        'to assign every channel/population a distinct neuron'
+    );
+  }
 
   const biologicalIds = new BigUint64Array(neuronCount);
   const presynapticSigns = new Int8Array(neuronCount);
@@ -102,18 +113,30 @@ export const createRandomGraph = (
     presynapticSigns[neuron] = random() < 0.5 ? -1 : 1;
   }
 
-  // Every input channel drives at least one neuron.
-  for (let channel = 0; channel < inputChannelCount; channel += 1) {
-    const neuron = Math.floor(random() * neuronCount);
-    inputChannelIndex[neuron] = channel;
-    inputWeight[neuron] = 0.5 + random();
+  // Seeded partial Fisher-Yates: draw `inputChannelCount + outputPopulationCount`
+  // distinct neurons so every channel and every population gets its own
+  // neuron (an earlier version drew each independently and could silently
+  // drop a channel/population to a collision).
+  const order = Array.from({ length: neuronCount }, (_, index) => index);
+  for (let i = order.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(random() * (i + 1));
+    [order[i], order[j]] = [order[j], order[i]];
   }
 
-  // Every output population is fed by at least one neuron.
+  const inputNeurons: number[] = [];
+  for (let channel = 0; channel < inputChannelCount; channel += 1) {
+    const neuron = order[channel];
+    inputChannelIndex[neuron] = channel;
+    inputWeight[neuron] = 0.5 + random();
+    inputNeurons.push(neuron);
+  }
+
+  const outputNeurons: number[] = [];
   for (let population = 0; population < outputPopulationCount; population += 1) {
-    const neuron = Math.floor(random() * neuronCount);
+    const neuron = order[inputChannelCount + population];
     outputPopulationIndex[neuron] = population;
     outputWeight[neuron] = 0.3 + random() * 0.7;
+    outputNeurons.push(neuron);
   }
 
   const edgesByPre: Array<Array<{ post: number; magnitude: number }>> = Array.from(
@@ -125,6 +148,17 @@ export const createRandomGraph = (
     for (let index = 0; index < outDegree; index += 1) {
       const post = Math.floor(random() * neuronCount);
       edgesByPre[pre].push({ post, magnitude: 0.1 + random() * 1.9 });
+    }
+  }
+
+  // Guarantee every output population actually receives drive whenever any
+  // input channel is active: a purely random topology can (and, checked
+  // empirically, sometimes does) leave an output neuron with no incoming
+  // edges at all, which would make its aggregated output identically zero
+  // for every step and make a parity test over it vacuous.
+  for (const inputNeuron of inputNeurons) {
+    for (const outputNeuron of outputNeurons) {
+      edgesByPre[inputNeuron].push({ post: outputNeuron, magnitude: 0.2 + random() * 0.8 });
     }
   }
 

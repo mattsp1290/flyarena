@@ -32,8 +32,11 @@ export const computeTelemetry = (state: Readonly<NeuralModelState>): NeuralTelem
   for (let neuron = 0; neuron < count; neuron += 1) {
     const value = rate[neuron];
     sum += value;
-    if (value < min) min = value;
-    if (value > max) max = value;
+    // Math.min/Math.max (unlike a manual `<`/`>` comparison) propagate NaN:
+    // a non-finite rate should make a non-finite summary visible rather than
+    // being silently skipped and reported as a misleadingly ordinary 0.
+    min = Math.min(min, value);
+    max = Math.max(max, value);
     if (Math.abs(value) > ACTIVITY_THRESHOLD) active += 1;
   }
 

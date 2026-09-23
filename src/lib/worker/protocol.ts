@@ -91,9 +91,14 @@ export interface DisposeWorkerSuccess {
   ok: true;
 }
 
-/** A failed response for any request type, carrying a structured error. */
+/**
+ * A failed response for any request type, carrying a structured error.
+ * `type` is `'unknown'` when the inbound message itself was too malformed
+ * (not an object, or missing a string `requestId`) to identify a request
+ * type or id at all.
+ */
 export interface WorkerFailure {
-  type: WorkerRequest['type'];
+  type: WorkerRequest['type'] | 'unknown';
   requestId: string;
   ok: false;
   error: WorkerError;

@@ -40,17 +40,62 @@ not a spec to follow — but they must always agree, and any real change is a
 | 12     | 4    | uint32  | `edgeCount`              | Number of directed synaptic entries, E (CSR non-zero count). |
 | 16     | 4    | uint32  | `inputChannelCount`      | Number of external observation channels (see `src/lib/arena/sensors.ts`'s 8-channel contract for the canonical POC input; this field is not hardcoded to 8). |
 | 20     | 4    | uint32  | `outputPopulationCount`  | Number of output populations. Convention: population 0/1/2 map to thrust/yaw/brake to match `decodeAction` in `src/lib/arena/actions.ts`, but the format itself is agnostic. |
-| 24     | 4    | float32 | `timestepSeconds`        | Simulated seconds integrated per neural substep. Must be > 0. |
-| 28     | 4    | float32 | `leakRate`               | Per-substep leak/decay coefficient. Must be >= 0. |
+| 24     | 4    | float32 | `timestepSeconds`        | Simulated seconds integrated per neural substep (`dt`). Must be > 0. |
+| 28     | 4    | float32 | `leakRate`               | **Continuous-time** leak/decay rate in units of 1/second, not a per-substep fraction — see [Dynamics](#dynamics-consumed-by-this-format-informative) below for the exact equation. The actual per-substep decay fraction is `leakRate * timestepSeconds`, which should stay `<= 1` for the leak term to decay monotonically toward zero rather than overshoot; values above `2` oscillate between `rateMin`/`rateMax` every substep. Must be >= 0. |
 | 32     | 4    | float32 | `rateMin`                | Lower bound every neuron's rate is clamped to. |
 | 36     | 4    | float32 | `rateMax`                | Upper bound every neuron's rate is clamped to. Must be >= `rateMin`. |
 | 40     | 4    | float32 | `inputClampMin`          | Lower bound applied to a raw channel value before it is injected as external drive. |
 | 44     | 4    | float32 | `inputClampMax`          | Upper bound for the same. Must be >= `inputClampMin`. |
-| 48     | 4    | float32 | `globalGain`             | Global multiplier applied to every recurrent synaptic contribution. Calibrated, not measured. |
+| 48     | 4    | float32 | `globalGain`             | Global multiplier applied to every recurrent synaptic contribution (see [Dynamics](#dynamics-consumed-by-this-format-informative)). **Not** applied to external channel drive. Calibrated, not measured. |
 | 52     | 4    | uint32  | `flags`                  | Reserved for future use. Writers must set this to `0`; readers must not reject a nonzero value on the strength of this field alone (forward-compatible reserve), but no flag bits are defined in format version 1. |
 
 Total header size: 56 bytes (already a multiple of 8; no header padding is
 needed).
+
+All header scalars are written and read as IEEE 754 **float32**, per the
+column above, even though this document and most implementations naturally
+work in float64. A writer that computes `timestepSeconds`, `leakRate`, or any
+other header float in float64 and does not round it to its nearest float32
+value before comparing against a value read back from a parsed file may see
+a tiny (~1e-7 relative) mismatch; `Math.fround` in JavaScript, or
+`numpy.float32(...)` in Python, performs this rounding explicitly.
+
+## Dynamics consumed by this format (informative)
+
+This section is not itself part of the wire format — nothing here changes
+what bytes a valid file contains — but it is the equation every field above
+exists to parametrize, and a compiler calibrating `globalGain`, `inputWeight`,
+`outputWeight`, and `leakRate` needs it to choose values that behave as
+intended. `src/lib/connectome/model.ts`'s `stepModel` is the executable
+version of this section.
+
+Every neural substep, for every neuron `i`, from the *pre-substep* rates
+(a synchronous update: nothing computed this substep feeds back into itself
+this same substep):
+
+```text
+drive[i] = sum over edges (pre -> i) of
+             presynapticSigns[pre] * contactMagnitudes[edge] * globalGain * rate[pre]
+         + (inputChannelIndex[i] >= 0
+             ? inputWeight[i] * clamp(channelValues[inputChannelIndex[i]], inputClampMin, inputClampMax)
+             : 0)
+
+rate[i] = clamp(rate[i] + timestepSeconds * (-leakRate * rate[i] + drive[i]), rateMin, rateMax)
+```
+
+Note that `timestepSeconds` scales the *entire* bracketed term, including
+`drive[i]` — both the recurrent and the external contribution — not only the
+leak term. A compiler that calibrates `globalGain` or `inputWeight` while
+holding `timestepSeconds` fixed is calibrating against this whole equation,
+not against `globalGain`/`inputWeight` in isolation.
+
+After all substeps for one world tick, output features are aggregated from
+the final rates (not accumulated across substeps):
+
+```text
+outputs[population] = sum over neurons i where outputPopulationIndex[i] == population of
+                         outputWeight[i] * rate[i]
+```
 
 ## Section layout
 

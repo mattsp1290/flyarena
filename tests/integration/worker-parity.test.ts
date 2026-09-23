@@ -86,6 +86,7 @@ describe('oracle vs Worker parity', () => {
     expect(initResponse.ok).toBe(true);
 
     const nextChannelValue = createChannelSequence(0xc0ffee);
+    const maxAbsSeenByPopulation = new Array<number>(oracle.outputs.length).fill(0);
 
     for (let step = 0; step < STEPS; step += 1) {
       const channelValues = Array.from(
@@ -103,12 +104,18 @@ describe('oracle vs Worker parity', () => {
       );
       const oracleTelemetry = computeTelemetry(oracle.state);
 
-      const response = handleWorkerRequest(runtime, {
-        type: 'step',
-        requestId: `step-${step}`,
-        channelValues: structuredClone(channelValues),
-        substeps: SUBSTEPS_PER_TICK
-      });
+      // Clone both directions of the postMessage boundary: the request (the
+      // main thread's outbound message) and the response (the Worker's
+      // outbound message), matching what structured clone actually does to
+      // plain objects/arrays in a real deployment.
+      const response = structuredClone(
+        handleWorkerRequest(runtime, {
+          type: 'step',
+          requestId: `step-${step}`,
+          channelValues: structuredClone(channelValues),
+          substeps: SUBSTEPS_PER_TICK
+        })
+      );
       if (!response.ok || response.type !== 'step') {
         throw new Error(`Worker step ${step} failed: ${JSON.stringify(response)}`);
       }
@@ -119,6 +126,10 @@ describe('oracle vs Worker parity', () => {
           oracle.outputs[population],
           `actionFeatures[${population}] at step ${step}`
         );
+        maxAbsSeenByPopulation[population] = Math.max(
+          maxAbsSeenByPopulation[population],
+          Math.abs(oracle.outputs[population])
+        );
       }
       expectClose(response.telemetry.meanRate, oracleTelemetry.meanRate, `meanRate at step ${step}`);
       expectClose(response.telemetry.minRate, oracleTelemetry.minRate, `minRate at step ${step}`);
@@ -128,6 +139,16 @@ describe('oracle vs Worker parity', () => {
         oracleTelemetry.activeFraction,
         `activeFraction at step ${step}`
       );
+    }
+
+    // A population that never moves would make its parity comparisons above
+    // pass vacuously (0 === 0 on every step); require every output
+    // population to actually activate at least once over the run.
+    for (let population = 0; population < maxAbsSeenByPopulation.length; population += 1) {
+      expect(
+        maxAbsSeenByPopulation[population],
+        `output population ${population} never activated during the run`
+      ).toBeGreaterThan(1e-3);
     }
   });
 
@@ -232,6 +253,68 @@ describe('Worker request validation', () => {
     });
     expect(response.ok).toBe(false);
     if (!response.ok) expect(response.error.code).toBe('invalid-request');
+  });
+
+  it('rejects a non-array channelValues', () => {
+    handleWorkerRequest(runtime, { type: 'init', requestId: 'i1', graphBuffer: structuredClone(buffer) });
+    const response = handleWorkerRequest(runtime, {
+      type: 'step',
+      requestId: 's1',
+      // Simulates a caller/protocol-version bug: not the declared array type.
+      channelValues: { length: 2, 0: 0, 1: 0 } as unknown as number[],
+      substeps: 1
+    });
+    expect(response.ok).toBe(false);
+    if (!response.ok) expect(response.error.code).toBe('invalid-request');
+  });
+
+  it('rejects a step whose channelValues contains a non-finite entry', () => {
+    handleWorkerRequest(runtime, { type: 'init', requestId: 'i1', graphBuffer: structuredClone(buffer) });
+    for (const badValue of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      const response = handleWorkerRequest(runtime, {
+        type: 'step',
+        requestId: `s-${badValue}`,
+        channelValues: [badValue, 0],
+        substeps: 1
+      });
+      expect(response.ok, `channelValues containing ${badValue}`).toBe(false);
+      if (!response.ok) expect(response.error.code).toBe('invalid-request');
+    }
+
+    // The rejected step must not have mutated network state: a clean step
+    // afterward must produce a finite, non-NaN action feature.
+    const clean = handleWorkerRequest(runtime, {
+      type: 'step',
+      requestId: 's-clean',
+      channelValues: [0.1, 0.1],
+      substeps: 1
+    });
+    expect(clean.ok).toBe(true);
+    if (clean.ok && clean.type === 'step') {
+      for (const value of clean.actionFeatures) expect(Number.isFinite(value)).toBe(true);
+    }
+  });
+
+  it('never throws for a malformed message envelope and always returns a response', () => {
+    for (const malformed of [null, undefined, 'not-an-object', 42, {}, { type: 'step' }]) {
+      const response = handleWorkerRequest(runtime, malformed as never);
+      expect(response.ok).toBe(false);
+      if (!response.ok) expect(response.error.code).toBe('invalid-request');
+    }
+  });
+
+  it('reports an unrecognized request type as unknown/invalid-request, echoing its requestId', () => {
+    handleWorkerRequest(runtime, { type: 'init', requestId: 'i1', graphBuffer: structuredClone(buffer) });
+    const response = handleWorkerRequest(runtime, {
+      type: 'not-a-real-type',
+      requestId: 'x1'
+    } as unknown as never);
+    expect(response.ok).toBe(false);
+    if (!response.ok) {
+      expect(response.type).toBe('unknown');
+      expect(response.requestId).toBe('x1');
+      expect(response.error.code).toBe('invalid-request');
+    }
   });
 
   it('rejects a non-positive-integer substeps value', () => {
