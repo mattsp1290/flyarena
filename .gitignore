@@ -11,3 +11,15 @@ test-results/
 .env
 .env.*
 !.env.example
+
+# Python (offline graph compiler, scripts/data/)
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Raw MaleCNS source exports (see scripts/data/download.py). These are
+# large (>1 GB) third-party files pulled from the pinned, hash-verified
+# URLs in download.py; only the compiled, small artifact under
+# public/data/ is committed.
+data/raw/

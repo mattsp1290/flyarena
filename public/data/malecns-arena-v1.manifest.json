@@ -1,0 +1,33 @@
+{
+  "artifact": "malecns-arena-v1.bin.gz",
+  "binaryBytes": 399792,
+  "binarySha256": "f1a0f982ffdfba12ecb2206d064c3dc1ceaae7cffa06a22049093d69a79098f7",
+  "edgeCount": 46311,
+  "formatVersion": 1,
+  "gzipBytes": 107391,
+  "gzipSha256": "ce247668a63df9a84d8e9969227de7b85d5eba679c45821644812ce0740dfb90",
+  "inputChannelCount": 8,
+  "license": "CC-BY-4.0",
+  "neuronCount": 1008,
+  "outputPopulationCount": 3,
+  "rewiredArms": {
+    "seed0": {
+      "artifact": "malecns-arena-v1-rewired-seed0.bin.gz",
+      "binaryBytes": 399792,
+      "binarySha256": "7321adeb7fc7a86ad72525007985d846327f3f525d19cd69724c87aaa1935986",
+      "gzipBytes": 118650,
+      "gzipSha256": "d143d6c2a0e8b357ec487f91b265fd39975aa8cc52c53b381a03d6c8b1a98e26",
+      "swapStats": {
+        "acceptedSwaps": 764340,
+        "allowSelfLoops": false,
+        "attempts": 926220,
+        "edgeCount": 46311,
+        "rejectedDegenerate": 2605,
+        "rejectedDuplicate": 157046,
+        "rejectedSelfLoop": 2213,
+        "seed": 0
+      }
+    }
+  },
+  "sourceDataset": "male-cns:v1.0 (Janelia FlyEM Male CNS connectome)"
+}

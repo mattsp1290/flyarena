@@ -1,0 +1,682 @@
+"""Offline compiler: pinned MaleCNS v1.0 export -> `public/data/malecns-arena-v1.bin.gz`.
+
+Two halves:
+
+- `compile_graph(...)` is the format-level core: given an already-selected
+  node list, an edge list (possibly with duplicate `(pre, post)` rows and
+  edges that reference bodies outside the node set), per-node signs, and an
+  authored input/output channel assignment, it aggregates duplicates, builds
+  the presynaptic CSR, and returns a validated `binfmt.GraphArrays` plus a
+  stats dict. This half has no knowledge of MaleCNS, feather files, or
+  neuPrint -- `tests_python/test_compile.py` drives it directly from a tiny
+  CSV fixture, and this module's own `main()` drives it from the real data.
+- Everything else in this module (`load_*`, `select_subgraph`,
+  `assign_channels`, `assign_signs`, `calibrate_global_gain`, `main`) is the
+  MaleCNS-specific selection policy: which neurons go in, which channels
+  they're wired to, and how the global dynamics parameters are calibrated.
+  Every constant here is also recorded in the emitted ledger so the policy
+  is reproducible from the ledger alone; see docs/data-provenance.md for the
+  prose explanation of *why* each rule was chosen.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+from typing import Mapping, Sequence
+
+import numpy as np
+import pandas as pd
+import pyarrow.feather as feather
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import binfmt  # noqa: E402
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+RAW_DATA_DIR = REPO_ROOT / "data" / "raw"
+PUBLIC_DATA_DIR = REPO_ROOT / "public" / "data"
+
+ARTIFACT_NAME = "malecns-arena-v1"
+
+# ---------------------------------------------------------------------------
+# Selection policy constants. All of these are echoed into the emitted
+# ledger's "selectionPolicy" block verbatim, so the ledger alone documents
+# exactly how the artifact was produced.
+# ---------------------------------------------------------------------------
+
+#: Only neurons with this `status` (body-annotations table) are eligible at
+#: all. "Traced" is the FlyEM status for a body considered essentially
+#: complete; it excludes "Orphan" (disconnected fragments), "Glia",
+#: "Unimportant", "Assign" (still under review), and "Anchor" (placeholder)
+#: bodies.
+ELIGIBLE_STATUS = "Traced"
+
+#: Sensory input candidates: real VNC (ventral nerve cord) sensory neurons,
+#: restricted to the two classes most analogous to this POC's abstracted
+#: egocentric channels (wall clearance, speed, bearing/distance) -- tactile
+#: and proprioceptive mechanosensation -- rather than the optic-lobe visual
+#: pathway (`ol_sensory`) or central-brain chemosensory pathways
+#: (`cb_sensory`), which this arena's declared 8-channel contract
+#: (src/lib/arena/sensors.ts) does not attempt to model at the level of real
+#: photoreceptor/olfactory-receptor input.
+SENSORY_SUPERCLASS = "vnc_sensory"
+SENSORY_CLASSES = ("mechanosensory_tactile", "mechanosensory_proprioceptive")
+
+#: Descending-neuron output candidates: DNs are the real anatomical class
+#: whose axons leave the brain through the neck connective to drive motor
+#: circuits in the VNC -- the direct biological analog of this POC's
+#: thrust/yaw/brake output populations (src/lib/arena/actions.ts).
+DESCENDING_SUPERCLASS = "descending_neuron"
+
+#: How many sensory/descending candidates survive the initial superclass
+#: filter are ranked by total measured degree (sum of `weight` over every
+#: edge touching that body, computed over the traced-only subgraph) and the
+#: top N are kept. This keeps the artifact tractable while preferring the
+#: best-connected (least likely to be a reconstruction fragment) neurons.
+SENSORY_TARGET = 160  # 20 per input channel (8 channels)
+DESCENDING_TARGET = 48  # 16 per output population (3 populations)
+
+#: Bridge/intermediate population: neurons that are simultaneously (a) a
+#: direct postsynaptic partner of some selected sensory neuron and (b) a
+#: direct presynaptic partner of some selected descending neuron -- i.e. the
+#: middle node of at least one real 2-edge sensory -> bridge -> descending
+#: path. Ranked by the same total-degree measure and capped at
+#: BRIDGE_TARGET. A 1-hop-each-direction bridge (rather than a longer BFS)
+#: was chosen because it already yields thousands of candidate bridge nodes
+#: (see docs/data-provenance.md); a deeper search was not needed to reach a
+#: densely-connected, budget-sized subgraph.
+BRIDGE_TARGET = 800
+
+#: Minimum aggregate synapse count for a connection to be retained. This is
+#: the standard connectomics practice of dropping very-low-count contacts
+#: that are more likely to be reconstruction/segmentation noise than a
+#: functionally meaningful synapse; the MaleCNS flat-connectome tables are
+#: already synapse-confidence filtered at minconf 0.5, this is an additional
+#: connection-level (not synapse-level) threshold applied on top.
+SYNAPSE_THRESHOLD = 3
+
+#: Presynaptic sign policy (Dale's law: this format applies one +-1 sign per
+#: presynaptic neuron to every edge it emits). `consensus_nt` is the source
+#: dataset's per-neuron aggregate neurotransmitter prediction (an
+#: *annotation*, not a topology measurement). The +-1 mapping itself is an
+#: authored policy:
+#:   - acetylcholine -> excitatory (+1): the dominant excitatory fast
+#:     transmitter in the fly CNS.
+#:   - gaba, glutamate -> inhibitory (-1): GABA is the dominant fast
+#:     inhibitory transmitter; glutamate is treated as inhibitory here
+#:     (ionotropic glutamate-gated chloride receptors are the dominant
+#:     glutamate receptor class in the fly CNS), following the same
+#:     convention used in prior connectome-constrained rate-model work.
+#:   - anything else (dopamine, octopamine, serotonin, "unclear", or a body
+#:     with no neurotransmitter-table row at all) -> defaulted to
+#:     excitatory (+1) and counted separately as `unknownTransmitterCount`
+#:     in the ledger, since these are neuromodulatory or low-confidence
+#:     calls this POC does not attempt to model directionally.
+SIGN_BY_TRANSMITTER: Mapping[str, int] = {
+    "acetylcholine": 1,
+    "gaba": -1,
+    "glutamate": -1,
+}
+
+#: Input/output channel counts (must match src/lib/arena/sensors.ts's
+#: `OBSERVATION_CHANNELS` length and src/lib/arena/actions.ts's
+#: `OUTPUT_POPULATION` size).
+INPUT_CHANNEL_COUNT = 8
+OUTPUT_POPULATION_COUNT = 3
+
+#: Global dynamics defaults shared with the rest of this codebase's tiny/
+#: random test fixtures (tests/fixtures/tiny-graph.ts's `createRandomGraph`),
+#: chosen here for consistency rather than re-derived: a 1/30s substep,
+#: continuous leak rate 0.35/s (so per-substep decay 0.35/30 ~= 0.0117,
+#: comfortably under the format's <=1 monotonic-decay guidance), and rate/
+#: input clamps of [-2, 2] / [-1, 1].
+TIMESTEP_SECONDS = 1.0 / 30.0
+LEAK_RATE = 0.35
+RATE_MIN = -2.0
+RATE_MAX = 2.0
+INPUT_CLAMP_MIN = -1.0
+INPUT_CLAMP_MAX = 1.0
+
+#: `globalGain` is calibrated (not authored as a fixed literal) from the
+#: compiled edge set itself: see `calibrate_global_gain`'s docstring for the
+#: exact formula. `GLOBAL_GAIN_TARGET_DRIVE` is the one authored knob in
+#: that formula -- the target total per-substep recurrent drive contribution
+#: (in rate units) for a fully-active (`rate == rateMax`) neuron at the 95th
+#: percentile of total outgoing contact-magnitude mass.
+GLOBAL_GAIN_TARGET_DRIVE = 0.5
+GLOBAL_GAIN_PERCENTILE = 95
+
+#: Input/output per-neuron weights are left at a flat, uncalibrated 1.0 for
+#: input neurons (channel values are already normalized to
+#: [-1, 1]/[0, 1] by src/lib/arena/sensors.ts before this weight is
+#: applied). Output neuron weight is 1 / (population size) so a
+#: population's aggregated output is population-size-invariant rather than
+#: scaling with how many neurons happen to be assigned to it.
+INPUT_WEIGHT = 1.0
+
+
+def git_revision() -> str:
+    try:
+        return (
+            subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO_ROOT)
+            .decode("ascii")
+            .strip()
+        )
+    except Exception:  # pragma: no cover - only when git is unavailable
+        return "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Format-level core: reusable by both the real pipeline and
+# tests_python/test_compile.py's tiny CSV fixture.
+# ---------------------------------------------------------------------------
+
+
+def compile_graph(
+    node_ids: Sequence[int],
+    edges: pd.DataFrame,  # columns: pre, post, weight (raw body ids, may duplicate / reference outside node_ids)
+    signs: Mapping[int, int],
+    input_assignment: Mapping[int, "tuple[int, float]"],
+    output_assignment: Mapping[int, "tuple[int, float]"],
+    input_channel_count: int,
+    output_population_count: int,
+    metadata_params: Mapping[str, float],
+) -> "tuple[binfmt.GraphArrays, dict]":
+    """Core aggregation + CSR construction, independent of where `node_ids`/
+    `edges`/`signs` came from. Returns `(graph, stats)`; `stats` feeds the
+    manifest/ledger (real pipeline) or test assertions (fixture pipeline).
+    """
+    node_order = sorted(set(int(n) for n in node_ids))
+    index_of = {body: i for i, body in enumerate(node_order)}
+    neuron_count = len(node_order)
+
+    pre_raw = edges["pre"].to_numpy()
+    post_raw = edges["post"].to_numpy()
+    weight_raw = edges["weight"].to_numpy(dtype=np.float64)
+
+    in_node_set = np.array(
+        [p in index_of and q in index_of for p, q in zip(pre_raw.tolist(), post_raw.tolist())],
+        dtype=bool,
+    )
+    dropped_endpoint_count = int((~in_node_set).sum())
+
+    pre_idx = np.array([index_of[p] for p in pre_raw[in_node_set].tolist()], dtype=np.int64)
+    post_idx = np.array([index_of[p] for p in post_raw[in_node_set].tolist()], dtype=np.int64)
+    weight = weight_raw[in_node_set]
+
+    kept_row_count = len(pre_idx)
+    self_loop_count = int((pre_idx == post_idx).sum())
+
+    # Aggregate duplicate (pre, post) rows by summing their magnitudes (see
+    # docs/graph-format.md's "Canonical row ordering and duplicate edges").
+    pair_key = pre_idx.astype(np.int64) * neuron_count + post_idx.astype(np.int64)
+    order = np.argsort(pair_key, kind="stable")
+    pair_key_sorted = pair_key[order]
+    weight_sorted = weight[order]
+    unique_keys, start_positions, counts = np.unique(
+        pair_key_sorted, return_index=True, return_counts=True
+    )
+    aggregated_weight = np.add.reduceat(weight_sorted, start_positions)
+    duplicate_aggregated_count = int(kept_row_count - len(unique_keys))
+
+    agg_pre = (unique_keys // neuron_count).astype(np.uint32)
+    agg_post = (unique_keys % neuron_count).astype(np.uint32)
+
+    # unique_keys is already sorted ascending, and since post = key % N for a
+    # fixed pre (key // N), rows for the same pre are already
+    # post-ascending too -- exactly the CSR order the format requires.
+    edge_count = len(unique_keys)
+    presynaptic_offsets = np.zeros(neuron_count + 1, dtype=np.uint32)
+    row_counts = np.bincount(agg_pre.astype(np.int64), minlength=neuron_count)
+    presynaptic_offsets[1:] = np.cumsum(row_counts)
+
+    biological_ids = np.array(node_order, dtype=np.uint64)
+    presynaptic_signs = np.array(
+        [signs.get(body, 1) for body in node_order], dtype=np.int8
+    )
+
+    input_channel_index = np.full(neuron_count, -1, dtype=np.int32)
+    input_weight = np.zeros(neuron_count, dtype=np.float32)
+    for body, (channel, weight_value) in input_assignment.items():
+        idx = index_of[body]
+        input_channel_index[idx] = channel
+        input_weight[idx] = weight_value
+
+    output_population_index = np.full(neuron_count, -1, dtype=np.int32)
+    output_weight = np.zeros(neuron_count, dtype=np.float32)
+    for body, (population, weight_value) in output_assignment.items():
+        idx = index_of[body]
+        output_population_index[idx] = population
+        output_weight[idx] = weight_value
+
+    metadata = {
+        "formatVersion": binfmt.SUPPORTED_FORMAT_VERSION,
+        "neuronCount": neuron_count,
+        "edgeCount": edge_count,
+        "inputChannelCount": input_channel_count,
+        "outputPopulationCount": output_population_count,
+        **metadata_params,
+    }
+
+    graph = binfmt.GraphArrays(
+        metadata=metadata,
+        biological_ids=biological_ids,
+        presynaptic_offsets=presynaptic_offsets,
+        postsynaptic_indices=agg_post,
+        contact_magnitudes=aggregated_weight.astype(np.float32),
+        presynaptic_signs=presynaptic_signs,
+        input_channel_index=input_channel_index,
+        input_weight=input_weight,
+        output_population_index=output_population_index,
+        output_weight=output_weight,
+    )
+    binfmt.validate_graph(graph)
+
+    touched = np.zeros(neuron_count, dtype=bool)
+    touched[agg_pre.astype(np.int64)] = True
+    touched[agg_post.astype(np.int64)] = True
+    isolated_node_count = int(neuron_count - touched.sum())
+
+    stats = {
+        "neuronCount": neuron_count,
+        "edgeCount": edge_count,
+        "droppedEndpointCount": dropped_endpoint_count,
+        "duplicateAggregatedCount": duplicate_aggregated_count,
+        "selfLoopCount": self_loop_count,
+        "isolatedNodeCount": isolated_node_count,
+    }
+    return graph, stats
+
+
+# ---------------------------------------------------------------------------
+# MaleCNS-specific selection policy.
+# ---------------------------------------------------------------------------
+
+
+def load_annotations(raw_dir: Path = RAW_DATA_DIR) -> pd.DataFrame:
+    return feather.read_table(
+        raw_dir / "body-annotations-male-cns-v1.0-minconf-0.5.feather"
+    ).to_pandas()
+
+
+def load_neurotransmitters(raw_dir: Path = RAW_DATA_DIR) -> pd.DataFrame:
+    return feather.read_table(
+        raw_dir / "body-neurotransmitters-male-cns-v1.0.feather"
+    ).to_pandas()
+
+
+def load_weights(raw_dir: Path = RAW_DATA_DIR) -> pd.DataFrame:
+    return feather.read_table(
+        raw_dir / "connectome-weights-male-cns-v1.0-minconf-0.5.feather",
+        columns=["body_pre", "body_post", "weight"],
+    ).to_pandas()
+
+
+def _build_adjacency(weights: pd.DataFrame):
+    pre = weights["body_pre"].to_numpy()
+    post = weights["body_post"].to_numpy()
+
+    order_f = np.argsort(pre, kind="stable")
+    pre_sorted = pre[order_f]
+    post_by_pre = post[order_f]
+    uniq_pre, start_f = np.unique(pre_sorted, return_index=True)
+    end_f = np.append(start_f[1:], len(pre_sorted))
+    forward_range = dict(zip(uniq_pre.tolist(), zip(start_f.tolist(), end_f.tolist())))
+
+    order_b = np.argsort(post, kind="stable")
+    post_sorted = post[order_b]
+    pre_by_post = pre[order_b]
+    uniq_post, start_b = np.unique(post_sorted, return_index=True)
+    end_b = np.append(start_b[1:], len(post_sorted))
+    backward_range = dict(zip(uniq_post.tolist(), zip(start_b.tolist(), end_b.tolist())))
+
+    def forward_neighbors(node: int) -> np.ndarray:
+        r = forward_range.get(node)
+        if r is None:
+            return np.empty(0, dtype=np.int64)
+        s, e = r
+        return post_by_pre[s:e]
+
+    def backward_neighbors(node: int) -> np.ndarray:
+        r = backward_range.get(node)
+        if r is None:
+            return np.empty(0, dtype=np.int64)
+        s, e = r
+        return pre_by_post[s:e]
+
+    return forward_neighbors, backward_neighbors
+
+
+def select_subgraph(annotations: pd.DataFrame, weights: pd.DataFrame) -> dict:
+    """Implements the SENSORY_* / DESCENDING_* / BRIDGE_TARGET policy
+    documented above. Returns a dict with `sensory_ids`, `descending_ids`,
+    `bridge_ids`, `node_ids` (their union, deduplicated) and the before/
+    after candidate counts the ledger records."""
+    traced = annotations[annotations["status"] == ELIGIBLE_STATUS].copy()
+
+    sensory_candidates = traced[
+        (traced["superclass"] == SENSORY_SUPERCLASS) & (traced["class"].isin(SENSORY_CLASSES))
+    ]
+    descending_candidates = traced[traced["superclass"] == DESCENDING_SUPERCLASS]
+
+    traced_ids = set(traced["bodyId"].tolist())
+    traced_mask = np.isin(weights["body_pre"].to_numpy(), list(traced_ids)) & np.isin(
+        weights["body_post"].to_numpy(), list(traced_ids)
+    )
+    traced_edges = weights[traced_mask]
+
+    degree = pd.concat(
+        [
+            traced_edges.groupby("body_pre")["weight"].sum(),
+            traced_edges.groupby("body_post")["weight"].sum(),
+        ]
+    ).groupby(level=0).sum()
+
+    sensory_ranked = sensory_candidates.assign(
+        degree=sensory_candidates["bodyId"].map(degree).fillna(0)
+    ).sort_values(["degree", "bodyId"], ascending=[False, True])
+    descending_ranked = descending_candidates.assign(
+        degree=descending_candidates["bodyId"].map(degree).fillna(0)
+    ).sort_values(["degree", "bodyId"], ascending=[False, True])
+
+    sensory_ids = sensory_ranked["bodyId"].head(SENSORY_TARGET).astype(np.int64).tolist()
+    descending_ids = descending_ranked["bodyId"].head(DESCENDING_TARGET).astype(np.int64).tolist()
+
+    forward_neighbors, backward_neighbors = _build_adjacency(traced_edges)
+
+    def one_hop(seed_ids, neighbor_fn) -> set:
+        visited: set = set()
+        for node in seed_ids:
+            for neighbor in neighbor_fn(node):
+                visited.add(int(neighbor))
+        return visited
+
+    forward_from_sensory = one_hop(sensory_ids, forward_neighbors)
+    backward_from_descending = one_hop(descending_ids, backward_neighbors)
+    bridge_candidates = (
+        (forward_from_sensory & backward_from_descending) - set(sensory_ids) - set(descending_ids)
+    )
+
+    bridge_arr = np.array(sorted(bridge_candidates), dtype=np.int64)
+    bridge_degree = pd.Series(bridge_arr).map(degree).fillna(0)
+    bridge_ranked = bridge_arr[bridge_degree.sort_values(ascending=False).index.to_numpy()]
+    bridge_ids = bridge_ranked[:BRIDGE_TARGET].tolist()
+
+    node_ids = sorted(set(sensory_ids) | set(descending_ids) | set(bridge_ids))
+
+    return {
+        "sensory_ids": sensory_ids,
+        "descending_ids": descending_ids,
+        "bridge_ids": bridge_ids,
+        "node_ids": node_ids,
+        "counts": {
+            "tracedBodyCount": len(traced_ids),
+            "sensoryCandidateCount": len(sensory_candidates),
+            "sensorySelectedCount": len(sensory_ids),
+            "descendingCandidateCount": len(descending_candidates),
+            "descendingSelectedCount": len(descending_ids),
+            "bridgeCandidateCount": len(bridge_candidates),
+            "bridgeSelectedCount": len(bridge_ids),
+            "finalNodeCount": len(node_ids),
+        },
+    }
+
+
+def select_edges(weights: pd.DataFrame, node_ids: Sequence[int]) -> pd.DataFrame:
+    node_arr = np.array(sorted(set(node_ids)), dtype=np.int64)
+    mask = np.isin(weights["body_pre"].to_numpy(), node_arr) & np.isin(
+        weights["body_post"].to_numpy(), node_arr
+    )
+    sub = weights[mask]
+    thresholded = sub[sub["weight"] >= SYNAPSE_THRESHOLD]
+    return thresholded.rename(columns={"body_pre": "pre", "body_post": "post"})[
+        ["pre", "post", "weight"]
+    ].reset_index(drop=True)
+
+
+def assign_signs(node_ids: Sequence[int], neurotransmitters: pd.DataFrame) -> "tuple[dict, dict]":
+    nt_by_body = neurotransmitters.set_index("body")["consensus_nt"]
+    signs: dict[int, int] = {}
+    unknown_by_label: dict[str, int] = {}
+    for body in node_ids:
+        label = nt_by_body.get(body)
+        sign = SIGN_BY_TRANSMITTER.get(label)
+        if sign is None:
+            signs[body] = 1
+            key = str(label) if label is not None and not pd.isna(label) else "missing"
+            unknown_by_label[key] = unknown_by_label.get(key, 0) + 1
+        else:
+            signs[body] = sign
+    return signs, unknown_by_label
+
+
+def assign_channels(
+    sensory_ids: Sequence[int], descending_ids: Sequence[int]
+) -> "tuple[dict, dict]":
+    """Authored (not biologically derived) input/output wiring: neurons are
+    sorted by ascending body ID and partitioned into equal contiguous
+    blocks, one block per channel/population. This is an arbitrary,
+    deterministic, fully documented assignment -- see docs/data-provenance.md
+    -- not a claim that a given real neuron "is" e.g. the food-bearing
+    sensor.
+    """
+    sensory_sorted = sorted(sensory_ids)
+    input_assignment: dict[int, "tuple[int, float]"] = {}
+    for position, body in enumerate(sensory_sorted):
+        # Contiguous equal-ish blocks: body at sorted position p goes to
+        # channel floor(p * INPUT_CHANNEL_COUNT / len(sensory_sorted)).
+        channel = min(
+            position * INPUT_CHANNEL_COUNT // len(sensory_sorted), INPUT_CHANNEL_COUNT - 1
+        )
+        input_assignment[body] = (channel, INPUT_WEIGHT)
+
+    descending_sorted = sorted(descending_ids)
+    output_assignment: dict[int, "tuple[int, float]"] = {}
+    counts_per_population = [0] * OUTPUT_POPULATION_COUNT
+    populations = []
+    for position, body in enumerate(descending_sorted):
+        population = min(
+            position * OUTPUT_POPULATION_COUNT // len(descending_sorted), OUTPUT_POPULATION_COUNT - 1
+        )
+        populations.append(population)
+        counts_per_population[population] += 1
+    for body, population in zip(descending_sorted, populations):
+        output_assignment[body] = (population, 1.0 / counts_per_population[population])
+
+    return input_assignment, output_assignment
+
+
+def calibrate_global_gain(edges: pd.DataFrame) -> float:
+    """`globalGain` is the one dynamics parameter derived from the compiled
+    edge set rather than fixed a priori. Per docs/graph-format.md's Dynamics
+    section, one substep's recurrent drive contribution from neuron `pre` to
+    all its targets combined is
+    `globalGain * rate[pre] * sum(contactMagnitudes over pre's row)`.
+    This computes the GLOBAL_GAIN_PERCENTILE-th percentile of that
+    per-neuron summed-magnitude ("out_sum"), then solves for the globalGain
+    that would make a fully-active (`rate == rateMax` conceptually
+    normalized to 1 activation unit) neuron at that percentile contribute
+    exactly GLOBAL_GAIN_TARGET_DRIVE rate-units of total outgoing drive in
+    one substep -- i.e. `globalGain = GLOBAL_GAIN_TARGET_DRIVE / out_sum_p95`.
+    This keeps the bulk of the network's recurrent drive within a bounded,
+    non-saturating range without hand-picking a magic constant.
+    """
+    out_sum = edges.groupby("pre")["weight"].sum()
+    percentile_value = float(np.percentile(out_sum.to_numpy(), GLOBAL_GAIN_PERCENTILE))
+    if percentile_value <= 0:
+        return 0.0
+    return GLOBAL_GAIN_TARGET_DRIVE / percentile_value
+
+
+def build_manifest_and_ledger(
+    graph: binfmt.GraphArrays,
+    stats: dict,
+    selection: dict,
+    unknown_by_label: dict,
+    binary_sha256: str,
+    binary_gzip_sha256: str,
+    binary_gzip_size: int,
+    binary_size: int,
+) -> "tuple[dict, dict]":
+    from download import SOURCE_FILES  # local import to avoid a hard dependency for fixture tests
+
+    meta = graph.metadata
+    manifest = {
+        "formatVersion": meta["formatVersion"],
+        "artifact": f"{ARTIFACT_NAME}.bin.gz",
+        "neuronCount": stats["neuronCount"],
+        "edgeCount": stats["edgeCount"],
+        "inputChannelCount": meta["inputChannelCount"],
+        "outputPopulationCount": meta["outputPopulationCount"],
+        "binarySha256": binary_sha256,
+        "binaryBytes": binary_size,
+        "gzipSha256": binary_gzip_sha256,
+        "gzipBytes": binary_gzip_size,
+        "license": "CC-BY-4.0",
+        "sourceDataset": "male-cns:v1.0 (Janelia FlyEM Male CNS connectome)",
+    }
+
+    ledger = {
+        "artifact": f"{ARTIFACT_NAME}.bin.gz",
+        "compilerRevision": git_revision(),
+        "sourceDataset": {
+            "name": "Male CNS Connectome",
+            "version": "v1.0",
+            "publisher": "Janelia FlyEM Project (HHMI), MRC Laboratory of Molecular Biology, Google Research",
+            "url": "https://male-cns.janelia.org/",
+            "license": "CC BY 4.0",
+            "licenseUrl": "https://creativecommons.org/licenses/by/4.0/",
+        },
+        "sourceFiles": [
+            {
+                "filename": source.filename,
+                "url": source.url,
+                "sha256": source.sha256,
+                "sizeBytes": source.size_bytes,
+            }
+            for source in SOURCE_FILES
+        ],
+        "selectionPolicy": {
+            "eligibleStatus": ELIGIBLE_STATUS,
+            "sensorySuperclass": SENSORY_SUPERCLASS,
+            "sensoryClasses": list(SENSORY_CLASSES),
+            "descendingSuperclass": DESCENDING_SUPERCLASS,
+            "sensoryTarget": SENSORY_TARGET,
+            "descendingTarget": DESCENDING_TARGET,
+            "bridgeTarget": BRIDGE_TARGET,
+            "synapseThreshold": SYNAPSE_THRESHOLD,
+        },
+        "selectionCounts": selection["counts"],
+        "compileStats": stats,
+        "unknownTransmitters": {
+            "totalCount": sum(unknown_by_label.values()),
+            "byLabel": unknown_by_label,
+            "policy": "defaulted to excitatory sign (+1); see SIGN_BY_TRANSMITTER in scripts/data/compile.py",
+        },
+        "dynamics": {
+            "timestepSeconds": TIMESTEP_SECONDS,
+            "leakRate": LEAK_RATE,
+            "rateMin": RATE_MIN,
+            "rateMax": RATE_MAX,
+            "inputClampMin": INPUT_CLAMP_MIN,
+            "inputClampMax": INPUT_CLAMP_MAX,
+            "globalGain": meta["globalGain"],
+            "globalGainCalibration": {
+                "targetDrive": GLOBAL_GAIN_TARGET_DRIVE,
+                "percentile": GLOBAL_GAIN_PERCENTILE,
+            },
+        },
+        "binarySha256": binary_sha256,
+        "binaryBytes": binary_size,
+        "gzipSha256": binary_gzip_sha256,
+        "gzipBytes": binary_gzip_size,
+        "license": "CC-BY-4.0",
+    }
+    return manifest, ledger
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--raw-dir", type=Path, default=RAW_DATA_DIR)
+    parser.add_argument("--out-dir", type=Path, default=PUBLIC_DATA_DIR)
+    args = parser.parse_args(argv)
+
+    print("Loading raw MaleCNS tables...")
+    annotations = load_annotations(args.raw_dir)
+    neurotransmitters = load_neurotransmitters(args.raw_dir)
+    weights = load_weights(args.raw_dir)
+
+    print("Selecting subgraph...")
+    selection = select_subgraph(annotations, weights)
+    print(f"  selection counts: {json.dumps(selection['counts'], indent=2)}")
+
+    edges = select_edges(weights, selection["node_ids"])
+    print(f"  final edges after synapse threshold: {len(edges)}")
+
+    signs, unknown_by_label = assign_signs(selection["node_ids"], neurotransmitters)
+    input_assignment, output_assignment = assign_channels(
+        selection["sensory_ids"], selection["descending_ids"]
+    )
+    global_gain = calibrate_global_gain(edges)
+    print(f"  calibrated globalGain = {global_gain}")
+
+    metadata_params = {
+        "timestepSeconds": TIMESTEP_SECONDS,
+        "leakRate": LEAK_RATE,
+        "rateMin": RATE_MIN,
+        "rateMax": RATE_MAX,
+        "inputClampMin": INPUT_CLAMP_MIN,
+        "inputClampMax": INPUT_CLAMP_MAX,
+        "globalGain": global_gain,
+    }
+
+    graph, stats = compile_graph(
+        node_ids=selection["node_ids"],
+        edges=edges,
+        signs=signs,
+        input_assignment=input_assignment,
+        output_assignment=output_assignment,
+        input_channel_count=INPUT_CHANNEL_COUNT,
+        output_population_count=OUTPUT_POPULATION_COUNT,
+        metadata_params=metadata_params,
+    )
+    print(f"  compile stats: {json.dumps(stats, indent=2)}")
+
+    binary = binfmt.encode_graph_binary(graph)
+    binary_sha256 = binfmt.sha256_hex(binary)
+
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    bin_gz_path = args.out_dir / f"{ARTIFACT_NAME}.bin.gz"
+    binfmt.write_gzip_deterministic(binary, bin_gz_path)
+    gzip_bytes = bin_gz_path.read_bytes()
+    gzip_sha256 = binfmt.sha256_hex(gzip_bytes)
+
+    manifest, ledger = build_manifest_and_ledger(
+        graph=graph,
+        stats=stats,
+        selection=selection,
+        unknown_by_label=unknown_by_label,
+        binary_sha256=binary_sha256,
+        binary_gzip_sha256=gzip_sha256,
+        binary_gzip_size=len(gzip_bytes),
+        binary_size=len(binary),
+    )
+
+    (args.out_dir / f"{ARTIFACT_NAME}.manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    )
+    (args.out_dir / f"{ARTIFACT_NAME}.ledger.json").write_text(
+        json.dumps(ledger, indent=2, sort_keys=True) + "\n"
+    )
+
+    print(f"\nWrote {bin_gz_path} ({len(gzip_bytes)} bytes, {len(gzip_bytes) / 1e6:.3f} MB)")
+    print(f"binary sha256: {binary_sha256}")
+    print(f"gzip sha256:   {gzip_sha256}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,22 @@
+[project]
+name = "flyarena-graph-compiler"
+version = "0.1.0"
+description = "Offline compiler that turns a pinned MaleCNS export into the flyarena connectome graph binary (docs/graph-format.md)."
+requires-python = ">=3.12"
+dependencies = [
+  "numpy>=1.26,<3",
+  "pandas>=2.2,<3",
+  "pyarrow>=17.0,<21",
+  "requests>=2.31,<3",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0,<9",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests_python"]
+
+[tool.uv]
+package = false
