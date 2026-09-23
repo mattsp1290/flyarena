@@ -26,6 +26,12 @@ npm run build
 
 The production build is written to `dist/`. `npm run test:e2e` is reserved for the later Playwright browser suite and currently succeeds with no tests.
 
+## Deployment
+
+Use `./scripts/deploy.sh` for deployment. See [.agents/deployment.md](.agents/deployment.md)
+for configuration, hosting requirements, verification, and rollback. Actual hostnames,
+addresses, and SSH destinations belong only in the ignored `.env` file.
+
 ## Architecture and model claims
 
 - [Architecture and closed-loop contract](docs/architecture.md)

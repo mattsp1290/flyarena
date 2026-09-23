@@ -6,3 +6,6 @@ playwright-report/
 test-results/
 .hermes/
 .DS_Store
+.env
+.env.*
+!.env.example

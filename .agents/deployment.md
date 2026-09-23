@@ -1,0 +1,88 @@
+# Deployment
+
+The preferred deployment entry point is `./scripts/deploy.sh`. Run it from any
+directory with Node 22 (at least 22.22.2), npm, Bash, tar, OpenSSH, and curl on PATH.
+If Node is installed with nvm, run `nvm use 22` first.
+
+Copy `.env.example` to `.env`, restrict it with `chmod 600 .env`, and fill in the
+deployment URL, SSH destination, and confirmed dedicated app directory. `.env`
+is trusted shell configuration and is ignored by Git. Never put actual hostnames,
+IP addresses, or SSH destinations in tracked documentation, scripts, or `VITE_*`
+variables. The backend placement requested by the owner is recorded as
+`BACKEND_SSH` in `.env`. This app currently has no backend, database, or daemon;
+deploy any future backend services on that designated machine.
+
+## Hosting contract
+
+Consult `~/.agents/` on the infrastructure SSH destination before configuring
+`DEPLOY_ROOT`. It must be a dedicated directory ending in `/flyarena`, beneath
+`/srv`, `/var/www`, `/opt`, or `/home`, writable by the deployment SSH account.
+The static web server must map `/fly/` to `DEPLOY_ROOT/current/` and redirect
+`/fly` to `/fly/`. The latter ensures relative browser URLs work correctly.
+Configure that route in the authoritative infrastructure configuration; this
+script does not guess or overwrite web-server configuration.
+
+The current host uses Apache in Kubernetes. Its deployment has a read-only
+hostPath mount of `DEPLOY_ROOT` at `/usr/local/apache2/flyarena`. Mount the entire
+app directory, not `current` as a subPath, so release switches remain visible.
+The Apache configuration includes:
+
+```apache
+LoadModule alias_module modules/mod_alias.so
+RedirectMatch 301 ^/fly$ /fly/
+Alias /fly/ /usr/local/apache2/flyarena/current/
+<Directory "/usr/local/apache2/flyarena">
+  Options -Indexes +FollowSymLinks
+  AllowOverride None
+  Require all granted
+</Directory>
+```
+
+The initial setup updated the existing Apache deployment manifest on the
+infrastructure host as well as the live ConfigMap and Deployment. Original
+configuration backups are in `~/.agents/deploy-backups/flyarena-initial/` on that
+host. No Kubernetes access or web-server restart is needed for routine deploys.
+
+The SSH host key must already be trusted, and key-based authentication must work
+without prompts. SSH aliases and IdentityFile settings in `~/.ssh/config` may be
+used. Do not disable host-key verification.
+
+## Build and publish
+
+```bash
+./scripts/deploy.sh --build-only
+./scripts/deploy.sh
+```
+
+Both modes install locked dependencies, run Svelte/TypeScript checks, and build
+with the configured `/fly/` base path. The package is `dist/flyarena.tar.gz` and
+contains only the built static site. `--build-only` needs no remote access.
+Deployment uploads a unique release, extracts it, and atomically switches the
+`current` symlink. Older releases remain available. Concurrent deploys should be
+avoided because each activation changes the same symlink.
+
+The script then fetches the public HTML and every emitted asset and compares
+them with the local build. A failed check exits nonzero; the release remains
+active for inspection. A successful upload alone is not verified deployment.
+
+## Rollback
+
+On the infrastructure host, inspect the dedicated app directory's `releases/`
+and select a previously verified release. From that app directory, create a
+temporary symlink and atomically replace `current`:
+
+```bash
+ln -s releases/SELECTED_RELEASE .rollback-current
+mv -Tf .rollback-current current
+```
+
+Verify the public page and its assets after rollback. Release cleanup is manual;
+retain the current release and at least one known-good predecessor.
+
+## Verified deployment
+
+On 2026-09-23, the script completed a live deployment and byte-for-byte public
+HTML/asset verification. A Chromium smoke check confirmed the `/fly` redirect,
+rendered application, and absence of failed resources or JavaScript errors.
+The existing homepage continued to return HTTP 200. Svelte/TypeScript checks
+and all 58 unit tests passed. Sensitive connection details remain in `.env`.
