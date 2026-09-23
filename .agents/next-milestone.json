@@ -62,12 +62,11 @@
     },
     {
       "name": "Client-only inspectability",
-      "question": "Can a visitor run and inspect the whole experiment in a browser with no backend, account, or credential?"
+      "question": "Can a visitor run and inspect the whole shipped experiment in a browser with no backend, account, or credential, with any offline Spark-trained or Spark-built artifact pinned, hashed, and labeled as such?"
     }
   ],
   "acceptance_journey": "A visitor opens the model ledger, follows one displayed claim to the pinned dataset manifest and its hash, and returns to a running arena.",
-  "non_goals": [
-  ],
+  "non_goals": [],
   "ecosystem": {
     "related_repositories": []
   }

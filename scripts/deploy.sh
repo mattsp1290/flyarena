@@ -16,9 +16,18 @@ esac
 source .env
 base=${DEPLOY_BASE:-/fly/}
 [[ "$base" =~ ^/([a-zA-Z0-9_-]+/)+$ ]] || die 'DEPLOY_BASE must be an absolute URL path ending in /.'
-for command in node npm tar; do
-  command -v "$command" >/dev/null || die "Missing command: $command"
+# Shell functions that lazy-load nvm are not inherited by this Bash process.
+if ! command -v node >/dev/null || ! command -v npm >/dev/null; then
+  export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+  if [[ -s "$NVM_DIR/nvm.sh" ]]; then
+    source "$NVM_DIR/nvm.sh" --no-use
+    nvm use --silent 22 || die 'Install Node 22 with `nvm install 22`, then retry.'
+  fi
+fi
+for command in node npm; do
+  command -v "$command" >/dev/null || die "Missing command: $command. Install Node.js 22 (at least 22.22.2) and npm, or run nvm install 22."
 done
+command -v tar >/dev/null || die 'Missing command: tar'
 
 if [[ "$mode" == --deploy ]]; then
   for command in ssh scp curl cmp; do

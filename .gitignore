@@ -5,6 +5,8 @@ coverage/
 playwright-report/
 test-results/
 .hermes/
+.agents/plans
+.agents/reviews
 .DS_Store
 .env
 .env.*

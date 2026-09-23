@@ -2,7 +2,10 @@
 
 The preferred deployment entry point is `./scripts/deploy.sh`. Run it from any
 directory with Node 22 (at least 22.22.2), npm, Bash, tar, OpenSSH, and curl on PATH.
-If Node is installed with nvm, run `nvm use 22` first.
+If Node or npm is missing from PATH, the script loads nvm from `$NVM_DIR`
+(defaulting to `~/.nvm`) and selects an installed Node 22. This also supports
+shells that lazy-load nvm. If Node 22 is not installed, run `nvm install 22`
+first. To switch an already active Node version, run `nvm use 22`.
 
 Copy `.env.example` to `.env`, restrict it with `chmod 600 .env`, and fill in the
 deployment URL, SSH destination, and confirmed dedicated app directory. `.env`
