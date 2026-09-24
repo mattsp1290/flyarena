@@ -16,6 +16,12 @@ import {
 import { DEFAULT_GRAPH_ID, TRACE_SEEDS, TRACE_SUBSTEPS, TRACE_TICKS } from '../../scripts/training/export-traces';
 import { runEpisode } from '../../scripts/training/episode';
 import { createTraceGraph } from '../fixtures/trace-graph';
+import {
+  diffCloseEnough,
+  FLOAT_ABS_TOLERANCE,
+  FLOAT_REL_TOLERANCE,
+  GOLDEN_GENERATING_ARCH
+} from '../fixtures/cross-arch-tolerance';
 
 const GOLDEN_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '../fixtures/golden');
 
@@ -42,6 +48,15 @@ const GOLDEN_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '../fixtures
  * fixture budget. Do not read this file and assume `episode.ts` needs to
  * run 300 ticks against a 60-tick golden fixture; 60 is deliberate and
  * matches every currently committed fixture.
+ *
+ * Cross-architecture note (see `tests/fixtures/cross-arch-tolerance.ts` and
+ * `docs/architecture.md`'s "Determinism scope"): `trace.actions` was
+ * recorded on `GOLDEN_GENERATING_ARCH`, but `result.left` below comes from
+ * a fresh `runEpisode` call on whatever architecture the test runs on.
+ * Those two can differ at the float64 ULP level the same way
+ * `golden-traces.test.ts`'s byte-for-byte check can — see that file's doc
+ * comment for the measured divergence — so the comparison below is exact
+ * only on `GOLDEN_GENERATING_ARCH` and tolerance-based everywhere else.
  */
 const goldenFinalLeftScore = (seed: number): AgentScore => {
   const trace = JSON.parse(
@@ -70,7 +85,21 @@ describe('runEpisode: authored decoder vs golden traces', () => {
       });
 
       expect(result.ticks).toBe(TRACE_TICKS);
-      expect(result.left).toEqual(goldenFinalLeftScore(seed));
+
+      const expectedScore = goldenFinalLeftScore(seed);
+      if (process.arch === GOLDEN_GENERATING_ARCH) {
+        expect(result.left).toEqual(expectedScore);
+      } else {
+        const mismatches: string[] = [];
+        diffCloseEnough(expectedScore, result.left, `seed-${seed}.left`, mismatches);
+        expect(
+          mismatches,
+          `seed ${seed}: runEpisode's left score differs from the golden-actions replay beyond ` +
+            `cross-arch float tolerance (process.arch=${process.arch}, fixtures generated on ` +
+            `${GOLDEN_GENERATING_ARCH}, abs<=${FLOAT_ABS_TOLERANCE} or rel<=${FLOAT_REL_TOLERANCE}):\n` +
+            mismatches.join('\n')
+        ).toEqual([]);
+      }
     }
   );
 });

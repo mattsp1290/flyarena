@@ -11,6 +11,12 @@ import {
   TRACE_TICKS
 } from '../../scripts/training/export-traces';
 import { createTraceGraph } from '../fixtures/trace-graph';
+import {
+  diffCloseEnough,
+  FLOAT_ABS_TOLERANCE,
+  FLOAT_REL_TOLERANCE,
+  GOLDEN_GENERATING_ARCH
+} from '../fixtures/cross-arch-tolerance';
 
 /**
  * Golden-trace regression: `scripts/training/export-traces.ts` is TypeScript
@@ -19,6 +25,19 @@ import { createTraceGraph } from '../fixtures/trace-graph';
  * this test fails, the arena/rate-model behavior changed; regenerate the
  * fixtures deliberately with `npm run training:traces` and review the diff
  * before committing it.
+ *
+ * Cross-architecture note (see also `docs/architecture.md`'s "Determinism
+ * scope" and `tests/fixtures/cross-arch-tolerance.ts`): the committed
+ * fixtures were generated on `GOLDEN_GENERATING_ARCH` (`linux-arm64`). The
+ * byte-for-byte comparison below is only meaningful there; every other
+ * architecture (e.g. GitHub's x86_64 CI runner) falls back to
+ * `diffCloseEnough`'s tolerance-based structural comparison, because V8's
+ * transcendental `Math.*` functions on the observation path
+ * (`arena/sensors.ts`'s `Math.atan2`/`Math.sin`/`Math.cos`/`Math.hypot`) are
+ * "implementation-defined rounding" per the ECMAScript spec and not
+ * guaranteed bit-identical across architectures — unlike
+ * `connectome/model.ts`'s `stepModel`/`aggregateOutputs`, which use only
+ * `+`/`-`/`*` and are bit-exact everywhere.
  */
 
 const GOLDEN_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '../fixtures/golden');
@@ -29,18 +48,37 @@ const readGoldenText = (fileName: string): string =>
 
 describe('golden trace regeneration', () => {
   it('regenerates every committed golden file byte-for-byte from a fresh build', () => {
-    // Comparing serialized *text* (not parsed objects with `toEqual`) is
-    // deliberate: `JSON.stringify` writes `-0` as `"0"`, but a parsed `-0`
-    // (which `decodeAction`'s clamp can produce, e.g. `Math.max(-1, -0)`)
-    // is distinct from `0` under `toEqual`'s `Object.is`-based comparison.
-    // Comparing text sidesteps that entirely and is a strictly stronger
-    // check: it is exactly "byte-identical to what's committed."
     const graph = createTraceGraph();
     const files = buildGoldenFiles(graph, DEFAULT_GRAPH_ID, TRACE_SUBSTEPS);
 
     expect(files.length).toBeGreaterThan(0);
-    for (const { fileName, value } of files) {
-      expect(JSON.stringify(value)).toBe(readGoldenText(fileName));
+
+    if (process.arch === GOLDEN_GENERATING_ARCH) {
+      // Comparing serialized *text* (not parsed objects with `toEqual`) is
+      // deliberate: `JSON.stringify` writes `-0` as `"0"`, but a parsed `-0`
+      // (which `decodeAction`'s clamp can produce, e.g. `Math.max(-1, -0)`)
+      // is distinct from `0` under `toEqual`'s `Object.is`-based comparison.
+      // Comparing text sidesteps that entirely and is a strictly stronger
+      // check — "byte-identical to what's committed" — but that equivalence
+      // only holds on the architecture that generated the fixtures; see
+      // this file's doc comment and `cross-arch-tolerance.ts` for every
+      // other arch.
+      for (const { fileName, value } of files) {
+        expect(JSON.stringify(value)).toBe(readGoldenText(fileName));
+      }
+    } else {
+      for (const { fileName, value } of files) {
+        const expected = JSON.parse(readGoldenText(fileName));
+        const mismatches: string[] = [];
+        diffCloseEnough(expected, value, fileName, mismatches);
+        expect(
+          mismatches,
+          `${fileName} differs from the committed fixture beyond cross-arch float tolerance ` +
+            `(process.arch=${process.arch}, fixtures generated on ${GOLDEN_GENERATING_ARCH}, ` +
+            `abs<=${FLOAT_ABS_TOLERANCE} or rel<=${FLOAT_REL_TOLERANCE}):\n` +
+            mismatches.slice(0, 20).join('\n')
+        ).toEqual([]);
+      }
     }
 
     // No orphaned committed file that buildGoldenFiles no longer produces.
