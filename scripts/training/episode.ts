@@ -16,7 +16,8 @@ import {
   createOutputBuffer,
   createStepScratch,
   runLesionedSubsteps,
-  runSubsteps
+  runSubsteps,
+  type SubstepObserver
 } from '../../src/lib/connectome/model';
 import {
   createReadoutOutput,
@@ -135,6 +136,22 @@ export interface AgentEpisodeConfig {
    * loops are no-ops at length zero.
    */
   readonly lesion?: Int32Array;
+  /**
+   * Read-only per-substep observer (`.agents/plans/null-explanation/
+   * 02-transfer-and-features.md`'s WP2 regime check), threaded straight
+   * through to `runLesionedSubsteps`'s own `onSubstep` parameter -- see
+   * `SubstepObserver`'s doc comment (`src/lib/connectome/model.ts`) for
+   * exactly what it observes and why it takes `channelValues` as well as
+   * `rate`. Valid only for the authored decoder family, matching `lesion`'s
+   * own restriction immediately above: `trained`/`silenced` never call
+   * `runLesionedSubsteps`/`runSubsteps` with per-substep visibility wired
+   * up this way, and `parked` never steps a network at all. `runEpisode`
+   * throws if this is set for any other decoder. Omitting it costs nothing
+   * (see `SubstepObserver`'s "optional and additive" doc comment); this is
+   * why `tests/unit/episode-runner-parity.test.ts` and the Worker parity
+   * test do not need to change to cover this addition.
+   */
+  readonly onSubstep?: SubstepObserver;
 }
 
 export interface EpisodeConfig {
@@ -258,10 +275,11 @@ const createNeuralRunner = (
     const flipThrust =
       config.decoder === 'authored-flip-thrust' || config.decoder === 'authored-flip-both';
     const flipYaw = config.decoder === 'authored-flip-yaw' || config.decoder === 'authored-flip-both';
+    const onSubstep = config.onSubstep;
     return {
       step: (world) => {
         const observation = observeAgent(world, agentId);
-        runLesionedSubsteps(graph, state, scratch, observation, lesion, substeps, outputs);
+        runLesionedSubsteps(graph, state, scratch, observation, lesion, substeps, outputs, onSubstep);
         if (flipThrust) outputs[OUTPUT_POPULATION.thrust] *= -1;
         if (flipYaw) outputs[OUTPUT_POPULATION.yaw] *= -1;
         const decoded = decodeAction(Array.from(outputs));
@@ -312,6 +330,12 @@ const createAgentRunner = (
   if (config.lesion && !isAuthoredFamily(config.decoder)) {
     throw new Error(
       `episode: agent "${agentId}" decoder "${config.decoder}" does not support lesion ` +
+        '(the authored decoder family only)'
+    );
+  }
+  if (config.onSubstep && !isAuthoredFamily(config.decoder)) {
+    throw new Error(
+      `episode: agent "${agentId}" decoder "${config.decoder}" does not support onSubstep ` +
         '(the authored decoder family only)'
     );
   }
