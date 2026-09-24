@@ -225,6 +225,11 @@ export const parseNullEvaluateArgs = (argv: readonly string[]): NullEvaluateArgs
   // — silently accepting it otherwise would let an operator believe an
   // override took effect when it didn't (a dual-review finding).
   if (graph !== undefined && !biological) throw new Error('--graph requires --biological');
+  // `runNullEvaluate` derives its run-meta sidecar path from `out` by
+  // replacing a trailing ".json" — enforced here so that never silently
+  // degrades into overwriting `out` itself (see `runMetaPathFor`'s doc
+  // comment, a dual-review finding).
+  if (!out.endsWith('.json')) throw new Error(`--out must end with ".json" (got "${out}")`);
 
   return { biological, graph, rewiredIndex, graphsDir, heldOutStart, heldOutCount, ticks, shards, out };
 };
@@ -368,7 +373,12 @@ export const runShardedEvaluation = async (
         finish();
       });
       child.on('exit', (code, signal) => {
-        const cleanExit = code === 0 || (code === null && aborted);
+        // `code === 0` alone isn't enough: a worker that exits cleanly
+        // while a task is still `inFlight` (no `result`/`error` message
+        // ever arrived for it) means that task's outcome is simply unknown
+        // — worth failing loudly on, not silently treating as "this shard
+        // is just done" (a dual-review finding).
+        const cleanExit = (code === 0 && !inFlight) || (code === null && aborted);
         if (!cleanExit) {
           errors.push(
             `worker exited unexpectedly (code ${String(code)}, signal ${String(signal)})` +
@@ -428,9 +438,11 @@ export interface NullRewiredGraphRaw extends NullGraphRaw {
  * `runShardedEvaluation`'s design is that it must not affect the result —
  * recording it here would make `--shards 1` and `--shards 3` runs differ by
  * exactly that one byte, defeating `tests/unit/null-evaluate.test.ts`'s
- * shard-determinism check. `null-report.ts` takes its own `--shards` flag
- * (the value actually used for the real run, for provenance in the
- * published artifact) rather than reading it from here.
+ * shard-determinism check. This script instead writes it (alongside wall
+ * time) to a `<out>.run.json` sidecar next to `authored.json`; `null-report.ts`
+ * reads `shards`/timing from that sidecar by default, with an explicit
+ * `--shards` flag available to override it (see `null-report.ts`'s
+ * `resolveRunMeta`).
  */
 export interface NullEvaluationRaw {
   readonly version: 1;
@@ -492,8 +504,26 @@ export const assembleRaw = (
 // main
 // ---------------------------------------------------------------------------
 
-/** `<out>.run.json` — see `null-report.ts`'s `RunMeta` doc comment for why this is a separate file from `authored.json` itself. */
-const runMetaPathFor = (outPath: string): string => outPath.replace(/\.json$/, '.run.json');
+/**
+ * `<out>.run.json` — see `null-report.ts`'s `RunMeta` doc comment for why
+ * this is a separate file from `authored.json` itself.
+ *
+ * Throws rather than falling back to a regex `.replace` that silently
+ * no-ops on a mismatch: `"foo".replace(/\.json$/, '.run.json')` returns
+ * `"foo"` unchanged when `outPath` doesn't end in `.json` (a dual-review
+ * finding), which would make this function return `outPath` itself —
+ * so the very next `writeFileSync` below would silently overwrite the
+ * multi-hour `authored.json` this function just wrote with the tiny
+ * run-meta sidecar. `--out` is validated to end in `.json` at parse time
+ * (`parseNullEvaluateArgs`), but this function stays self-checking for any
+ * other caller (a test, a future script) that might not go through the CLI.
+ */
+const runMetaPathFor = (outPath: string): string => {
+  if (!outPath.endsWith('.json')) {
+    throw new Error(`null-evaluate: expected a ".json" output path, got "${outPath}"`);
+  }
+  return `${outPath.slice(0, -'.json'.length)}.run.json`;
+};
 
 export const runNullEvaluate = async (
   args: Readonly<NullEvaluateArgs>

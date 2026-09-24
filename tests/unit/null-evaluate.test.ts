@@ -85,6 +85,17 @@ describe('parseNullEvaluateArgs', () => {
       /Unknown argument/
     );
   });
+
+  it('rejects --out without a .json extension', () => {
+    // Regression test for a dual-review finding: runNullEvaluate derives its
+    // <out>.run.json sidecar path by stripping a trailing ".json" off --out;
+    // without this guard, a non-.json --out would make the sidecar path
+    // collide with --out itself, and writing the sidecar would silently
+    // overwrite the just-written authored.json.
+    expect(() =>
+      parseNullEvaluateArgs(['--rewired-index', 'i.json', '--graphs-dir', 'g', '--out', 'authored'])
+    ).toThrow(/--out must end with "\.json"/);
+  });
 });
 
 const sha256Hex = (data: Uint8Array): string => createHash('sha256').update(data).digest('hex');

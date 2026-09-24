@@ -80,6 +80,13 @@ describe('parseNullReportArgs', () => {
   it('rejects an unknown flag', () => {
     expect(() => parseNullReportArgs(['--bogus'])).toThrow(/Unknown argument/);
   });
+
+  it('rejects --authored without a .json extension', () => {
+    // Regression test for a dual-review finding, mirroring null-evaluate.ts's
+    // equivalent --out guard: resolveRunMeta derives its sidecar path by
+    // stripping a trailing ".json" off --authored.
+    expect(() => parseNullReportArgs(['--authored', 'authored'])).toThrow(/--authored must end with "\.json"/);
+  });
 });
 
 describe('resolveRunMeta', () => {
@@ -153,6 +160,20 @@ describe('buildArtifact', () => {
     const raw = buildRaw();
     const tampered = { ...raw, disconnected: { ...raw.disconnected!, heldOutSeeds: [1, 2, 3] } };
     expect(() => buildArtifact(tampered, args, runMeta)).toThrow(/different held-out seeds/);
+  });
+
+  it('throws on a non-finite score anywhere in a hand-edited authored.json', () => {
+    // Regression test for a dual-review finding: null-worker.ts refuses to
+    // *produce* a non-finite score, but authored.json is a plain file that
+    // could be hand-edited (or merged from an older/buggy evaluator) after
+    // the fact -- without this check, a NaN/Infinity would round-trip
+    // through JSON.stringify as `null` and then be silently summed as 0.
+    const raw = buildRaw();
+    const tampered = {
+      ...raw,
+      rewired: raw.rewired.map((entry) => (entry.seed === 2 ? { ...entry, movementScore: [1, NaN, 3] } : entry))
+    };
+    expect(() => buildArtifact(tampered, args, runMeta)).toThrow(/rewired-2\.movementScore\[1\] is not a finite number/);
   });
 
   it('throws an actionable error when rewired seed 0 is missing', () => {
@@ -249,6 +270,23 @@ describe('runNullReport', () => {
   it('refuses to publish when the authored graph sha does not match the manifest being updated', () => {
     writeTestManifest(manifestPath, HEX64('f')); // a different graph than raw.sourceGraphSha256
     expect(() => runNullReport(args)).toThrow(/was scored against a graph with sha256/);
+  });
+
+  it('refuses to publish (before writing anything) when the manifest cannot round-trip byte-identically', () => {
+    // Regression test for a dual-review finding: the manifest round-trip
+    // safety check must run as a preflight, before the artifact is written
+    // -- not only inside updateManifestWithRewiringNull (called last), which
+    // would leave a new rewiring-null-v1.json on disk with no manifest entry
+    // pointing at it if the check failed there instead.
+    // Hand-written text (not JSON.stringify'd): a JS number can't hold the
+    // distinction between "1" and "1.0", so this has to be literal text on
+    // disk to reproduce the Python-vs-JS formatting mismatch the check guards against.
+    writeFileSync(
+      manifestPath,
+      `{\n  "artifact": "test.bin.gz",\n  "binarySha256": "${buildRaw().sourceGraphSha256}",\n  "value": 1.0\n}\n`
+    );
+    expect(() => runNullReport(args)).toThrow(/produced different bytes/);
+    expect(() => readFileSync(outPath)).toThrow(); // nothing was written
   });
 
   it('refuses to run when --trained points at a file that exists (WP3 not implemented yet)', () => {

@@ -15,7 +15,7 @@ import {
   type Histogram,
   type NullSummary
 } from './null-stats';
-import type { NullEvaluationRaw } from './null-evaluate';
+import type { NullEvaluationRaw, NullGraphRaw } from './null-evaluate';
 
 /**
  * `.agents/plans/rewiring-null/02-authored-null-evaluation.md`'s
@@ -142,6 +142,11 @@ export const parseNullReportArgs = (argv: readonly string[]): NullReportArgs => 
     }
   }
 
+  // `resolveRunMeta` derives its sidecar path from `authored` by replacing a
+  // trailing ".json" — enforced here for the same reason `null-evaluate.ts`
+  // enforces it on `--out` (a dual-review finding).
+  if (!authored.endsWith('.json')) throw new Error(`--authored must end with ".json" (got "${authored}")`);
+
   return { authored, trained, out, reportMd, manifest, bootstrapSeed, bootstrapResamples, histogramBins, shards };
 };
 
@@ -163,7 +168,19 @@ export interface RunMeta {
   readonly perEpisodeMs?: number;
 }
 
-const runMetaPathFor = (authoredPath: string): string => authoredPath.replace(/\.json$/, '.run.json');
+/**
+ * See `null-evaluate.ts`'s identically-named function's doc comment for why
+ * this throws instead of using a regex `.replace` that silently no-ops (and
+ * so would read the sidecar from `authoredPath` itself) when `authoredPath`
+ * doesn't end in `.json`. `--authored` is validated to end in `.json` at
+ * parse time; this stays self-checking for any other caller.
+ */
+const runMetaPathFor = (authoredPath: string): string => {
+  if (!authoredPath.endsWith('.json')) {
+    throw new Error(`null-report: expected a ".json" authored path, got "${authoredPath}"`);
+  }
+  return `${authoredPath.slice(0, -'.json'.length)}.run.json`;
+};
 
 /**
  * Resolve the published artifact's `shards`/timing fields. `--shards`
@@ -276,14 +293,17 @@ const sortKeysDeep = (value: unknown): unknown => {
  * silently rewrite unrelated bytes. Guarded below by re-serializing the
  * manifest before touching it and refusing to proceed if that round trip
  * isn't byte-identical to the file on disk.
+ *
+ * That check is exposed separately (`verifyManifestRoundTrips`) so
+ * `runNullReport` can run it as a preflight, before the artifact or report
+ * are written — a dual-review pass caught that running it only inside this
+ * function (called last, after the artifact write) left a half-published
+ * state on failure: a new `rewiring-null-v1.json` on disk with no manifest
+ * entry pointing at it.
  */
-export const updateManifestWithRewiringNull = (
-  manifestPath: string,
-  entry: { readonly artifact: string; readonly sha256: string }
-): void => {
+export const verifyManifestRoundTrips = (manifestPath: string): void => {
   const originalText = readFileSync(manifestPath, 'utf8');
   const manifest = JSON.parse(originalText) as Record<string, unknown>;
-
   const roundTripped = `${JSON.stringify(sortKeysDeep(manifest), null, 2)}\n`;
   if (roundTripped !== originalText) {
     throw new Error(
@@ -292,7 +312,14 @@ export const updateManifestWithRewiringNull = (
         '-- refusing to write, to avoid silently rewriting unrelated manifest bytes'
     );
   }
+};
 
+export const updateManifestWithRewiringNull = (
+  manifestPath: string,
+  entry: { readonly artifact: string; readonly sha256: string }
+): void => {
+  verifyManifestRoundTrips(manifestPath);
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>;
   manifest.rewiringNull = entry;
   atomicWriteFileSync(manifestPath, `${JSON.stringify(sortKeysDeep(manifest), null, 2)}\n`);
 };
@@ -346,6 +373,30 @@ export const buildArtifact = (
       );
     }
   }
+
+  // `null-worker.ts` already refuses to produce a non-finite movementScore/
+  // foodPickups/hazardContacts, but that only protects a *fresh*
+  // `null-evaluate.ts` run — `authored.json` is a plain file on disk that
+  // could be hand-edited or merged from an older/buggy evaluator. Without
+  // this, a `null`/NaN score would round-trip through `JSON.stringify` as
+  // `null`, then get silently summed as `0` in every statistic below (a
+  // dual-review finding).
+  const assertFiniteScores = (label: string, graph: Readonly<NullGraphRaw>): void => {
+    const arrays: readonly (readonly [string, readonly number[]])[] = [
+      ['movementScore', graph.movementScore],
+      ['foodPickups', graph.foodPickups],
+      ['hazardContacts', graph.hazardContacts]
+    ];
+    for (const [field, values] of arrays) {
+      const badIndex = values.findIndex((value) => typeof value !== 'number' || !Number.isFinite(value));
+      if (badIndex !== -1) {
+        throw new Error(`null-report: ${args.authored}: ${label}.${field}[${badIndex}] is not a finite number`);
+      }
+    }
+  };
+  assertFiniteScores('biological', raw.biological);
+  assertFiniteScores('disconnected', raw.disconnected);
+  for (const entry of raw.rewired) assertFiniteScores(`rewired-${entry.seed}`, entry);
 
   const { bootstrapSeed, bootstrapResamples } = args;
   const biologicalStats = graphStats(raw.biological.movementScore, bootstrapSeed, 'biological', bootstrapResamples);
@@ -626,6 +677,7 @@ export const runNullReport = (args: Readonly<NullReportArgs>): RunNullReportResu
   guardShippedDefault(args.reportMd, DEFAULT_REPORT_MD, 'report', artifact.rewired.length);
   guardShippedDefault(args.manifest, DEFAULT_MANIFEST, 'manifest', artifact.rewired.length);
   verifySourceGraphMatchesManifest(args.manifest, artifact, args.authored);
+  verifyManifestRoundTrips(args.manifest);
 
   // Rendered before any file is written: if markdown rendering ever threw
   // (a future template bug), a partial publish (artifact + manifest written,
