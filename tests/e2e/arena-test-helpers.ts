@@ -131,6 +131,10 @@ export interface DownloadedReplay {
   topology: Record<'left' | 'right', string>;
   finalSummary: { ticks: number };
   trace: ReadonlyArray<{ tick: number; timeSeconds: number; agents: Record<'left' | 'right', unknown> }>;
+  /** The decoder that produced this trace — see `ExperimentReplayExport.decoder`'s doc comment (`src/lib/arena/replay.ts`). */
+  decoder: 'authored' | 'trained';
+  /** Present only when `decoder === 'trained'`; see `ExperimentReplayExport.trainedReadoutArtifactSha256`'s doc comment. */
+  trainedReadoutArtifactSha256?: string;
 }
 
 /** Triggers the replay download (only enabled while paused/finished — see `ExperimentPanel`'s `canDownload`) and parses the resulting JSON file from disk. */

@@ -116,9 +116,10 @@ describe('ExperimentController trained-readout / setDecoder', () => {
 
   /**
    * Round-2 dual review: both independent reviewers found the same gap —
-   * `decoderSwitchInFlight` protected `changeTopology` against `setDecoder`,
-   * but `setDecoder` never checked it against a second, overlapping call to
-   * *itself*. `decoder === this.decoder` alone does not exclude this: the
+   * the `DecoderSwitch` collaborator (`controller.ts`) protected
+   * `changeTopology` against `setDecoder`, but `setDecoder` never checked it
+   * against a second, overlapping call to *itself*. `decoder === this.decoder`
+   * alone does not exclude this: the
    * first call has not written `this.decoder` yet when the second call's
    * guards run, so a same-target overlap would previously fire two
    * independent `Promise.all`/`runner.reset()` sequences. Exercised the same
@@ -179,10 +180,11 @@ describe('ExperimentController trained-readout / setDecoder', () => {
    * reads `this.decoder`, which `setDecoder` only writes *after* its await
    * resolves, so the rebuilt arm could silently stay on `'authored'` while
    * the controller went on to report `'trained'` for both arms. Fixed by
-   * `ExperimentController#decoderSwitchInFlight`, set synchronously (before
-   * `setDecoder`'s first `await`) and checked by `changeTopology`'s own
-   * guard — this test exercises exactly that window without any artificial
-   * timing: `changeTopology` is called synchronously, in the same
+   * `ExperimentController`'s `decoderSwitch` field (a `DecoderSwitch`,
+   * `controller.ts`), whose `acquire()` is called synchronously (before
+   * `setDecoder`'s first `await`) and whose `isInFlight` is checked by
+   * `changeTopology`'s own guard — this test exercises exactly that window
+   * without any artificial timing: `changeTopology` is called synchronously, in the same
    * microtask, right after `setDecoder` is invoked (before its `Promise.all`
    * has any chance to settle).
    */

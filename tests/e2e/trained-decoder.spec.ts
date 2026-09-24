@@ -4,6 +4,7 @@ import { expect, test } from '@playwright/test';
 import {
   decoderRadio,
   downloadReplay,
+  downloadReplayButton,
   pauseButton,
   publicDataDir,
   resetButton,
@@ -34,12 +35,24 @@ test.describe('trained decoder toggle (WP6)', () => {
 
     const N = 40;
 
+    // Read once up front, reused by every provenance assertion below (same
+    // pattern as the manifest read in the ledger-row test further down this
+    // file).
+    const readoutManifest = JSON.parse(
+      readFileSync(resolve(publicDataDir, 'trained-readout-v1.manifest.json'), 'utf-8')
+    ) as { artifactSha256: string };
+
     // Authored baseline (the default) for this seed.
     await startOrResumeButton(page).click();
     await waitForTick(page, N);
     await pauseButton(page).click();
     await expect(statusRegion(page)).toHaveText('paused');
     const authored = await downloadReplay(page);
+    // Provenance: an Authored-mode export must say so, and must never carry
+    // a trained-readout hash (see `App.svelte#handleDownloadReplay` and
+    // `createExperimentReplayExport`'s decoder-gated inclusion).
+    expect(authored.decoder).toBe('authored');
+    expect(authored.trainedReadoutArtifactSha256).toBeUndefined();
 
     await resetButton(page).click();
     await expect(statusRegion(page)).toHaveText('ready');
@@ -58,6 +71,10 @@ test.describe('trained decoder toggle (WP6)', () => {
     await pauseButton(page).click();
     await expect(statusRegion(page)).toHaveText('paused');
     const trainedFirst = await downloadReplay(page);
+    // Provenance: a Trained-mode export must say so, and must carry the
+    // shipped artifact's manifest-recorded hash exactly.
+    expect(trainedFirst.decoder).toBe('trained');
+    expect(trainedFirst.trainedReadoutArtifactSha256).toBe(readoutManifest.artifactSha256);
 
     expect(trainedFirst.seed).toBe(authored.seed);
     // Same seed, same topology, different decoder: the trace must differ.
@@ -74,8 +91,50 @@ test.describe('trained decoder toggle (WP6)', () => {
     await pauseButton(page).click();
     await expect(statusRegion(page)).toHaveText('paused');
     const trainedSecond = await downloadReplay(page);
+    expect(trainedSecond.decoder).toBe('trained');
+    expect(trainedSecond.trainedReadoutArtifactSha256).toBe(readoutManifest.artifactSha256);
 
     expect(trainedSecond.trace.slice(0, N)).toEqual(trainedFirst.trace.slice(0, N));
+  });
+
+  test('switching to Authored after a Trained run, without pressing Reset first, blocks downloading the now-stale trace rather than mislabeling it', async ({
+    page
+  }) => {
+    await page.goto('/');
+    await waitForReady(page);
+
+    const N = 40;
+
+    await expect(decoderRadio(page, 'trained')).toBeEnabled({ timeout: 20_000 });
+    await decoderRadio(page, 'trained').click();
+    await expect(decoderRadio(page, 'trained')).toBeChecked();
+    await expect(statusRegion(page)).toHaveText('ready');
+
+    await startOrResumeButton(page).click();
+    await waitForTick(page, N);
+    await pauseButton(page).click();
+    await expect(statusRegion(page)).toHaveText('paused');
+    // The Trained-mode trace is downloadable and correctly labeled while it stands.
+    await expect(downloadReplayButton(page)).toBeEnabled();
+
+    // `ExperimentController#setDecoder` (`controller.ts`) only refuses to
+    // switch while `running` — `paused` is allowed, same as `finished` — and
+    // switching resets the run to tick 0 as a side effect, exactly like an
+    // explicit Reset (`setDecoder`'s own doc comment). Switch directly here,
+    // without pressing the Reset button first, to exercise that path: this
+    // is the "review's scenario" thermo-fix-verification's Important finding
+    // asked for coverage of.
+    await decoderRadio(page, 'authored').click();
+    await expect(decoderRadio(page, 'authored')).toBeChecked();
+
+    // The switch's internal reset means there is no longer a paused/finished
+    // Trained trace to export at all: `ExperimentPanel`'s `canDownload` only
+    // allows downloading at `paused`/`finished`, and the reset lands at
+    // `ready`. So the download button must go disabled here, not stay
+    // enabled and let `handleDownloadReplay` re-export the just-cleared
+    // trace mislabeled as `decoder: 'authored'`.
+    await expect(statusRegion(page)).toHaveText('ready');
+    await expect(downloadReplayButton(page)).toBeDisabled();
   });
 
   test('shows the "Readout (trained mode)" ledger row with the shipped artifact\'s hash/parameter count/architecture, visible without toggling', async ({
