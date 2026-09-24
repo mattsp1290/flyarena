@@ -43,6 +43,22 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # TEMPORARY (fix/golden-cross-arch): measure cross-architecture golden
+      # trace divergence on the real x86_64 runner. Removed before this
+      # branch merges — see scripts/training/diag-cross-arch.ts.
+      - name: TEMP diagnostic - cross-arch golden trace report
+        run: npx tsx scripts/training/diag-cross-arch.ts /tmp/cross-arch-diag
+        continue-on-error: true
+
+      - name: TEMP diagnostic - upload cross-arch report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cross-arch-diag
+          path: /tmp/cross-arch-diag
+          retention-days: 7
+          if-no-files-found: warn
+
       - name: Type-check (svelte-check)
         run: npm run check
 
