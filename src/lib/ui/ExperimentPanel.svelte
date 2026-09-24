@@ -31,6 +31,20 @@
     controlsLocked: boolean;
     /** True while any topology switch is in flight. Locks Pause/Reset (a switch always implies a reset already in progress; a fresh explicit reset/pause request would race it) in addition to their own status-based rule; see `topologyControlsLocked` for the selectors' own, stricter lock. */
     topologySwitchPending: boolean;
+    /**
+     * True while a decoder switch is in flight. Locks Reset alongside
+     * `topologySwitchPending` (round-2 dual review): `ExperimentController#setDecoder`
+     * always ends with its own `runner.reset()` once both arms' Workers ack
+     * — a manual Reset click during that window doesn't desync anything
+     * (both are idempotent, FIFO-ordered per Worker), but it does get
+     * silently redone a moment later by the pending switch's own reset,
+     * which is a confusing, unexplained double reset from the user's
+     * perspective. Pause needs no equivalent guard: `ExperimentController#setDecoder`
+     * only proceeds while `status !== 'running'`, so a decoder switch can
+     * never be in flight while Pause's own `canPauseNow` (`status ===
+     * 'running'`) is true in the first place.
+     */
+    decoderSwitchPending: boolean;
     /** `controlsLocked`, plus true whenever the run isn't idle at `ready`/`finished` — a topology switch is never allowed mid-run, including merely `paused`. */
     topologyControlsLocked: boolean;
     /** Which decoder both agents currently share (`ExperimentController#getDecoder()`); authored by default. */
@@ -62,6 +76,7 @@
     topology,
     controlsLocked,
     topologySwitchPending,
+    decoderSwitchPending,
     topologyControlsLocked,
     decoder,
     decoderControlsLocked,
@@ -135,7 +150,7 @@
       {startLabel}
     </button>
     <button type="button" onclick={onPause} disabled={!canPauseNow || topologySwitchPending}>Pause</button>
-    <button type="button" onclick={onReset} disabled={!canResetNow || topologySwitchPending}>Reset</button>
+    <button type="button" onclick={onReset} disabled={!canResetNow || topologySwitchPending || decoderSwitchPending}>Reset</button>
   </div>
 
   <div class="field">

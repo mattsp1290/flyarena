@@ -866,6 +866,34 @@ describe('ExperimentController trained-readout / setDecoder', () => {
   });
 
   /**
+   * Round-2 dual review: both independent reviewers found the same gap —
+   * `decoderSwitchInFlight` protected `changeTopology` against `setDecoder`,
+   * but `setDecoder` never checked it against a second, overlapping call to
+   * *itself*. `decoder === this.decoder` alone does not exclude this: the
+   * first call has not written `this.decoder` yet when the second call's
+   * guards run, so a same-target overlap would previously fire two
+   * independent `Promise.all`/`runner.reset()` sequences. Exercised the same
+   * way as the round-1 regression test above: the second call is issued
+   * synchronously, before the first call's `Promise.all` has any chance to
+   * settle.
+   */
+  it('a second, overlapping setDecoder call for the same target decoder is a no-op (regression: round-2 dual review)', async () => {
+    const { controller, callbacks } = await setUp();
+    const runner = controller.getRunner()!;
+
+    const first = controller.setDecoder('trained');
+    const second = controller.setDecoder('trained');
+    await Promise.all([first, second]);
+
+    expect(controller.getDecoder()).toBe('trained');
+    // Exactly one apply, not two — the second call's guard must have caught
+    // it before it fired its own Worker round trip.
+    expect(callbacks.decodersApplied).toEqual(['trained']);
+    expect(runner.getTelemetry().tick).toBe(0);
+    expect(callbacks.errors).toHaveLength(0);
+  });
+
+  /**
    * The WP6 acceptance bar this test targets directly: "two runs with the
    * same seed and Trained give identical score traces over 300 ticks; the
    * Authored and Trained traces differ." `targetTickIntervalMs: 0` disables

@@ -153,7 +153,12 @@ export class ExperimentController {
    * where both would proceed: whichever of `setDecoder`/`changeTopology` a
    * caller invokes first synchronously claims its guard before the other
    * can run at all (this module has no `await` between either method's own
-   * entry and the point it sets its own flag).
+   * entry and the point it sets its own flag). `setDecoder` also checks this
+   * flag against itself (round-2 dual review) — a second, overlapping
+   * `setDecoder` call would otherwise not be excluded by `decoder ===
+   * this.decoder` alone (the first call has not written `this.decoder` yet),
+   * letting two calls fire independent Worker round trips and double-apply
+   * `runner.reset()`.
    */
   private decoderSwitchInFlight = false;
 
@@ -462,6 +467,15 @@ export class ExperimentController {
    */
   async setDecoder(decoder: DecoderKind): Promise<void> {
     if (!this.runner || !this.workerClients) return;
+    // Round-2 dual review: guards this method against a second, overlapping
+    // call to *itself* — `decoderSwitchInFlight` otherwise only protected
+    // `changeTopology` against `setDecoder`, not `setDecoder` against a
+    // repeat of itself. Without this, `this.decoder === this.decoder` alone
+    // does not exclude a same-target overlap (the first call has not
+    // written `this.decoder` yet, so a second call requesting the *same*
+    // target decoder would pass that check too and fire a second, redundant
+    // `Promise.all`/`runner.reset()`).
+    if (this.decoderSwitchInFlight) return;
     if (decoder === this.decoder) return;
     if (this.runner.getStatus() === 'running') return;
     if (this.topologySwitchCount.left > 0 || this.topologySwitchCount.right > 0) return;

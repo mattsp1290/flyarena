@@ -16,6 +16,7 @@ describe('ExperimentPanel accessibility and wiring', () => {
     topology: { left: 'biological' as const, right: 'rewired' as const },
     controlsLocked: false,
     topologySwitchPending: false,
+    decoderSwitchPending: false,
     topologyControlsLocked: false,
     decoder: 'authored' as const,
     decoderControlsLocked: false,
@@ -188,6 +189,21 @@ describe('ExperimentPanel accessibility and wiring', () => {
       controlsLocked: false,
       topologySwitchPending: true
     });
+    expect(screen.getByRole('button', { name: /^pause$/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /^reset$/i })).toBeDisabled();
+  });
+
+  it('decoderSwitchPending disables Reset (but not Pause) independent of controlsLocked (round-2 dual review)', () => {
+    render(ExperimentPanel, {
+      ...baseProps(),
+      status: 'paused',
+      controlsLocked: false,
+      topologySwitchPending: false,
+      decoderSwitchPending: true
+    });
+    // Pause needs no guard here: `canPauseNow` already requires `running`,
+    // which `ExperimentController#setDecoder` never allows a switch to be
+    // in flight during — see `ExperimentPanel.svelte`'s own doc comment.
     expect(screen.getByRole('button', { name: /^pause$/i })).toBeDisabled();
     expect(screen.getByRole('button', { name: /^reset$/i })).toBeDisabled();
   });

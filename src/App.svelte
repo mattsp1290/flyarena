@@ -431,6 +431,7 @@
       {topology}
       {controlsLocked}
       {topologySwitchPending}
+      {decoderSwitchPending}
       {topologyControlsLocked}
       {decoder}
       {decoderControlsLocked}
