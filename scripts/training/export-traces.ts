@@ -44,9 +44,10 @@ import { requireValue } from './cli';
  *
  * Cross-architecture determinism: `stepModel`/`aggregateOutputs`
  * (`connectome/model.ts`) use only `+`/`-`/`*`, which IEEE-754 guarantees
- * bit-identical across architectures, but the observation path
- * (`arena/sensors.ts`'s `Math.atan2`/`Math.sin`/`Math.cos`/`Math.hypot`)
- * calls transcendental `Math.*` functions, whose rounding is
+ * bit-identical across architectures, but the observation/physics path
+ * (`arena/sensors.ts`'s `Math.atan2`/`Math.sin`/`Math.cos`/`Math.hypot`, and
+ * `arena/world.ts`'s `Math.sin`/`Math.cos`/`Math.hypot` in `createWorld`/
+ * `stepWorld`) calls transcendental `Math.*` functions, whose rounding is
  * implementation-defined per the ECMAScript spec and not guaranteed
  * bit-identical across architectures (V8's libm differs between x86_64 and
  * arm64). The committed fixtures here were generated on `linux-arm64`;

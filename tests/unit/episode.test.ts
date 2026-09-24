@@ -57,6 +57,16 @@ const GOLDEN_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '../fixtures
  * `golden-traces.test.ts`'s byte-for-byte check can — see that file's doc
  * comment for the measured divergence — so the comparison below is exact
  * only on `GOLDEN_GENERATING_ARCH` and tolerance-based everywhere else.
+ *
+ * Unlike the trace columns in `golden-traces.test.ts` (which round-trip
+ * through `Float32Array` on the way to `actions`), `stepWorld` here runs
+ * entirely in float64 and its own `Math.sin`/`Math.cos`/`Math.hypot` calls
+ * (`arena/world.ts`) are not protected by that rounding. Empirically, on
+ * the real x86_64 CI runner this comparison matched exactly (0 mismatches,
+ * every committed seed) even before this file's tolerance fallback existed
+ * — see the `fix/golden-cross-arch` PR — but that is an observation for
+ * these four seeds, not a structural guarantee; see
+ * `cross-arch-tolerance.ts`'s doc comment for the caveat.
  */
 const goldenFinalLeftScore = (seed: number): AgentScore => {
   const trace = JSON.parse(
@@ -72,8 +82,14 @@ const goldenFinalLeftScore = (seed: number): AgentScore => {
 };
 
 describe('runEpisode: authored decoder vs golden traces', () => {
+  // `it.each` with a flat array of primitives passes exactly one value
+  // (`seed`) to the callback, so a title with two `%d` placeholders (the
+  // pre-existing version of this string) silently renders its second
+  // placeholder as "NaN" -- there is no second argument to fill it. Use one
+  // placeholder and inline TRACE_TICKS instead.
   it.each(TRACE_SEEDS)(
-    'reproduces the golden trace score at the final recorded tick (%d) exactly, seed %d',
+    `reproduces the golden trace score at tick ${TRACE_TICKS} seed %d ` +
+      `(exact on ${GOLDEN_GENERATING_ARCH}, within cross-arch tolerance elsewhere)`,
     (seed) => {
       const graph = createTraceGraph();
       const result = runEpisode({
@@ -90,8 +106,7 @@ describe('runEpisode: authored decoder vs golden traces', () => {
       if (process.arch === GOLDEN_GENERATING_ARCH) {
         expect(result.left).toEqual(expectedScore);
       } else {
-        const mismatches: string[] = [];
-        diffCloseEnough(expectedScore, result.left, `seed-${seed}.left`, mismatches);
+        const { mismatches } = diffCloseEnough(expectedScore, result.left, `seed-${seed}.left`);
         expect(
           mismatches,
           `seed ${seed}: runEpisode's left score differs from the golden-actions replay beyond ` +

@@ -15,7 +15,8 @@ import {
   diffCloseEnough,
   FLOAT_ABS_TOLERANCE,
   FLOAT_REL_TOLERANCE,
-  GOLDEN_GENERATING_ARCH
+  GOLDEN_GENERATING_ARCH,
+  MAX_INEXACT_LEAVES
 } from '../fixtures/cross-arch-tolerance';
 
 /**
@@ -26,28 +27,32 @@ import {
  * fixtures deliberately with `npm run training:traces` and review the diff
  * before committing it.
  *
- * Cross-architecture note (see also `docs/architecture.md`'s "Determinism
- * scope" and `tests/fixtures/cross-arch-tolerance.ts`): the committed
- * fixtures were generated on `GOLDEN_GENERATING_ARCH` (`linux-arm64`). The
- * byte-for-byte comparison below is only meaningful there; every other
- * architecture (e.g. GitHub's x86_64 CI runner) falls back to
- * `diffCloseEnough`'s tolerance-based structural comparison, because V8's
- * transcendental `Math.*` functions on the observation path
- * (`arena/sensors.ts`'s `Math.atan2`/`Math.sin`/`Math.cos`/`Math.hypot`) are
- * "implementation-defined rounding" per the ECMAScript spec and not
- * guaranteed bit-identical across architectures — unlike
- * `connectome/model.ts`'s `stepModel`/`aggregateOutputs`, which use only
- * `+`/`-`/`*` and are bit-exact everywhere.
+ * Cross-architecture note: see `tests/fixtures/cross-arch-tolerance.ts`
+ * (the full rationale and measured divergence) and `docs/architecture.md`'s
+ * "Determinism scope". Short version: the committed fixtures were generated
+ * on `GOLDEN_GENERATING_ARCH` (`linux-arm64`), and the byte-for-byte
+ * comparison below is only meaningful there; every other architecture
+ * (e.g. GitHub's x86_64 CI runner) falls back to `diffCloseEnough`'s
+ * tolerance-based structural comparison, because V8's transcendental
+ * `Math.*` functions used on the observation/physics path (`arena/sensors.ts`,
+ * `arena/world.ts`) are "implementation-defined rounding" per the
+ * ECMAScript spec and not guaranteed bit-identical across architectures —
+ * unlike `connectome/model.ts`'s `stepModel`/`aggregateOutputs`, which use
+ * only `+`/`-`/`*` and are bit-exact everywhere.
  */
 
 const GOLDEN_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '../fixtures/golden');
 const GOLDEN_BUDGET_BYTES = 200_000;
+const MAX_REPORTED_MISMATCHES = 20;
 
 const readGoldenText = (fileName: string): string =>
   readFileSync(resolve(GOLDEN_DIR, fileName), 'utf8');
 
+const exactnessLabel =
+  process.arch === GOLDEN_GENERATING_ARCH ? 'byte-for-byte' : 'within cross-arch tolerance';
+
 describe('golden trace regeneration', () => {
-  it('regenerates every committed golden file byte-for-byte from a fresh build', () => {
+  it(`regenerates every committed golden file from a fresh build (${exactnessLabel})`, () => {
     const graph = createTraceGraph();
     const files = buildGoldenFiles(graph, DEFAULT_GRAPH_ID, TRACE_SUBSTEPS);
 
@@ -67,18 +72,49 @@ describe('golden trace regeneration', () => {
         expect(JSON.stringify(value)).toBe(readGoldenText(fileName));
       }
     } else {
+      // Collected across every file before asserting (rather than failing
+      // at the first divergent file) so a failure reports every affected
+      // file, not just the first one alphabetically/positionally.
+      const allMismatches: string[] = [];
+      const overBudget: string[] = [];
       for (const { fileName, value } of files) {
         const expected = JSON.parse(readGoldenText(fileName));
-        const mismatches: string[] = [];
-        diffCloseEnough(expected, value, fileName, mismatches);
-        expect(
-          mismatches,
-          `${fileName} differs from the committed fixture beyond cross-arch float tolerance ` +
-            `(process.arch=${process.arch}, fixtures generated on ${GOLDEN_GENERATING_ARCH}, ` +
-            `abs<=${FLOAT_ABS_TOLERANCE} or rel<=${FLOAT_REL_TOLERANCE}):\n` +
-            mismatches.slice(0, 20).join('\n')
-        ).toEqual([]);
+        // Diff against the same JSON round-trip the byte-exact path
+        // compares (`JSON.stringify` then re-parsed), not the raw
+        // in-memory `value` — keeps both arch paths enforcing the same
+        // serialization contract (NaN/Infinity, typed arrays, dropped
+        // `undefined`, ... all normalize the same way).
+        const actual = JSON.parse(JSON.stringify(value));
+        const { mismatches, inexactLeaves } = diffCloseEnough(expected, actual, fileName);
+        allMismatches.push(...mismatches);
+        if (inexactLeaves > MAX_INEXACT_LEAVES) {
+          overBudget.push(`${fileName}: ${inexactLeaves} inexact leaves (budget ${MAX_INEXACT_LEAVES})`);
+        }
       }
+
+      // Dense-regression gate: see MAX_INEXACT_LEAVES's doc comment. Sparse
+      // cross-arch drift stays under budget; a real behavior change touches
+      // hundreds to thousands of leaves and trips this even when every
+      // individual leaf is within FLOAT_ABS_TOLERANCE/FLOAT_REL_TOLERANCE.
+      expect(
+        overBudget,
+        'One or more golden files have more not-bit-identical numeric leaves than the measured ' +
+          `cross-arch drift budget allows (measured drift: at most 1 leaf per file; budget ` +
+          `${MAX_INEXACT_LEAVES}). This usually means a real behavior change, not architecture noise ` +
+          `-- regenerate deliberately on ${GOLDEN_GENERATING_ARCH} and review the diff before ` +
+          `committing:\n${overBudget.join('\n')}`
+      ).toEqual([]);
+
+      const shown = allMismatches.slice(0, MAX_REPORTED_MISMATCHES);
+      const omitted = allMismatches.length - shown.length;
+      expect(
+        allMismatches,
+        `Golden fixtures differ from a fresh build beyond cross-arch float tolerance ` +
+          `(process.arch=${process.arch}, fixtures generated on ${GOLDEN_GENERATING_ARCH}, ` +
+          `abs<=${FLOAT_ABS_TOLERANCE} or rel<=${FLOAT_REL_TOLERANCE}). Showing ${shown.length} of ` +
+          `${allMismatches.length}:\n${shown.join('\n')}` +
+          (omitted > 0 ? `\n... and ${omitted} more` : '')
+      ).toEqual([]);
     }
 
     // No orphaned committed file that buildGoldenFiles no longer produces.
