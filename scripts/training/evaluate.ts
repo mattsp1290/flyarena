@@ -59,6 +59,37 @@ const SHIPPED_TRAINER_SEED = 101;
 const sha256Hex = (data: Uint8Array | string): string => createHash('sha256').update(data).digest('hex');
 
 /**
+ * A topological (not statistical) guarantee that this arm's readout input —
+ * the gathered rates of its output-assigned neurons — is exactly zero on
+ * every tick of every episode, for every possible weights/seed. True only
+ * when BOTH (a) the graph has no edges at all (`metadata.edgeCount === 0`,
+ * so no recurrent synaptic drive can ever reach any neuron — see
+ * `runSubsteps`/`stepModel` in `src/lib/connectome/model.ts`), AND (b) none
+ * of the output-assigned neurons is itself directly wired to an input
+ * channel (`inputChannelIndex[neuron] < 0` for all of them — `stepModel`
+ * injects external sensory drive into a neuron independently of edges when
+ * it *is* channel-mapped, so a zero-edge graph alone does not guarantee a
+ * zero rate for such a neuron). Under both conditions, every output-assigned
+ * neuron's rate starts at 0 (`createModelState`'s zero-fill) and never
+ * receives any nonzero drive from either source, so leaky integration keeps
+ * it at exactly 0 for the whole episode, regardless of weight saturation,
+ * fitness scale, or anything statistical — this is what makes the
+ * "structurally zero" report finding (`report.ts`) a fact about the graph
+ * rather than an inference from identical trained/silenced scores (review
+ * finding: the prior version inferred this from score identity alone, which
+ * saturated tanh/sigmoid units or coincidentally-matching actions could also
+ * produce for a genuinely nonzero input).
+ */
+const graphGuaranteesZeroReadoutInput = (graph: Readonly<ConnectomeGraph>): boolean => {
+  if (graph.metadata.edgeCount !== 0) return false;
+  const indices = outputNeuronIndices(graph);
+  for (let i = 0; i < indices.length; i += 1) {
+    if (graph.inputChannelIndex[indices[i]] >= 0) return false;
+  }
+  return true;
+};
+
+/**
  * `git rev-parse HEAD` for the manifest's `evaluatorGitRev` field (the
  * plan's "evaluator git rev" manifest field). `null` on any failure (not a
  * git checkout, `git` not on `PATH`, etc.) — informational provenance, not
@@ -300,6 +331,13 @@ export const parseEvaluateArgs = (argv: readonly string[]): EvaluateArgs => {
   if (gpuRerunMaxAbsDiff !== undefined && gpuRerunMaxAbsDiff < 0) {
     throw new Error(`--gpu-rerun-max-abs-diff must be non-negative, got ${gpuRerunMaxAbsDiff}`);
   }
+  const gpuRerunFlagsGiven = [gpuRerunMaxAbsDiff, gpuRerunFitnessDelta].filter((v) => v !== undefined).length;
+  if (gpuRerunFlagsGiven === 1) {
+    throw new Error(
+      '--gpu-rerun-max-abs-diff/--gpu-rerun-fitness-delta must be passed together (both or neither): they ' +
+        'come from one CUDA rerun measurement, so recording only one would publish a partial result'
+    );
+  }
 
   return {
     graphPath,
@@ -359,6 +397,20 @@ export interface RunEvaluateResult {
 /** Core logic, separated from CLI parsing/`main` so tests can call it in-process without a subprocess. */
 export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => {
   const graphIdentity = computeGraphIdentity(args.graphPath);
+
+  // --parity-graph-sha256 is a caller-supplied claim ("the parity suite
+  // passed against this graph"); nothing upstream cross-checks it against
+  // the graph actually being evaluated. Without this, a stale or mistyped
+  // sha would publish what looks like a passed real-graph parity gate for a
+  // *different* graph than the one this run actually scored, with no
+  // warning (review finding: both independent reviewers flagged this).
+  if (args.parityGraphSha256 !== undefined && args.parityGraphSha256 !== graphIdentity.graphArtifactSha256) {
+    throw new Error(
+      `evaluate: --parity-graph-sha256 ${args.parityGraphSha256} does not match the graph actually being ` +
+        `evaluated (graphArtifactSha256 ${graphIdentity.graphArtifactSha256}); the parity suite must be ` +
+        're-run against this exact graph before its result can be recorded'
+    );
+  }
 
   // Trace-graph dev mode (no --graph) must never silently overwrite the
   // real shipped artifact: `npm run training:evaluate -- --runs <dirs>`
@@ -527,7 +579,8 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
       provenance: armGraphs.bundleProvenance[arm],
       armBundleSha256: armGraphs.bundleSha256[arm],
       authored: authoredStats,
-      replicas: replicasReport
+      replicas: replicasReport,
+      structurallyZeroInput: graphGuaranteesZeroReadoutInput(graph)
     };
   }
 
@@ -694,10 +747,18 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
 
   // CEM hyperparameters + training-seed RNG policy: every arm's replica-0
   // run is required to share an identical config except --arm/--replica-seed
-  // (`05-production-run.md` step 4), so this reports one representative
-  // (arbitrarily, the first ARM_NAMES entry present) and flags any arm whose
-  // recorded hyperparameters actually disagree with it, rather than silently
-  // publishing whichever arm happened to load last.
+  // (`05-production-run.md` step 4), so this reports one representative and
+  // flags any arm whose recorded hyperparameters actually disagree with it
+  // (or has none recorded at all), rather than silently publishing whichever
+  // arm happened to load last. The representative is the first ARM_NAMES
+  // entry that actually HAS a recorded config — not merely the first arm
+  // seen — so an arm with an older/tiny run dir lacking these fields (all
+  // `undefined`) is skipped when picking the baseline rather than adopted as
+  // one, and never silently discards a later arm's real, present config
+  // (review finding: adopting the first-seen arm unconditionally could pick
+  // an empty baseline, "differ" against every real config that follows, and
+  // then null the whole block out because the adopted baseline itself was
+  // empty — dropping every arm's real data with a misleading warning).
   const CEM_CONFIG_FIELDS = [
     'population',
     'elites',
@@ -711,29 +772,51 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
     'validationSeedRange',
     'heldOutSeedRange'
   ] as const;
-  let trainingBlock: Record<string, unknown> | null = null;
+  const isEmptyCemConfig = (candidate: Readonly<Record<string, unknown>>): boolean =>
+    Object.values(candidate).every((value) => value === undefined);
+
+  // Two passes, deliberately: a single forward pass over ARM_NAMES can only
+  // compare each arm against a baseline established by an *earlier* arm, so
+  // an early arm with no recorded config (e.g. "biological", first in
+  // ARM_NAMES order) would never get flagged even when a *later* arm (e.g.
+  // "rewired") does have one — the loop reaches the empty arm before any
+  // baseline exists to contrast it against. Computing every arm's candidate
+  // first, then picking the baseline as the first *non-empty* one regardless
+  // of position, makes the warning (and the published `training` block)
+  // independent of which arm happens to come first in ARM_NAMES.
+  const cemCandidates: Partial<Record<ArmName, Record<string, unknown>>> = {};
   for (const arm of ARM_NAMES) {
     const config = shippedConfig[arm];
     if (!config) continue;
     const candidate: Record<string, unknown> = {};
     for (const field of CEM_CONFIG_FIELDS) candidate[field] = config[field];
-    if (trainingBlock === null) {
-      trainingBlock = candidate;
-    } else if (JSON.stringify(candidate) !== JSON.stringify(trainingBlock)) {
+    cemCandidates[arm] = candidate;
+  }
+  const armsWithShippedConfig = ARM_NAMES.filter((arm) => cemCandidates[arm] !== undefined);
+  const trainingBlockSourceArm =
+    armsWithShippedConfig.find((arm) => !isEmptyCemConfig(cemCandidates[arm]!)) ?? null;
+  const trainingBlock: Record<string, unknown> | null =
+    trainingBlockSourceArm !== null ? cemCandidates[trainingBlockSourceArm]! : null;
+
+  for (const arm of armsWithShippedConfig) {
+    const candidate = cemCandidates[arm]!;
+    if (isEmptyCemConfig(candidate)) {
+      if (trainingBlockSourceArm !== null) {
+        warnings.push(
+          `arm "${arm}" replica 0's config.json has no recorded CEM hyperparameters, while arm ` +
+            `"${trainingBlockSourceArm}" does; manifest's training block cannot include arm "${arm}"'s values.`
+        );
+      }
+      continue;
+    }
+    if (arm === trainingBlockSourceArm) continue; // it IS the baseline; nothing to compare it against
+    if (JSON.stringify(candidate) !== JSON.stringify(trainingBlock)) {
       warnings.push(
-        `arm "${arm}" replica 0's CEM config/training-seed policy differs from another shipped arm's ` +
-          "(run must use identical config except --arm/--replica-seed); manifest's training block " +
-          'reports the first arm seen, not this one.'
+        `arm "${arm}" replica 0's CEM config/training-seed policy differs from arm ` +
+          `"${trainingBlockSourceArm}"'s (run must use identical config except --arm/--replica-seed); ` +
+          `manifest's training block reports arm "${trainingBlockSourceArm}"'s, not this one.`
       );
     }
-  }
-  // A run dir with none of `CEM_CONFIG_FIELDS` set (e.g. an older/tiny test
-  // fixture) would otherwise produce a `training` block of every field
-  // explicitly `undefined` — `JSON.stringify` drops those keys anyway, but
-  // `null` says plainly "no training metadata available" rather than
-  // publishing an object that merely serializes as empty.
-  if (trainingBlock !== null && Object.values(trainingBlock).every((value) => value === undefined)) {
-    trainingBlock = null;
   }
 
   // Real-graph (production) evaluation must record the WP5 parity gate that

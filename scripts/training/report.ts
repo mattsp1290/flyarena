@@ -38,6 +38,15 @@ export interface ArmReport {
   readonly authored: ConditionStats;
   /** Keyed by `String(trainerSeed)`, e.g. `"101"`. */
   readonly replicas: Readonly<Record<string, ArmReplicaReport>>;
+  /**
+   * A topological (not statistical) guarantee, computed by `evaluate.ts`'s
+   * `graphGuaranteesZeroReadoutInput` from the arm's own graph arrays, that
+   * this arm's readout input is exactly zero on every tick of every
+   * episode. See that function's doc comment for the exact condition
+   * (`edgeCount === 0` and no output-assigned neuron is input-channel-
+   * mapped). Used by `structurallyZeroReadoutInputArms` below.
+   */
+  readonly structurallyZeroInput: boolean;
 }
 
 export interface ArmPairReport {
@@ -394,23 +403,25 @@ const renderWhatThisDoesNotShow = (): string =>
   ['## What this does not show', '', OPPONENT_PARKED_DISCLOSURE].join('\n');
 
 /**
- * Distinct from `nearInputIndependentPolicyArms` below: an arm whose
- * `trained` and `silenced` conditions are numerically *identical* for every
- * held-out seed of every replica (paired difference exactly 0, so its
- * bootstrap CI is exactly `[0, 0]`) regardless of how `trained` compares to
- * `authored`. This is a structural fact about the graph, not a statistical
- * "not distinguishable from zero": it means the readout's gathered input
- * (the output-assigned neurons' rates) was exactly zero on every tick of
- * every episode, so `trained` and a version of itself with its input forced
- * to zero computed the identical function — any score the readout achieved
- * came entirely from its learned bias terms (a fixed action), never from
- * sensory information, however that score compares to the authored decoder.
- * The `disconnected` control arm (zero edges) is the expected case this
- * catches: with no edges and no output-assigned neuron directly wired to an
- * input channel, `runSubsteps` can never move those neurons' rates away
- * from their zero initial state.
+ * Distinct from `nearInputIndependentPolicyArms` below: an arm whose readout
+ * input is *provably* zero on every tick of every episode. This must NOT be
+ * inferred from `trained`/`silenced` score identity alone — saturated
+ * `tanh`/`sigmoid` readout units, or a fitness function insensitive to small
+ * action differences, could produce identical scores for a genuinely nonzero
+ * input too. Instead this requires BOTH: (a) `armReport.structurallyZeroInput`
+ * — `evaluate.ts`'s `graphGuaranteesZeroReadoutInput`, a topological proof
+ * from the graph's own arrays (no edges, and no output-assigned neuron is
+ * directly input-channel-mapped) that the readout's gathered rates cannot
+ * ever be nonzero, independent of any weights or seeds — AND (b) every
+ * replica's `trained`/`silenced` paired difference is empirically exactly 0
+ * (CI exactly `[0, 0]`), as a corroborating check: if the topological proof
+ * held but the empirical scores somehow differed, that would indicate a bug
+ * elsewhere, and this finding must stay silent rather than assert something
+ * that contradicts the run's own data. The `disconnected` control arm (zero
+ * edges) is the expected case both conditions catch together.
  */
 const armHasStructurallyZeroReadoutInput = (armReport: Readonly<ArmReport>): boolean => {
+  if (!armReport.structurallyZeroInput) return false;
   const replicas = replicasInOrder(armReport);
   if (replicas.length === 0) return false;
   return replicas.every(
@@ -433,13 +444,15 @@ const renderStructurallyZeroReadoutInputFinding = (report: Readonly<EvaluationRe
   return [
     '## Finding: readout input was structurally zero',
     '',
-    `For ${arms.join(', ')}, every replica’s \`trained\` and \`silenced\` scores were numerically ` +
-      'identical on every held-out seed (paired difference exactly 0, 95% CI exactly [0, 0]). This is ' +
-      'a structural fact, not a statistical non-difference: the readout’s gathered input (the ' +
-      'output-assigned neurons’ rates) was exactly zero on every tick, so `trained` and `silenced` ' +
-      'computed the identical function for that arm. Any score above `authored` for that arm reflects ' +
-      'only the readout’s learned bias terms — a fixed action — never any use of sensory information. ' +
-      'This finding is descriptive only: it does not rank or compare arms against each other.'
+    `For ${arms.join(', ')}, the graph itself guarantees the readout's input was exactly zero on every ` +
+      'tick of every episode: the graph has no edges, and none of its output-assigned neurons is itself ' +
+      'directly wired to an input channel, so their rates can never leave their zero starting value, ' +
+      'independent of weights or seeds. Every replica’s `trained` and `silenced` scores were also ' +
+      'numerically identical on every held-out seed (paired difference exactly 0, 95% CI exactly ' +
+      '[0, 0]), consistent with that guarantee. For that arm, `trained` and `silenced` computed the ' +
+      'identical function; whatever score the readout achieved came entirely from its learned bias ' +
+      'terms — a fixed, input-independent action — never from sensory information. This finding is ' +
+      'descriptive only: it does not rank or compare arms against each other.'
   ].join('\n');
 };
 

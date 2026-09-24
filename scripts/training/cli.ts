@@ -39,6 +39,13 @@ export const requireNonNegativeInt = (flag: string, value: string | undefined): 
 /** Any finite real number — for measured/informational values (e.g. `evaluate.ts`'s `--gpu-rerun-*` flags) that may be negative (a signed delta) or non-integer. */
 export const requireFloat = (flag: string, value: string | undefined): number => {
   const raw = requireValue(flag, value);
+  // `Number('')` (or an all-whitespace string) is `0`, not `NaN` — without
+  // this check, an accidentally-empty value would silently record a
+  // measurement of exactly 0 (e.g. "zero CUDA rerun drift") instead of
+  // failing loudly.
+  if (raw.trim() === '') {
+    throw new Error(`${flag} must be a finite number, got "${raw}"`);
+  }
   const parsed = Number(raw);
   if (!Number.isFinite(parsed)) {
     throw new Error(`${flag} must be a finite number, got "${raw}"`);

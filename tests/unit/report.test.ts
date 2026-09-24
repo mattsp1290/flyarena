@@ -305,12 +305,17 @@ describe('nearInputIndependentPolicyArms / the near-input-independent finding se
     ...overrides
   });
 
-  const armReport = (replicas: Readonly<Record<string, ArmReplicaReport>>, authoredCi: readonly [number, number] = [8, 12]): ArmReport => ({
+  const armReport = (
+    replicas: Readonly<Record<string, ArmReplicaReport>>,
+    authoredCi: readonly [number, number] = [8, 12],
+    structurallyZeroInput = false
+  ): ArmReport => ({
     D: 6,
     provenance: undefined,
     armBundleSha256: undefined,
     authored: stats(10, authoredCi), // trained's mean (10) falls inside [8, 12]
-    replicas
+    replicas,
+    structurallyZeroInput
   });
 
   const baseEvaluation: EvaluationReport['evaluation'] = {
@@ -398,11 +403,12 @@ describe('nearInputIndependentPolicyArms / the near-input-independent finding se
   // nearInputIndependentPolicyArms does NOT flag it, but trained/silenced
   // were bit-identical because the zero-edge graph never moves the
   // output-assigned neurons' rates away from zero.
-  it('flags an arm whose trained/silenced paired difference is exactly [0, 0], even when trained clearly beats authored', () => {
+  it('flags an arm whose trained/silenced paired difference is exactly [0, 0] AND the graph structurally guarantees it, even when trained clearly beats authored', () => {
     const r = report({
       disconnected: armReport(
         { '101': replica({ trained: stats(35, [33, 37]), pairedTrainedVsSilenced: paired(0, [0, 0]) }) },
-        [-2, -1] // authored's CI: nowhere near trained's 35 — nearInputIndependentPolicyArms must NOT fire
+        [-2, -1], // authored's CI: nowhere near trained's 35 — nearInputIndependentPolicyArms must NOT fire
+        true // graphGuaranteesZeroReadoutInput: true for this arm's graph
       )
     });
     expect(nearInputIndependentPolicyArms(r)).toEqual([]);
@@ -412,22 +418,53 @@ describe('nearInputIndependentPolicyArms / the near-input-independent finding se
     expect(markdown).not.toContain('## Finding: near-input-independent policy');
     expect(markdown).toContain('## Finding: readout input was structurally zero');
     expect(markdown).toContain('disconnected');
-    expect(markdown).not.toMatch(/\bbetter\b|\bsuperior\b|\boutperform/i);
+
+    // Scoped to the new finding's own section, not the whole document: the
+    // boilerplate "What this does not show" disclosure legitimately
+    // contains the word "above" ("the headline per-arm numbers above"),
+    // which is a document-position reference, not a superiority claim —
+    // checking the whole markdown would false-positive on that.
+    const findingSection = markdown.slice(
+      markdown.indexOf('## Finding: readout input was structurally zero'),
+      markdown.indexOf('## What this does not show')
+    );
+    expect(findingSection).not.toMatch(/\bbetter\b|\bsuperior\b|\boutperform|\bbeats\b|\babove\b/i);
   });
 
-  it('does not flag an arm whose trained/silenced CI is merely close to zero (not exactly [0, 0])', () => {
+  it('does NOT flag an arm whose trained/silenced scores are empirically identical but the graph does not structurally guarantee a zero input (e.g. saturated units)', () => {
+    // structurallyZeroInput defaults to false: the topological check did not
+    // hold (real edges, or an output neuron directly input-channel-mapped),
+    // so an empirical [0, 0] paired-difference CI alone must not be enough
+    // to claim the input was structurally zero.
     const r = report({
-      disconnected: armReport({ '101': replica({ pairedTrainedVsSilenced: paired(0.001, [-0.5, 0.5]) }) })
+      biological: armReport({ '101': replica({ pairedTrainedVsSilenced: paired(0, [0, 0]) }) })
+    });
+    expect(structurallyZeroReadoutInputArms(r)).toEqual([]);
+    const markdown = renderReportMarkdown(r);
+    expect(markdown).not.toContain('## Finding: readout input was structurally zero');
+  });
+
+  it('does not flag an arm whose trained/silenced CI is merely close to zero (not exactly [0, 0]), even if structurally guaranteed', () => {
+    const r = report({
+      disconnected: armReport(
+        { '101': replica({ pairedTrainedVsSilenced: paired(0.001, [-0.5, 0.5]) }) },
+        [8, 12],
+        true
+      )
     });
     expect(structurallyZeroReadoutInputArms(r)).toEqual([]);
   });
 
   it('requires every replica of an arm to be exactly [0, 0], not just one', () => {
     const r = report({
-      disconnected: armReport({
-        '101': replica({ pairedTrainedVsSilenced: paired(0, [0, 0]) }),
-        '202': replica({ pairedTrainedVsSilenced: paired(3, [1, 5]) })
-      })
+      disconnected: armReport(
+        {
+          '101': replica({ pairedTrainedVsSilenced: paired(0, [0, 0]) }),
+          '202': replica({ pairedTrainedVsSilenced: paired(3, [1, 5]) })
+        },
+        [8, 12],
+        true
+      )
     });
     expect(structurallyZeroReadoutInputArms(r)).toEqual([]);
   });

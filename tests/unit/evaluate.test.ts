@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 
 import { outputNeuronIndices, validateReadoutWeights } from '../../src/lib/connectome/readout';
 import { TRACE_SUBSTEPS } from '../../scripts/training/export-traces';
-import { runExportArms } from '../../scripts/training/export-arms';
+import { computeGraphIdentity, runExportArms } from '../../scripts/training/export-arms';
 import { parseEvaluateArgs, runEvaluate, type EvaluateArgs } from '../../scripts/training/evaluate';
 import { createTraceGraph } from '../fixtures/trace-graph';
 import { writeTinyRunDir } from '../fixtures/trained-readout-run';
@@ -64,9 +64,27 @@ describe('parseEvaluateArgs', () => {
     expect(() => parseEvaluateArgs(['--runs', 'a', '--gpu-rerun-max-abs-diff', '-1'])).toThrow(/non-negative/);
   });
 
-  it('accepts a negative --gpu-rerun-fitness-delta (a signed difference)', () => {
-    const args = parseEvaluateArgs(['--runs', 'a', '--gpu-rerun-fitness-delta', '-2.5']);
+  it('accepts a negative --gpu-rerun-fitness-delta (a signed difference), passed alongside --gpu-rerun-max-abs-diff', () => {
+    const args = parseEvaluateArgs([
+      '--runs',
+      'a',
+      '--gpu-rerun-max-abs-diff',
+      '0.5',
+      '--gpu-rerun-fitness-delta',
+      '-2.5'
+    ]);
     expect(args.gpuRerunFitnessDelta).toBeCloseTo(-2.5);
+  });
+
+  it('rejects either --gpu-rerun-* flag passed alone (both or neither: they come from one CUDA rerun)', () => {
+    expect(() => parseEvaluateArgs(['--runs', 'a', '--gpu-rerun-max-abs-diff', '0.5'])).toThrow(/together/);
+    expect(() => parseEvaluateArgs(['--runs', 'a', '--gpu-rerun-fitness-delta', '-2.5'])).toThrow(/together/);
+  });
+
+  it('requireFloat rejects an empty/whitespace --gpu-rerun-fitness-delta rather than silently recording 0', () => {
+    expect(() =>
+      parseEvaluateArgs(['--runs', 'a', '--gpu-rerun-max-abs-diff', '0', '--gpu-rerun-fitness-delta', ''])
+    ).toThrow(/finite number/);
   });
 });
 
@@ -206,10 +224,17 @@ describe('runEvaluate (tiny fixture, trace graph)', () => {
         weightSeed += 17;
       }
 
+      // --parity-graph-sha256 must equal the graph actually being evaluated
+      // (evaluate.ts now throws otherwise — see the "throws when
+      // --parity-graph-sha256 does not match the evaluated graph" test
+      // below), so this uses the trace graph's own real identity, not an
+      // arbitrary placeholder.
+      const realGraphSha256 = computeGraphIdentity().graphArtifactSha256;
+
       const outDir = join(root, 'out');
       const args: EvaluateArgs = {
         ...baseArgs(exportResult.outDir, runDirs, outDir),
-        parityGraphSha256: 'deadbeef',
+        parityGraphSha256: realGraphSha256,
         parityK: 4,
         parityPassedAt: '2026-09-24T00:00:00Z',
         gpuRerunMaxAbsDiff: 0.0007,
@@ -234,9 +259,76 @@ describe('runEvaluate (tiny fixture, trace graph)', () => {
         generations: 150,
         trainingSeedRng: 'default_rng([trainerSeed, generation])'
       });
-      expect(manifest.parity).toEqual({ graphSha: 'deadbeef', K: 4, passedAt: '2026-09-24T00:00:00Z' });
+      expect(manifest.parity).toEqual({ graphSha: realGraphSha256, K: 4, passedAt: '2026-09-24T00:00:00Z' });
       expect(manifest.gpuRerunMaxAbsDiff).toBeCloseTo(0.0007);
       expect(manifest.gpuRerunFitnessDelta).toBeCloseTo(-1.25);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('throws when --parity-graph-sha256 does not match the graph actually being evaluated', () => {
+    const { root, armsDir, runDirs } = buildFixture();
+    try {
+      const outDir = join(root, 'out-parity-mismatch');
+      const args: EvaluateArgs = {
+        ...baseArgs(armsDir, runDirs, outDir),
+        parityGraphSha256: 'not-the-real-graph-sha',
+        parityK: 4,
+        parityPassedAt: '2026-09-24T00:00:00Z'
+      };
+      expect(() => runEvaluate(args)).toThrow(/parity-graph-sha256.*does not match/s);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('CEM config: a later arm’s real config is preserved (not silently dropped) when an earlier arm has none', () => {
+    const root = mkdtempSync(join(tmpdir(), 'evaluate-cemconfig-order-'));
+    try {
+      const armsRoot = join(root, 'arms');
+      const exportResult = runExportArms({ outDir: armsRoot, fixtureRewire: true, fixtureRewireSeed: 3 });
+      const graph = createTraceGraph();
+      const D = outputNeuronIndices(graph).length;
+      const H = 4;
+      const cemConfig = { population: 128, elites: 32, generations: 150 };
+
+      const runDirs: string[] = [];
+      let weightSeed = 1;
+      // 'biological' sorts before 'rewired'/'disconnected' in ARM_NAMES, so
+      // this exercises the exact order the fix targets: the first-in-order
+      // arm ('biological') has NO cemConfig; a later arm ('rewired') does.
+      for (const arm of ['biological', 'rewired', 'disconnected'] as const) {
+        const dir = join(root, 'runs', `${arm}-101`);
+        writeTinyRunDir({
+          dir,
+          arm,
+          trainerSeed: 101,
+          D,
+          H,
+          substeps: TRACE_SUBSTEPS,
+          weightSeed,
+          includeEnv: true,
+          ...(arm === 'biological' ? {} : { cemConfig })
+        });
+        runDirs.push(dir);
+        weightSeed += 17;
+      }
+
+      const outDir = join(root, 'out');
+      const result = runEvaluate(baseArgs(exportResult.outDir, runDirs, outDir));
+      expect(result.artifactWritten).toBe(true);
+      // biological (no config) must produce a warning naming the real
+      // source arm, not silently pass or blame the wrong arm.
+      expect(result.warnings.some((w) => w.includes('biological') && w.includes('no recorded CEM'))).toBe(true);
+
+      const manifest = JSON.parse(readFileSync(resolve(outDir, 'trained-readout-v1.manifest.json'), 'utf8')) as {
+        training: Record<string, unknown> | null;
+      };
+      // The bug this test guards against: rewired's real config would be
+      // silently dropped (manifest.training === null) because 'biological'
+      // (visited first, no config) was wrongly adopted as the baseline.
+      expect(manifest.training).toMatchObject({ population: 128, elites: 32, generations: 150 });
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
