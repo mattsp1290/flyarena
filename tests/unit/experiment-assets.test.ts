@@ -110,6 +110,18 @@ describe('verifyAndDecompressArtifact', () => {
 });
 
 describe('loadArenaArtifacts (fetch -> gunzip -> hash-verify, against real committed files)', () => {
+  it('resolves its default dataBaseUrl from the Vite base path (publicAssetUrl(\'data\')) rather than a hard-coded "/data"', async () => {
+    // Regression coverage for the root-absolute-URL bug: under a non-root
+    // deployment base (e.g. `/fly/`) a literal '/data' default would fetch
+    // from the origin root and 404. This asserts the *default* argument
+    // (no explicit dataBaseUrl passed) still resolves correctly under the
+    // '/' base Vitest/jsdom provides — `tests/unit/paths.test.ts` covers
+    // the helper's own behavior under a non-root base directly.
+    vi.stubGlobal('fetch', createPublicDataFetch());
+    const artifacts = await loadArenaArtifacts();
+    expect(artifacts.manifest.neuronCount).toBe(manifest.neuronCount);
+  });
+
   it('loads and verifies both arms via a fetch stand-in that serves the real public/data files', async () => {
     vi.stubGlobal('fetch', createPublicDataFetch());
     const artifacts = await loadArenaArtifacts('/data', 'malecns-arena-v1.manifest.json');

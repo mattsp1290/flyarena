@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { ArenaManifest } from '../experiment/assets';
+  import { publicAssetUrl } from '../paths';
 
   /**
    * The model ledger vocabulary (`docs/model-ledger.md`) plus provenance
@@ -52,8 +53,8 @@
 
   <h3>Provenance and licensing</h3>
   <ul class="links">
-    <li><a href="/data/malecns-arena-v1.manifest.json" target="_blank" rel="noreferrer">Compiled artifact manifest (JSON)</a></li>
-    <li><a href="/data/malecns-arena-v1.ledger.json" target="_blank" rel="noreferrer">Compiler ledger (JSON)</a></li>
+    <li><a href={publicAssetUrl('data/malecns-arena-v1.manifest.json')} target="_blank" rel="noreferrer">Compiled artifact manifest (JSON)</a></li>
+    <li><a href={publicAssetUrl('data/malecns-arena-v1.ledger.json')} target="_blank" rel="noreferrer">Compiler ledger (JSON)</a></li>
     <li><a href="https://male-cns.janelia.org/" target="_blank" rel="noreferrer">Male CNS Connectome project page</a></li>
     <li>
       <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noreferrer">CC BY 4.0</a>

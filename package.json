@@ -9,11 +9,13 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "build:fly": "vite build --base /fly/ --outDir dist-fly",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "test": "vitest",
     "test:unit": "vitest run",
     "test:e2e": "playwright test",
     "preview": "vite preview --host 127.0.0.1",
+    "preview:fly": "vite preview --host 127.0.0.1 --base /fly/ --outDir dist-fly --port 4174",
     "training:traces": "tsx scripts/training/export-traces.ts",
     "training:export-arms": "tsx scripts/training/export-arms.ts",
     "training:evaluate": "tsx scripts/training/evaluate.ts",

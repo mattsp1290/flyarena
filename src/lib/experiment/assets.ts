@@ -11,6 +11,7 @@
  */
 
 import { parseGraphBinary } from '../connectome/format';
+import { publicAssetUrl } from '../paths';
 
 export class ArtifactIntegrityError extends Error {
   constructor(message: string) {
@@ -210,7 +211,7 @@ export interface LoadedArenaArtifacts {
  * Start.
  */
 export const loadArenaArtifacts = async (
-  dataBaseUrl = '/data',
+  dataBaseUrl = publicAssetUrl('data'),
   manifestFilename = 'malecns-arena-v1.manifest.json'
 ): Promise<LoadedArenaArtifacts> => {
   const manifest = await fetchJson<ArenaManifest>(`${dataBaseUrl}/${manifestFilename}`);
