@@ -7,7 +7,8 @@ import { readFileSync, writeFileSync } from 'node:fs';
  * natural output of `training/`'s not-yet-built CEM trainer, WP3). This is
  * not a general NPY implementation: no Fortran-order, multi-dimensional, or
  * big-endian support, because the run-directory contract this evaluator
- * consumes (`evaluate.ts`'s `RunConfig` doc comment) never needs them.
+ * consumes (`scripts/training/run-dir.ts`'s `RunConfig` doc comment) never
+ * needs them.
  *
  * Format (see https://numpy.org/doc/stable/reference/generated/numpy.lib.format.html):
  * 6-byte magic `\x93NUMPY`, 1-byte major version, 1-byte minor version, a

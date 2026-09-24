@@ -12,6 +12,7 @@ import {
 import { outputNeuronIndices } from '../../src/lib/connectome/readout';
 import { createTraceGraph } from '../../tests/fixtures/trace-graph';
 import { createFixtureRewiredTraceGraph } from '../../tests/fixtures/trace-graph-rewire';
+import type { ArmName } from './arms';
 import { requireValue } from './cli';
 import { DEFAULT_GRAPH_ID, graphIdFromPath, loadGraphArtifact } from './export-traces';
 
@@ -60,10 +61,12 @@ import { DEFAULT_GRAPH_ID, graphIdFromPath, loadGraphArtifact } from './export-t
 
 const sha256Hex = (data: Uint8Array | string): string => createHash('sha256').update(data).digest('hex');
 
-export type ArmName = 'biological' | 'rewired' | 'disconnected';
-
-/** Every valid `ArmName`, in the fixed order used by every report/artifact table. */
-export const ARM_NAMES: readonly ArmName[] = ['biological', 'rewired', 'disconnected'];
+// `ArmName`/`ARM_NAMES` live in `./arms` (a leaf module with no imports of
+// its own) so `run-dir.ts`/`report.ts` can depend on the arm vocabulary
+// without pulling in this CLI script's own imports (`export-traces.ts`,
+// test fixtures). Re-exported here so this module's public surface is
+// unchanged for existing callers.
+export { ARM_NAMES, type ArmName } from './arms';
 
 export type ArmProvenance =
   | { readonly kind: 'biological-artifact'; readonly artifactPath: string; readonly artifactSha256: string }

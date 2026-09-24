@@ -3,8 +3,8 @@ import { resolve } from 'node:path';
 
 import { readoutParameterCount } from '../../src/lib/connectome/readout';
 import { mulberry32 } from '../../src/lib/random/mulberry32';
-import type { ArmName } from '../../scripts/training/export-arms';
-import type { RunConfig } from '../../scripts/training/evaluate';
+import type { ArmName } from '../../scripts/training/arms';
+import type { RunConfig } from '../../scripts/training/run-dir';
 import { writeNpyFloat32Array } from '../../scripts/training/npy';
 
 /**

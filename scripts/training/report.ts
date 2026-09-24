@@ -1,4 +1,5 @@
-import type { ArmName, ArmProvenance } from './export-arms';
+import { ARM_NAMES, type ArmName } from './arms';
+import type { ArmProvenance } from './export-arms';
 import type { ConditionStats, PairedStats } from './stats';
 
 /**
@@ -92,13 +93,15 @@ export interface EvaluationReport {
 export const OPPONENT_PARKED_DISCLOSURE =
   'The headline per-arm numbers above were measured single-agent with the opponent parked, ' +
   'which differs from the shipped two-agent side-by-side default; see the Side-by-side section ' +
-  'below for the shipped two-agent condition.';
+  'of this report for the shipped two-agent condition.';
 
-const ARM_ORDER: readonly ArmName[] = ['biological', 'rewired', 'disconnected'];
-
-/** Stable arm ordering for every table: fixed `ArmName` order, not object-key insertion order. */
+/**
+ * Stable arm ordering for every table: fixed `ArmName` order (`ARM_NAMES`,
+ * `./arms` — the same list `export-arms.ts`, `run-dir.ts`, and `evaluate.ts`
+ * share), not object-key insertion order.
+ */
 const armsInOrder = (arms: Readonly<Record<string, ArmReport>>): Array<[ArmName, ArmReport]> =>
-  ARM_ORDER.filter((arm) => arms[arm] !== undefined).map((arm) => [arm, arms[arm]!]);
+  ARM_NAMES.filter((arm) => arms[arm] !== undefined).map((arm) => [arm, arms[arm]!]);
 
 /** Ascending-trainerSeed replica entries for one arm's `replicas` map. */
 const replicasInOrder = (arm: ArmReport): Array<[number, ArmReplicaReport]> =>
@@ -117,13 +120,17 @@ const mdTable = (headers: readonly string[], rows: ReadonlyArray<readonly string
   return [headerRow, separatorRow, ...bodyRows].join('\n');
 };
 
+/** `10000` -> `10,000`, without depending on `toLocaleString`'s ICU-dependent behavior (deterministic, plain ASCII). */
+const thousands = (n: number): string => n.toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+
 const renderMethod = (report: EvaluationReport): string => {
   const { evaluation, graph } = report;
+  const evaluatedArms = armsInOrder(report.arms).map(([arm]) => arm);
   const lines = [
     '## Method',
     '',
-    `Each arm (biological, rewired, disconnected) is scored on ${evaluation.heldOutSeeds.count} held-out seeds ` +
-      `(seeds ${evaluation.heldOutSeeds.start}–${
+    `Each evaluated arm (${evaluatedArms.join(', ')}) is scored on ${evaluation.heldOutSeeds.count} held-out ` +
+      `seeds (seeds ${evaluation.heldOutSeeds.start}–${
         evaluation.heldOutSeeds.start + evaluation.heldOutSeeds.count - 1
       }), running ${evaluation.ticks} ticks at ${evaluation.substeps} neural substeps per tick, with the opponent ` +
       'parked (zero action) unless stated otherwise in the Side-by-side section.',
@@ -136,7 +143,7 @@ const renderMethod = (report: EvaluationReport): string => {
       'circuit-silenced control.',
     '',
     'For every condition: mean, median, population standard deviation, and a 95% bootstrap confidence ' +
-      `interval of the mean (${evaluation.bootstrap.resamples.toLocaleString('en-US')} seeded resamples, ` +
+      `interval of the mean (${thousands(evaluation.bootstrap.resamples)} seeded resamples, ` +
       `bootstrap seed ${evaluation.bootstrap.seed}). For every arm pair and every trained-vs-authored/` +
       'trained-vs-silenced comparison: a paired difference on the same seeds, with its own 95% bootstrap CI. ' +
       'No significance or superiority language is used beyond these confidence intervals.',
@@ -146,15 +153,32 @@ const renderMethod = (report: EvaluationReport): string => {
   return lines.join('\n');
 };
 
+/**
+ * The distinct values of `pick(replica)` across an arm's replicas, joined
+ * for display. A WP3 run is expected to use one training config per arm
+ * except `arm`/`replica-seed` (`03-cem-training.md`), so this is normally a
+ * single value — but nothing in `runEvaluate` enforces H/parameterCount
+ * equality across an arm's own replicas (only across the shipped replica
+ * 101's three arms), so a real mismatch is surfaced here rather than
+ * silently hidden by only reading the first replica.
+ */
+const distinctReplicaValues = (
+  replicas: ReadonlyArray<[number, ArmReplicaReport]>,
+  pick: (replica: ArmReplicaReport) => number
+): string => {
+  if (replicas.length === 0) return 'n/a (no trained replica)';
+  const distinct = [...new Set(replicas.map(([, replica]) => pick(replica)))];
+  return distinct.length === 1 ? String(distinct[0]) : `${distinct.join(', ')} (differs across this arm's replicas)`;
+};
+
 const renderParameterAccounting = (report: EvaluationReport): string => {
   const rows = armsInOrder(report.arms).map(([arm, armReport]) => {
     const replicas = replicasInOrder(armReport);
-    const first = replicas[0]?.[1];
     return [
       arm,
       String(armReport.D),
-      first ? String(first.H) : 'n/a (no trained replica)',
-      first ? String(first.parameterCount) : 'n/a (no trained replica)'
+      distinctReplicaValues(replicas, (replica) => replica.H),
+      distinctReplicaValues(replicas, (replica) => replica.parameterCount)
     ];
   });
   return [
@@ -324,7 +348,32 @@ const renderSideBySide = (report: EvaluationReport): string => {
   ].join('\n');
 };
 
+/**
+ * The plan's default held-out range (`04-authoritative-evaluation-and-artifacts.md`:
+ * `30001…30100`), disjoint by construction from its training (`1..10000`)
+ * and validation (`20001..20064`) ranges. `--held-out-start`/`--held-out-count`
+ * are free CLI inputs this evaluator does not cross-check against a training
+ * seed range, so the disjointness claim below is only made when the range
+ * actually in use matches the plan's default — otherwise it would be an
+ * unchecked claim about arbitrary CLI input.
+ */
+const DEFAULT_HELD_OUT_START = 30001;
+const DEFAULT_HELD_OUT_COUNT = 100;
+
 const renderLimitations = (report: EvaluationReport): string => {
+  const { evaluation } = report;
+  const heldOutRange = `${evaluation.heldOutSeeds.start}–${
+    evaluation.heldOutSeeds.start + evaluation.heldOutSeeds.count - 1
+  }`;
+  const isPlanDefaultHeldOutRange =
+    evaluation.heldOutSeeds.start === DEFAULT_HELD_OUT_START && evaluation.heldOutSeeds.count === DEFAULT_HELD_OUT_COUNT;
+  const heldOutBullet = isPlanDefaultHeldOutRange
+    ? `- Held-out seeds (${heldOutRange}) are the plan's default range, disjoint from its training ` +
+      '(1–10000) and validation (20001–20064) seed ranges, but are a fixed, finite sample ' +
+      '(not the full seed space).'
+    : `- This run's held-out seeds (${heldOutRange}) are a non-default range; disjointness from any ` +
+      'training/validation seed range was not checked for it. They are, in any case, a fixed, finite ' +
+      'sample (not the full seed space).';
   const bullets = [
     '- Headline per-arm statistics (Results, Paired differences) are measured single-agent, opponent ' +
       'parked — see "What this does not show" below.',
@@ -332,8 +381,7 @@ const renderLimitations = (report: EvaluationReport): string => {
       'test or superiority claim is made or implied.',
     '- The `silenced` control forces the trained readout’s input vector to zero every tick; it does ' +
       'not silence the recurrent connectome dynamics themselves.',
-    '- Held-out seeds are disjoint from training/validation seed ranges, but are a fixed, finite sample ' +
-      '(not the full seed space).'
+    heldOutBullet
   ];
   if (report.warnings.length > 0) {
     bullets.push('- This run recorded the following warnings:');

@@ -201,6 +201,27 @@ describe('runExportArms: assertMatchingNodeSet gate (round-2 R2-I1 regression co
     return path;
   };
 
+  /**
+   * Runs `runExportArms` once (not twice — one thrown error, captured and
+   * asserted against both the error class and its message) and asserts the
+   * error message's parenthetical mismatch list is *exactly* `(field)`, not
+   * merely that it contains `field` somewhere. `assertMatchingNodeSet`
+   * accumulates every mismatching field into one comma-joined parenthetical
+   * (`export-arms.ts`'s `mismatches.join(', ')`); asserting the exact
+   * parenthetical pins that this mutation tripped only the intended branch,
+   * not that branch plus an unintended second one.
+   */
+  const expectSoleGateMismatch = (run: () => unknown, field: string): void => {
+    let caught: unknown;
+    try {
+      run();
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(ExportArmsGateError);
+    expect((caught as Error).message).toMatch(new RegExp(`\\(${field}\\)`));
+  };
+
   it('throws when the "rewired" artifact has a different leakRate (metadata mismatch)', () => {
     const outDir = mkdtempSync(join(tmpdir(), 'export-arms-'));
     try {
@@ -211,12 +232,10 @@ describe('runExportArms: assertMatchingNodeSet gate (round-2 R2-I1 regression co
       const bioPath = writeGraphBin(outDir, 'biological.bin', biological);
       const rewiredPath = writeGraphBin(outDir, 'leak-rate-mutated.bin', mutated);
 
-      expect(() =>
-        runExportArms({ graphPath: bioPath, rewiredPath, fixtureRewire: false, fixtureRewireSeed: 0, outDir })
-      ).toThrow(ExportArmsGateError);
-      expect(() =>
-        runExportArms({ graphPath: bioPath, rewiredPath, fixtureRewire: false, fixtureRewireSeed: 0, outDir })
-      ).toThrow(/metadata/);
+      expectSoleGateMismatch(
+        () => runExportArms({ graphPath: bioPath, rewiredPath, fixtureRewire: false, fixtureRewireSeed: 0, outDir }),
+        'metadata \\(excluding edgeCount\\)'
+      );
     } finally {
       rmSync(outDir, { recursive: true, force: true });
     }
@@ -235,12 +254,10 @@ describe('runExportArms: assertMatchingNodeSet gate (round-2 R2-I1 regression co
       const bioPath = writeGraphBin(outDir, 'biological.bin', biological);
       const rewiredPath = writeGraphBin(outDir, 'input-weight-scaled.bin', mutated);
 
-      expect(() =>
-        runExportArms({ graphPath: bioPath, rewiredPath, fixtureRewire: false, fixtureRewireSeed: 0, outDir })
-      ).toThrow(ExportArmsGateError);
-      expect(() =>
-        runExportArms({ graphPath: bioPath, rewiredPath, fixtureRewire: false, fixtureRewireSeed: 0, outDir })
-      ).toThrow(/inputWeight/);
+      expectSoleGateMismatch(
+        () => runExportArms({ graphPath: bioPath, rewiredPath, fixtureRewire: false, fixtureRewireSeed: 0, outDir }),
+        'inputWeight'
+      );
     } finally {
       rmSync(outDir, { recursive: true, force: true });
     }
@@ -258,12 +275,10 @@ describe('runExportArms: assertMatchingNodeSet gate (round-2 R2-I1 regression co
       const bioPath = writeGraphBin(outDir, 'biological.bin', biological);
       const rewiredPath = writeGraphBin(outDir, 'sign-flipped.bin', mutated);
 
-      expect(() =>
-        runExportArms({ graphPath: bioPath, rewiredPath, fixtureRewire: false, fixtureRewireSeed: 0, outDir })
-      ).toThrow(ExportArmsGateError);
-      expect(() =>
-        runExportArms({ graphPath: bioPath, rewiredPath, fixtureRewire: false, fixtureRewireSeed: 0, outDir })
-      ).toThrow(/presynapticSigns/);
+      expectSoleGateMismatch(
+        () => runExportArms({ graphPath: bioPath, rewiredPath, fixtureRewire: false, fixtureRewireSeed: 0, outDir }),
+        'presynapticSigns'
+      );
     } finally {
       rmSync(outDir, { recursive: true, force: true });
     }
@@ -274,19 +289,21 @@ describe('runExportArms: assertMatchingNodeSet gate (round-2 R2-I1 regression co
     try {
       const biological = createTraceGraph();
       const mutatedOutputWeight = Float32Array.from(biological.outputWeight);
-      mutatedOutputWeight[18] += 0.5; // neuron 18 is an output neuron in this fixture (see trace-graph.ts)
+      // Derived from the fixture rather than a hardcoded index, so a future
+      // change to trace-graph.ts's output-neuron layout can't silently turn
+      // this into a no-op mutation on a non-output neuron.
+      const firstOutputNeuron = outputNeuronIndices(biological)[0];
+      mutatedOutputWeight[firstOutputNeuron] += 0.5;
       const mutated = { ...biological, outputWeight: mutatedOutputWeight };
       expect(() => validateGraph(mutated)).not.toThrow();
 
       const bioPath = writeGraphBin(outDir, 'biological.bin', biological);
       const rewiredPath = writeGraphBin(outDir, 'output-weight-mutated.bin', mutated);
 
-      expect(() =>
-        runExportArms({ graphPath: bioPath, rewiredPath, fixtureRewire: false, fixtureRewireSeed: 0, outDir })
-      ).toThrow(ExportArmsGateError);
-      expect(() =>
-        runExportArms({ graphPath: bioPath, rewiredPath, fixtureRewire: false, fixtureRewireSeed: 0, outDir })
-      ).toThrow(/outputWeight/);
+      expectSoleGateMismatch(
+        () => runExportArms({ graphPath: bioPath, rewiredPath, fixtureRewire: false, fixtureRewireSeed: 0, outDir }),
+        'outputWeight'
+      );
     } finally {
       rmSync(outDir, { recursive: true, force: true });
     }

@@ -102,7 +102,7 @@ describe('runEvaluate: docs/trained-readout-report.md generation', () => {
       expect(markdown).toContain(
         'The headline per-arm numbers above were measured single-agent with the opponent parked, ' +
           'which differs from the shipped two-agent side-by-side default; see the Side-by-side section ' +
-          'below for the shipped two-agent condition.'
+          'of this report for the shipped two-agent condition.'
       );
       // Hardcoded above (not imported) so a future edit to the exported
       // constant can't silently "fix" this test along with the wording;
@@ -114,6 +114,14 @@ describe('runEvaluate: docs/trained-readout-report.md generation', () => {
       expect(disclosureSection).toContain('single-agent');
       expect(disclosureSection).toContain('opponent parked');
       expect(disclosureSection).toContain('side-by-side');
+
+      // The disclosure deliberately says "the Side-by-side section of this
+      // report" rather than "above"/"below" (a correctness review round
+      // caught the prior wording claiming "below" while Side-by-side
+      // actually rendered above this section) — but the section still must
+      // actually exist somewhere in the document for the pointer to mean
+      // anything.
+      expect(markdown.indexOf('## Side-by-side')).toBeGreaterThan(-1);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

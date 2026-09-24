@@ -17,9 +17,15 @@ import { readNpyFloat32Array, writeNpyFloat32Array } from '../../scripts/trainin
  * without a dedicated regression test.
  *
  * `tests/fixtures/npy/real-numpy-{f4,f8}.npy` were written once by real
- * `numpy.save` (`uv run --with numpy python3 -c "..."`, see this file's git
- * history) and committed so this test does not depend on `uv`/`numpy` being
- * available in CI.
+ * `numpy.save` (via `uv run --with numpy python3 -c "..."`, no separate
+ * requirements file needed) and committed so this test does not depend on
+ * `uv`/`numpy` being available in CI. To regenerate them:
+ *
+ * ```python
+ * import numpy as np
+ * np.save('tests/fixtures/npy/real-numpy-f4.npy', np.array([1.5, -2.25, 0.0, 3.0, 42.125], dtype='<f4'))
+ * np.save('tests/fixtures/npy/real-numpy-f8.npy', np.array([1.5, -2.25, 0.0, 3.0, 42.125, 100.0625], dtype='<f8'))
+ * ```
  */
 
 const HERE = dirname(fileURLToPath(import.meta.url));

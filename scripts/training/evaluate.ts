@@ -11,21 +11,20 @@ import {
   type ReadoutWeights
 } from '../../src/lib/connectome/readout';
 import type { ConnectomeGraph } from '../../src/lib/connectome/format';
+import { ARM_NAMES, type ArmName } from './arms';
 import {
-  ARM_NAMES,
   computeArmBundleSha256,
   computeGraphIdentity,
   deserializeArmBundle,
   expectedProvenanceKind,
   DEFAULT_ARMS_OUT_DIR,
-  type ArmName,
   type ArmProvenance,
   type SerializedArmBundle
 } from './export-arms';
 import { runEpisode } from './episode';
 import { TRACE_SUBSTEPS } from './export-traces';
 import { requireNonNegativeInt, requirePositiveInt, requireValue } from './cli';
-import { readRunDir, type LoadedRun, type RunConfig } from './run-dir';
+import { readRunDir, type LoadedRun } from './run-dir';
 import { conditionRng, conditionStats, pairedStats } from './stats';
 import {
   renderReportMarkdown,
@@ -53,8 +52,6 @@ import {
  * parsing, arm-bundle loading/verification, the per-arm/per-pair/side-by-side
  * evaluation loops, and writing the four artifacts.
  */
-
-export type { RunConfig };
 
 /** Replica 0 (`03-cem-training.md`: "Replica 0 is the one shipped to the browser"). */
 const SHIPPED_TRAINER_SEED = 101;
@@ -268,24 +265,27 @@ export const parseEvaluateArgs = (argv: readonly string[]): EvaluateArgs => {
   };
 };
 
+/** Whether `outDir` resolves to the real shipped `public/data` — the one definition both guards below share. */
+const isDefaultOutDir = (outDir: string): boolean =>
+  resolve(process.cwd(), outDir) === resolve(process.cwd(), DEFAULT_OUT_DIR);
+
+const isDefaultReportMdPath = (reportMdPath: string): boolean =>
+  resolve(process.cwd(), reportMdPath) === resolve(process.cwd(), DEFAULT_REPORT_MD_PATH);
+
 /**
  * `docs/trained-readout-report.md`'s path, per WP4's plan text (it names
  * that exact path for the real, shipped evaluation). `--report-md`
  * overrides unconditionally. Otherwise: default to `docs/` only when `--out`
  * itself resolves to the real shipped `public/data` — i.e. only for a real
- * evaluation run, mirroring the trace-graph-mode `--out` guard above. Every
- * other invocation (trace-graph dev mode, and every test) writes the report
- * markdown alongside `--out`'s own report.json/artifact, so tests never
- * touch `docs/`.
+ * evaluation run, mirroring the trace-graph-mode `--out` guard in
+ * `runEvaluate` below. Every other invocation (trace-graph dev mode, and
+ * every test) writes the report markdown alongside `--out`'s own
+ * report.json/artifact, so tests never touch `docs/`.
  */
 export const resolveReportMdPath = (args: Readonly<EvaluateArgs>): string => {
   if (args.reportMdPath) return resolve(process.cwd(), args.reportMdPath);
-  const resolvedOutDir = resolve(process.cwd(), args.outDir);
-  const resolvedDefaultOutDir = resolve(process.cwd(), DEFAULT_OUT_DIR);
-  if (resolvedOutDir === resolvedDefaultOutDir) {
-    return resolve(process.cwd(), DEFAULT_REPORT_MD_PATH);
-  }
-  return resolve(resolvedOutDir, 'trained-readout-report.md');
+  if (isDefaultOutDir(args.outDir)) return resolve(process.cwd(), DEFAULT_REPORT_MD_PATH);
+  return resolve(process.cwd(), args.outDir, 'trained-readout-report.md');
 };
 
 // ---------------------------------------------------------------------------
@@ -308,14 +308,23 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
   // with no --graph defaults to the trace graph AND to --out public/data,
   // which would otherwise clobber the product's public/data/trained-readout-v1.*
   // with fixture output. Mirrors export-traces.ts's --out overwrite guard.
+  // The same applies to the report markdown: an explicit `--report-md
+  // docs/trained-readout-report.md` (or a resolved default `--report-md`
+  // that happens to land there) must not let a trace-graph run clobber the
+  // real shipped docs/ page with fixture numbers either.
   if (graphIdentity.graphSource !== 'artifact') {
-    const resolvedOutDir = resolve(process.cwd(), args.outDir);
-    const resolvedDefaultOutDir = resolve(process.cwd(), DEFAULT_OUT_DIR);
-    if (!args.outDirExplicit || resolvedOutDir === resolvedDefaultOutDir) {
+    if (!args.outDirExplicit || isDefaultOutDir(args.outDir)) {
       throw new Error(
         'evaluate: trace-graph mode (no --graph) refuses to write to the default --out ' +
           `(${DEFAULT_OUT_DIR}); pass --out <scratch dir> explicitly, or pass --graph <artifact> ` +
           'for a real evaluation run.'
+      );
+    }
+    if (isDefaultReportMdPath(resolveReportMdPath(args))) {
+      throw new Error(
+        'evaluate: trace-graph mode (no --graph) refuses to write to the default report path ' +
+          `(${DEFAULT_REPORT_MD_PATH}); pass --report-md <scratch path> explicitly, or pass ` +
+          '--graph <artifact> for a real evaluation run.'
       );
     }
   }
@@ -357,7 +366,7 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
     }
   }
 
-  const armNames = (['biological', 'rewired', 'disconnected'] as const).filter((arm) => armGraphs[arm]);
+  const armNames = ARM_NAMES.filter((arm) => armGraphs[arm]);
   const armD = new Map<ArmName, number>(armNames.map((arm) => [arm, outputNeuronIndices(armGraphs[arm]!).length]));
   const distinctD = new Set(armD.values());
   if (distinctD.size > 1) {

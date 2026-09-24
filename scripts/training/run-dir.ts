@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 import { readoutParameterCount, type ReadoutWeights } from '../../src/lib/connectome/readout';
-import { ARM_NAMES, type ArmName } from './export-arms';
+import { ARM_NAMES, type ArmName } from './arms';
 import { readNpyFloat32Array } from './npy';
 
 /**
