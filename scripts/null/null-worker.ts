@@ -14,8 +14,10 @@ import { assertFiniteScores, runWorkerMain } from './null-worker-shared';
  * `parentPort` — `fork` gives every child its own process, which is what
  * lets `tsx`'s loader (inherited via `execArgv`) resolve this file's own
  * TypeScript imports without a separate build step), scores it on every
- * held-out seed with the authored decoder against a parked opponent, and
- * reports back the raw per-seed results. `null-evaluate.ts` (the parent)
+ * held-out seed with the authored decoder (or one of its `NullDecoderKind`
+ * sign-flip variants, per the task's own `decoder` field — see
+ * `.agents/plans/null-explanation/01-decoder-variants.md`) against a parked
+ * opponent, and reports back the raw per-seed results. `null-evaluate.ts` (the parent)
  * owns all statistics and ordering; this file never sorts or aggregates —
  * it only produces one seed-ordered results array per task, so the parent
  * can reassemble a fully deterministic output regardless of which shard
@@ -23,6 +25,16 @@ import { assertFiniteScores, runWorkerMain } from './null-worker-shared';
  */
 
 export type NullTaskMode = GraphMode;
+
+/**
+ * The authored decoder family kinds this study's evaluator ever drives the
+ * left agent with (`scripts/training/episode.ts`'s `EpisodeDecoderKind`,
+ * restricted to the `isAuthoredFamily` subset) —
+ * `.agents/plans/null-explanation/01-decoder-variants.md` WP1's
+ * decoder-convention-check variants. `null-evaluate.ts`'s `--decoder` flag
+ * accepts exactly these four and rejects anything else.
+ */
+export type NullDecoderKind = 'authored' | 'authored-flip-thrust' | 'authored-flip-yaw' | 'authored-flip-both';
 
 export interface NullWorkerTask {
   readonly graphId: string;
@@ -33,6 +45,13 @@ export interface NullWorkerTask {
   readonly expectedSha256: string;
   readonly heldOutSeeds: readonly number[];
   readonly ticks: number;
+  /**
+   * Left-agent decoder for this task. Defaults to `'authored'` when absent
+   * (older callers, and every existing test's hand-built task literal), so
+   * this field is additive rather than a breaking change to the wire
+   * protocol — see `runTask`'s own default below.
+   */
+  readonly decoder?: NullDecoderKind;
 }
 
 export interface NullSeedResult {
@@ -102,12 +121,13 @@ const graphFromTask = (task: NullWorkerTask, graphBinary: ArrayBuffer) => {
 const runTask = (task: NullWorkerTask): readonly NullSeedResult[] => {
   const graphBinary = loadVerifiedGraphBinary(task.path, task.expectedSha256);
   const graph = graphFromTask(task, graphBinary);
+  const decoder = task.decoder ?? 'authored';
 
   return task.heldOutSeeds.map((seed) => {
     const result = runEpisode({
       seed,
       ticks: task.ticks,
-      left: { decoder: 'authored', graph },
+      left: { decoder, graph },
       right: { decoder: 'parked' }
     });
     const { movementScore, foodPickups, hazardContacts } = result.left;

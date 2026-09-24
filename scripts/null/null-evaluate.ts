@@ -7,7 +7,7 @@ import { gunzipSync } from 'node:zlib';
 import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import { requireNonNegativeInt, requirePositiveInt, requireValue } from '../training/cli';
 import { atomicWriteFileSync, sha256Hex } from '../training/fsio';
-import type { NullSeedResult, NullTaskMode, NullWorkerMessage, NullWorkerTask } from './null-worker';
+import type { NullDecoderKind, NullSeedResult, NullTaskMode, NullWorkerMessage, NullWorkerTask } from './null-worker';
 
 /**
  * `.agents/plans/rewiring-null/02-authored-null-evaluation.md`'s WP2 driver:
@@ -40,6 +40,24 @@ const DEFAULT_HELD_OUT_COUNT = 100;
 const DEFAULT_TICKS = 1800;
 const DEFAULT_SHARDS = 18;
 const DEFAULT_OUT = resolve(repoRoot, 'training/runs/null/authored.json');
+const DEFAULT_DECODER: NullDecoderKind = 'authored';
+
+/**
+ * The only values `--decoder` accepts — the authored decoder family
+ * (`.agents/plans/null-explanation/01-decoder-variants.md` WP1). `trained`/
+ * `silenced`/`parked` are never valid here: this evaluator always drives the
+ * left agent through the authored path (with an optional sign flip) against
+ * a parked opponent, matching `null-worker.ts`'s own `NullDecoderKind`.
+ */
+const NULL_EVALUATE_DECODERS: readonly NullDecoderKind[] = [
+  'authored',
+  'authored-flip-thrust',
+  'authored-flip-yaw',
+  'authored-flip-both'
+];
+
+const isNullDecoderKind = (value: string): value is NullDecoderKind =>
+  (NULL_EVALUATE_DECODERS as readonly string[]).includes(value);
 
 // ---------------------------------------------------------------------------
 // rewire_batch.py index.json
@@ -181,6 +199,18 @@ export interface NullEvaluateArgs {
   readonly ticks: number;
   readonly shards: number;
   readonly out: string;
+  /** Left-agent decoder for every task this run builds. Defaults to `'authored'`. */
+  readonly decoder: NullDecoderKind;
+  /**
+   * Restricts `buildTasks`'s rewired-graph tasks to `index.json` seeds in
+   * `[start, end)` (half-open, matching `--rewired-seeds START:END`'s CLI
+   * spelling to Python slice semantics) — used by the WP1 reproduction gate
+   * (`--rewired-seeds 0:5` re-scores only seeds 0..4) so a full 500-graph
+   * rerun isn't needed just to check that the new code path reproduces a
+   * handful of published scores exactly. Leaving it unset evaluates every
+   * seed in the index, unchanged from before this flag existed.
+   */
+  readonly rewiredSeeds?: { readonly start: number; readonly end: number };
 }
 
 export const parseNullEvaluateArgs = (argv: readonly string[]): NullEvaluateArgs => {
@@ -193,6 +223,8 @@ export const parseNullEvaluateArgs = (argv: readonly string[]): NullEvaluateArgs
   let ticks = DEFAULT_TICKS;
   let shards = DEFAULT_SHARDS;
   let out = DEFAULT_OUT;
+  let decoder: NullDecoderKind = DEFAULT_DECODER;
+  let rewiredSeeds: { start: number; end: number } | undefined;
 
   let index = 0;
   while (index < argv.length) {
@@ -224,6 +256,26 @@ export const parseNullEvaluateArgs = (argv: readonly string[]): NullEvaluateArgs
     } else if (flag === '--out') {
       out = resolve(process.cwd(), requireValue(flag, argv[index + 1]));
       index += 2;
+    } else if (flag === '--decoder') {
+      const value = requireValue(flag, argv[index + 1]);
+      if (!isNullDecoderKind(value)) {
+        throw new Error(`--decoder must be one of ${NULL_EVALUATE_DECODERS.join(', ')} (got "${value}")`);
+      }
+      decoder = value;
+      index += 2;
+    } else if (flag === '--rewired-seeds') {
+      const value = requireValue(flag, argv[index + 1]);
+      const match = /^(\d+):(\d+)$/.exec(value);
+      if (!match) {
+        throw new Error(`--rewired-seeds must be START:END (got "${value}")`);
+      }
+      const start = Number(match[1]);
+      const end = Number(match[2]);
+      if (end <= start) {
+        throw new Error(`--rewired-seeds end must be greater than start (got "${value}")`);
+      }
+      rewiredSeeds = { start, end };
+      index += 2;
     } else {
       throw new Error(`Unknown argument: ${flag}`);
     }
@@ -241,12 +293,40 @@ export const parseNullEvaluateArgs = (argv: readonly string[]): NullEvaluateArgs
   // comment, a dual-review finding).
   if (!out.endsWith('.json')) throw new Error(`--out must end with ".json" (got "${out}")`);
 
-  return { biological, graph, rewiredIndex, graphsDir, heldOutStart, heldOutCount, ticks, shards, out };
+  return {
+    biological,
+    graph,
+    rewiredIndex,
+    graphsDir,
+    heldOutStart,
+    heldOutCount,
+    ticks,
+    shards,
+    out,
+    decoder,
+    rewiredSeeds
+  };
 };
 
 // ---------------------------------------------------------------------------
 // Task list
 // ---------------------------------------------------------------------------
+
+/**
+ * `sortedRewireSeeds(index)` narrowed to `args.rewiredSeeds`'s half-open
+ * `[start, end)` range when given (see `NullEvaluateArgs.rewiredSeeds`'s doc
+ * comment), otherwise every seed in the index — unchanged from before the
+ * flag existed.
+ */
+const selectedRewireSeeds = (
+  index: Readonly<RewireIndex>,
+  args: Readonly<NullEvaluateArgs>
+): readonly RewireIndexSeedEntry[] => {
+  const seeds = sortedRewireSeeds(index);
+  if (!args.rewiredSeeds) return seeds;
+  const { start, end } = args.rewiredSeeds;
+  return seeds.filter((entry) => entry.seed >= start && entry.seed < end);
+};
 
 export const buildTasks = (
   index: Readonly<RewireIndex>,
@@ -257,19 +337,26 @@ export const buildTasks = (
   const tasks: NullWorkerTask[] = [];
 
   if (args.biological) {
-    const commonBio = { path: biologicalPath, expectedSha256: index.sourceSha256, heldOutSeeds, ticks: args.ticks };
+    const commonBio = {
+      path: biologicalPath,
+      expectedSha256: index.sourceSha256,
+      heldOutSeeds,
+      ticks: args.ticks,
+      decoder: args.decoder
+    };
     tasks.push({ graphId: 'biological', mode: 'biological' as NullTaskMode, ...commonBio });
     tasks.push({ graphId: 'disconnected', mode: 'disconnected' as NullTaskMode, ...commonBio });
   }
 
-  for (const entry of sortedRewireSeeds(index)) {
+  for (const entry of selectedRewireSeeds(index, args)) {
     tasks.push({
       graphId: `rewired-${entry.seed}`,
       mode: 'rewired' as NullTaskMode,
       path: resolve(args.graphsDir, entry.artifact),
       expectedSha256: entry.binarySha256,
       heldOutSeeds,
-      ticks: args.ticks
+      ticks: args.ticks,
+      decoder: args.decoder
     });
   }
   return tasks;
@@ -484,6 +571,15 @@ export interface NullEvaluationRaw {
   readonly seeds: { readonly start: number; readonly count: number };
   readonly ticks: number;
   readonly substeps: number;
+  /**
+   * The left-agent decoder every task in this run used (`--decoder`,
+   * default `'authored'`). `null-report.ts` reads this to pick the
+   * published artifact's `condition` label and to enforce that a
+   * non-authored run is never written to a shipped path (see that file's
+   * `runNullReport`). Absent on any `authored.json` produced before this
+   * field existed — every reader treats a missing value as `'authored'`.
+   */
+  readonly decoder: NullDecoderKind;
   readonly biological?: NullGraphRaw;
   readonly disconnected?: NullGraphRaw;
   readonly rewired: readonly NullRewiredGraphRaw[];
@@ -517,7 +613,7 @@ export const assembleRaw = (
     return found;
   };
 
-  const rewired: NullRewiredGraphRaw[] = sortedRewireSeeds(index).map((entry) => ({
+  const rewired: NullRewiredGraphRaw[] = selectedRewireSeeds(index, args).map((entry) => ({
     seed: entry.seed,
     gzipSha256: entry.gzipSha256,
     acceptedSwaps: entry.stats.acceptedSwaps,
@@ -532,6 +628,7 @@ export const assembleRaw = (
     seeds: { start: args.heldOutStart, count: args.heldOutCount },
     ticks: args.ticks,
     substeps: NEURAL_SUBSTEPS_PER_TICK,
+    decoder: args.decoder,
     ...(args.biological
       ? { biological: toGraphRaw(require('biological')), disconnected: toGraphRaw(require('disconnected')) }
       : {}),

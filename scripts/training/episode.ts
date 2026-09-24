@@ -1,4 +1,4 @@
-import { decodeAction } from '../../src/lib/arena/actions';
+import { decodeAction, OUTPUT_POPULATION } from '../../src/lib/arena/actions';
 import { observeAgent } from '../../src/lib/arena/sensors';
 import { createWorld, stepWorld } from '../../src/lib/arena/world';
 import type {
@@ -58,6 +58,18 @@ import {
  * `.agents/plans/trained-readout/00-overview.md`'s "Opponent slot" row).
  * `authored`: the current shipped path, `aggregateOutputs` (inside
  * `runSubsteps`) -> `decodeAction`.
+ * `authored-flip-thrust`/`authored-flip-yaw`/`authored-flip-both`: the
+ * authored family's decoder-convention-check variants
+ * (`.agents/plans/null-explanation/01-decoder-variants.md` WP1) — identical
+ * to `authored` except that, after `runSubsteps`/`runLesionedSubsteps` fills
+ * the raw `outputs` buffer and before `decodeAction`, the thrust and/or yaw
+ * entries (`OUTPUT_POPULATION.thrust`/`.yaw`, `src/lib/arena/actions.ts`)
+ * are negated. Brake is never flipped. These exist to test whether the
+ * authored decoder's fixed sign convention (as opposed to the biological
+ * connectome's topology) explains the rewiring-null study's below-null
+ * biological score; they are not a claim about which convention is
+ * "correct" and never change the shipped `decodeAction`/`aggregateOutputs`
+ * path itself.
  * `trained`: `readoutForward` on the real per-neuron output rates ->
  * `decodeAction`.
  * `silenced`: `readoutForward` fed an all-zero input vector every tick
@@ -66,17 +78,28 @@ import {
  * the circuit-silenced control (`04-authoritative-evaluation-and-artifacts.md`'s
  * "silenced" condition, following Fly Dino's practice).
  */
-export type EpisodeDecoderKind = 'authored' | 'trained' | 'silenced' | 'parked';
+export type EpisodeDecoderKind =
+  | 'authored'
+  | 'authored-flip-thrust'
+  | 'authored-flip-yaw'
+  | 'authored-flip-both'
+  | 'trained'
+  | 'silenced'
+  | 'parked';
 
 /**
- * True for the `authored` decoder family -- today just `authored` itself.
- * Written as a predicate rather than the two independent `=== 'authored'` /
- * `!== 'authored'` literals this replaced, so a future `authored-flip-*`
- * kind (`.agents/plans/null-explanation/01-decoder-variants.md`) widens
- * lesion support with one edit here instead of two call sites that can
- * drift out of sync.
+ * True for the `authored` decoder family: `authored` and its three
+ * sign-flip variants (`authored-flip-thrust`/`authored-flip-yaw`/
+ * `authored-flip-both`, `.agents/plans/null-explanation/01-decoder-variants.md`).
+ * Written as a predicate rather than repeating this set at every call site,
+ * so lesion support (and any other authored-family-only behavior) stays in
+ * sync across `createAgentRunner`/`createNeuralRunner` with one edit here.
  */
-const isAuthoredFamily = (decoder: EpisodeDecoderKind): boolean => decoder === 'authored';
+const isAuthoredFamily = (decoder: EpisodeDecoderKind): boolean =>
+  decoder === 'authored' ||
+  decoder === 'authored-flip-thrust' ||
+  decoder === 'authored-flip-yaw' ||
+  decoder === 'authored-flip-both';
 
 export interface AgentEpisodeConfig {
   readonly decoder: EpisodeDecoderKind;
@@ -227,10 +250,18 @@ const createNeuralRunner = (
       lesion = Int32Array.from(config.lesion);
       validateLesionIndices(agentId, lesion, graph.metadata.neuronCount);
     }
+    // Precomputed once per runner (not per tick): which raw output entries
+    // this decoder kind flips before `decodeAction`, per the
+    // `authored-flip-*` doc comment above. `authored` itself flips neither.
+    const flipThrust =
+      config.decoder === 'authored-flip-thrust' || config.decoder === 'authored-flip-both';
+    const flipYaw = config.decoder === 'authored-flip-yaw' || config.decoder === 'authored-flip-both';
     return {
       step: (world) => {
         const observation = observeAgent(world, agentId);
         runLesionedSubsteps(graph, state, scratch, observation, lesion, substeps, outputs);
+        if (flipThrust) outputs[OUTPUT_POPULATION.thrust] *= -1;
+        if (flipYaw) outputs[OUTPUT_POPULATION.yaw] *= -1;
         const decoded = decodeAction(Array.from(outputs));
         return [decoded.thrust, decoded.yaw, decoded.brake];
       }

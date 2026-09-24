@@ -16,6 +16,7 @@ import {
   type NullSummary
 } from './null-stats';
 import type { NullEvaluationRaw, NullGraphRaw } from './null-evaluate';
+import type { NullDecoderKind } from './null-worker';
 import { buildTrainedSection, renderTrainedSection, type TrainedSection } from './null-report-trained';
 import type { NullTrainedEvaluationRaw } from './null-trained-evaluate';
 
@@ -75,6 +76,18 @@ export interface NullReportArgs {
    * guessed default. See that function and `RunMeta`'s doc comment.
    */
   readonly shards?: number;
+  /**
+   * `.agents/plans/null-explanation/01-decoder-variants.md` WP1's
+   * variant-JSON escape hatch: when set, `runNullReport` writes **only** the
+   * built artifact (the same statistics `buildArtifact` always computes) to
+   * this path, and never touches `--out`/`--report-md`/`--manifest` at all
+   * — no shipped-path write, no manifest update, no report markdown. Left
+   * unset, `runNullReport` follows its original authored-only publish path
+   * unchanged. `--authored`'s `decoder` (see `NullEvaluationRaw.decoder`)
+   * being anything other than `'authored'` *requires* this flag — see
+   * `runNullReport`'s own check, which throws before any write otherwise.
+   */
+  readonly variantOut?: string;
 }
 
 export const parseNullReportArgs = (argv: readonly string[]): NullReportArgs => {
@@ -88,6 +101,7 @@ export const parseNullReportArgs = (argv: readonly string[]): NullReportArgs => 
   let bootstrapResamples = DEFAULT_BOOTSTRAP_RESAMPLES;
   let histogramBins = DEFAULT_HISTOGRAM_BINS;
   let shards: number | undefined;
+  let variantOut: string | undefined;
 
   let index = 0;
   while (index < argv.length) {
@@ -122,6 +136,9 @@ export const parseNullReportArgs = (argv: readonly string[]): NullReportArgs => 
     } else if (flag === '--shards') {
       shards = requirePositiveInt(flag, argv[index + 1]);
       index += 2;
+    } else if (flag === '--variant-out') {
+      variantOut = resolve(process.cwd(), requireValue(flag, argv[index + 1]));
+      index += 2;
     } else {
       throw new Error(`Unknown argument: ${flag}`);
     }
@@ -142,7 +159,8 @@ export const parseNullReportArgs = (argv: readonly string[]): NullReportArgs => 
     bootstrapSeed,
     bootstrapResamples,
     histogramBins,
-    shards
+    shards,
+    variantOut
   };
 };
 
@@ -223,9 +241,31 @@ export interface RewiredEntry extends ScoredEntry {
   readonly attempts: number;
 }
 
+/**
+ * Every condition `buildArtifact` can label a run with — the authored
+ * condition (unchanged wording, so the shipped `rewiring-null-v1.json` stays
+ * byte-identical) plus the three decoder-convention-check variants
+ * (`.agents/plans/null-explanation/01-decoder-variants.md` WP1). See
+ * `CONDITION_LABELS` for the `NullDecoderKind -> RewiringNullCondition`
+ * mapping.
+ */
+export type RewiringNullCondition =
+  | 'authored, opponent parked'
+  | 'authored (thrust flipped), opponent parked'
+  | 'authored (yaw flipped), opponent parked'
+  | 'authored (thrust and yaw flipped), opponent parked';
+
+/** `NullDecoderKind -> RewiringNullCondition`, the single source of truth `runNullReport` uses to pick `buildArtifact`'s `condition` argument from `raw.decoder`. */
+export const CONDITION_LABELS: Record<NullDecoderKind, RewiringNullCondition> = {
+  authored: 'authored, opponent parked',
+  'authored-flip-thrust': 'authored (thrust flipped), opponent parked',
+  'authored-flip-yaw': 'authored (yaw flipped), opponent parked',
+  'authored-flip-both': 'authored (thrust and yaw flipped), opponent parked'
+};
+
 export interface RewiringNullArtifact {
   readonly version: 1;
-  readonly condition: 'authored, opponent parked';
+  readonly condition: RewiringNullCondition;
   readonly seeds: { readonly start: number; readonly count: number };
   readonly ticks: number;
   readonly substeps: number;
@@ -338,7 +378,8 @@ export const updateManifestWithRewiringNull = (
 
 export interface RunNullReportResult {
   readonly out: string;
-  readonly reportMdPath: string;
+  /** Undefined in variant mode (`args.variantOut` set) — no report markdown is written; see `runNullReport`. */
+  readonly reportMdPath?: string;
   readonly artifactSha256: string;
   readonly artifact: RewiringNullArtifact;
 }
@@ -350,7 +391,8 @@ const sameSeeds = (a: readonly number[], b: readonly number[]): boolean =>
 export const buildArtifact = (
   raw: Readonly<NullEvaluationRaw>,
   args: Readonly<NullReportArgs>,
-  runMeta: Readonly<RunMeta>
+  runMeta: Readonly<RunMeta>,
+  condition: RewiringNullCondition = 'authored, opponent parked'
 ): RewiringNullArtifact => {
   if (raw.version !== 1) {
     throw new Error(`null-report: ${args.authored} has unsupported version ${String(raw.version)}, expected 1`);
@@ -447,7 +489,7 @@ export const buildArtifact = (
 
   return {
     version: 1,
-    condition: 'authored, opponent parked',
+    condition,
     seeds: raw.seeds,
     ticks: raw.ticks,
     substeps: raw.substeps,
@@ -696,8 +738,28 @@ const verifySourceGraphMatchesManifest = (
 
 export const runNullReport = (args: Readonly<NullReportArgs>): RunNullReportResult => {
   const raw = JSON.parse(readFileSync(args.authored, 'utf8')) as NullEvaluationRaw;
+  // Missing on any authored.json produced before this field existed (see
+  // NullEvaluationRaw.decoder's doc comment) -- treated as 'authored', the
+  // only value every such file could ever have meant.
+  const decoder: NullDecoderKind = raw.decoder ?? 'authored';
+  const condition = CONDITION_LABELS[decoder];
+
+  // A new check alongside guardShippedDefault below (a dual-review-style
+  // finding this WP predeclares): guardShippedDefault only looks at the
+  // rewired count, so a non-authored run with a full 500-graph rewired
+  // count would otherwise sail past it and overwrite the shipped authored
+  // artifact with a decoder-variant condition. Checked before anything is
+  // read from `args.trained` or written anywhere.
+  if (decoder !== 'authored' && !args.variantOut) {
+    throw new Error(
+      `null-report: ${args.authored} was scored with decoder "${decoder}", not "authored" -- pass ` +
+        '--variant-out <path> to write its summary JSON there. A non-authored condition must never be written ' +
+        'to a shipped path (public/data/rewiring-null-v1.json, docs/rewiring-null-report.md, or the manifest).'
+    );
+  }
+
   const runMeta = resolveRunMeta(args);
-  const authoredArtifact = buildArtifact(raw, args, runMeta);
+  const authoredArtifact = buildArtifact(raw, args, runMeta, condition);
 
   // `--trained` is optional: "Reads authored.json (and trained.json from
   // WP3 if present)" (02-authored-null-evaluation.md). When present, its
@@ -717,6 +779,19 @@ export const runNullReport = (args: Readonly<NullReportArgs>): RunNullReportResu
       raw.substeps
     );
     artifact = { ...authoredArtifact, trained: trainedSection };
+  }
+
+  // Variant mode: write only the built artifact to --variant-out. Never
+  // touches --out/--report-md/--manifest -- no guardShippedDefault check,
+  // no manifest preflight/update, no report markdown, regardless of
+  // `decoder` (including 'authored', if a caller passes --variant-out
+  // anyway; see NullReportArgs.variantOut's doc comment).
+  if (args.variantOut) {
+    const artifactContents = JSON.stringify(artifact);
+    const artifactSha256 = sha256Hex(artifactContents);
+    mkdirSync(dirname(args.variantOut), { recursive: true });
+    atomicWriteFileSync(args.variantOut, artifactContents);
+    return { out: args.variantOut, artifactSha256, artifact };
   }
 
   guardShippedDefault(args.out, DEFAULT_OUT, 'published artifact', artifact.rewired.length);
@@ -750,10 +825,14 @@ const main = (): void => {
       throw new Error(`${args.authored} does not exist; run "npm run null:evaluate" first`);
     }
     const result = runNullReport(args);
+    const wroteLine = result.reportMdPath
+      ? `wrote ${result.out} (sha256 ${result.artifactSha256}) and ${result.reportMdPath}`
+      : `wrote ${result.out} (sha256 ${result.artifactSha256}) [variant mode: --out/--report-md/--manifest untouched]`;
     // eslint-disable-next-line no-console -- CLI tool: this is its user-facing output.
     console.log(
-      `null-report: wrote ${result.out} (sha256 ${result.artifactSha256}) and ${result.reportMdPath}\n` +
-        `bioPercentile=${pct(result.artifact.bioPercentile)} null.degenerate=${result.artifact.null.degenerate}`
+      `null-report: ${wroteLine}\n` +
+        `condition=${result.artifact.condition} bioPercentile=${pct(result.artifact.bioPercentile)} ` +
+        `null.degenerate=${result.artifact.null.degenerate}`
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

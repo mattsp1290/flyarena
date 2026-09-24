@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { NullEvaluationRaw, NullGraphRaw } from '../../scripts/null/null-evaluate';
 import type { NullTrainedEvaluationRaw } from '../../scripts/null/null-trained-evaluate';
 import {
+  CONDITION_LABELS,
   DEFAULT_MANIFEST,
   DEFAULT_OUT,
   DEFAULT_REPORT_MD,
@@ -46,6 +47,7 @@ const buildRaw = (overrides: Partial<NullEvaluationRaw> = {}): NullEvaluationRaw
     seeds: { start: 30001, count: 3 },
     ticks: 20,
     substeps: 4,
+    decoder: 'authored',
     biological: graph(1),
     disconnected: graph(-1),
     rewired: [0, 1, 2, 3, 4].map((seed) => ({
@@ -237,6 +239,18 @@ describe('buildArtifact', () => {
     expect(withoutTiming.timing).toBeUndefined();
     const withTiming = buildArtifact(buildRaw(), args, { shards: 1, elapsedMs: 100, perEpisodeMs: 2 });
     expect(withTiming.timing).toEqual({ elapsedMs: 100, perEpisodeMs: 2 });
+  });
+
+  it('defaults condition to the authored label when omitted', () => {
+    const artifact = buildArtifact(buildRaw(), args, runMeta);
+    expect(artifact.condition).toBe('authored, opponent parked');
+  });
+
+  it('takes condition as an explicit parameter for each decoder-variant label', () => {
+    for (const decoder of ['authored', 'authored-flip-thrust', 'authored-flip-yaw', 'authored-flip-both'] as const) {
+      const artifact = buildArtifact(buildRaw({ decoder }), args, runMeta, CONDITION_LABELS[decoder]);
+      expect(artifact.condition).toBe(CONDITION_LABELS[decoder]);
+    }
   });
 });
 
@@ -433,6 +447,62 @@ describe('runNullReport', () => {
   it('does not write authored.run.json as part of publishing (that sidecar is null-evaluate.ts\'s output)', () => {
     runNullReport(args);
     expect(() => readFileSync(join(root, 'authored.run.json'))).toThrow();
+  });
+
+  describe('variant mode (--variant-out, WP1 decoder-convention-check runs)', () => {
+    it('a non-authored decoder with no --variant-out throws before writing anything', () => {
+      writeFileSync(authoredPath, JSON.stringify(buildRaw({ decoder: 'authored-flip-both' })));
+      expect(() => runNullReport(args)).toThrow(/authored-flip-both.*--variant-out/s);
+      expect(() => readFileSync(outPath)).toThrow(); // nothing was written
+      expect(() => readFileSync(reportMdPath)).toThrow();
+      const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>;
+      expect(manifest.rewiringNull).toBeUndefined();
+    });
+
+    it('with --variant-out, writes only that file -- the shipped-path fixtures (out/report-md/manifest) keep their bytes', () => {
+      writeFileSync(authoredPath, JSON.stringify(buildRaw({ decoder: 'authored-flip-both' })));
+      const manifestBefore = readFileSync(manifestPath);
+      // out.json/out.md do not exist yet in this fixture -- assert they
+      // never get created, not merely that their bytes are unchanged.
+      expect(() => readFileSync(outPath)).toThrow();
+
+      const variantOut = join(root, 'variant-authored-flip-both-summary.json');
+      const result = runNullReport({ ...args, variantOut });
+
+      expect(result.out).toBe(variantOut);
+      expect(result.reportMdPath).toBeUndefined();
+      expect(() => readFileSync(outPath)).toThrow();
+      expect(() => readFileSync(reportMdPath)).toThrow();
+      expect(readFileSync(manifestPath).equals(manifestBefore)).toBe(true);
+
+      const variantArtifact = JSON.parse(readFileSync(variantOut, 'utf8')) as { condition: string };
+      expect(variantArtifact.condition).toBe(CONDITION_LABELS['authored-flip-both']);
+    });
+
+    it("the variant summary's condition names the variant for each decoder kind", () => {
+      for (const decoder of ['authored-flip-thrust', 'authored-flip-yaw', 'authored-flip-both'] as const) {
+        writeFileSync(authoredPath, JSON.stringify(buildRaw({ decoder })));
+        const variantOut = join(root, `variant-${decoder}-summary.json`);
+        const result = runNullReport({ ...args, variantOut });
+        expect(result.artifact.condition).toBe(CONDITION_LABELS[decoder]);
+      }
+    });
+
+    it('an authored decoder with --variant-out also writes only the variant file (variant mode is decoder-agnostic)', () => {
+      const variantOut = join(root, 'variant-authored-summary.json');
+      const result = runNullReport({ ...args, variantOut });
+      expect(result.artifact.condition).toBe('authored, opponent parked');
+      expect(() => readFileSync(outPath)).toThrow();
+    });
+
+    it('running variant mode twice on the same input is byte-identical', () => {
+      writeFileSync(authoredPath, JSON.stringify(buildRaw({ decoder: 'authored-flip-yaw' })));
+      const variantOut = join(root, 'variant-authored-flip-yaw-summary.json');
+      const first = runNullReport({ ...args, variantOut });
+      const second = runNullReport({ ...args, variantOut });
+      expect(second.artifactSha256).toBe(first.artifactSha256);
+      expect(readFileSync(variantOut, 'utf8')).toEqual(readFileSync(variantOut, 'utf8'));
+    });
   });
 });
 

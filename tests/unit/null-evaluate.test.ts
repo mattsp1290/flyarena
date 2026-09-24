@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { encodeGraphBinary } from '../../src/lib/connectome/format';
 import { createTraceGraph } from '../fixtures/trace-graph';
 import { createFixtureRewiredTraceGraph } from '../fixtures/trace-graph-rewire';
-import { parseNullEvaluateArgs, readRewireIndex, runShardedEvaluation } from '../../scripts/null/null-evaluate';
+import { buildTasks, parseNullEvaluateArgs, readRewireIndex, runShardedEvaluation } from '../../scripts/null/null-evaluate';
 import type { NullSeedResult, NullWorkerMessage, NullWorkerTask } from '../../scripts/null/null-worker';
 
 /**
@@ -41,6 +41,45 @@ describe('parseNullEvaluateArgs', () => {
     expect(args.shards).toBe(18);
     expect(args.rewiredIndex).toBe(resolve(process.cwd(), 'i.json'));
     expect(args.graphsDir).toBe(resolve(process.cwd(), 'g'));
+    expect(args.decoder).toBe('authored');
+    expect(args.rewiredSeeds).toBeUndefined();
+  });
+
+  it('parses --decoder for each accepted variant', () => {
+    for (const decoder of ['authored', 'authored-flip-thrust', 'authored-flip-yaw', 'authored-flip-both'] as const) {
+      const args = parseNullEvaluateArgs(['--rewired-index', 'i.json', '--graphs-dir', 'g', '--decoder', decoder]);
+      expect(args.decoder).toBe(decoder);
+    }
+  });
+
+  it('rejects an unknown --decoder value', () => {
+    expect(() =>
+      parseNullEvaluateArgs(['--rewired-index', 'i.json', '--graphs-dir', 'g', '--decoder', 'trained'])
+    ).toThrow(/--decoder must be one of/);
+  });
+
+  it('parses --rewired-seeds START:END', () => {
+    const args = parseNullEvaluateArgs([
+      '--rewired-index',
+      'i.json',
+      '--graphs-dir',
+      'g',
+      '--rewired-seeds',
+      '0:5'
+    ]);
+    expect(args.rewiredSeeds).toEqual({ start: 0, end: 5 });
+  });
+
+  it('rejects a malformed --rewired-seeds value', () => {
+    expect(() =>
+      parseNullEvaluateArgs(['--rewired-index', 'i.json', '--graphs-dir', 'g', '--rewired-seeds', '5'])
+    ).toThrow(/--rewired-seeds must be START:END/);
+  });
+
+  it('rejects --rewired-seeds with end <= start', () => {
+    expect(() =>
+      parseNullEvaluateArgs(['--rewired-index', 'i.json', '--graphs-dir', 'g', '--rewired-seeds', '5:5'])
+    ).toThrow(/end must be greater than start/);
   });
 
   it('throws without --rewired-index', () => {
@@ -210,6 +249,49 @@ describe('null-evaluate CLI: shard determinism (trace-graph fixture)', () => {
     }
   });
 
+  it('--rewired-seeds 0:2 evaluates only those seeds end-to-end (buildTasks and assembleRaw agree)', () => {
+    // Regression test: an earlier version filtered buildTasks's task list by
+    // --rewired-seeds but assembleRaw still iterated the full, unfiltered
+    // index when reassembling output, throwing "missing results for
+    // rewired-2" (the first seed outside the requested range) instead of
+    // producing a 2-seed authored.json.
+    const out = join(root, 'authored-rewired-seeds-0-2.json');
+    const result = spawnSync(
+      process.execPath,
+      [
+        '--import',
+        'tsx',
+        'scripts/null/null-evaluate.ts',
+        '--biological',
+        '--graph',
+        bioGzipPath,
+        '--rewired-index',
+        indexPath,
+        '--graphs-dir',
+        graphsDir,
+        '--held-out-start',
+        String(HELD_OUT_START),
+        '--held-out-count',
+        String(HELD_OUT_COUNT),
+        '--ticks',
+        String(TICKS),
+        '--shards',
+        '2',
+        '--rewired-seeds',
+        '0:2',
+        '--decoder',
+        'authored',
+        '--out',
+        out
+      ],
+      { encoding: 'utf8', timeout: 60_000 }
+    );
+    expect(result.status, result.stderr).toBe(0);
+    const parsed = JSON.parse(readFileSync(out, 'utf8'));
+    expect(parsed.decoder).toBe('authored');
+    expect(parsed.rewired.map((r: { seed: number }) => r.seed)).toEqual([0, 1]);
+  });
+
   it('rejects a rewired file whose bytes do not match index.json', () => {
     const tamperedDir = join(root, 'graphs-tampered');
     mkdirSync(tamperedDir, { recursive: true });
@@ -332,6 +414,60 @@ describe('readRewireIndex: duplicate/malformed seed rejection', () => {
     );
     expect(() => readRewireIndex(indexPath)).toThrow(/malformed seed entry/);
     rmSync(root, { recursive: true, force: true });
+  });
+});
+
+describe('buildTasks: --decoder propagation and --rewired-seeds filtering', () => {
+  const indexFor = (seeds: readonly number[]) => ({
+    sourceArtifact: 'src.bin.gz',
+    sourceSha256: 'c'.repeat(64),
+    rewireSourceSha256: 'd'.repeat(64),
+    seeds: seeds.map((seed) => ({
+      seed,
+      artifact: `rewired-${seed}.bin.gz`,
+      binarySha256: `${seed}`.padStart(64, '0'),
+      binaryBytes: 1,
+      gzipSha256: `${seed}`.padStart(64, '0'),
+      gzipBytes: 1,
+      stats: { acceptedSwaps: 1, attempts: 1 }
+    }))
+  });
+
+  const baseArgs = () => ({
+    biological: true,
+    graph: undefined,
+    rewiredIndex: 'unused',
+    graphsDir: 'unused',
+    heldOutStart: 30001,
+    heldOutCount: 2,
+    ticks: 20,
+    shards: 1,
+    out: 'unused.json',
+    decoder: 'authored' as const,
+    rewiredSeeds: undefined as { start: number; end: number } | undefined
+  });
+
+  it('--rewired-seeds 0:2 evaluates only seeds 0 and 1', () => {
+    const index = indexFor([0, 1, 2, 3, 4]);
+    const args = { ...baseArgs(), rewiredSeeds: { start: 0, end: 2 } };
+    const tasks = buildTasks(index, args, 'bio.bin.gz');
+    const rewiredGraphIds = tasks.filter((t) => t.mode === 'rewired').map((t) => t.graphId);
+    expect(rewiredGraphIds).toEqual(['rewired-0', 'rewired-1']);
+  });
+
+  it('omitting --rewired-seeds evaluates every seed in the index', () => {
+    const index = indexFor([0, 1, 2]);
+    const tasks = buildTasks(index, baseArgs(), 'bio.bin.gz');
+    const rewiredGraphIds = tasks.filter((t) => t.mode === 'rewired').map((t) => t.graphId);
+    expect(rewiredGraphIds).toEqual(['rewired-0', 'rewired-1', 'rewired-2']);
+  });
+
+  it('every task (biological, disconnected, and each rewired seed) carries the requested decoder', () => {
+    const index = indexFor([0, 1]);
+    const args = { ...baseArgs(), decoder: 'authored-flip-both' as const };
+    const tasks = buildTasks(index, args, 'bio.bin.gz');
+    expect(tasks.length).toBeGreaterThan(0);
+    for (const task of tasks) expect(task.decoder).toBe('authored-flip-both');
   });
 });
 
