@@ -37,9 +37,32 @@ import { requireValue } from './cli';
  * `.agents/plans/trained-readout/02-gpu-port-and-parity.md`) can be checked
  * against them. Run with no flags to regenerate the committed fixtures under
  * `tests/fixtures/golden/` (`npm run training:traces`); `tests/unit/golden-traces.test.ts`
- * regenerates seed 1 in-process (importing `buildSeedTrace` below, not
- * shelling out to this file) and deep-equals it against the committed file,
- * so a TS behavior change forces a deliberate trace refresh.
+ * regenerates every committed file in-process (importing `buildGoldenFiles`/
+ * `buildSeedTrace` below, not shelling out to this file) and compares it
+ * against the committed bytes, so a TS behavior change forces a deliberate
+ * trace refresh.
+ *
+ * Cross-architecture determinism: `stepModel`/`aggregateOutputs`
+ * (`connectome/model.ts`) use only `+`/`-`/`*`, which IEEE-754 guarantees
+ * bit-identical across architectures, but the observation/physics path
+ * (`arena/sensors.ts`'s `Math.atan2`/`Math.sin`/`Math.cos`/`Math.hypot`, and
+ * `arena/world.ts`'s `Math.sin`/`Math.cos`/`Math.hypot` in `createWorld`/
+ * `stepWorld`) calls transcendental `Math.*` functions, whose rounding is
+ * implementation-defined per the ECMAScript spec and not guaranteed
+ * bit-identical across architectures (V8's libm differs between x86_64 and
+ * arm64). The committed fixtures here were generated on `linux-arm64`;
+ * `golden-traces.test.ts` therefore does a strict byte-for-byte comparison
+ * only when `process.arch` matches that, and a tight float-tolerance
+ * structural comparison otherwise (measured divergence and the tolerance it
+ * justifies: `tests/fixtures/cross-arch-tolerance.ts`; see also
+ * `docs/architecture.md`'s "Determinism scope"). This exporter itself is
+ * unaffected — it always writes whatever this process's `Math.*`
+ * implementation actually produces; only the *test*'s comparison strategy
+ * is architecture-aware. Regenerate committed fixtures (`npm run
+ * training:traces`) on `linux-arm64` to keep the byte-exact path
+ * meaningful; regenerating on another architecture would silently change
+ * `GOLDEN_GENERATING_ARCH`'s assumption in `cross-arch-tolerance.ts` and
+ * must update that constant too.
  *
  * `--graph`, `--substeps`, and `--out` let a later work package (WP5) export
  * traces from a real compiled graph artifact at the real closed-loop
