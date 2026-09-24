@@ -14,6 +14,8 @@ For every condition: mean, median, population standard deviation, and a 95% boot
 
 Graph source: `artifact` (`public/data/malecns-arena-v1.bin.gz`), sha256 `ce247668a63df9a84d8e9969227de7b85d5eba679c45821644812ce0740dfb90`.
 
+CEM population for the shipped replicas was 128, reduced from the plan's default of 256; per `05-production-run.md` step 3, population is reduced to 128 when a calibration run projects total wall time across all arms/replicas exceeding a 12-hour budget (see the manifest `training` block for the full CEM config).
+
 ## Parameter accounting
 
 D (input size, output-neuron count) is gated equal across arms at export time (`export-arms.ts`’s node-set gate). H (hidden size) and parameter count are taken from each arm’s replicas, which share one training config except `arm`/`replica-seed` and are therefore expected equal across arms as well.
@@ -139,10 +141,12 @@ The shipped default view: both agents driven, same seeds, biological vs. rewired
 - Statistics are descriptive (mean/median/std) plus bootstrap confidence intervals; no significance test or superiority claim is made or implied.
 - The `silenced` control forces the trained readout’s input vector to zero every tick; it does not silence the recurrent connectome dynamics themselves.
 - Held-out seeds (30001–30100) are the plan's default range, disjoint from its training (1–10000) and validation (20001–20064) seed ranges, but are a fixed, finite sample (not the full seed space).
+- A CUDA rerun of the shipped biological replica (trainer seed 101) produced a TS held-out `trained` mean of 69.3167, vs. the original run's mean of 62.9627 and its own 95% CI [58.9467, 67.4333] (`gpuRerunFitnessDelta` +6.3540, sign convention rerun minus original: positive means the GPU rerun scored higher) — the rerun mean falls **outside** that CI.
+- GPU training is not bit-reproducible: this rerun's drift (`gpuRerunFitnessDelta` +6.3540, rerun minus original) is comparable in size to this arm's 9.4884-point between-replica spread (62.9627 (101) / 72.2304 (202) / 62.7420 (303)), so a single replica's bootstrap 95% CI should not be read as bounding how precisely this method's score is known for that arm — the replica-to-replica spread is the more honest measure of this method's uncertainty than any one replica’s CI.
 
 ## Finding: readout input was structurally zero
 
-For disconnected, the graph itself guarantees the readout's input was exactly zero on every tick of every episode: the graph has no edges, and none of its output-assigned neurons is itself directly wired to an input channel, so their rates can never leave their zero starting value, independent of weights or seeds. Every replica’s `trained` and `silenced` scores were also numerically identical on every held-out seed (paired difference exactly 0, 95% CI exactly [0, 0]), consistent with that guarantee. For that arm, `trained` and `silenced` computed the identical function; whatever score the readout achieved came entirely from its learned bias terms — a fixed, input-independent action — never from sensory information. This finding is descriptive only: it does not rank or compare arms against each other.
+For disconnected, the graph itself guarantees the readout's input was exactly zero on every tick of every episode: the graph has no edges, and none of its output-assigned neurons is itself directly wired to an input channel, so their rates can never leave their zero starting value, independent of weights or seeds. Every replica’s `trained` and `silenced` scores were also numerically identical on every held-out seed (paired difference exactly 0, 95% CI exactly [0, 0]), consistent with that guarantee. For that arm, `trained` and `silenced` computed the identical function; whatever score the readout achieved came from a fixed, input-independent action determined entirely by the readout’s learned weights and biases (applied to a structurally zero input) — never from sensory information. This finding is descriptive only: it does not rank or compare arms against each other.
 
 ## What this does not show
 
