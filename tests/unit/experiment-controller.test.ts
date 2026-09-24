@@ -285,73 +285,78 @@ describe('ExperimentController#changeTopology', () => {
 });
 
 /**
- * A `FakeNeuralWorker`-shaped wrapper that can hold the *next* `init`
- * request's delivery to the inner worker until the test releases it.
+ * A `FakeNeuralWorker`-shaped wrapper that can hold the *next* `dispose`
+ * request, and every message posted after it, until the test releases
+ * them — delivered then in the exact order they were posted.
  *
- * An earlier version of this helper (`GatedDisposeWorker`) gated `dispose`
- * instead and was caught by dual review as not exercising the race it
- * claimed to: `changeTopology` posts `dispose` one microtask *after*
- * `changeTopology()` returns (it runs inside a `.then(async () => ...)`
- * continuation — see `controller.ts`), so a racing `setActivityStreaming`
- * call issued synchronously right after `changeTopology()` had its own
- * `set-activity` message posted, and delivered, *before* `dispose` was even
- * sent — never landing in the dispose/init window at all. Worse, that
- * version forwarded every non-`dispose` message to the inner worker
- * immediately even while `dispose` was held, so a message posted after the
- * gated `dispose` could be *delivered* ahead of it — a real `Worker` never
- * reorders messages like that, so the double had silently stopped modeling
- * one.
+ * Two earlier versions of this helper were both caught by dual review as
+ * not exercising the race they claimed to, for the same underlying reason
+ * (only the gated message type moved between versions):
  *
- * Gating `init` instead fixes both problems for the scenario this test
- * actually wants: `changeTopology`'s `dispose` is allowed to complete
- * normally (undelayed), so the Worker genuinely reaches `idle` before this
- * helper intercepts anything; `initHeld` resolves exactly when the rebuilt
- * binding's `init` has been *posted* (proving the Worker is idle and the
- * dispose/rebuild window has genuinely opened), so a test can `await` it
- * before racing another call in that window with no timing guesswork; and
- * every message this helper does not hold (including one posted while an
- * `init` is being held) still goes straight to the inner worker in call
- * order, so it never itself introduces a reordering the real Worker
- * couldn't produce.
+ * - `GatedDisposeWorker` (v1) held only the one `dispose` message but
+ *   forwarded every later message to the inner worker *immediately* — so a
+ *   message posted after the gated `dispose` could be *delivered* ahead of
+ *   it, something a real `Worker` (whose message channel is strictly FIFO)
+ *   can never do.
+ * - `GatedInitWorker` (v2) moved the gate to `init` for the same reason —
+ *   `changeTopology` posts `dispose` a microtask after `changeTopology()`
+ *   returns — but reintroduced the exact same defect: it held the gated
+ *   `init` while still forwarding a later `set-activity` straight through,
+ *   so the test's `not-initialized` assertion passed only because
+ *   `set-activity` was *delivered* before `init` even though `init` was
+ *   *posted* first. Reviewers confirmed this empirically: swapping in a
+ *   version that preserves posting order made the test's `errorSpy`
+ *   assertion fail, proving the old assertion depended on the reordering.
+ *
+ * This version holds `dispose` in a queue (not a single `.then`) and, once
+ * held, queues *every* subsequent message behind it too, flushing the whole
+ * queue to the inner worker — in original posting order — only on
+ * `releaseDispose()`. Nothing this helper does not hold ever overtakes
+ * something it does. `disposeHeld` resolves exactly when the gated
+ * `dispose` has been *posted* (proving `changeTopology`'s chain has reached
+ * that call), giving a test a real signal to await instead of guessed
+ * microtask-hop counts, with no risk of delivering anything out of order.
  */
-class GatedInitWorker {
+class GatedDisposeWorker {
   private readonly inner = new FakeNeuralWorker();
   private gating = false;
+  private holding = false;
+  private queue: Array<[WorkerRequest, Transferable[] | undefined]> = [];
   private markHeld: (() => void) | undefined;
-  private releaseFn: (() => void) | undefined;
   /**
-   * Resolves once the gated `init` has actually been posted (and is being
-   * held) — reassigned to a fresh pending promise by `gateNextInit()`, and
-   * a test must call `gateNextInit()` (which a test always does before the
-   * racing call that posts `init`) and hold onto *that* promise reference
-   * before awaiting it, since `postMessage` settles this exact object
-   * in place rather than replacing it — an `await` on a stale reference
-   * from before `gateNextInit()` would never resolve.
+   * Resolves once the gated `dispose` has actually been posted (and queued)
+   * — reassigned to a fresh pending promise by `gateNextDispose()`, which a
+   * test must call before the call that posts `dispose`.
    */
-  initHeld: Promise<void> = Promise.resolve();
+  disposeHeld: Promise<void> = Promise.resolve();
   terminated = false;
 
-  /** Arms the gate and resets `initHeld` to a fresh pending promise that the next `init` request's `postMessage` call will settle. */
-  gateNextInit(): void {
+  /** Arms the gate and resets `disposeHeld` to a fresh pending promise that the next `dispose` request's `postMessage` call will settle. */
+  gateNextDispose(): void {
     this.gating = true;
-    this.initHeld = new Promise((resolve) => {
+    this.disposeHeld = new Promise((resolve) => {
       this.markHeld = resolve;
     });
   }
 
-  releaseInit(): void {
-    this.releaseFn?.();
-    this.releaseFn = undefined;
+  /** Flushes every queued message to the inner worker, in the exact order they were originally posted. */
+  releaseDispose(): void {
+    this.holding = false;
+    const queued = this.queue;
+    this.queue = [];
+    for (const [message, transfer] of queued) this.inner.postMessage(message, transfer);
   }
 
   postMessage(message: WorkerRequest, transfer?: Transferable[]): void {
-    if (message.type === 'init' && this.gating) {
+    if (message.type === 'dispose' && this.gating) {
       this.gating = false;
-      const release = new Promise<void>((resolve) => {
-        this.releaseFn = resolve;
-      });
-      void release.then(() => this.inner.postMessage(message, transfer));
+      this.holding = true;
+      this.queue.push([message, transfer]);
       this.markHeld?.();
+      return;
+    }
+    if (this.holding) {
+      this.queue.push([message, transfer]);
       return;
     }
     this.inner.postMessage(message, transfer);
@@ -368,6 +373,75 @@ class GatedInitWorker {
   terminate(): void {
     this.terminated = true;
     this.inner.terminate();
+  }
+}
+
+/**
+ * A `FakeNeuralWorker`-shaped wrapper whose next `set-activity` request can
+ * be armed to fail with a synthetic error instead of reaching the real
+ * Worker runtime — used to regression-test that a rejected re-apply of
+ * streaming after a topology switch (`controller.ts#changeTopology`) never
+ * fails the run. Every other request type (including a *later*
+ * `set-activity`, once the arm has fired) is forwarded to the inner worker
+ * unchanged.
+ *
+ * `addEventListener`/`removeEventListener` register on both this wrapper's
+ * own listener set (so the synthetic failure response below can be
+ * dispatched directly to the same callbacks `WorkerClient` registered) and
+ * on the inner worker (so its real dispatches keep reaching those same
+ * callbacks too) — the same function reference either way, so a listener is
+ * never invoked twice for one real inner-worker message.
+ */
+class FailingReapplyWorker {
+  private readonly inner = new FakeNeuralWorker();
+  private readonly listeners = new Map<string, Set<(event: MessageEvent<WorkerResponse>) => void>>();
+  private failNextSetActivity = false;
+  terminated = false;
+
+  /** The next `set-activity` request posted to this worker fails synthetically instead of reaching the real runtime. */
+  armFailNextSetActivity(): void {
+    this.failNextSetActivity = true;
+  }
+
+  postMessage(message: WorkerRequest, transfer?: Transferable[]): void {
+    if (message.type === 'set-activity' && this.failNextSetActivity) {
+      this.failNextSetActivity = false;
+      queueMicrotask(() => {
+        const response: WorkerResponse = {
+          type: 'set-activity',
+          requestId: message.requestId,
+          ok: false,
+          error: { code: 'internal-error', message: 'simulated re-apply failure' }
+        };
+        this.dispatch('message', new MessageEvent('message', { data: response }));
+      });
+      return;
+    }
+    this.inner.postMessage(message, transfer);
+  }
+
+  addEventListener(type: string, listener: (event: MessageEvent<WorkerResponse>) => void): void {
+    let set = this.listeners.get(type);
+    if (!set) {
+      set = new Set();
+      this.listeners.set(type, set);
+    }
+    set.add(listener);
+    this.inner.addEventListener(type, listener);
+  }
+
+  removeEventListener(type: string, listener: (event: MessageEvent<WorkerResponse>) => void): void {
+    this.listeners.get(type)?.delete(listener);
+    this.inner.removeEventListener(type, listener);
+  }
+
+  terminate(): void {
+    this.terminated = true;
+    this.inner.terminate();
+  }
+
+  private dispatch(type: string, event: MessageEvent<WorkerResponse>): void {
+    for (const listener of this.listeners.get(type) ?? []) listener(event);
   }
 }
 
@@ -409,25 +483,24 @@ describe('ExperimentController activity streaming', () => {
 
   /**
    * bb45-style race test: `runner.setActivityStreaming(true)` issued while
-   * `changeTopology`'s own dispose -> rebuild chain is genuinely in the
-   * `idle` window for the same arm — after `dispose` has resolved (the
-   * Worker is truly idle) but before the rebuilt binding's `init` has been
-   * delivered. `setActivityStreaming`'s `setActivity` call against that
-   * still-`idle` Worker is expected to fail with `not-initialized` (caught
-   * and logged inside `ExperimentRunner`, per its doc comment — never
-   * rejects to this test): this test asserts that rejection is actually
-   * exercised (via a `console.error` spy), not merely that the end state
-   * looks right despite it never having run — see `GatedInitWorker`'s doc
-   * comment for why an earlier version of this test (gating `dispose`, not
-   * `init`) never actually reached this window at all.
+   * `changeTopology`'s own `dispose` round trip is genuinely still in
+   * flight for the same arm — the one window where a real Worker can
+   * actually receive `set-activity` while `idle` (see `GatedDisposeWorker`'s
+   * doc comment for why this specific window, and why two earlier versions
+   * of this test's gate did not reach it). `setActivityStreaming`'s
+   * `setActivity` call against that still-`idle` Worker is expected to fail
+   * with `not-initialized` (caught and logged inside `ExperimentRunner`, per
+   * its doc comment — never rejects to this test): this test asserts that
+   * rejection is actually exercised (via a `console.error` spy), not merely
+   * that the end state looks right despite it never having run.
    */
-  it('setActivityStreaming(true) racing changeTopology through the idle window resolves without an unhandled rejection, logs the expected not-initialized failure, and streaming is active on both arms afterward', async () => {
-    let gatedWorker: GatedInitWorker | undefined;
+  it('setActivityStreaming(true) racing changeTopology through the dispose window resolves without an unhandled rejection, logs the expected not-initialized failure, and streaming is active on both arms afterward', async () => {
+    let gatedWorker: GatedDisposeWorker | undefined;
     let createCount = 0;
     const createGatedWorker = (): Worker => {
       createCount += 1;
       if (createCount === 1) {
-        gatedWorker = new GatedInitWorker();
+        gatedWorker = new GatedDisposeWorker();
         return gatedWorker as unknown as Worker;
       }
       return new FakeNeuralWorker() as unknown as Worker;
@@ -450,19 +523,23 @@ describe('ExperimentController activity streaming', () => {
 
       // The left arm's Worker (the one `createGatedWorker` hands out first,
       // matching `initialize()`'s `left`-then-`right` construction order)
-      // will hold its rebuilt binding's `init` request. `changeTopology`'s
-      // own `dispose` is left ungated, so it completes normally — the
-      // Worker genuinely reaches `idle` before this test's racing call.
-      gatedWorker!.gateNextInit();
+      // will hold its `dispose` request — and everything posted after it,
+      // in order — until released.
+      gatedWorker!.gateNextDispose();
 
       controller.changeTopology('left', 'disconnected');
-      // Resolves only once `init` has actually been posted — proof the
-      // dispose/rebuild window has opened and the Worker is idle, not a
-      // guessed number of microtask hops.
-      await gatedWorker!.initHeld;
+      // Resolves only once `dispose` has actually been posted — proof
+      // `changeTopology`'s chain has reached that call, not a guessed
+      // number of microtask hops.
+      await gatedWorker!.disposeHeld;
 
+      // Posted while `dispose` is still held: queued strictly behind it, so
+      // releasing delivers `dispose` first (the Worker goes `idle`), then
+      // this `set-activity` (which genuinely fails with `not-initialized`
+      // against that idle Worker) — the one ordering a real Worker's own
+      // message channel can actually produce.
       const streamingPromise = runner!.setActivityStreaming(true);
-      gatedWorker!.releaseInit();
+      gatedWorker!.releaseDispose();
 
       await expect(streamingPromise).resolves.toBeUndefined();
       await vi.waitFor(() => expect(runner!.getTelemetry().agents.left.topology).toBe('disconnected'));
@@ -493,13 +570,13 @@ describe('ExperimentController activity streaming', () => {
    * re-applies `setActivity(true)`, never `(true)` when the flag reads
    * `false`), so the topology-switched arm produces no `rates`.
    */
-  it('setActivityStreaming(false) racing changeTopology through the idle window leaves the rebuilt binding not streaming', async () => {
-    let gatedWorker: GatedInitWorker | undefined;
+  it('setActivityStreaming(false) racing changeTopology through the dispose window leaves the rebuilt binding not streaming', async () => {
+    let gatedWorker: GatedDisposeWorker | undefined;
     let createCount = 0;
     const createGatedWorker = (): Worker => {
       createCount += 1;
       if (createCount === 1) {
-        gatedWorker = new GatedInitWorker();
+        gatedWorker = new GatedDisposeWorker();
         return gatedWorker as unknown as Worker;
       }
       return new FakeNeuralWorker() as unknown as Worker;
@@ -523,12 +600,12 @@ describe('ExperimentController activity streaming', () => {
       await runner!.setActivityStreaming(true);
       expect(runner!.isActivityStreaming()).toBe(true);
 
-      gatedWorker!.gateNextInit();
+      gatedWorker!.gateNextDispose();
       controller.changeTopology('left', 'disconnected');
-      await gatedWorker!.initHeld;
+      await gatedWorker!.disposeHeld;
 
       const streamingPromise = runner!.setActivityStreaming(false);
-      gatedWorker!.releaseInit();
+      gatedWorker!.releaseDispose();
 
       await expect(streamingPromise).resolves.toBeUndefined();
       await vi.waitFor(() => expect(runner!.getTelemetry().agents.left.topology).toBe('disconnected'));
@@ -537,11 +614,78 @@ describe('ExperimentController activity streaming', () => {
       expect(callbacks.errors).toHaveLength(0);
 
       runner!.start();
-      // The right arm never toggled off, but streaming is off runner-wide,
-      // so neither arm should ever populate `latestRates`.
-      await new Promise((resolve) => setTimeout(resolve, 30));
+      // A fixed sleep alone would pass vacuously if no tick ever ran (the
+      // assertion below would hold trivially); wait for a real tick first,
+      // so "still undefined" actually means "streaming produced nothing",
+      // not "nothing happened yet".
+      await vi.waitFor(() => expect(runner!.getTelemetry().tick).toBeGreaterThan(0));
       expect(runner!.getLatestRates('left')).toBeUndefined();
       expect(runner!.getLatestRates('right')).toBeUndefined();
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  /**
+   * Regression test for the second dual-review finding: a rejected re-apply
+   * of `setActivity(true)` after a topology switch (`controller.ts`'s
+   * `changeTopology`) must not fail the run or block `onTopologyApplied`,
+   * matching `ExperimentRunner#setActivityStreaming`'s own documented
+   * policy that a per-arm streaming-toggle failure is not a run failure.
+   * `FailingReapplyWorker` makes the rebuilt binding's own `setActivity`
+   * round trip reject synthetically, independent of any real Worker state,
+   * so this test exercises `changeTopology`'s fire-and-forget `.catch`
+   * directly rather than relying on incidental timing.
+   */
+  it('a rejected re-apply of streaming after a topology switch does not fail the run', async () => {
+    let failingWorker: FailingReapplyWorker | undefined;
+    let createCount = 0;
+    const createFailingWorker = (): Worker => {
+      createCount += 1;
+      if (createCount === 1) {
+        failingWorker = new FailingReapplyWorker();
+        return failingWorker as unknown as Worker;
+      }
+      return new FakeNeuralWorker() as unknown as Worker;
+    };
+
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const callbacks = createCallbacks();
+      const controller = new ExperimentController({
+        seed: SEED,
+        totalTicks: TOTAL_TICKS,
+        initialTopology: { left: 'biological', right: 'rewired' },
+        createWorker: createFailingWorker,
+        callbacks
+      });
+      await controller.initialize();
+      const runner = controller.getRunner();
+      expect(runner).toBeDefined();
+      expect(failingWorker).toBeDefined();
+
+      await runner!.setActivityStreaming(true);
+      expect(runner!.isActivityStreaming()).toBe(true);
+
+      // Arms the *next* set-activity request on this arm's Worker — the
+      // rebuilt binding's own re-apply call, not the enable above (which
+      // already succeeded before this line runs).
+      failingWorker!.armFailNextSetActivity();
+
+      controller.changeTopology('left', 'disconnected');
+      await vi.waitFor(() => expect(runner!.getTelemetry().agents.left.topology).toBe('disconnected'));
+
+      // The rejection must be logged (never silently swallowed)...
+      expect(errorSpy).toHaveBeenCalled();
+      // ...but must not fail the run, and must not block onTopologyApplied
+      // or onTelemetry, which setAgentBinding already committed to fire.
+      expect(runner!.getStatus()).not.toBe('error');
+      expect(callbacks.errors).toHaveLength(0);
+      expect(callbacks.topologyApplied).toContainEqual(['left', 'disconnected']);
+      // The runner's own flag stays authoritative regardless of the
+      // rejected re-apply — this is what lets a later successful toggle (or
+      // a future topology switch) recover it.
+      expect(runner!.isActivityStreaming()).toBe(true);
     } finally {
       errorSpy.mockRestore();
     }
