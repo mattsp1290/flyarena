@@ -168,20 +168,74 @@ describe('runEvaluate (tiny fixture, trace graph)', () => {
     }
   });
 
-  it('report.json is byte-identical regardless of --runs argument order', () => {
+  it('report.json is byte-identical regardless of --runs argument order (>= 2 replicas per arm)', () => {
+    // A single replica per arm cannot actually exercise the order-fix: with
+    // only one trainerSeed per arm, armReplicas' per-arm Map has one entry
+    // regardless of --runs order, so sortedReplicas's sort is a no-op and
+    // this test would pass even against the pre-fix code. A second replica
+    // (trainerSeed 202) per arm makes within-arm ordering — and therefore
+    // conditionRng's label-derived seeding, and armPairs'/sideBySide's
+    // element order — actually depend on something --runs order could
+    // perturb if it weren't fixed.
     const { root, armsDir, runDirs } = buildFixture();
     try {
+      const graph = createTraceGraph();
+      const D = outputNeuronIndices(graph).length;
+      const secondReplicaDirs: string[] = [];
+      let weightSeed = 500;
+      for (const arm of ['biological', 'rewired', 'disconnected'] as const) {
+        const dir = join(root, 'runs', `${arm}-202`);
+        writeTinyRunDir({ dir, arm, trainerSeed: 202, D, H: 4, substeps: TRACE_SUBSTEPS, weightSeed, includeEnv: true });
+        secondReplicaDirs.push(dir);
+        weightSeed += 17;
+      }
+      const allRunDirs = [...runDirs, ...secondReplicaDirs];
+      // A genuine shuffle, not just a reversal: interleave the two
+      // replicas across arms differently from `allRunDirs`'s own order.
+      const shuffled = [
+        secondReplicaDirs[1],
+        runDirs[0],
+        secondReplicaDirs[2],
+        runDirs[1],
+        secondReplicaDirs[0],
+        runDirs[2]
+      ];
+      expect([...shuffled].sort()).toEqual([...allRunDirs].sort());
+
       const outForward = join(root, 'out-forward');
       const outReversed = join(root, 'out-reversed');
+      const outShuffled = join(root, 'out-shuffled');
 
-      const forward = runEvaluate(baseArgs(armsDir, runDirs, outForward));
-      const reversed = runEvaluate(baseArgs(armsDir, [...runDirs].reverse(), outReversed));
+      const forward = runEvaluate(baseArgs(armsDir, allRunDirs, outForward));
+      const reversed = runEvaluate(baseArgs(armsDir, [...allRunDirs].reverse(), outReversed));
+      const shuffledResult = runEvaluate(baseArgs(armsDir, shuffled, outShuffled));
 
       expect(forward.artifactWritten).toBe(true);
       expect(reversed.artifactWritten).toBe(true);
+      expect(shuffledResult.artifactWritten).toBe(true);
       const reportForward = readFileSync(resolve(outForward, 'trained-readout-v1.report.json'));
       const reportReversed = readFileSync(resolve(outReversed, 'trained-readout-v1.report.json'));
+      const reportShuffled = readFileSync(resolve(outShuffled, 'trained-readout-v1.report.json'));
       expect(reportReversed.equals(reportForward)).toBe(true);
+      expect(reportShuffled.equals(reportForward)).toBe(true);
+
+      // And: this arm/replica's own CI must not depend on which OTHER
+      // arms/replicas were also evaluated (conditionRng's per-label
+      // seeding, not just sortedReplicas' ordering).
+      const outSubset = join(root, 'out-subset');
+      const subsetResult = runEvaluate(
+        baseArgs(armsDir, [join(root, 'runs', 'biological-101'), join(root, 'runs', 'biological-202')], outSubset)
+      );
+      expect(subsetResult.artifactWritten).toBe(false); // rewired/disconnected not evaluated at all
+      const fullReport = JSON.parse(readFileSync(resolve(outForward, 'trained-readout-v1.report.json'), 'utf8')) as {
+        arms: { biological: { replicas: { '101': { trained: { ci95: [number, number] } } } } };
+      };
+      const subsetReport = JSON.parse(readFileSync(resolve(outSubset, 'trained-readout-v1.report.json'), 'utf8')) as {
+        arms: { biological: { replicas: { '101': { trained: { ci95: [number, number] } } } } };
+      };
+      expect(subsetReport.arms.biological.replicas['101'].trained.ci95).toEqual(
+        fullReport.arms.biological.replicas['101'].trained.ci95
+      );
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

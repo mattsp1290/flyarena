@@ -542,7 +542,25 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
   }
 
   const heldOutSeeds = Array.from({ length: args.heldOutCount }, (_, i) => args.heldOutStart + i);
-  const rng = mulberry32(args.bootstrapSeed);
+  /**
+   * A fresh, independently-seeded bootstrap RNG for one statistic, keyed by
+   * a stable label (e.g. `"biological|trained|101"`). Each `conditionStats`/
+   * `pairedStats` call gets its own stream derived from `--bootstrap-seed`
+   * + its label (sha256, first 4 bytes as a uint32) rather than all of them
+   * sharing one sequentially-consumed `mulberry32` stream: with a shared
+   * stream, a statistic's resample draws — and therefore its CI bounds —
+   * depended on how many other statistics happened to be computed before
+   * it, so adding or removing an unrelated arm/replica from `--runs` would
+   * silently shift every later CI even though that arm/replica's own data
+   * never changed. Per-label seeding makes every statistic's CI a pure
+   * function of (`--bootstrap-seed`, its own label, its own data) —
+   * independent of what else this invocation evaluated, not merely
+   * independent of `--runs` argument order.
+   */
+  const conditionRng = (label: string): (() => number) => {
+    const digest = createHash('sha256').update(`${args.bootstrapSeed}|${label}`).digest();
+    return mulberry32(digest.readUInt32LE(0));
+  };
 
   const scoreCache = new Map<string, number>();
   const computeLeftScore = (
@@ -576,11 +594,12 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
   /**
    * Ascending-by-trainerSeed entries for one arm's replicas. `armReplicas`'s
    * `Map` iterates in insertion order, which is the order run dirs appeared
-   * on `--runs` — sorting here makes every downstream loop order (and
-   * therefore the single shared bootstrap `rng`'s draw sequence, and
-   * `armPairs`'s element order) independent of `--runs` argument order, so
-   * the same *set* of runs always produces the same `report.json` bytes,
-   * not just the same argv.
+   * on `--runs` — sorting here makes `armPairs`'s and `replicas`'s element
+   * order independent of `--runs` argument order, so the same *set* of runs
+   * always produces the same `report.json` bytes, not just the same argv.
+   * (Each statistic's bootstrap CI is independently seeded via
+   * `conditionRng`, so it no longer depends on iteration order or on what
+   * else this invocation evaluated — see `conditionRng`'s doc comment.)
    */
   const sortedReplicas = (arm: ArmName): Array<[number, LoadedRun]> =>
     [...(armReplicas.get(arm) ?? new Map<number, LoadedRun>())].sort(([a], [b]) => a - b);
@@ -593,7 +612,7 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
     const D = armD.get(arm)!;
 
     const authoredScores = heldOutSeeds.map((seed) => computeLeftScore(arm, 'authored', null, null, seed));
-    const authoredStats = conditionStats(authoredScores, args.bootstrapResamples, rng);
+    const authoredStats = conditionStats(authoredScores, args.bootstrapResamples, conditionRng(`${arm}|authored`));
 
     const replicasReport: Record<string, unknown> = {};
     for (const [trainerSeed, run] of sortedReplicas(arm)) {
@@ -605,10 +624,20 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
         parameterCount: run.config.parameterCount,
         weightsSha256: run.weightsSha256,
         env: run.env,
-        trained: conditionStats(trainedScores, args.bootstrapResamples, rng),
-        silenced: conditionStats(silencedScores, args.bootstrapResamples, rng),
-        pairedTrainedVsAuthored: pairedStats(trainedScores, authoredScores, args.bootstrapResamples, rng),
-        pairedTrainedVsSilenced: pairedStats(trainedScores, silencedScores, args.bootstrapResamples, rng)
+        trained: conditionStats(trainedScores, args.bootstrapResamples, conditionRng(`${arm}|trained|${trainerSeed}`)),
+        silenced: conditionStats(silencedScores, args.bootstrapResamples, conditionRng(`${arm}|silenced|${trainerSeed}`)),
+        pairedTrainedVsAuthored: pairedStats(
+          trainedScores,
+          authoredScores,
+          args.bootstrapResamples,
+          conditionRng(`${arm}|paired-trained-vs-authored|${trainerSeed}`)
+        ),
+        pairedTrainedVsSilenced: pairedStats(
+          trainedScores,
+          silencedScores,
+          args.bootstrapResamples,
+          conditionRng(`${arm}|paired-trained-vs-silenced|${trainerSeed}`)
+        )
       };
     }
 
@@ -634,7 +663,12 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
         trainerSeed: null,
         armA,
         armB,
-        pairedDifference: pairedStats(authoredA, authoredB, args.bootstrapResamples, rng)
+        pairedDifference: pairedStats(
+          authoredA,
+          authoredB,
+          args.bootstrapResamples,
+          conditionRng(`armpair|authored|${armA}|${armB}`)
+        )
       });
 
       const replicasB = armReplicas.get(armB) ?? new Map<number, LoadedRun>();
@@ -649,7 +683,12 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
             trainerSeed,
             armA,
             armB,
-            pairedDifference: pairedStats(scoresA, scoresB, args.bootstrapResamples, rng)
+            pairedDifference: pairedStats(
+              scoresA,
+              scoresB,
+              args.bootstrapResamples,
+              conditionRng(`armpair|${condition}|${armA}|${armB}|${trainerSeed}`)
+            )
           });
         }
       }
@@ -676,9 +715,14 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
       leftArm: 'biological',
       rightArm: 'rewired',
       replica: null,
-      left: conditionStats(leftAuthored, args.bootstrapResamples, rng),
-      right: conditionStats(rightAuthored, args.bootstrapResamples, rng),
-      pairedLeftMinusRight: pairedStats(leftAuthored, rightAuthored, args.bootstrapResamples, rng)
+      left: conditionStats(leftAuthored, args.bootstrapResamples, conditionRng('sidebyside|authored|left')),
+      right: conditionStats(rightAuthored, args.bootstrapResamples, conditionRng('sidebyside|authored|right')),
+      pairedLeftMinusRight: pairedStats(
+        leftAuthored,
+        rightAuthored,
+        args.bootstrapResamples,
+        conditionRng('sidebyside|authored|paired')
+      )
     });
 
     const rewiredReplicas = armReplicas.get('rewired') ?? new Map<number, LoadedRun>();
@@ -703,9 +747,18 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
         leftArm: 'biological',
         rightArm: 'rewired',
         replica: trainerSeed,
-        left: conditionStats(leftTrained, args.bootstrapResamples, rng),
-        right: conditionStats(rightTrained, args.bootstrapResamples, rng),
-        pairedLeftMinusRight: pairedStats(leftTrained, rightTrained, args.bootstrapResamples, rng)
+        left: conditionStats(leftTrained, args.bootstrapResamples, conditionRng(`sidebyside|trained|${trainerSeed}|left`)),
+        right: conditionStats(
+          rightTrained,
+          args.bootstrapResamples,
+          conditionRng(`sidebyside|trained|${trainerSeed}|right`)
+        ),
+        pairedLeftMinusRight: pairedStats(
+          leftTrained,
+          rightTrained,
+          args.bootstrapResamples,
+          conditionRng(`sidebyside|trained|${trainerSeed}|paired`)
+        )
       });
     }
   } else {

@@ -44,8 +44,10 @@ import { DEFAULT_GRAPH_ID, loadGraphArtifact } from './export-traces';
  *
  * Gate: `D` (the output-neuron count, `outputNeuronIndices(graph).length`)
  * must be equal across every arm actually exported, AND every non-biological
- * arm's node set / I/O maps (`biologicalIds`, `outputNeuronIndices`,
- * `outputPopulationIndex`, `inputChannelIndex`) must exactly match the
+ * arm's node set / I/O maps / dynamics metadata (`biologicalIds`,
+ * `outputNeuronIndices`, `outputPopulationIndex`, `inputChannelIndex`,
+ * `inputWeight`, `outputWeight`, `presynapticSigns`, and every
+ * `GraphMetadata` field except `edgeCount`) must exactly match the
  * biological arm's (`assertMatchingNodeSet`), or this script exits
  * non-zero. Rewiring/disconnection preserve the node set by construction,
  * so this is expected to hold trivially; the gate exists to catch a
@@ -308,17 +310,31 @@ const sameStringArray = (a: ArrayLike<string>, b: ArrayLike<string>): boolean =>
   a.length === b.length && Array.prototype.every.call(a, (value: string, index: number) => value === b[index]);
 
 /**
- * Exact node-set / I/O-map equality against the biological bundle. `D`
- * equality alone (this script's older gate) cannot catch a `--rewired`
- * artifact compiled from a different graph that happens to have the same
- * output-neuron count — degree-preserving rewiring preserves the node set
- * and every per-neuron I/O mapping exactly
- * (`docs/data-provenance.md`'s "Rewired control arm" section), so this
- * comparison is expected to hold, not merely likely to.
+ * Exact node-set / I/O-map / dynamics-parameter equality against the
+ * biological bundle. `D` equality alone (this script's older gate) cannot
+ * catch a `--rewired` artifact compiled from a different graph (or a
+ * different calibration of the same graph) that happens to have the same
+ * output-neuron count — degree-preserving rewiring preserves the node set,
+ * every per-neuron I/O mapping, sign ownership, and every dynamics
+ * parameter exactly (`docs/data-provenance.md`'s "Rewired control arm"
+ * section: only `edgeCount` and the CSR edge arrays themselves may differ,
+ * and `edgeCount` is excluded here only because `disconnected`'s
+ * `edgeCount: 0` is an intentional, expected difference for that one arm —
+ * see `toDisconnectedGraph`), so every other comparison here is expected
+ * to hold, not merely likely to. Verified directly against the real
+ * MaleCNS biological/rewired-seed0 artifacts: identical on every field
+ * this checks.
  */
 const assertMatchingNodeSet = (biological: SerializedArmBundle, other: SerializedArmBundle): void => {
   const mismatches: string[] = [];
-  if (other.metadata.neuronCount !== biological.metadata.neuronCount) mismatches.push('neuronCount');
+  // Every metadata field except edgeCount (disconnected's one expected,
+  // intentional difference): timestepSeconds, leakRate, rateMin/rateMax,
+  // inputClampMin/inputClampMax, globalGain, neuronCount, etc.
+  const { edgeCount: _bioEdgeCount, ...biologicalMetadataSansEdgeCount } = biological.metadata;
+  const { edgeCount: _otherEdgeCount, ...otherMetadataSansEdgeCount } = other.metadata;
+  if (JSON.stringify(otherMetadataSansEdgeCount) !== JSON.stringify(biologicalMetadataSansEdgeCount)) {
+    mismatches.push('metadata (excluding edgeCount)');
+  }
   if (!sameStringArray(other.biologicalIds, biological.biologicalIds)) mismatches.push('biologicalIds');
   if (!sameNumericArray(other.outputNeuronIndices, biological.outputNeuronIndices)) {
     mismatches.push('outputNeuronIndices');
@@ -327,9 +343,12 @@ const assertMatchingNodeSet = (biological: SerializedArmBundle, other: Serialize
     mismatches.push('outputPopulationIndex');
   }
   if (!sameNumericArray(other.inputChannelIndex, biological.inputChannelIndex)) mismatches.push('inputChannelIndex');
+  if (!sameNumericArray(other.inputWeight, biological.inputWeight)) mismatches.push('inputWeight');
+  if (!sameNumericArray(other.outputWeight, biological.outputWeight)) mismatches.push('outputWeight');
+  if (!sameNumericArray(other.presynapticSigns, biological.presynapticSigns)) mismatches.push('presynapticSigns');
   if (mismatches.length > 0) {
     throw new ExportArmsGateError(
-      `arm "${other.arm}" node set / I/O map differs from "biological" (${mismatches.join(', ')}); ` +
+      `arm "${other.arm}" node set / I/O map / dynamics differs from "biological" (${mismatches.join(', ')}); ` +
         `is --rewired paired with the wrong biological --graph?`
     );
   }
