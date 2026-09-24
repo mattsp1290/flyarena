@@ -49,10 +49,12 @@ import { runShardedEvaluation } from '../null/null-evaluate';
  * directions too, so a future `Null*` shape change that this adapter no
  * longer actually matches fails to compile here instead of silently
  * mis-happening in atlas-worker.ts's real IPC traffic. `atlas-worker.ts`
- * also refuses to run a task with no `lesionIndex` field, so pointing
- * `workerPath` at the wrong worker (e.g. `null-worker.ts`, by copy-paste or
- * a future "unify the workers" refactor) fails loudly instead of silently
- * scoring every task unlesioned. If a generic
+ * also refuses to run a task with no `lesionIndex` field -- see its own
+ * `process.on('message', ...)` handler's doc comment for exactly what that
+ * guards against (a real `NullWorkerTask` reaching this file's handler) and
+ * what it does *not* guard against (`workerPath` pointed at the wrong
+ * worker file entirely, which never reaches this file's code at all). If a
+ * generic
  * `runShardedEvaluation<Task, Result>` lands later, this file's
  * `tasks`/`workerPath` can be handed to it directly and this whole adapter
  * note (and the assertions/guard above) can be deleted.
@@ -151,22 +153,27 @@ export type AtlasWorkerMessage = AtlasWorkerResultMessage | AtlasWorkerErrorMess
 /**
  * Compile-time proof that this adapter's shapes stay compatible with the
  * reused (non-generic) `runShardedEvaluation` in every direction data
- * actually flows: tasks go from this file into it; messages go from
- * `atlas-worker.ts`'s real IPC traffic into its own message handler; the
- * results it returns are what `assembleRaw` reads back out. `tasks` below
- * already relies on `_TaskCompat`'s direction implicitly (passing
- * `AtlasWorkerTask[]` where `readonly NullWorkerTask[]` is expected); these
- * three aliases make all three directions an explicit, named compile error
- * -- not merely an incidental consequence of one call site's argument type
- * -- if a future `Null*` shape change ever makes this adapter stop
- * matching. A type here that fails to satisfy its `extends` bound does not
- * compile, which is the point: catch the drift here, not in
- * `atlas-worker.ts`'s real IPC traffic.
+ * actually flows: tasks go from this file into it (`_AtlasTaskCompat`,
+ * already relied on implicitly by passing `AtlasWorkerTask[]` where
+ * `readonly NullWorkerTask[]` is expected -- made an explicit, named
+ * assertion here too); messages go from `atlas-worker.ts`'s real IPC
+ * traffic into its own message handler (`_AtlasMessageCompat`); the
+ * results it returns (typed `Map<string, readonly NullSeedResult[]>`,
+ * fixed by its own non-generic signature) are what `runAtlasEvaluate`
+ * assigns into `assembleRaw`'s `ReadonlyMap<string, readonly
+ * AtlasSeedResult[]>` parameter (`_AtlasResultCompat` -- note the
+ * direction: `NullSeedResult extends AtlasSeedResult`, not the reverse,
+ * since that assignment is what needs `NullSeedResult`'s fields to cover
+ * `AtlasSeedResult`'s, a round-2 dual-review correction of an earlier,
+ * backwards version of this assertion). A type here that fails to satisfy
+ * its `extends` bound does not compile, which is the point: catch the
+ * drift here, not in `atlas-worker.ts`'s real IPC traffic or in
+ * `runAtlasEvaluate`'s call site.
  */
 type AssertExtends<T extends U, U> = T;
 export type _AtlasTaskCompat = AssertExtends<AtlasWorkerTask, NullWorkerTask>;
 export type _AtlasMessageCompat = AssertExtends<AtlasWorkerMessage, NullWorkerMessage>;
-export type _AtlasResultCompat = AssertExtends<AtlasSeedResult, NullSeedResult>;
+export type _AtlasResultCompat = AssertExtends<NullSeedResult, AtlasSeedResult>;
 
 // ---------------------------------------------------------------------------
 // Manifest
@@ -218,9 +225,11 @@ const graphSpecFor = (key: AtlasGraphKey, manifest: ArenaManifestShape, graphsDi
   return { key, path: resolve(graphsDir, seed0.artifact), expectedSha256: seed0.binarySha256, gzipSha256: seed0.gzipSha256 };
 };
 
-/** Verify every requested graph's decompressed sha256 against the manifest before any shard is forked -- mirrors `null-evaluate.ts`'s `verifyRewiredFiles`/`verifyBiologicalSource` up-front check. */
 /**
- * Verifies sha256 (as before) and, now, also that each graph's own
+ * Verify every requested graph's decompressed sha256 against the manifest
+ * before any shard is forked -- mirrors `null-evaluate.ts`'s
+ * `verifyRewiredFiles`/`verifyBiologicalSource` up-front check -- and, now,
+ * also that each graph's own
  * `neuronCount` agrees with the manifest's -- both graphs feed the same
  * lesion-index range (`buildTasks` below, sized off `manifest.neuronCount`
  * alone) and the same `positions.json` body-ID/role lookup at report time,
@@ -232,7 +241,7 @@ const graphSpecFor = (key: AtlasGraphKey, manifest: ArenaManifestShape, graphsDi
  * matching `null-evaluate.ts`'s existing "verify up front, workers verify
  * again independently" pattern.
  */
-const verifyGraphFiles = (specs: readonly GraphSpec[], expectedNeuronCount: number): void => {
+export const verifyGraphFiles = (specs: readonly GraphSpec[], expectedNeuronCount: number): void => {
   const mismatches: string[] = [];
   for (const spec of specs) {
     let gzipBytes: Buffer;
@@ -486,9 +495,12 @@ export const runAtlasEvaluate = async (
     // `runShardedEvaluation`'s own thrown messages are prefixed
     // "null-evaluate: ..." (it is, after all, that module's function) --
     // re-prefixed here so an atlas-run failure points an operator at this
-    // script, not at the unrelated null study.
+    // script, not at the unrelated null study. `cause` preserves the
+    // original error (and its stack) for anyone inspecting it
+    // programmatically, even though the top-level message is rewritten (a
+    // round-2 dual-review suggestion).
     const message = error instanceof Error ? error.message : String(error);
-    throw new Error(message.replace(/^null-evaluate:/, 'atlas-evaluate:'));
+    throw new Error(message.replace(/^null-evaluate:/, 'atlas-evaluate:'), { cause: error });
   }
   const elapsedMs = performance.now() - started;
   const episodeCount = tasks.length * args.heldOutCount;

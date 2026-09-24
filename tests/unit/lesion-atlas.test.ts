@@ -17,6 +17,7 @@ import {
   DEFAULT_TICKS,
   buildTasks,
   parseAtlasEvaluateArgs,
+  verifyGraphFiles,
   type AtlasEvaluateArgs,
   type AtlasGraphKey,
   type GraphSpec
@@ -29,9 +30,13 @@ import {
   buildArtifact,
   pairedBootstrapPValue,
   parseAtlasReportArgs,
+  requireOutBesideManifest,
   resolveRunMeta,
   roundSignificant,
   runAtlasReport,
+  validateRawShape,
+  verifyRawGraphsMatchManifest,
+  verifyRawSeedsConsistent,
   type AtlasReportArgs
 } from '../../scripts/lesion/atlas-report';
 import { conditionRng } from '../../scripts/training/stats';
@@ -255,6 +260,10 @@ describe('atlas-evaluate CLI: shard determinism (trace-graph fixture)', () => {
     expect(parsed.version).toBe(1);
     expect(parsed.ticks).toBe(TICKS);
     expect(parsed.seeds).toEqual({ start: HELD_OUT_START, count: HELD_OUT_COUNT });
+    // Present (and correct) only because this run used --max-lesions --
+    // absent on a production/full-neuron run (see AtlasEvaluationRaw's doc
+    // comment on the field).
+    expect(parsed.maxLesions).toBe(MAX_LESIONS);
 
     const biological = parsed.graphs.biological as AtlasGraphRaw;
     const rewiredSeed0 = parsed.graphs.rewiredSeed0 as AtlasGraphRaw;
@@ -446,14 +455,22 @@ describe('pairedBootstrapPValue', () => {
     expect(p).toBeLessThan(predicted + 0.03);
   });
 
-  it('noise around a true zero effect gives a large (non-significant) p-value', () => {
+  it('noise around a true zero effect does not look significant (a non-tiny p-value)', () => {
+    // A valid p-value is uniformly distributed on [0,1] across random draws
+    // of null (no-true-effect) data -- so no fixed threshold much above 0.05
+    // is guaranteed to hold for every seed (a round-2 dual-review finding:
+    // a much stricter bound here would hold for most but not all seeds,
+    // which is a property of p-values under the null, not a bug). `> 0.05`
+    // is both robust (expected to hold for ~95% of seeds) and still
+    // meaningful: it shows pure resampled noise does not spuriously clear
+    // this study's own FDR/CI significance threshold.
     const rng = conditionRng(3, 'noise-test');
     // Small symmetric noise around 0 -- no real effect.
     const diffs = Array.from({ length: 50 }, () => (rng() - 0.5) * 0.01);
     const zeros = diffs.map(() => 0);
     const observed = diffs.reduce((sum, v) => sum + v, 0) / diffs.length;
     const p = pairedBootstrapPValue(diffs, zeros, RESAMPLES, conditionRng(4, 'noise-test-resample'), observed);
-    expect(p).toBeGreaterThan(0.2);
+    expect(p).toBeGreaterThan(0.05);
   });
 });
 
@@ -641,12 +658,18 @@ describe('resolveRunMeta (lesion atlas)', () => {
  */
 const writeTestManifest = (
   path: string,
-  shas: { biologicalSha256?: string; rewiredSeed0Sha256?: string } = {}
+  opts: { biologicalSha256?: string; rewiredSeed0Sha256?: string; neuronCount?: number } = {}
 ): void => {
   const manifest = {
-    binarySha256: shas.biologicalSha256 ?? HEX64('a'),
+    binarySha256: opts.biologicalSha256 ?? HEX64('a'),
+    // `verifyRawGraphsMatchManifest` (a dual-review round-2 hardening)
+    // cross-checks `raw.neuronCount` against this field before any write --
+    // defaults to 2 to match `buildRaw`'s own default in every existing
+    // call site below; the `guardShippedDefault` describe block overrides
+    // it to match its own 1008-neuron fixtures.
+    neuronCount: opts.neuronCount ?? 2,
     note: 'test fixture, not the real manifest',
-    rewiredArms: { seed0: { binarySha256: shas.rewiredSeed0Sha256 ?? HEX64('b') } }
+    rewiredArms: { seed0: { binarySha256: opts.rewiredSeed0Sha256 ?? HEX64('b') } }
   };
   writeFileSync(path, `${JSON.stringify(manifest, null, 2)}\n`);
 };
@@ -849,7 +872,8 @@ describe('runAtlasReport: guardShippedDefault (regression)', () => {
     const manifestPath = join(root, 'm.json');
     writeTestManifest(manifestPath, {
       biologicalSha256: realManifest.binarySha256,
-      rewiredSeed0Sha256: realManifest.rewiredArms.seed0.binarySha256
+      rewiredSeed0Sha256: realManifest.rewiredArms.seed0.binarySha256,
+      neuronCount: FULL_NEURON_COUNT
     });
     expect(() =>
       runAtlasReport(guardedArgs(rawPath, join(root, 'o.json'), DEFAULT_REPORT_MD, manifestPath))
@@ -863,9 +887,13 @@ describe('runAtlasReport: guardShippedDefault (regression)', () => {
     // independently of neuron coverage, not merely as a side effect of a
     // smoke run also being short on seeds.
     writeFixture(rawPath, { start: DEFAULT_HELD_OUT_START, count: DEFAULT_HELD_OUT_COUNT }, DEFAULT_TICKS - 1);
+    // Matches on "ticks" specifically (not just "refusing to overwrite the
+    // shipped"), so this test cannot pass for the wrong reason -- e.g. if a
+    // future change broke the neuron-coverage or seeds check instead and
+    // masked a broken ticks check behind it (a round-2 dual-review finding).
     expect(() =>
       runAtlasReport(guardedArgs(rawPath, DEFAULT_OUT, join(root, 'r.md'), DEFAULT_MANIFEST))
-    ).toThrow(/refusing to overwrite the shipped/);
+    ).toThrow(/refusing to overwrite the shipped.*ticks \d+ \(shipped: \d+\)/s);
   });
 
   it('does not guard a scratch path: a short run still writes when none of out/report-md/manifest is a shipped default', () => {
@@ -874,7 +902,8 @@ describe('runAtlasReport: guardShippedDefault (regression)', () => {
     const manifestPath = join(root, 'manifest.json');
     writeTestManifest(manifestPath, {
       biologicalSha256: realManifest.binarySha256,
-      rewiredSeed0Sha256: realManifest.rewiredArms.seed0.binarySha256
+      rewiredSeed0Sha256: realManifest.rewiredArms.seed0.binarySha256,
+      neuronCount: FULL_NEURON_COUNT
     });
     const result = runAtlasReport(guardedArgs(rawPath, join(root, 'o.json'), join(root, 'r.md'), manifestPath));
     expect(result.artifact.neuronCount).toBe(FULL_NEURON_COUNT);
@@ -897,5 +926,183 @@ describe('parseAtlasReportArgs', () => {
 
   it('rejects an unknown flag', () => {
     expect(() => parseAtlasReportArgs(['--bogus'])).toThrow(/Unknown argument/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Direct negative-path coverage for the round-2 dual-review guards: each of
+// these previously had only end-to-end coverage through runAtlasReport with
+// fixtures crafted to pass every *other* check, which proves the guards are
+// wired in but not that each one actually rejects the specific bad input it
+// exists to catch (a round-2 dual-review finding, raised independently by
+// both reviewers).
+// ---------------------------------------------------------------------------
+
+describe('requireOutBesideManifest', () => {
+  it('allows --out and --manifest in the same directory', () => {
+    expect(() => requireOutBesideManifest('/a/b/out.json', '/a/b/manifest.json')).not.toThrow();
+  });
+
+  it('rejects --out in a different directory than --manifest', () => {
+    expect(() => requireOutBesideManifest('/a/b/out.json', '/a/c/manifest.json')).toThrow(
+      /must be in the same directory/
+    );
+  });
+});
+
+describe('validateRawShape', () => {
+  const validRaw = (): AtlasEvaluationRaw => buildRaw(2, [1, -1]);
+
+  it('accepts a well-formed raw evaluation', () => {
+    expect(() => validateRawShape('atlas-raw.json', validRaw())).not.toThrow();
+  });
+
+  it('rejects an unsupported version', () => {
+    expect(() => validateRawShape('atlas-raw.json', { ...validRaw(), version: 2 as 1 })).toThrow(
+      /unsupported version/
+    );
+  });
+
+  it('rejects a raw file missing seeds.start/seeds.count', () => {
+    const raw = validRaw() as unknown as { seeds: unknown };
+    raw.seeds = { start: 'not-a-number', count: 3 };
+    expect(() => validateRawShape('atlas-raw.json', raw as unknown as AtlasEvaluationRaw)).toThrow(
+      /missing a valid seeds/
+    );
+  });
+
+  it('rejects a raw file missing graphs', () => {
+    const raw = validRaw() as unknown as { graphs: unknown };
+    raw.graphs = null;
+    expect(() => validateRawShape('atlas-raw.json', raw as unknown as AtlasEvaluationRaw)).toThrow(
+      /missing a graphs object/
+    );
+  });
+});
+
+describe('verifyRawSeedsConsistent', () => {
+  it('accepts a raw evaluation whose graphs report exactly raw.seeds', () => {
+    expect(() => verifyRawSeedsConsistent(buildRaw(2, [1, -1]))).not.toThrow();
+  });
+
+  it('rejects a graph whose heldOutSeeds do not match raw.seeds', () => {
+    const raw = buildRaw(2, [1, -1]);
+    const tampered: AtlasEvaluationRaw = {
+      ...raw,
+      graphs: {
+        ...raw.graphs,
+        biological: { ...raw.graphs.biological!, heldOutSeeds: [...raw.graphs.biological!.heldOutSeeds].reverse() }
+      }
+    };
+    expect(() => verifyRawSeedsConsistent(tampered)).toThrow(/heldOutSeeds do not match raw\.seeds/);
+  });
+
+  it('rejects a graph whose baselineMovementScore length disagrees with raw.seeds.count', () => {
+    const raw = buildRaw(2, [1, -1]);
+    const tampered: AtlasEvaluationRaw = {
+      ...raw,
+      graphs: {
+        ...raw.graphs,
+        biological: { ...raw.graphs.biological!, baselineMovementScore: raw.graphs.biological!.baselineMovementScore.slice(1) }
+      }
+    };
+    expect(() => verifyRawSeedsConsistent(tampered)).toThrow(/baselineMovementScore length/);
+  });
+
+  it('rejects a lesion entry whose movementScore length disagrees with raw.seeds.count', () => {
+    const raw = buildRaw(2, [1, -1]);
+    const tampered: AtlasEvaluationRaw = {
+      ...raw,
+      graphs: {
+        ...raw.graphs,
+        biological: {
+          ...raw.graphs.biological!,
+          lesion: [
+            { index: 0, movementScore: raw.graphs.biological!.lesion[0].movementScore.slice(1) },
+            raw.graphs.biological!.lesion[1]
+          ]
+        }
+      }
+    };
+    expect(() => verifyRawSeedsConsistent(tampered)).toThrow(/lesion index 0's movementScore length/);
+  });
+});
+
+describe('verifyRawGraphsMatchManifest', () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'verify-raw-vs-manifest-'));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  const writeManifest = (neuronCount: number, biologicalSha: string, rewiredSha: string): string => {
+    const path = join(root, 'manifest.json');
+    writeTestManifest(path, { biologicalSha256: biologicalSha, rewiredSeed0Sha256: rewiredSha, neuronCount });
+    return path;
+  };
+
+  it('accepts a raw evaluation whose neuronCount and graph shas match the manifest', () => {
+    const raw = buildRaw(2, [1, -1]); // graphSha256: HEX64('a')/HEX64('b')
+    const manifestPath = writeManifest(2, HEX64('a'), HEX64('b'));
+    expect(() => verifyRawGraphsMatchManifest(manifestPath, raw)).not.toThrow();
+  });
+
+  it('rejects a raw evaluation whose neuronCount does not match the manifest', () => {
+    const raw = buildRaw(2, [1, -1]);
+    const manifestPath = writeManifest(1008, HEX64('a'), HEX64('b'));
+    expect(() => verifyRawGraphsMatchManifest(manifestPath, raw)).toThrow(/neuronCount \(2\) does not match/);
+  });
+
+  it('rejects a raw evaluation whose biological graphSha256 does not match the manifest', () => {
+    const raw = buildRaw(2, [1, -1]);
+    const manifestPath = writeManifest(2, HEX64('f'), HEX64('b'));
+    expect(() => verifyRawGraphsMatchManifest(manifestPath, raw)).toThrow(/biological graphSha256/);
+  });
+
+  it('rejects a raw evaluation whose rewiredSeed0 graphSha256 does not match the manifest', () => {
+    const raw = buildRaw(2, [1, -1]);
+    const manifestPath = writeManifest(2, HEX64('a'), HEX64('f'));
+    expect(() => verifyRawGraphsMatchManifest(manifestPath, raw)).toThrow(/rewiredSeed0 graphSha256/);
+  });
+});
+
+describe('verifyGraphFiles: neuronCount cross-check (atlas-evaluate)', () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'verify-graph-files-'));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it('rejects a graph file whose parsed neuronCount disagrees with the manifest', () => {
+    const graph = createTraceGraph(); // 24 neurons
+    const binary = Buffer.from(encodeGraphBinary(graph));
+    const gzip = gzipSync(binary);
+    const path = join(root, 'graph.bin.gz');
+    writeFileSync(path, gzip);
+
+    const spec: GraphSpec = {
+      key: 'biological',
+      path,
+      expectedSha256: sha256Hex(binary),
+      gzipSha256: sha256Hex(gzip)
+    };
+    // The manifest claims 1008 neurons; the fixture graph actually has 24.
+    expect(() => verifyGraphFiles([spec], 1008)).toThrow(/has neuronCount 24, but the manifest's neuronCount is 1008/);
+  });
+
+  it('accepts a graph file whose parsed neuronCount matches the manifest', () => {
+    const graph = createTraceGraph();
+    const binary = Buffer.from(encodeGraphBinary(graph));
+    const gzip = gzipSync(binary);
+    const path = join(root, 'graph.bin.gz');
+    writeFileSync(path, gzip);
+
+    const spec: GraphSpec = {
+      key: 'biological',
+      path,
+      expectedSha256: sha256Hex(binary),
+      gzipSha256: sha256Hex(gzip)
+    };
+    expect(() => verifyGraphFiles([spec], graph.metadata.neuronCount)).not.toThrow();
   });
 });

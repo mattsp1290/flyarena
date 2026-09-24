@@ -68,8 +68,6 @@ const TOP_EFFECTS_COUNT = 20;
 /** "Numbers are rounded to 6 significant digits for size" (the plan's artifact-shape row). */
 const SIGNIFICANT_DIGITS = 6;
 
-const MIN_NEURONS_FOR_SHIPPED_DEFAULT = 1008;
-
 // ---------------------------------------------------------------------------
 // Rounding
 // ---------------------------------------------------------------------------
@@ -514,14 +512,20 @@ export const updateManifestWithLesionAtlas = (
 const fmt = (value: number, digits = 4): string => value.toFixed(digits);
 
 /**
- * `pairedBootstrapPValue` can only return multiples of `2/resamples` (each
- * resample contributes `1/resamples`, doubled for the two-sided formula);
- * `p === 0` means no resample landed on the opposite side, not that the
- * true p-value is exactly zero. Printing `0.0000` would read as the
- * stronger claim -- shown as an explicit resolution floor instead, so a
- * reader never mistakes Monte Carlo resolution for exact significance.
+ * `pairedBootstrapPValue` accumulates `oppositeSideCount` in steps of `1`
+ * (a full opposite-side resample) or `0.5` (an exact-zero tie, weighted
+ * evenly between the two sides) -- so its smallest achievable *nonzero*
+ * output is `2 * 0.5 / resamples = 1/resamples`, from a single tie, not
+ * `2/resamples` (a dual-review round-2 finding: a full opposite-side
+ * resample alone gives `2/resamples`, but a lone tie gives a *smaller*
+ * nonzero value, so `1/resamples` is the true floor). `p === 0` means no
+ * resample landed on the opposite side and no resample tied at exactly
+ * 0 -- not that the true p-value is exactly zero. Printing `0.0000` would
+ * read as the stronger claim -- shown as an explicit resolution floor
+ * instead, so a reader never mistakes Monte Carlo resolution for exact
+ * significance.
  */
-const fmtP = (p: number, resamples: number): string => (p === 0 ? `< ${(2 / resamples).toExponential(0)}` : fmt(p, 4));
+const fmtP = (p: number, resamples: number): string => (p === 0 ? `< ${(1 / resamples).toExponential(0)}` : fmt(p, 4));
 
 const renderGraphSection = (title: string, graph: Readonly<AtlasGraphArtifact>, bootstrapResamples: number): string => {
   const topRows = graph.summary.topEffects
@@ -540,7 +544,7 @@ const renderGraphSection = (title: string, graph: Readonly<AtlasGraphArtifact>, 
 | 5th percentile effect | ${fmt(graph.summary.p5Effect)} |
 | 95th percentile effect | ${fmt(graph.summary.p95Effect)} |
 | CIs excluding 0 (uncorrected) | ${graph.summary.ciExcludesZeroCount} (expected by chance: ${fmt(graph.summary.expectedChanceExclusions, 1)}) |
-| FDR-surviving neurons (q=0.05) | ${graph.summary.fdrSignificantCount} |
+| FDR-surviving neurons (q=${FDR_Q}) | ${graph.summary.fdrSignificantCount} |
 
 Top ${graph.summary.topEffects.length} neurons by \\|effect\\|:
 
@@ -585,12 +589,14 @@ the top-effects tables below is a separate two-sided percentile-bootstrap p-valu
 resampled mean differences on the opposite side of 0 from the observed effect, capped at 1), drawn from its
 own RNG stream independent of the CI's -- a neuron's CI and p-value can therefore disagree near the
 boundary (a CI that just excludes 0 while p is just above 0.05, or the reverse). With
-${artifact.bootstrap.resamples} resamples the p-value's resolution is \`2/${artifact.bootstrap.resamples}\`;
-\`p < ...\` below means no resample crossed to the other side, not that the true p-value is exactly zero.
+${artifact.bootstrap.resamples} resamples the smallest achievable nonzero p-value is
+\`1/${artifact.bootstrap.resamples}\` (from a single resample landing exactly on 0, weighted evenly between
+the two sides); \`p < ...\` below means no resample crossed to, or landed on, the other side, not that the
+true p-value is exactly zero.
 
 **Multiple comparisons.** With ${artifact.neuronCount} simultaneous per-neuron CIs per graph, about
 ${fmt(artifact.neuronCount * CI_ALPHA, 0)} are expected to exclude 0 by chance alone even if every neuron's true
-effect were exactly 0. Benjamini-Hochberg FDR control at \`q = 0.05\` (per graph, ${artifact.neuronCount}
+effect were exactly 0. Benjamini-Hochberg FDR control at \`q = ${FDR_Q}\` (per graph, ${artifact.neuronCount}
 tests) marks which neurons' effects survive that correction (\`fdrSignificant\`); only FDR-surviving neurons
 should be read as reliable effects, not every neuron whose raw CI happens to exclude 0.
 
@@ -654,10 +660,14 @@ const rawShippedGradeProblems = (raw: Readonly<AtlasEvaluationRaw>): readonly st
   const problems: string[] = [];
   const biologicalCount = raw.graphs.biological?.lesion.length ?? 0;
   const rewiredCount = raw.graphs.rewiredSeed0?.lesion.length ?? 0;
-  if (biologicalCount < MIN_NEURONS_FOR_SHIPPED_DEFAULT || rewiredCount < MIN_NEURONS_FOR_SHIPPED_DEFAULT) {
+  // Compared against `raw.neuronCount` (cross-checked against the live
+  // manifest by `verifyRawGraphsMatchManifest`, called before this), not a
+  // hardcoded constant -- a round-1 dual-review suggestion, so this never
+  // goes stale if the compiled graph's neuron count ever changes.
+  if (biologicalCount < raw.neuronCount || rewiredCount < raw.neuronCount) {
     problems.push(
       `covers ${biologicalCount}/${rewiredCount} neurons (biological/rewiredSeed0), shipped requires ` +
-        `${MIN_NEURONS_FOR_SHIPPED_DEFAULT} for both`
+        `${raw.neuronCount} for both`
     );
   }
   if (raw.seeds.start !== DEFAULT_HELD_OUT_START || raw.seeds.count !== DEFAULT_HELD_OUT_COUNT) {
@@ -688,7 +698,7 @@ const guardShippedDefault = (path: string, defaultPath: string, label: string, p
  * guard, then leave the shipped manifest pointing at a `public/data/`
  * filename that does not actually exist there (a dual-review finding).
  */
-const requireOutBesideManifest = (outPath: string, manifestPath: string): void => {
+export const requireOutBesideManifest = (outPath: string, manifestPath: string): void => {
   if (resolve(dirname(outPath)) === resolve(dirname(manifestPath))) return;
   throw new Error(
     `atlas-report: --out (${outPath}) must be in the same directory as --manifest (${manifestPath}) -- the ` +
@@ -696,19 +706,6 @@ const requireOutBesideManifest = (outPath: string, manifestPath: string): void =
   );
 };
 
-/**
- * `atlas-evaluate.ts` verifies every graph file's sha256 against the
- * manifest before scoring anything, but `atlas-raw.json` is a plain file on
- * disk that can go stale (the manifest recompiled or re-rewired since that
- * run) or be hand-edited/merged. Without this check, a stale raw evaluation
- * would publish an artifact whose `graphSha256` no longer matches the
- * manifest it was just written next to -- caught only later, in the
- * browser, by WP3's loader (a dual-review finding: this mirrors
- * `null-report.ts`'s `verifySourceGraphMatchesManifest`, but that function
- * is specific to the null study's `NullReportArgs`/single source graph, not
- * reused here). Skips a graph key `raw.graphs` doesn't have -- `buildArtifact`
- * already gives the clearer "missing biological/rewiredSeed0" error for that.
- */
 /**
  * Defense in depth: `pairedStats` throws if a lesioned/baseline pair has
  * mismatched *lengths*, but says nothing about whether they are actually
@@ -721,7 +718,7 @@ const requireOutBesideManifest = (outPath: string, manifestPath: string): void =
  * its own output -- this only protects a file that reached this point some
  * other way.
  */
-const verifyRawSeedsConsistent = (raw: Readonly<AtlasEvaluationRaw>): void => {
+export const verifyRawSeedsConsistent = (raw: Readonly<AtlasEvaluationRaw>): void => {
   const expected = Array.from({ length: raw.seeds.count }, (_, i) => raw.seeds.start + i);
   const sameSeeds = (seeds: readonly number[]): boolean =>
     seeds.length === expected.length && seeds.every((seed, i) => seed === expected[i]);
@@ -744,11 +741,37 @@ const verifyRawSeedsConsistent = (raw: Readonly<AtlasEvaluationRaw>): void => {
   }
 };
 
-const verifyRawGraphsMatchManifest = (manifestPath: string, raw: Readonly<AtlasEvaluationRaw>): void => {
+/**
+ * `atlas-evaluate.ts` verifies every graph file's sha256 against the
+ * manifest before scoring anything, but `atlas-raw.json` is a plain file on
+ * disk that can go stale (the manifest recompiled or re-rewired since that
+ * run) or be hand-edited/merged. Without this check, a stale raw evaluation
+ * would publish an artifact whose `graphSha256` no longer matches the
+ * manifest it was just written next to -- caught only later, in the
+ * browser, by WP3's loader (a dual-review finding: this mirrors
+ * `null-report.ts`'s `verifySourceGraphMatchesManifest`, but that function
+ * is specific to the null study's `NullReportArgs`/single source graph, not
+ * reused here). Skips a graph key `raw.graphs` doesn't have -- `buildArtifact`
+ * already gives the clearer "missing biological/rewiredSeed0" error for that.
+ */
+export const verifyRawGraphsMatchManifest = (manifestPath: string, raw: Readonly<AtlasEvaluationRaw>): void => {
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
+    readonly neuronCount?: number;
     readonly binarySha256?: string;
     readonly rewiredArms?: { readonly seed0?: { readonly binarySha256?: string } };
   };
+  // `rawShippedGradeProblems` below compares neuron coverage against
+  // `raw.neuronCount` rather than a hardcoded constant (a dual-review
+  // round-1 suggestion this round-2 pass adopts) -- that comparison is only
+  // meaningful if `raw.neuronCount` itself is checked against the live
+  // manifest here, or a hand-edited raw file could claim any neuronCount
+  // and trivially "cover" it, defeating the guard entirely.
+  if (raw.neuronCount !== manifest.neuronCount) {
+    throw new Error(
+      `atlas-report: raw evaluation's neuronCount (${raw.neuronCount}) does not match ${manifestPath} ` +
+        `(${String(manifest.neuronCount)}) -- stale atlas-raw.json?`
+    );
+  }
   const expected: Record<AtlasGraphKey, string | undefined> = {
     biological: manifest.binarySha256,
     rewiredSeed0: manifest.rewiredArms?.seed0?.binarySha256
@@ -772,8 +795,39 @@ export interface RunAtlasReportResult {
   readonly artifact: LesionAtlasArtifact;
 }
 
+/**
+ * The minimum shape every check below assumes (`raw.seeds.start`/`.count`
+ * in particular -- `verifyRawSeedsConsistent`/`rawShippedGradeProblems`
+ * both read them directly with no shape check of their own). A malformed
+ * or wrong-version `atlas-raw.json` would otherwise fail with a raw
+ * `TypeError: Cannot read properties of undefined` from deep inside one of
+ * those checks instead of a clear, actionable message (a dual-review
+ * round-2 finding). `buildArtifact` has its own, later `raw.version !== 1`
+ * check for the same reason `null-report.ts`'s `buildArtifact` does --
+ * this one exists so every *earlier* check in `runAtlasReport` can assume
+ * this shape holds without re-checking it itself.
+ */
+export const validateRawShape = (rawPath: string, raw: Readonly<AtlasEvaluationRaw>): void => {
+  if (raw.version !== 1) {
+    throw new Error(`atlas-report: ${rawPath} has unsupported version ${String(raw.version)}, expected 1`);
+  }
+  if (
+    typeof raw.seeds !== 'object' ||
+    raw.seeds === null ||
+    !Number.isInteger(raw.seeds.start) ||
+    !Number.isInteger(raw.seeds.count) ||
+    raw.seeds.count <= 0
+  ) {
+    throw new Error(`atlas-report: ${rawPath} is missing a valid seeds.start/seeds.count`);
+  }
+  if (typeof raw.graphs !== 'object' || raw.graphs === null) {
+    throw new Error(`atlas-report: ${rawPath} is missing a graphs object`);
+  }
+};
+
 export const runAtlasReport = (args: Readonly<AtlasReportArgs>): RunAtlasReportResult => {
   const raw = JSON.parse(readFileSync(args.raw, 'utf8')) as AtlasEvaluationRaw;
+  validateRawShape(args.raw, raw);
   const runMeta = resolveRunMeta(args);
 
   // Every check in this block is cheap (file reads and field comparisons,
