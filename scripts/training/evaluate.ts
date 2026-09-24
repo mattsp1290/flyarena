@@ -186,6 +186,40 @@ const loadArmGraphs = (
   return { ...graphs, graphArtifactSha256, bundleSha256, bundleProvenance };
 };
 
+/**
+ * Throws unless `run` was trained at the same `substeps` this evaluation
+ * invocation is running episodes at. Shared by the regular `--runs` loop
+ * (called before the arm bundles are loaded, so a mismatch fails fast) and
+ * `--gpu-rerun-run` (`EvaluateArgs.gpuRerunRunDir`'s doc comment promises
+ * the "same `config.json`/`theta_final.npy` contract as `--runs`" — a
+ * rerun trained at a different substep count would otherwise be silently
+ * scored as if it were a like-for-like comparison).
+ */
+const validateRunSubsteps = (run: LoadedRun, expectedSubsteps: number): void => {
+  if (run.config.substeps !== expectedSubsteps) {
+    throw new Error(
+      `evaluate: ${run.dir}/config.json was trained at substeps=${run.config.substeps} but ` +
+        `evaluation is running at --substeps ${expectedSubsteps}; pass --substeps ${run.config.substeps} ` +
+        'or re-check which run this is.'
+    );
+  }
+};
+
+/**
+ * Throws when `run.config.armBundleSha256` (when recorded) disagrees with
+ * the arm-bundle revision actually loaded for `run.config.arm`. Shared by
+ * the regular `--runs` loop and `--gpu-rerun-run`, for the same reason as
+ * `validateRunSubsteps` above.
+ */
+const validateRunArmBundleSha256 = (run: LoadedRun, loadedArmBundleSha256: string | undefined): void => {
+  if (run.config.armBundleSha256 && loadedArmBundleSha256 && run.config.armBundleSha256 !== loadedArmBundleSha256) {
+    throw new Error(
+      `evaluate: ${run.dir}/config.json was trained against arm bundle sha256 ` +
+        `${run.config.armBundleSha256}, but the loaded "${run.config.arm}" bundle is ${loadedArmBundleSha256}`
+    );
+  }
+};
+
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
@@ -442,13 +476,7 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
       throw new Error(`evaluate: duplicate run for arm "${run.config.arm}" trainerSeed ${run.config.trainerSeed}`);
     }
     seenKeys.add(key);
-    if (run.config.substeps !== args.substeps) {
-      throw new Error(
-        `evaluate: ${run.dir}/config.json was trained at substeps=${run.config.substeps} but ` +
-          `evaluation is running at --substeps ${args.substeps}; pass --substeps ${run.config.substeps} ` +
-          'or re-check which run this is.'
-      );
-    }
+    validateRunSubsteps(run, args.substeps);
   }
 
   const neededArms = new Set(runs.map((run) => run.config.arm));
@@ -462,13 +490,7 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
     );
   }
   for (const run of runs) {
-    const loadedSha256 = armGraphs.bundleSha256[run.config.arm];
-    if (run.config.armBundleSha256 && loadedSha256 && run.config.armBundleSha256 !== loadedSha256) {
-      throw new Error(
-        `evaluate: ${run.dir}/config.json was trained against arm bundle sha256 ` +
-          `${run.config.armBundleSha256}, but the loaded "${run.config.arm}" bundle is ${loadedSha256}`
-      );
-    }
+    validateRunArmBundleSha256(run, armGraphs.bundleSha256[run.config.arm]);
   }
 
   const armNames = ARM_NAMES.filter((arm) => armGraphs[arm]);
@@ -789,6 +811,12 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
           `${rerunTrainerSeed}, but no matching run was passed via --runs to compare it against.`
       );
     }
+    // Same `config.json`/`theta_final.npy` contract as `--runs`
+    // (`EvaluateArgs.gpuRerunRunDir`'s doc comment) — validated the same
+    // way, via the shared helpers above, so a mis-trained/stale rerun can't
+    // be silently scored as if it were a like-for-like comparison.
+    validateRunSubsteps(rerunRun, args.substeps);
+    validateRunArmBundleSha256(rerunRun, armGraphs.bundleSha256[rerunArm]);
     if (rerunRun.config.D !== originalRun.config.D || rerunRun.config.H !== originalRun.config.H) {
       throw new Error(
         `evaluate: --gpu-rerun-run ${args.gpuRerunRunDir} has D=${rerunRun.config.D}/H=${rerunRun.config.H}, ` +

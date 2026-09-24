@@ -24,6 +24,8 @@ export interface TinyRunOptions {
   readonly substeps: number;
   readonly weightSeed: number;
   readonly includeEnv?: boolean;
+  /** Optional `RunConfig.armBundleSha256`, for tests exercising the arm-bundle-sha256 compatibility check. */
+  readonly armBundleSha256?: string;
   /**
    * Optional CEM-config fields (`RunConfig`'s optional properties), for
    * tests that exercise `evaluate.ts`'s manifest `training` block (the
@@ -47,7 +49,7 @@ export interface TinyRunOptions {
 }
 
 export const writeTinyRunDir = (options: Readonly<TinyRunOptions>): void => {
-  const { dir, arm, trainerSeed, D, H, substeps, weightSeed, includeEnv, cemConfig } = options;
+  const { dir, arm, trainerSeed, D, H, substeps, weightSeed, includeEnv, armBundleSha256, cemConfig } = options;
   mkdirSync(dir, { recursive: true });
 
   const parameterCount = readoutParameterCount(D, H);
@@ -58,7 +60,16 @@ export const writeTinyRunDir = (options: Readonly<TinyRunOptions>): void => {
   const theta = Float32Array.from({ length: parameterCount }, () => (random() * 2 - 1) * 0.3);
   writeNpyFloat32Array(resolve(dir, 'theta_final.npy'), theta);
 
-  const config: RunConfig = { arm, trainerSeed, D, H, parameterCount, substeps, ...cemConfig };
+  const config: RunConfig = {
+    arm,
+    trainerSeed,
+    D,
+    H,
+    parameterCount,
+    substeps,
+    ...(armBundleSha256 !== undefined ? { armBundleSha256 } : {}),
+    ...cemConfig
+  };
   writeFileSync(resolve(dir, 'config.json'), JSON.stringify(config));
 
   if (includeEnv) {

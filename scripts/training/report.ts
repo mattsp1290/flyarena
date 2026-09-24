@@ -175,10 +175,12 @@ const thousands = (n: number): string => n.toFixed(0).replace(/\B(?=(\d{3})+(?!\
  * reduce P to 128 before reducing G. Record the change in the manifest's CEM
  * config." Used only to detect and disclose a deviation from this default —
  * `renderMethod` never asserts *why* a given run's population differs beyond
- * this documented policy.
+ * this documented policy, and never hard-codes the reduced value: the
+ * disclosure sentence always names the *actual* recorded `population`, not
+ * a literal `128`, so it can't become self-contradictory if a future run
+ * reduces to some other value.
  */
 const PLAN_DEFAULT_CEM_POPULATION = 256;
-const CALIBRATION_REDUCED_CEM_POPULATION = 128;
 
 const renderMethod = (report: EvaluationReport): string => {
   const { evaluation, graph } = report;
@@ -213,7 +215,7 @@ const renderMethod = (report: EvaluationReport): string => {
       '',
       `CEM population for the shipped replicas was ${population}, reduced from the plan's default of ` +
         `${PLAN_DEFAULT_CEM_POPULATION}; per \`05-production-run.md\` step 3, population is reduced to ` +
-        `${CALIBRATION_REDUCED_CEM_POPULATION} when a calibration run projects total wall time across all arms/` +
+        `${population} when a calibration run projects total wall time across all arms/` +
         'replicas exceeding a 12-hour budget (see the manifest `training` block for the full CEM config).'
     );
   }

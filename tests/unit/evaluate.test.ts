@@ -301,6 +301,87 @@ describe('runEvaluate (tiny fixture, trace graph)', () => {
     }
   });
 
+  // Mirrors "throws when a run was trained at a different substep count than
+  // --substeps" (the regular --runs loop, below) but for --gpu-rerun-run:
+  // `EvaluateArgs.gpuRerunRunDir`'s doc comment promises the "same
+  // config.json/theta_final.npy contract as --runs", which must include the
+  // substeps check, not just the arm/trainerSeed and D/H checks (thermo-fix
+  // review I1).
+  it('throws when --gpu-rerun-run was trained at a different substep count than --substeps', () => {
+    const { root, armsDir, runDirs } = buildFixture();
+    try {
+      const graph = createTraceGraph();
+      const D = outputNeuronIndices(graph).length;
+      const gpuRerunDir = join(root, 'runs', 'biological-101-gpurerun-substeps-mismatch');
+      writeTinyRunDir({
+        dir: gpuRerunDir,
+        arm: 'biological',
+        trainerSeed: 101, // matches buildFixture's biological/101 run
+        D,
+        H: 4,
+        substeps: TRACE_SUBSTEPS + 95, // deliberately different from baseArgs' substeps
+        weightSeed: 999
+      });
+      const outDir = join(root, 'out-gpu-rerun-substeps-mismatch');
+      const args: EvaluateArgs = { ...baseArgs(armsDir, runDirs, outDir), gpuRerunRunDir: gpuRerunDir };
+      expect(() => runEvaluate(args)).toThrow(/substeps/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // Same review finding (I1): the --gpu-rerun-run block must also validate
+  // armBundleSha256 against the loaded arm bundle, exactly like the regular
+  // --runs loop does.
+  it('throws when --gpu-rerun-run was trained against a different arm bundle sha256 than the loaded bundle', () => {
+    const { root, armsDir, runDirs } = buildFixture();
+    try {
+      const graph = createTraceGraph();
+      const D = outputNeuronIndices(graph).length;
+      const gpuRerunDir = join(root, 'runs', 'biological-101-gpurerun-bundle-mismatch');
+      writeTinyRunDir({
+        dir: gpuRerunDir,
+        arm: 'biological',
+        trainerSeed: 101, // matches buildFixture's biological/101 run
+        D,
+        H: 4,
+        substeps: TRACE_SUBSTEPS,
+        weightSeed: 999,
+        armBundleSha256: 'not-the-real-loaded-arm-bundle-sha256'
+      });
+      const outDir = join(root, 'out-gpu-rerun-bundle-mismatch');
+      const args: EvaluateArgs = { ...baseArgs(armsDir, runDirs, outDir), gpuRerunRunDir: gpuRerunDir };
+      expect(() => runEvaluate(args)).toThrow(/arm bundle sha256/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // 02-suggestions.md S1: the D/H mismatch throw for --gpu-rerun-run had no
+  // test coverage.
+  it('throws when --gpu-rerun-run has a different H than the original run', () => {
+    const { root, armsDir, runDirs } = buildFixture();
+    try {
+      const graph = createTraceGraph();
+      const D = outputNeuronIndices(graph).length;
+      const gpuRerunDir = join(root, 'runs', 'biological-101-gpurerun-h-mismatch');
+      writeTinyRunDir({
+        dir: gpuRerunDir,
+        arm: 'biological',
+        trainerSeed: 101, // matches buildFixture's biological/101 run
+        D,
+        H: 5, // buildFixture's biological/101 run was trained at H=4
+        substeps: TRACE_SUBSTEPS,
+        weightSeed: 999
+      });
+      const outDir = join(root, 'out-gpu-rerun-h-mismatch');
+      const args: EvaluateArgs = { ...baseArgs(armsDir, runDirs, outDir), gpuRerunRunDir: gpuRerunDir };
+      expect(() => runEvaluate(args)).toThrow(/does not match the original run/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('throws when --parity-graph-sha256 does not match the graph actually being evaluated', () => {
     const { root, armsDir, runDirs } = buildFixture();
     try {
