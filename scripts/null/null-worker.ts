@@ -111,12 +111,21 @@ const runTask = (task: NullWorkerTask): readonly NullSeedResult[] => {
       left: { decoder: 'authored', graph },
       right: { decoder: 'parked' }
     });
-    return {
-      seed,
-      movementScore: result.left.movementScore,
-      foodPickups: result.left.foodPickups,
-      hazardContacts: result.left.hazardContacts
-    };
+    const { movementScore, foodPickups, hazardContacts } = result.left;
+    // A NaN/Infinity score would silently become `null` under
+    // `JSON.stringify` and then `0` wherever `authored.json` is later
+    // summed (`conditionStats`'s sums, the bootstrap resample sums, even
+    // `Array.prototype.sort`'s comparator) — shifting a graph's mean, CI,
+    // and null rank with no error anywhere downstream. Fail here instead,
+    // where the graph and seed that produced it are still known (a
+    // dual-review finding).
+    if (![movementScore, foodPickups, hazardContacts].every(Number.isFinite)) {
+      throw new Error(
+        `null-worker: ${task.graphId} seed ${seed} produced a non-finite score ` +
+          `(movementScore=${movementScore}, foodPickups=${foodPickups}, hazardContacts=${hazardContacts})`
+      );
+    }
+    return { seed, movementScore, foodPickups, hazardContacts };
   });
 };
 

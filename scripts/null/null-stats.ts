@@ -123,16 +123,26 @@ export interface Histogram {
  * `binCount` equal-width bins spanning `[min(values), max(values)]`
  * (the plan's "30 equal-width histogram bins over
  * `[min(N ∪ {bio, disc}), max(N ∪ {bio, disc})]`" — the caller passes that
- * union in). A single-point span (every value identical) puts every value
- * in the first bin rather than dividing by zero.
+ * union in as `range`, but `values` (what gets *counted*) should normally be
+ * `N` alone: a dual-review pass caught that an earlier version counted the
+ * union too, so the published "null distribution of 500 rewired graphs"
+ * histogram silently included the biological and disconnected scores as
+ * extra bars (`sum(counts) === 502`, not 500) — see `null-report.ts`'s
+ * `buildArtifact` for how `range` and `values` are now passed separately.
+ * A single-point span (every value identical) puts every value in the
+ * first bin rather than dividing by zero.
  */
-export const buildHistogram = (values: readonly number[], binCount = DEFAULT_HISTOGRAM_BINS): Histogram => {
+export const buildHistogram = (
+  values: readonly number[],
+  binCount = DEFAULT_HISTOGRAM_BINS,
+  range?: readonly [number, number]
+): Histogram => {
   if (values.length === 0) throw new Error('null-stats: buildHistogram requires at least one value');
   if (!Number.isInteger(binCount) || binCount <= 0) {
     throw new Error(`null-stats: binCount must be a positive integer, got ${binCount}`);
   }
-  const min = Math.min(...values);
-  const max = Math.max(...values);
+  const [min, max] = range ?? [Math.min(...values), Math.max(...values)];
+  if (!(min <= max)) throw new Error(`null-stats: range [${min}, ${max}] is not a valid ascending range`);
   const span = max - min;
   const edges = Array.from({ length: binCount + 1 }, (_, i) => min + (span * i) / binCount);
   const counts = new Array<number>(binCount).fill(0);

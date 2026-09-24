@@ -7,10 +7,14 @@ import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { encodeGraphBinary } from '../../src/lib/connectome/format';
 import { createTraceGraph } from '../fixtures/trace-graph';
 import { createFixtureRewiredTraceGraph } from '../fixtures/trace-graph-rewire';
-import { parseNullEvaluateArgs } from '../../scripts/null/null-evaluate';
+import { parseNullEvaluateArgs, readRewireIndex, runShardedEvaluation } from '../../scripts/null/null-evaluate';
+import type { NullWorkerTask } from '../../scripts/null/null-worker';
 
 /**
  * Coverage for `scripts/null/null-evaluate.ts`. Two halves:
@@ -35,8 +39,8 @@ describe('parseNullEvaluateArgs', () => {
     expect(args.heldOutCount).toBe(100);
     expect(args.ticks).toBe(1800);
     expect(args.shards).toBe(18);
-    expect(args.rewiredIndex).toBe('i.json');
-    expect(args.graphsDir).toBe('g');
+    expect(args.rewiredIndex).toBe(resolve(process.cwd(), 'i.json'));
+    expect(args.graphsDir).toBe(resolve(process.cwd(), 'g'));
   });
 
   it('throws without --rewired-index', () => {
@@ -68,6 +72,18 @@ describe('parseNullEvaluateArgs', () => {
     expect(args.heldOutCount).toBe(3);
     expect(args.ticks).toBe(20);
     expect(args.shards).toBe(2);
+  });
+
+  it('rejects --graph without --biological', () => {
+    expect(() =>
+      parseNullEvaluateArgs(['--graph', 'x.bin.gz', '--rewired-index', 'i.json', '--graphs-dir', 'g'])
+    ).toThrow(/--graph requires --biological/);
+  });
+
+  it('rejects an unknown flag', () => {
+    expect(() => parseNullEvaluateArgs(['--rewired-index', 'i.json', '--graphs-dir', 'g', '--bogus'])).toThrow(
+      /Unknown argument/
+    );
   });
 });
 
@@ -214,5 +230,133 @@ describe('null-evaluate CLI: shard determinism (trace-graph fixture)', () => {
     );
     expect(result.status).not.toBe(0);
     expect(result.stderr).toMatch(/failed verification|gzip sha256/);
+  });
+
+  it('rejects a rewired file with a flipped byte (same length, wrong gzip sha256)', () => {
+    // Appending a byte (the case above) only ever reaches the gzipBytes
+    // length check in verifyRewiredFiles; flipping a byte in place keeps
+    // the length the same and actually exercises the sha256 comparison.
+    const tamperedDir = join(root, 'graphs-tampered-flip');
+    mkdirSync(tamperedDir, { recursive: true });
+    cpSync(graphsDir, tamperedDir, { recursive: true });
+    const victim = join(tamperedDir, 'trace-graph-rewired-seed1.bin.gz');
+    const bytes = readFileSync(victim);
+    bytes[bytes.length - 5] ^= 0xff;
+    writeFileSync(victim, bytes);
+
+    const out = join(root, 'authored-tampered-flip.json');
+    const result = spawnSync(
+      process.execPath,
+      [
+        '--import',
+        'tsx',
+        'scripts/null/null-evaluate.ts',
+        '--rewired-index',
+        indexPath,
+        '--graphs-dir',
+        tamperedDir,
+        '--held-out-count',
+        '1',
+        '--ticks',
+        String(TICKS),
+        '--shards',
+        '1',
+        '--out',
+        out
+      ],
+      { encoding: 'utf8', timeout: 60_000 }
+    );
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/gzip sha256/);
+  });
+});
+
+describe('readRewireIndex: duplicate/malformed seed rejection', () => {
+  it('rejects a duplicate rewiring seed', () => {
+    const root = mkdtempSync(join(tmpdir(), 'null-evaluate-dup-seed-'));
+    const indexPath = join(root, 'index.json');
+    const seedEntry = {
+      seed: 0,
+      artifact: 'x.bin.gz',
+      binarySha256: 'a'.repeat(64),
+      binaryBytes: 1,
+      gzipSha256: 'b'.repeat(64),
+      gzipBytes: 1,
+      stats: { acceptedSwaps: 1, attempts: 1 }
+    };
+    writeFileSync(
+      indexPath,
+      JSON.stringify({
+        sourceArtifact: 'src.bin.gz',
+        sourceSha256: 'c'.repeat(64),
+        rewireSourceSha256: 'd'.repeat(64),
+        seeds: [seedEntry, { ...seedEntry }]
+      })
+    );
+    expect(() => readRewireIndex(indexPath)).toThrow(/more than once/);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('rejects a non-integer seed', () => {
+    const root = mkdtempSync(join(tmpdir(), 'null-evaluate-bad-seed-'));
+    const indexPath = join(root, 'index.json');
+    writeFileSync(
+      indexPath,
+      JSON.stringify({
+        sourceArtifact: 'src.bin.gz',
+        sourceSha256: 'c'.repeat(64),
+        rewireSourceSha256: 'd'.repeat(64),
+        seeds: [
+          {
+            seed: 1.5,
+            artifact: 'x.bin.gz',
+            binarySha256: 'a'.repeat(64),
+            binaryBytes: 1,
+            gzipSha256: 'b'.repeat(64),
+            gzipBytes: 1,
+            stats: { acceptedSwaps: 1, attempts: 1 }
+          }
+        ]
+      })
+    );
+    expect(() => readRewireIndex(indexPath)).toThrow(/malformed seed entry/);
+    rmSync(root, { recursive: true, force: true });
+  });
+});
+
+describe('runShardedEvaluation: failure/abort paths (stub worker)', () => {
+  const stubWorkerPath = resolve(dirname(fileURLToPath(import.meta.url)), '../fixtures/null-stub-worker.mjs');
+
+  /** `delayMs` is a stub-worker-only extension of the wire protocol, not part of the real `NullWorkerTask`. */
+  const task = (graphId: string, delayMs = 0): NullWorkerTask & { delayMs: number } => ({
+    graphId,
+    mode: 'rewired',
+    path: 'unused',
+    expectedSha256: 'unused',
+    heldOutSeeds: [],
+    ticks: 0,
+    delayMs
+  });
+
+  it('collects every result regardless of which shard finishes which task first', async () => {
+    // Reverse-order completion: task 0 is slowest, task 4 is fastest.
+    const tasks = [0, 1, 2, 3, 4].map((i) => task(`t${i}`, (5 - i) * 15));
+    const results = await runShardedEvaluation(tasks, 5, stubWorkerPath);
+    expect([...results.keys()].sort()).toEqual(['t0', 't1', 't2', 't3', 't4']);
+  });
+
+  it('a task-level error aborts the whole run quickly, not after the full queue drains', async () => {
+    const tasks = [task('err'), ...Array.from({ length: 8 }, (_, i) => task(`t${i}`, 300))];
+    const started = Date.now();
+    await expect(runShardedEvaluation(tasks, 2, stubWorkerPath)).rejects.toThrow(/stub-induced failure/);
+    const elapsedMs = Date.now() - started;
+    // If the other shard kept draining its half of the queue (4 tasks x 300ms
+    // each), this would take >= 1200ms. Aborting promptly keeps it well under.
+    expect(elapsedMs).toBeLessThan(900);
+  });
+
+  it('a worker killed by a signal is reported as a failure, not treated as a clean exit', async () => {
+    const tasks = [task('kill'), task('t1', 50), task('t2', 50)];
+    await expect(runShardedEvaluation(tasks, 3, stubWorkerPath)).rejects.toThrow(/exited unexpectedly/);
   });
 });

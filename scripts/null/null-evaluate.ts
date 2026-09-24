@@ -19,10 +19,13 @@ import type { NullSeedResult, NullTaskMode, NullWorkerMessage, NullWorkerTask } 
  * This script owns everything the plan calls out for `null-evaluate.ts`:
  * building the task list (biological, disconnected, one task per rewired
  * seed), verifying every rewired file's sha256 against `index.json` before
- * any scoring starts, dispatching tasks to shards, and writing results
- * **sorted by graph id** so the output is independent of shard count and
- * completion timing (`tests/unit/null-evaluate.test.ts` proves `--shards 1`
- * and `--shards 3` are byte-identical). Statistics (mean/CI/percentile/
+ * any scoring starts, dispatching tasks to shards, and writing results in
+ * **canonical task order** (biological, disconnected, then rewired sorted
+ * by numeric seed — never a sort over collected results or over `graphId`
+ * strings, which would put `rewired-10` before `rewired-2`) so the output
+ * is independent of shard count and completion timing
+ * (`tests/unit/null-evaluate.test.ts` proves `--shards 1` and `--shards 3`
+ * are byte-identical). Statistics (mean/CI/percentile/
  * histogram) are deliberately not computed here — they live in
  * `null-stats.ts`/`null-report.ts`, which run cheaply against this script's
  * raw-per-seed `authored.json` output without re-simulating anything.
@@ -82,17 +85,31 @@ export const readRewireIndex = (path: string): RewireIndex => {
   if (!Array.isArray(parsed.seeds) || parsed.seeds.length === 0) {
     throw new Error(`null-evaluate: ${path} has no seeds`);
   }
+  const seenSeeds = new Set<number>();
   for (const entry of parsed.seeds) {
     if (
       typeof entry.seed !== 'number' ||
+      !Number.isInteger(entry.seed) ||
+      entry.seed < 0 ||
       typeof entry.artifact !== 'string' ||
       typeof entry.binarySha256 !== 'string' ||
       typeof entry.gzipSha256 !== 'string' ||
+      typeof entry.gzipBytes !== 'number' ||
       typeof entry.stats?.acceptedSwaps !== 'number' ||
       typeof entry.stats?.attempts !== 'number'
     ) {
       throw new Error(`null-evaluate: ${path} has a malformed seed entry: ${JSON.stringify(entry)}`);
     }
+    // A duplicate seed would create two tasks with the same graphId
+    // (`rewired-${seed}`); which result "wins" then depends on completion
+    // order, which is exactly what the shard byte-identity guarantee
+    // promises can never happen — reject it here instead (a dual-review
+    // finding; `rewire_batch.py` itself can't produce this, since it
+    // iterates a `range`, but a hand-merged or hand-edited index.json can).
+    if (seenSeeds.has(entry.seed)) {
+      throw new Error(`null-evaluate: ${path} lists rewiring seed ${entry.seed} more than once`);
+    }
+    seenSeeds.add(entry.seed);
   }
   return parsed as RewireIndex;
 };
@@ -174,13 +191,13 @@ export const parseNullEvaluateArgs = (argv: readonly string[]): NullEvaluateArgs
       biological = true;
       index += 1;
     } else if (flag === '--graph') {
-      graph = requireValue(flag, argv[index + 1]);
+      graph = resolve(process.cwd(), requireValue(flag, argv[index + 1]));
       index += 2;
     } else if (flag === '--rewired-index') {
-      rewiredIndex = requireValue(flag, argv[index + 1]);
+      rewiredIndex = resolve(process.cwd(), requireValue(flag, argv[index + 1]));
       index += 2;
     } else if (flag === '--graphs-dir') {
-      graphsDir = requireValue(flag, argv[index + 1]);
+      graphsDir = resolve(process.cwd(), requireValue(flag, argv[index + 1]));
       index += 2;
     } else if (flag === '--held-out-start') {
       heldOutStart = requireNonNegativeInt(flag, argv[index + 1]);
@@ -204,6 +221,10 @@ export const parseNullEvaluateArgs = (argv: readonly string[]): NullEvaluateArgs
 
   if (!rewiredIndex) throw new Error('--rewired-index is required');
   if (!graphsDir) throw new Error('--graphs-dir is required');
+  // `graph` is only ever read when `biological` is set (see `runNullEvaluate`)
+  // — silently accepting it otherwise would let an operator believe an
+  // override took effect when it didn't (a dual-review finding).
+  if (graph !== undefined && !biological) throw new Error('--graph requires --biological');
 
   return { biological, graph, rewiredIndex, graphsDir, heldOutStart, heldOutCount, ticks, shards, out };
 };
@@ -244,6 +265,9 @@ export const buildTasks = (
 // Sharded execution
 // ---------------------------------------------------------------------------
 
+/** Node's `--inspect*` flags carry a fixed debug port; forking `shardCount` children with all of them inheriting the same port would collide with `EADDRINUSE` at startup instead of doing any real work. */
+const execArgvForChildren = (): string[] => process.execArgv.filter((flag) => !flag.startsWith('--inspect'));
+
 /**
  * Fork `shardCount` copies of `null-worker.ts`, hand each one tasks one at
  * a time (a worker that finishes gets the next queued task, so a slow
@@ -252,6 +276,18 @@ export const buildTasks = (
  * which shard executes which task or in what order: the caller reassembles
  * output by iterating `tasks` (the canonical, seed-sorted order), not by
  * collection order.
+ *
+ * Failure handling (a dual-review pass caught two real gaps in an earlier
+ * version): the moment *any* task reports an error, or any child exits
+ * abnormally (a non-zero code, or a signal this function didn't itself ask
+ * for — an OOM kill, an external `kill`, a native crash — previously
+ * mistaken for a clean exit whenever `code === null`), every other worker
+ * is killed immediately (`abortAll`) rather than being left to keep
+ * draining the queue until `Promise.all` happens to settle. Every child is
+ * tracked in `children` and swept in a `finally`, so no worker outlives
+ * this function on any exit path. `errors` (not promise rejection) is the
+ * single source of truth for failure, so a killed sibling's own `exit`
+ * event never itself throws — only the thing that caused the abort does.
  */
 export const runShardedEvaluation = async (
   tasks: readonly NullWorkerTask[],
@@ -260,57 +296,109 @@ export const runShardedEvaluation = async (
 ): Promise<Map<string, readonly NullSeedResult[]>> => {
   const results = new Map<string, readonly NullSeedResult[]>();
   const errors: string[] = [];
+  const children = new Set<ReturnType<typeof fork>>();
   let nextTaskIndex = 0;
+  let aborted = false;
+
+  const abortAll = (): void => {
+    aborted = true;
+    for (const child of children) child.kill();
+  };
 
   const runWorker = (): Promise<void> =>
-    new Promise((resolveWorker, rejectWorker) => {
-      const child = fork(workerPath, [], { execArgv: process.execArgv });
+    new Promise((resolveWorker) => {
+      const child = fork(workerPath, [], { execArgv: execArgvForChildren() });
+      children.add(child);
       let settled = false;
+      let inFlight: NullWorkerTask | undefined;
 
-      const finish = (fn: () => void): void => {
+      const finish = (): void => {
         if (settled) return;
         settled = true;
-        fn();
+        children.delete(child);
+        resolveWorker();
       };
 
       const assignNext = (): void => {
-        if (nextTaskIndex >= tasks.length) {
+        if (aborted || nextTaskIndex >= tasks.length) {
           child.disconnect();
           return;
         }
         const task = tasks[nextTaskIndex];
         nextTaskIndex += 1;
+        inFlight = task;
         child.send(task);
       };
 
       child.on('message', (message: NullWorkerMessage) => {
+        const expectedTask = inFlight;
+        inFlight = undefined;
+        // Self-checking protocol: a worker replying about a task this
+        // parent never sent it (or replying with a seed list that doesn't
+        // match what it was asked to score) indicates a wire-protocol bug,
+        // not a legitimate result — treat it as a failure rather than
+        // silently trusting whatever came back over IPC.
+        if (!expectedTask || message.graphId !== expectedTask.graphId) {
+          errors.push(
+            `null-evaluate: received a message for "${message.graphId}" but no matching task was in flight ` +
+              `(expected "${expectedTask?.graphId ?? 'none'}")`
+          );
+          abortAll();
+          return;
+        }
         if (message.type === 'result') {
-          results.set(message.graphId, message.results);
+          const seedsMatch =
+            message.results.length === expectedTask.heldOutSeeds.length &&
+            message.results.every((result, i) => result.seed === expectedTask.heldOutSeeds[i]);
+          if (!seedsMatch) {
+            errors.push(`${message.graphId}: result shape does not match the task's held-out seeds`);
+            abortAll();
+            return;
+          }
+          if (!results.has(message.graphId)) results.set(message.graphId, message.results);
           assignNext();
         } else {
           errors.push(`${message.graphId}: ${message.message}`);
-          child.kill();
+          abortAll();
         }
       });
-      child.on('error', (error) => finish(() => rejectWorker(error)));
+      child.on('error', (error) => {
+        errors.push(`worker process error: ${error.message}`);
+        abortAll();
+        finish();
+      });
       child.on('exit', (code, signal) => {
-        finish(() => {
-          if (code !== 0 && code !== null) {
-            rejectWorker(new Error(`null-evaluate: worker exited with code ${code} (signal ${signal})`));
-          } else {
-            resolveWorker();
-          }
-        });
+        const cleanExit = code === 0 || (code === null && aborted);
+        if (!cleanExit) {
+          errors.push(
+            `worker exited unexpectedly (code ${String(code)}, signal ${String(signal)})` +
+              (inFlight ? ` while running "${inFlight.graphId}"` : '')
+          );
+          abortAll();
+        }
+        finish();
       });
 
       assignNext();
     });
 
   const workerCount = Math.max(1, Math.min(shardCount, tasks.length));
-  await Promise.all(Array.from({ length: workerCount }, runWorker));
+  try {
+    await Promise.all(Array.from({ length: workerCount }, runWorker));
+  } finally {
+    // Safety net: `abortAll` already kills every tracked child as soon as a
+    // failure is detected, but this catches anything still alive on any
+    // other exit path (including a successful run, where every child has
+    // already disconnected and is exiting on its own).
+    for (const child of children) child.kill();
+  }
 
   if (errors.length > 0) {
     throw new Error(`null-evaluate: ${errors.length} task(s) failed:\n${errors.join('\n')}`);
+  }
+  const missing = tasks.filter((task) => !results.has(task.graphId)).map((task) => task.graphId);
+  if (missing.length > 0) {
+    throw new Error(`null-evaluate: no result for ${missing.length} task(s): ${missing.join(', ')}`);
   }
   return results;
 };
@@ -404,7 +492,12 @@ export const assembleRaw = (
 // main
 // ---------------------------------------------------------------------------
 
-export const runNullEvaluate = async (args: Readonly<NullEvaluateArgs>): Promise<{ out: string; taskCount: number; elapsedMs: number }> => {
+/** `<out>.run.json` — see `null-report.ts`'s `RunMeta` doc comment for why this is a separate file from `authored.json` itself. */
+const runMetaPathFor = (outPath: string): string => outPath.replace(/\.json$/, '.run.json');
+
+export const runNullEvaluate = async (
+  args: Readonly<NullEvaluateArgs>
+): Promise<{ out: string; runMetaOut: string; taskCount: number; elapsedMs: number }> => {
   const index = readRewireIndex(args.rewiredIndex);
   verifyRewiredFiles(index, args.graphsDir);
 
@@ -417,24 +510,32 @@ export const runNullEvaluate = async (args: Readonly<NullEvaluateArgs>): Promise
   const started = performance.now();
   const results = await runShardedEvaluation(tasks, args.shards, workerPath);
   const elapsedMs = performance.now() - started;
+  const perEpisodeMs = elapsedMs / (tasks.length * args.heldOutCount);
 
   const raw = assembleRaw(index, args, results);
   mkdirSync(dirname(args.out), { recursive: true });
   writeFileSync(args.out, JSON.stringify(raw));
 
-  return { out: args.out, taskCount: tasks.length, elapsedMs };
+  // Operational metadata `authored.json` deliberately excludes (see
+  // `NullEvaluationRaw`'s doc comment) — `null-report.ts` reads this
+  // sidecar for its published `shards`/timing fields.
+  const runMetaOut = runMetaPathFor(args.out);
+  writeFileSync(runMetaOut, `${JSON.stringify({ shards: args.shards, elapsedMs, perEpisodeMs }, null, 2)}\n`);
+
+  return { out: args.out, runMetaOut, taskCount: tasks.length, elapsedMs };
 };
 
 const main = async (): Promise<void> => {
   try {
     const args = parseNullEvaluateArgs(process.argv.slice(2));
-    const { out, taskCount, elapsedMs } = await runNullEvaluate(args);
+    const { out, runMetaOut, taskCount, elapsedMs } = await runNullEvaluate(args);
     const totalEpisodes = taskCount * args.heldOutCount;
     const perEpisodeMs = elapsedMs / totalEpisodes;
     // eslint-disable-next-line no-console -- CLI tool: this is its user-facing output.
     console.log(
-      `null-evaluate: wrote ${out} (${taskCount} graphs x ${args.heldOutCount} seeds = ${totalEpisodes} episodes) ` +
-        `in ${(elapsedMs / 1000).toFixed(1)}s (${perEpisodeMs.toFixed(1)} ms/episode, ${args.shards} shards)`
+      `null-evaluate: wrote ${out} and ${runMetaOut} (${taskCount} graphs x ${args.heldOutCount} seeds = ` +
+        `${totalEpisodes} episodes) in ${(elapsedMs / 1000).toFixed(1)}s (${perEpisodeMs.toFixed(1)} ms/episode, ` +
+        `${args.shards} shards)`
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

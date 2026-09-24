@@ -1,5 +1,5 @@
-import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -36,17 +36,42 @@ const repoRoot = resolve(here, '../..');
 
 const DEFAULT_AUTHORED = resolve(repoRoot, 'training/runs/null/authored.json');
 const DEFAULT_TRAINED = resolve(repoRoot, 'training/runs/null/trained.json');
-const DEFAULT_OUT = resolve(repoRoot, 'public/data/rewiring-null-v1.json');
-const DEFAULT_REPORT_MD = resolve(repoRoot, 'docs/rewiring-null-report.md');
-const DEFAULT_MANIFEST = resolve(repoRoot, 'public/data/malecns-arena-v1.manifest.json');
+/** Exported so tests can exercise `guardShippedDefault`'s exact-path match without duplicating this resolution logic. */
+export const DEFAULT_OUT = resolve(repoRoot, 'public/data/rewiring-null-v1.json');
+export const DEFAULT_REPORT_MD = resolve(repoRoot, 'docs/rewiring-null-report.md');
+export const DEFAULT_MANIFEST = resolve(repoRoot, 'public/data/malecns-arena-v1.manifest.json');
 
 /** 'N','U','L','L' as a fixed default seed; arbitrary but stable across runs, matching `evaluate.ts`'s `DEFAULT_BOOTSTRAP_SEED` convention. */
 const DEFAULT_BOOTSTRAP_SEED = 0x4e554c4c;
 const DEFAULT_BOOTSTRAP_RESAMPLES = 10000;
-/** Matches `null-evaluate.ts`'s own `DEFAULT_SHARDS` — the plan's "Default 18 (leaves 2 cores)" implementer decision. */
-const DEFAULT_SHARDS = 18;
+
+/** This study's committed methodology (the plan's "500 rewired graphs"): the floor below which `--out`/`--report-md`/`--manifest` refuse to write to their default (shipped) paths, so a dev/fixture/partial run can never silently clobber the real published artifacts. */
+const MIN_REWIRED_FOR_SHIPPED_DEFAULT = 500;
 
 const sha256Hex = (data: string): string => createHash('sha256').update(data, 'utf8').digest('hex');
+
+/**
+ * Write `contents` to `path` via a same-directory temp file + `renameSync`
+ * (POSIX rename is atomic), so a process killed mid-write leaves either the
+ * previous file or nothing — never a truncated one. Matches
+ * `scripts/data/fsutil.py`'s `atomic_write_text` convention, which
+ * `positions.py`/`rewire_batch.py` already use for the files this script's
+ * output sits alongside.
+ */
+const atomicWriteFileSync = (path: string, contents: string): void => {
+  const tmpPath = resolve(dirname(path), `.${basename(path)}.${randomBytes(6).toString('hex')}.tmp`);
+  try {
+    writeFileSync(tmpPath, contents);
+    renameSync(tmpPath, path);
+  } catch (error) {
+    try {
+      unlinkSync(tmpPath);
+    } catch {
+      // tmpPath was never created, or was already cleaned up — nothing more to do.
+    }
+    throw error;
+  }
+};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -62,13 +87,13 @@ export interface NullReportArgs {
   readonly bootstrapResamples: number;
   readonly histogramBins: number;
   /**
-   * Provenance only, for the published artifact's `shards` field — the
-   * number of shards actually used for the real evaluation run. Not read
-   * from `authored.json`: see that file's `NullEvaluationRaw` doc comment
-   * for why shard count deliberately isn't part of the deterministic raw
-   * output.
+   * Explicit override for the published artifact's `shards` field. Left
+   * `undefined` (the default — no flag passed), `resolveRunMeta` reads it
+   * from `null-evaluate.ts`'s `<authored>.run.json` sidecar instead, so the
+   * published value reflects what the real run actually used rather than a
+   * guessed default. See that function and `RunMeta`'s doc comment.
    */
-  readonly shards: number;
+  readonly shards?: number;
 }
 
 export const parseNullReportArgs = (argv: readonly string[]): NullReportArgs => {
@@ -80,7 +105,7 @@ export const parseNullReportArgs = (argv: readonly string[]): NullReportArgs => 
   let bootstrapSeed = DEFAULT_BOOTSTRAP_SEED;
   let bootstrapResamples = DEFAULT_BOOTSTRAP_RESAMPLES;
   let histogramBins = DEFAULT_HISTOGRAM_BINS;
-  let shards = DEFAULT_SHARDS;
+  let shards: number | undefined;
 
   let index = 0;
   while (index < argv.length) {
@@ -118,6 +143,53 @@ export const parseNullReportArgs = (argv: readonly string[]): NullReportArgs => 
   }
 
   return { authored, trained, out, reportMd, manifest, bootstrapSeed, bootstrapResamples, histogramBins, shards };
+};
+
+// ---------------------------------------------------------------------------
+// Run metadata (shard count, wall time) — the operational counterpart to
+// authored.json's deterministic raw data
+// ---------------------------------------------------------------------------
+
+/**
+ * `null-evaluate.ts` writes `<out>.run.json` (e.g. `authored.run.json`)
+ * alongside `authored.json`, since `authored.json` itself deliberately
+ * excludes shard count and wall time (operational parameters of *that run*,
+ * not properties of the data — see `NullEvaluationRaw`'s doc comment in
+ * `null-evaluate.ts`). This is that sidecar's shape.
+ */
+export interface RunMeta {
+  readonly shards: number;
+  readonly elapsedMs?: number;
+  readonly perEpisodeMs?: number;
+}
+
+const runMetaPathFor = (authoredPath: string): string => authoredPath.replace(/\.json$/, '.run.json');
+
+/**
+ * Resolve the published artifact's `shards`/timing fields. `--shards`
+ * explicitly overrides the sidecar's shard count (for a caller that knows
+ * better, or is regenerating a report for a run whose sidecar was lost);
+ * otherwise the sidecar is required — there is no silent "assume 18"
+ * fallback, since a wrong-but-plausible-looking shard count would be
+ * unverifiable provenance in the published artifact (a dual-review finding:
+ * an earlier version defaulted to 18 unconditionally).
+ */
+export const resolveRunMeta = (args: Readonly<NullReportArgs>): RunMeta => {
+  const sidecarPath = runMetaPathFor(args.authored);
+  const sidecar: Partial<RunMeta> = existsSync(sidecarPath)
+    ? (JSON.parse(readFileSync(sidecarPath, 'utf8')) as Partial<RunMeta>)
+    : {};
+
+  if (args.shards !== undefined) {
+    return { shards: args.shards, elapsedMs: sidecar.elapsedMs, perEpisodeMs: sidecar.perEpisodeMs };
+  }
+  if (typeof sidecar.shards !== 'number') {
+    throw new Error(
+      `null-report: cannot determine shard count -- pass --shards explicitly, or ensure ${sidecarPath} exists ` +
+        'with a numeric "shards" field (written by null-evaluate.ts next to its authored.json output)'
+    );
+  }
+  return { shards: sidecar.shards, elapsedMs: sidecar.elapsedMs, perEpisodeMs: sidecar.perEpisodeMs };
 };
 
 // ---------------------------------------------------------------------------
@@ -160,6 +232,8 @@ export interface RewiringNullArtifact {
   readonly pairedBiologicalVsRewiredSeed0: PairedStats;
   readonly bootstrap: { readonly resamples: number; readonly seed: number };
   readonly host: { readonly arch: string; readonly node: string };
+  /** Present only when `null-evaluate.ts`'s `.run.json` sidecar recorded it. */
+  readonly timing?: { readonly elapsedMs: number; readonly perEpisodeMs: number };
 }
 
 const toScoredEntry = (stats: ConditionStats): ScoredEntry => ({
@@ -191,15 +265,36 @@ const sortKeysDeep = (value: unknown): unknown => {
  * every other byte-derived field (`compilerSourceSha256`, the graph/positions
  * hashes, `rewiredArms`) untouched — same additive pattern the `positions`
  * key uses (`scripts/data/positions.py`). Re-serialized with sorted keys and
- * 2-space indent, matching the file's existing (Python-written) format.
+ * 2-space indent, matching the file's existing (Python-written)
+ * `json.dumps(..., indent=2, sort_keys=True)` format.
+ *
+ * That byte-for-byte match is verified, not assumed: this only holds
+ * because the manifest currently has no float fields (Python writes `1.0`/
+ * `1e-05`, JS writes `1`/`0.00001`) and no non-ASCII text (Python's default
+ * `ensure_ascii=True` escapes it, JS does not) — a dual-review finding. If
+ * either ever changes, re-serializing the *unmodified* manifest would
+ * silently rewrite unrelated bytes. Guarded below by re-serializing the
+ * manifest before touching it and refusing to proceed if that round trip
+ * isn't byte-identical to the file on disk.
  */
 export const updateManifestWithRewiringNull = (
   manifestPath: string,
   entry: { readonly artifact: string; readonly sha256: string }
 ): void => {
-  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>;
+  const originalText = readFileSync(manifestPath, 'utf8');
+  const manifest = JSON.parse(originalText) as Record<string, unknown>;
+
+  const roundTripped = `${JSON.stringify(sortKeysDeep(manifest), null, 2)}\n`;
+  if (roundTripped !== originalText) {
+    throw new Error(
+      `null-report: re-serializing ${manifestPath} without any change produced different bytes than the ` +
+        "file on disk (likely a float or non-ASCII field JS formats differently than Python's json.dumps) " +
+        '-- refusing to write, to avoid silently rewriting unrelated manifest bytes'
+    );
+  }
+
   manifest.rewiringNull = entry;
-  writeFileSync(manifestPath, `${JSON.stringify(sortKeysDeep(manifest), null, 2)}\n`);
+  atomicWriteFileSync(manifestPath, `${JSON.stringify(sortKeysDeep(manifest), null, 2)}\n`);
 };
 
 // ---------------------------------------------------------------------------
@@ -213,12 +308,43 @@ export interface RunNullReportResult {
   readonly artifact: RewiringNullArtifact;
 }
 
-export const buildArtifact = (raw: Readonly<NullEvaluationRaw>, args: Readonly<NullReportArgs>): RewiringNullArtifact => {
+/** `a` and `b` name the same held-out seeds in the same order. */
+const sameSeeds = (a: readonly number[], b: readonly number[]): boolean =>
+  a.length === b.length && a.every((seed, i) => seed === b[i]);
+
+export const buildArtifact = (
+  raw: Readonly<NullEvaluationRaw>,
+  args: Readonly<NullReportArgs>,
+  runMeta: Readonly<RunMeta>
+): RewiringNullArtifact => {
+  if (raw.version !== 1) {
+    throw new Error(`null-report: ${args.authored} has unsupported version ${String(raw.version)}, expected 1`);
+  }
   if (!raw.biological || !raw.disconnected) {
     throw new Error(
       `null-report: ${args.authored} has no biological/disconnected section ` +
         '(run null-evaluate with --biological for the real report)'
     );
+  }
+
+  // Every graph must have been scored on the same held-out seeds, in the
+  // same order — `pairedStats` below pairs biological against rewired-seed-0
+  // by array index, and the null set otherwise mixes scores from seed lists
+  // that were never actually the same episodes. `null-evaluate.ts` always
+  // builds every task's `heldOutSeeds` from one shared array, so this holds
+  // by construction for its own output; this check protects a hand-merged
+  // or hand-edited `authored.json` from silently producing a nonsensical
+  // paired comparison (a dual-review finding).
+  const referenceSeeds = raw.biological.heldOutSeeds;
+  if (!sameSeeds(raw.disconnected.heldOutSeeds, referenceSeeds)) {
+    throw new Error(`null-report: ${args.authored}: disconnected was scored on different held-out seeds than biological`);
+  }
+  for (const entry of raw.rewired) {
+    if (!sameSeeds(entry.heldOutSeeds, referenceSeeds)) {
+      throw new Error(
+        `null-report: ${args.authored}: rewired seed ${entry.seed} was scored on different held-out seeds than biological`
+      );
+    }
   }
 
   const { bootstrapSeed, bootstrapResamples } = args;
@@ -236,7 +362,12 @@ export const buildArtifact = (raw: Readonly<NullEvaluationRaw>, args: Readonly<N
 
   const seed0 = raw.rewired.find((entry) => entry.seed === 0);
   if (!seed0) {
-    throw new Error('null-report: rewired seed 0 is missing (required for the paired biological-vs-rewired-seed0 comparison)');
+    const seeds = raw.rewired.map((entry) => entry.seed).sort((a, b) => a - b);
+    throw new Error(
+      `null-report: rewired seed 0 is missing from ${args.authored} ` +
+        `(found ${seeds.length} seed(s): ${seeds[0]}..${seeds[seeds.length - 1]}) -- the paired comparison needs ` +
+        'the shipped control arm; rerun rewire_batch.py/null-evaluate with a seed range that includes 0'
+    );
   }
   const paired = pairedStats(
     raw.biological.movementScore,
@@ -245,7 +376,15 @@ export const buildArtifact = (raw: Readonly<NullEvaluationRaw>, args: Readonly<N
     conditionRng(bootstrapSeed, 'paired|biological-vs-rewired-seed0')
   );
 
-  const bins = buildHistogram([...nullValues, biologicalStats.mean, disconnectedStats.mean], args.histogramBins);
+  // Bin *edges* span the union with biological/disconnected (so both land
+  // inside the plotted range even if they're outliers relative to N), but
+  // bin *counts* are the null set N alone: a dual-review pass caught that
+  // counting biological/disconnected into the bars too made
+  // `sum(bins.counts) === 502` instead of 500, so the published "null
+  // distribution of 500 rewired graphs" histogram silently included two
+  // extra bars for graphs that were never part of the rewiring null.
+  const unionForRange = [...nullValues, biologicalStats.mean, disconnectedStats.mean];
+  const bins = buildHistogram(nullValues, args.histogramBins, [Math.min(...unionForRange), Math.max(...unionForRange)]);
 
   return {
     version: 1,
@@ -255,7 +394,7 @@ export const buildArtifact = (raw: Readonly<NullEvaluationRaw>, args: Readonly<N
     substeps: raw.substeps,
     sourceGraphSha256: raw.sourceGraphSha256,
     rewireSourceSha256: raw.rewireSourceSha256,
-    shards: args.shards,
+    shards: runMeta.shards,
     biological: toScoredEntry(biologicalStats),
     disconnected: toScoredEntry(disconnectedStats),
     rewired: rewiredStats.map(({ entry, stats }) => ({
@@ -272,7 +411,10 @@ export const buildArtifact = (raw: Readonly<NullEvaluationRaw>, args: Readonly<N
     bins,
     pairedBiologicalVsRewiredSeed0: paired,
     bootstrap: { resamples: bootstrapResamples, seed: bootstrapSeed },
-    host: raw.host
+    host: raw.host,
+    ...(runMeta.elapsedMs !== undefined && runMeta.perEpisodeMs !== undefined
+      ? { timing: { elapsedMs: runMeta.elapsedMs, perEpisodeMs: runMeta.perEpisodeMs } }
+      : {})
   };
 };
 
@@ -282,6 +424,20 @@ export const buildArtifact = (raw: Readonly<NullEvaluationRaw>, args: Readonly<N
 
 const fmt = (value: number, digits = 4): string => value.toFixed(digits);
 const pct = (value: number): string => `${(value * 100).toFixed(1)}%`;
+
+/**
+ * Describes the rewired seed set from the data itself rather than assuming
+ * `0..n-1` — `null-evaluate.ts` sorts `rewired` by seed but never requires
+ * it to be a contiguous range starting at 0 (a partial or extended batch,
+ * e.g. seeds `0..249` plus `300..549`, is possible). A dual-review pass
+ * caught the report text asserting `0..n-1` unconditionally.
+ */
+const rewiredSeedRangeText = (rewired: readonly RewiredEntry[]): string => {
+  const seeds = [...rewired.map((entry) => entry.seed)].sort((a, b) => a - b);
+  const contiguousFromZero = seeds.every((seed, i) => seed === i);
+  if (contiguousFromZero) return `0..${seeds.length - 1}`;
+  return `${seeds.length} seeds, ${seeds[0]}..${seeds[seeds.length - 1]} (not necessarily contiguous)`;
+};
 
 const renderHistogramTable = (bins: Histogram): string => {
   const maxCount = Math.max(...bins.counts, 1);
@@ -297,6 +453,10 @@ const renderHistogramTable = (bins: Histogram): string => {
 
 export const renderReportMarkdown = (artifact: Readonly<RewiringNullArtifact>): string => {
   const seed0 = artifact.rewired.find((entry) => entry.seed === 0);
+  const seedRangeText = rewiredSeedRangeText(artifact.rewired);
+  const timingRow = artifact.timing
+    ? `| Wall time | ${(artifact.timing.elapsedMs / 1000).toFixed(1)}s |\n| Per-episode time | ${artifact.timing.perEpisodeMs.toFixed(1)} ms |\n`
+    : '';
 
   const degenerateSection = artifact.null.degenerate
     ? `\n> **Degenerate null.** This null distribution's IQR (${artifact.null.iqr.toExponential(3)}) is below the ` +
@@ -306,7 +466,7 @@ export const renderReportMarkdown = (artifact: Readonly<RewiringNullArtifact>): 
       'This is a finding about this specific condition, not a general claim about the MaleCNS connectome.\n'
     : '';
 
-  return `# Rewiring null — authored-decoder evaluation
+  const markdown = `# Rewiring null — authored-decoder evaluation
 
 Where the measured biological MaleCNS topology falls among ${artifact.rewired.length} degree-preserving
 rewirings of the same graph, scored under identical dynamics, encoder, decoder, and held-out seeds.
@@ -318,7 +478,7 @@ is scored by \`scripts/training/episode.ts\`'s \`runEpisode\`: the authored deco
 the right agent is parked (always the zero action), over the same ${artifact.seeds.count} held-out seeds
 (\`${artifact.seeds.start}..${artifact.seeds.start + artifact.seeds.count - 1}\`), \`T = ${artifact.ticks}\`
 ticks, \`K = ${artifact.substeps}\` neural substeps per tick. Degree-preserving rewiring comes only from
-\`scripts/data/rewire.py\`'s \`rewire_graph\` (rewiring seeds \`0..${artifact.rewired.length - 1}\`, seed 0
+\`scripts/data/rewire.py\`'s \`rewire_graph\` (rewiring seeds \`${seedRangeText}\`, seed 0
 being the shipped control arm). A graph's score is the mean \`movementScore\` over its held-out seeds; the
 null set \`N\` is the ${artifact.rewired.length} rewired graphs' mean scores.
 
@@ -330,9 +490,9 @@ null set \`N\` is the ${artifact.rewired.length} rewired graphs' mean scores.
 | Held-out seeds | ${artifact.seeds.start}..${artifact.seeds.start + artifact.seeds.count - 1} (n=${artifact.seeds.count}) |
 | Ticks (T) | ${artifact.ticks} |
 | Substeps (K) | ${artifact.substeps} |
-| Rewired graphs | ${artifact.rewired.length} (seeds 0..${artifact.rewired.length - 1}) |
+| Rewired graphs | ${artifact.rewired.length} (seeds ${seedRangeText}) |
 | Evaluation shards | ${artifact.shards} |
-| Bootstrap resamples | ${artifact.bootstrap.resamples} |
+${timingRow}| Bootstrap resamples | ${artifact.bootstrap.resamples} |
 | Bootstrap seed | ${artifact.bootstrap.seed} |
 | Histogram bins | ${artifact.bins.counts.length} |
 | Source graph sha256 | \`${artifact.sourceGraphSha256}\` |
@@ -375,28 +535,112 @@ ${renderHistogramTable(artifact.bins)}
 - **No causal or superiority claim is made.** The percentile and rank statistics above are descriptive: they
   say where the biological graph's score falls among this null model's rewirings under this exact evaluation
   setup, not that biological topology causes or predicts any particular score.
-${artifact.null.degenerate ? '- The null distribution is **degenerate** (IQR below threshold) — see the note above.\n' : ''}
-`;
+${artifact.null.degenerate ? '- The null distribution is **degenerate** (IQR below threshold) — see the note above.\n' : ''}`;
+
+  // A non-degenerate report otherwise ends with a trailing blank line (the
+  // template's own newline before the closing backtick, doubled up with the
+  // conditional bullet's own newline) — trimmed here rather than reworking
+  // every interpolation site, so the markdown always ends with exactly one
+  // newline regardless of which optional sections are present.
+  return `${markdown.trimEnd()}\n`;
 };
 
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
-export const runNullReport = (args: Readonly<NullReportArgs>): RunNullReportResult => {
-  const raw = JSON.parse(readFileSync(args.authored, 'utf8')) as NullEvaluationRaw;
-  const artifact = buildArtifact(raw, args);
+/**
+ * Refuse to write to a default (shipped) path unless the input looks like a
+ * real run — `rewiredCount >= MIN_REWIRED_FOR_SHIPPED_DEFAULT`. Mirrors
+ * `scripts/training/evaluate.ts`'s trace-graph-mode `--out`/`--report-md`
+ * guards: a dev/fixture/partial run must not silently clobber a shipped
+ * artifact just because the caller forgot an explicit `--out`.
+ */
+const guardShippedDefault = (path: string, defaultPath: string, label: string, rewiredCount: number): void => {
+  if (resolve(path) !== resolve(defaultPath)) return;
+  if (rewiredCount >= MIN_REWIRED_FOR_SHIPPED_DEFAULT) return;
+  throw new Error(
+    `null-report: refusing to overwrite the shipped ${label} (${defaultPath}) -- the input has only ` +
+      `${rewiredCount} rewired graph(s) (this study's committed methodology uses ` +
+      `${MIN_REWIRED_FOR_SHIPPED_DEFAULT}). Pass an explicit --out/--report-md/--manifest scratch path for a ` +
+      'dev/test run.'
+  );
+};
 
+/**
+ * The manifest being updated must describe the same biological graph (and,
+ * where recorded, the same shipped rewired-seed-0 control) that
+ * `authored.json` was actually scored against — otherwise a stale
+ * `authored.json` (from before a graph recompile) would attach a
+ * `rewiringNull` entry to a manifest describing a different graph, with no
+ * warning (a dual-review finding). The seed-0 cross-check is best-effort:
+ * `manifest.rewiredArms.seed0` is optional here (a scratch/dev manifest
+ * fixture need not carry it) and skipped when absent.
+ */
+const verifySourceGraphMatchesManifest = (
+  manifestPath: string,
+  artifact: Readonly<Pick<RewiringNullArtifact, 'sourceGraphSha256' | 'rewired'>>,
+  authoredPath: string
+): void => {
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
+    binarySha256?: string;
+    rewiredArms?: { seed0?: { gzipSha256?: string } };
+  };
+  if (manifest.binarySha256 !== artifact.sourceGraphSha256) {
+    throw new Error(
+      `null-report: ${authoredPath} was scored against a graph with sha256 ${artifact.sourceGraphSha256}, but ` +
+        `${manifestPath}'s biological graph sha256 is ${String(manifest.binarySha256)} -- refusing to attach a ` +
+        "rewiringNull entry that doesn't describe the manifest's own graph"
+    );
+  }
+  const manifestSeed0GzipSha256 = manifest.rewiredArms?.seed0?.gzipSha256;
+  const artifactSeed0 = artifact.rewired.find((entry) => entry.seed === 0);
+  if (manifestSeed0GzipSha256 && artifactSeed0 && artifactSeed0.gzipSha256 !== manifestSeed0GzipSha256) {
+    throw new Error(
+      `null-report: rewired seed 0's gzip sha256 (${artifactSeed0.gzipSha256}) does not match ` +
+        `${manifestPath}'s shipped rewiredArms.seed0 (${manifestSeed0GzipSha256}) -- the report claims seed 0 ` +
+        'is "the shipped control arm", which would no longer be true'
+    );
+  }
+};
+
+export const runNullReport = (args: Readonly<NullReportArgs>): RunNullReportResult => {
+  // --trained is plumbed for WP3 ("Reads authored.json (and trained.json
+  // from WP3 if present)", 02-authored-null-evaluation.md) but WP3 isn't
+  // implemented yet. Rather than silently ignoring a real file an operator
+  // pointed --trained at (the flag was dead code otherwise — a dual-review
+  // finding), fail loudly if one exists; the common case (no WP3 output
+  // yet) hits neither branch.
+  if (existsSync(args.trained)) {
+    throw new Error(
+      `null-report: ${args.trained} exists, but merging a trained-readout section is not implemented yet (WP3). ` +
+        'Remove --trained or move/delete that file to publish the authored-only report.'
+    );
+  }
+
+  const raw = JSON.parse(readFileSync(args.authored, 'utf8')) as NullEvaluationRaw;
+  const runMeta = resolveRunMeta(args);
+  const artifact = buildArtifact(raw, args, runMeta);
+
+  guardShippedDefault(args.out, DEFAULT_OUT, 'published artifact', artifact.rewired.length);
+  guardShippedDefault(args.reportMd, DEFAULT_REPORT_MD, 'report', artifact.rewired.length);
+  guardShippedDefault(args.manifest, DEFAULT_MANIFEST, 'manifest', artifact.rewired.length);
+  verifySourceGraphMatchesManifest(args.manifest, artifact, args.authored);
+
+  // Rendered before any file is written: if markdown rendering ever threw
+  // (a future template bug), a partial publish (artifact + manifest written,
+  // report missing) is worse than failing before anything changes on disk.
   const artifactContents = JSON.stringify(artifact);
-  mkdirSync(dirname(args.out), { recursive: true });
-  writeFileSync(args.out, artifactContents);
   const artifactSha256 = sha256Hex(artifactContents);
+  const reportMdContents = renderReportMarkdown(artifact);
+
+  mkdirSync(dirname(args.out), { recursive: true });
+  atomicWriteFileSync(args.out, artifactContents);
 
   updateManifestWithRewiringNull(args.manifest, { artifact: basename(args.out), sha256: artifactSha256 });
 
-  const reportMdContents = renderReportMarkdown(artifact);
   mkdirSync(dirname(args.reportMd), { recursive: true });
-  writeFileSync(args.reportMd, reportMdContents);
+  atomicWriteFileSync(args.reportMd, reportMdContents);
 
   return { out: args.out, reportMdPath: args.reportMd, artifactSha256, artifact };
 };

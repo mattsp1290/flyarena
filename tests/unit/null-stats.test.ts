@@ -23,7 +23,12 @@ describe('graphStats', () => {
     expect(a).toEqual(b);
     expect(a.mean).toBe(3);
     expect(a.median).toBe(3);
+    expect(a.std).toBeCloseTo(Math.sqrt(2), 12);
     expect(a.ci95[0]).toBeLessThanOrEqual(a.ci95[1]);
+    // The CI is over the same statistic (the mean) the resamples are drawn
+    // from, so for a small, low-variance sample it should bracket the mean.
+    expect(a.ci95[0]).toBeLessThanOrEqual(a.mean);
+    expect(a.ci95[1]).toBeGreaterThanOrEqual(a.mean);
   });
 
   it('different labels give different (independent) bootstrap draws', () => {
@@ -148,5 +153,21 @@ describe('buildHistogram', () => {
 
   it('throws on a non-positive bin count', () => {
     expect(() => buildHistogram([1, 2], 0)).toThrow(/positive integer/);
+  });
+
+  it('an explicit range sets the edges without counting values outside `values`', () => {
+    // Regression test for a dual-review finding: null-report.ts must pass
+    // the null set N alone as `values` (so counts sum to |N|) while widening
+    // the *edges* to cover biological/disconnected via `range` — not fold
+    // those two extra scores into the counted values.
+    const nullValues = [1, 2, 3];
+    const hist = buildHistogram(nullValues, 5, [0, 10]);
+    expect(hist.edges[0]).toBe(0);
+    expect(hist.edges[5]).toBe(10);
+    expect(hist.counts.reduce((sum, c) => sum + c, 0)).toBe(nullValues.length);
+  });
+
+  it('throws on a descending range', () => {
+    expect(() => buildHistogram([1, 2], 5, [10, 0])).toThrow(/not a valid ascending range/);
   });
 });
