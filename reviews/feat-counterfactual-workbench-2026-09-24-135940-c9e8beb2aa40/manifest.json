@@ -1,0 +1,25 @@
+{
+  "schema_version": "review-v1",
+  "branch": "feat/counterfactual-workbench",
+  "base_ref": "main",
+  "head_sha": "c9e8beb2aa4052185459c43871a218b35346201f",
+  "pass": true,
+  "reviewers": [
+    {
+      "slug": "causal-correctness",
+      "display_name": "Causal Correctness",
+      "role": "Scientific invariants, runtime correctness and job lifecycle."
+    },
+    {
+      "slug": "structural-thermonuclear",
+      "display_name": "Structural Thermonuclear",
+      "role": "Full live Cursor thermonuclear maintainability and integration audit."
+    }
+  ],
+  "remediation_commit": "63862b4",
+  "rubric_sha256": "7faca08b51b643b2ddd0836f92af15574444024685dcc1e677dbbb39ae8c9e8f",
+  "final_verdicts": {
+    "causal-correctness": "APPROVE",
+    "structural-thermonuclear": "APPROVE"
+  }
+}

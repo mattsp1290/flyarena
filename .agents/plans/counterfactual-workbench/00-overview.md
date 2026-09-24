@@ -1,6 +1,6 @@
 # Counterfactual workbench
 
-Status: Ready. Two independent reviews and a fresh adversarial review completed; accepted findings are incorporated. This integration has not been implemented. The existing DGX sandbox is implemented on `feat/dgx-counterfactual-lab` and remains a separate source of reusable code.
+Status: Implemented. Independent code review findings are resolved; final combined validation and merge evidence are recorded in docs/counterfactual-validation.md. The original DGX sandbox source is integrated as the optional synthetic mode.
 
 ## Application context
 ```json
