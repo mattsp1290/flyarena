@@ -3,7 +3,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { ARENA_CONFIG, type ArenaConfig } from '../arena/config';
 import type { AgentId, ArenaSnapshot, FoodState, Vec2 } from '../arena/types';
 import type { GraphMode } from '../connectome/format';
-import { disposeObject3D, disposeRenderer } from './dispose';
+import { createCanvasResizeObserver, createContextLossHandler, resizeRendererAndCamera, teardownWebglScene } from './lifecycle';
 import {
   agentTransform,
   detectFoodPickups,
@@ -343,11 +343,10 @@ export class ArenaScene {
   private contextLost = false;
   private disposed = false;
 
-  private readonly handleContextLost = (event: Event): void => {
-    event.preventDefault();
+  private readonly handleContextLost = createContextLossHandler(() => {
     this.contextLost = true;
     this.options.onContextLost?.({ reason: 'webglcontextlost' });
-  };
+  });
 
   constructor(options: ArenaSceneOptions) {
     this.options = options;
@@ -430,10 +429,14 @@ export class ArenaScene {
       const initialHeight = this.container.clientHeight || 1;
       this.resize(initialWidth, initialHeight);
     } catch (error) {
-      this.canvas.removeEventListener('webglcontextlost', this.handleContextLost, false);
-      this.resizeObserver?.disconnect();
-      disposeObject3D(this.scene);
-      disposeRenderer(this.renderer, controls);
+      teardownWebglScene({
+        canvas: this.canvas,
+        handleContextLost: this.handleContextLost,
+        resizeObserver: this.resizeObserver,
+        scene: this.scene,
+        renderer: this.renderer,
+        controls
+      });
       throw error;
     }
   }
@@ -481,16 +484,7 @@ export class ArenaScene {
   }
 
   private setupResizeObserver(): void {
-    if (typeof ResizeObserver === 'undefined') return;
-    this.resizeObserver = new ResizeObserver((entries) => {
-      const entry = entries[0];
-      if (!entry) return;
-      const box = entry.contentBoxSize?.[0];
-      const width = box ? box.inlineSize : entry.contentRect.width;
-      const height = box ? box.blockSize : entry.contentRect.height;
-      if (width > 0 && height > 0) this.resize(width, height);
-    });
-    this.resizeObserver.observe(this.container);
+    this.resizeObserver = createCanvasResizeObserver(this.container, (width, height) => this.resize(width, height));
   }
 
   /**
@@ -541,11 +535,7 @@ export class ArenaScene {
   /** Explicit resize hook, also used internally by the `ResizeObserver` callback. */
   resize(width: number, height: number): void {
     if (this.disposed) return;
-    const safeWidth = Math.max(1, Math.floor(width));
-    const safeHeight = Math.max(1, Math.floor(height));
-    this.renderer.setSize(safeWidth, safeHeight, false);
-    this.camera.aspect = safeWidth / safeHeight;
-    this.camera.updateProjectionMatrix();
+    resizeRendererAndCamera(this.renderer, this.camera, width, height);
   }
 
   private ensurePoolSize(
@@ -779,13 +769,18 @@ export class ArenaScene {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    this.resizeObserver?.disconnect();
-    this.canvas.removeEventListener('webglcontextlost', this.handleContextLost, false);
-    disposeObject3D(this.scene);
-    // If the context is already lost (dispose() called from an
-    // onContextLost handler), skip forceContextLoss() — it's a harmless
-    // no-op there but some WebGL implementations log a spurious warning.
-    disposeRenderer(this.renderer, this.controls, { skipForceContextLoss: this.contextLost });
-    this.scene.clear();
+    teardownWebglScene({
+      canvas: this.canvas,
+      handleContextLost: this.handleContextLost,
+      resizeObserver: this.resizeObserver,
+      scene: this.scene,
+      renderer: this.renderer,
+      controls: this.controls,
+      // If the context is already lost (dispose() called from an
+      // onContextLost handler), skip forceContextLoss() — it's a harmless
+      // no-op there but some WebGL implementations log a spurious warning.
+      skipForceContextLoss: this.contextLost,
+      clearScene: true
+    });
   }
 }

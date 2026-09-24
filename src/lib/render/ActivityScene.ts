@@ -2,16 +2,17 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import type { AgentId } from '../arena/types';
 import type { PositionsArtifact } from '../experiment/assets';
-import { disposeObject3D, disposeRenderer } from './dispose';
+import { createCanvasResizeObserver, createContextLossHandler, resizeRendererAndCamera, teardownWebglScene } from './lifecycle';
 import { layoutPositions, partitionByRole, writeColors, type NeuronRole } from './activity-layout';
 import { VIRIDIS_LUT } from './colormap';
+import { POINT_SIZE } from './activity-constants';
 
 /**
  * Read-only Three.js presentation layer for the anatomical activity view
- * (WP3). Mirrors `ArenaScene.ts`'s lifecycle/disposal/context-loss patterns
- * (constructor rolls back a partially-built GPU context on any throw;
- * `dispose()` is idempotent and frees every GPU-owned resource via
- * `dispose.ts`), but is otherwise independent: it never touches
+ * (WP3). Shares `ArenaScene.ts`'s lifecycle/disposal/context-loss plumbing
+ * via `./lifecycle.ts` (constructor rolls back a partially-built GPU context
+ * on any throw; `dispose()` is idempotent and frees every GPU-owned resource
+ * via `dispose.ts`), but is otherwise independent: it never touches
  * `src/lib/arena/*` simulation state, and its only per-tick input is each
  * arm's already-computed rate vector (`update(agentId, rates)`), never a
  * live reference into Worker/runner state.
@@ -51,7 +52,6 @@ export class ActivitySceneUnavailableError extends Error {
 
 /** Horizontal offset of each arm's group from the shared origin, in the same normalized units `layoutPositions` scales soma positions into (main cloud extent `[-1, 1]`). Large enough that neither arm's point cloud (nor its unavailable strip) ever overlaps the other's. */
 const ARM_OFFSET = 1.7;
-const POINT_SIZE = 0.045;
 const ROLES: readonly NeuronRole[] = ['sensory', 'bridge', 'descending'];
 /**
  * Neutral "no computed rate yet" color: a mid grey, deliberately outside
@@ -129,11 +129,10 @@ export class ActivityScene {
   private contextLost = false;
   private disposed = false;
 
-  private readonly handleContextLost = (event: Event): void => {
-    event.preventDefault();
+  private readonly handleContextLost = createContextLossHandler(() => {
     this.contextLost = true;
     this.onContextLost?.({ reason: 'webglcontextlost' });
-  };
+  });
 
   constructor(options: ActivitySceneOptions) {
     this.canvas = options.canvas;
@@ -199,10 +198,14 @@ export class ActivityScene {
       const initialHeight = this.container.clientHeight || 1;
       this.resize(initialWidth, initialHeight);
     } catch (error) {
-      this.canvas.removeEventListener('webglcontextlost', this.handleContextLost, false);
-      this.resizeObserver?.disconnect();
-      disposeObject3D(this.scene);
-      disposeRenderer(this.renderer, controls);
+      teardownWebglScene({
+        canvas: this.canvas,
+        handleContextLost: this.handleContextLost,
+        resizeObserver: this.resizeObserver,
+        scene: this.scene,
+        renderer: this.renderer,
+        controls
+      });
       throw error;
     }
   }
@@ -311,24 +314,11 @@ export class ActivityScene {
   /** Explicit resize hook, also used internally by the `ResizeObserver` callback. */
   resize(width: number, height: number): void {
     if (this.disposed) return;
-    const safeWidth = Math.max(1, Math.floor(width));
-    const safeHeight = Math.max(1, Math.floor(height));
-    this.renderer.setSize(safeWidth, safeHeight, false);
-    this.camera.aspect = safeWidth / safeHeight;
-    this.camera.updateProjectionMatrix();
+    resizeRendererAndCamera(this.renderer, this.camera, width, height);
   }
 
   private setupResizeObserver(): void {
-    if (typeof ResizeObserver === 'undefined') return;
-    this.resizeObserver = new ResizeObserver((entries) => {
-      const entry = entries[0];
-      if (!entry) return;
-      const box = entry.contentBoxSize?.[0];
-      const width = box ? box.inlineSize : entry.contentRect.width;
-      const height = box ? box.blockSize : entry.contentRect.height;
-      if (width > 0 && height > 0) this.resize(width, height);
-    });
-    this.resizeObserver.observe(this.container);
+    this.resizeObserver = createCanvasResizeObserver(this.container, (width, height) => this.resize(width, height));
   }
 
   /**
@@ -353,10 +343,15 @@ export class ActivityScene {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    this.resizeObserver?.disconnect();
-    this.canvas.removeEventListener('webglcontextlost', this.handleContextLost, false);
-    disposeObject3D(this.scene);
-    disposeRenderer(this.renderer, this.controls, { skipForceContextLoss: this.contextLost });
-    this.scene.clear();
+    teardownWebglScene({
+      canvas: this.canvas,
+      handleContextLost: this.handleContextLost,
+      resizeObserver: this.resizeObserver,
+      scene: this.scene,
+      renderer: this.renderer,
+      controls: this.controls,
+      skipForceContextLoss: this.contextLost,
+      clearScene: true
+    });
   }
 }

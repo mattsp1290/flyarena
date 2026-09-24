@@ -13,6 +13,7 @@
  * node set; only connections differ), so one layout/partition serves both.
  */
 import { rateToLutIndex } from './colormap';
+import { POINT_SIZE } from './activity-constants';
 
 export type PositionSource = 'soma' | 'tosoma' | 'none';
 export type NeuronRole = 'sensory' | 'bridge' | 'descending';
@@ -33,15 +34,25 @@ export interface PositionLayout {
 const STRIP_Y = -1.35;
 const STRIP_Z = 0;
 /**
- * Minimum on-screen gap between adjacent strip points, along both the
- * strip's X spread and its row spacing. Kept at least as large as
- * `ActivityScene.ts`'s point sprite size (0.045 normalized units) so a
- * real-sized unavailable set (165 of 1,008 neurons in the shipped MaleCNS
- * data) wraps into multiple rows instead of cramming into one row where
- * points overlap into an unreadable smear — a real, reproduced problem with
- * an earlier single-row version of this layout.
+ * Extra clearance beyond the point sprite's own footprint (`POINT_SIZE`), so
+ * adjacent strip points don't visually touch even accounting for
+ * antialiasing/blur at the sprite edge.
  */
-const STRIP_MIN_SPACING = 0.06;
+const STRIP_SPACING_MARGIN = 0.015;
+/**
+ * Minimum on-screen gap between adjacent strip points, along both the
+ * strip's X spread and its row spacing. Derived from (and kept at least as
+ * large as) `POINT_SIZE` — imported from `./activity-constants`, the same
+ * module `ActivityScene.ts` sources its point sprite size from (thermo-
+ * maintainability S1 fix: these two values used to be linked only by a
+ * comment, with nothing enforcing that a future `POINT_SIZE` change would
+ * update this one too) — so a real-sized unavailable set (165 of 1,008
+ * neurons in the shipped MaleCNS data) wraps into multiple rows instead of
+ * cramming into one row where points overlap into an unreadable smear — a
+ * real, reproduced problem with an earlier single-row version of this
+ * layout.
+ */
+const STRIP_MIN_SPACING = POINT_SIZE + STRIP_SPACING_MARGIN;
 /** Matches the main cloud's `[-1, 1]` centered/scaled extent (see below). */
 const STRIP_WIDTH = 2;
 
@@ -178,12 +189,11 @@ export const partitionByRole = (role: readonly NeuronRole[]): RolePartition => {
  * buffers, and `lut` can be any table shaped `steps * 3` (not necessarily
  * `colormap.ts#VIRIDIS_LUT`) — accepting it as a parameter rather than
  * hard-coding the concrete colormap keeps this function testable against a
- * synthetic table. It shares its clamp/rounding math with
- * `colormap.ts#rateToColor` via `rateToLutIndex` (a pure `(rate, min, max,
- * steps) -> index` function with no dependency on any concrete LUT data),
- * so the two color paths cannot silently disagree after a future edit to
- * just one of them — a real risk an earlier, independently-duplicated
- * version of this math had.
+ * synthetic table. Its clamp/rounding math lives in its own pure function,
+ * `colormap.ts#rateToLutIndex` (a `(rate, min, max, steps) -> index`
+ * function with no dependency on any concrete LUT data), rather than being
+ * reimplemented inline here — a real risk an earlier, independently-
+ * duplicated version of this math had.
  */
 export const writeColors = (
   rates: Float32Array,

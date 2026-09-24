@@ -11,14 +11,15 @@
  * cheaper to keep correct and just as fast once baked into `VIRIDIS_LUT`.
  * Only the resulting `Float32Array` values matter to callers; the exact
  * polynomial coefficients are an implementation detail. This module never
- * claims measured colors — `rateToColor`/`writeColors` (`activity-layout.ts`)
- * both operate on `ConnectomeGraph.metadata.rateMin`/`rateMax`, a *declared*
+ * claims measured colors — `writeColors` (`activity-layout.ts`, the only
+ * color-write path production actually calls — see `ActivityScene#update`)
+ * operates on `ConnectomeGraph.metadata.rateMin`/`rateMax`, a *declared*
  * dynamics bound, never a per-frame auto-normalized range (see the plan's
  * "no per-frame auto-normalization" decision — that would exaggerate tiny
  * activity into a misleadingly full-range color).
  */
 
-/** Number of entries in `VIRIDIS_LUT`; also the number of distinguishable color steps `rateToColor` can produce. */
+/** Number of entries in `VIRIDIS_LUT`; also the number of distinguishable color steps `rateToLutIndex` can produce. */
 export const COLORMAP_SIZE = 256;
 
 const viridisPolynomial = (t: number): readonly [number, number, number] => {
@@ -54,13 +55,18 @@ export const VIRIDIS_LUT: Float32Array = buildViridisLut();
 
 /**
  * Map `rate` (clamped to `[min, max]`) to an index into an LUT with
- * `lutSteps` entries. Shared by `rateToColor` below (against
- * `VIRIDIS_LUT`/`COLORMAP_SIZE`) and `activity-layout.ts#writeColors`
- * (against a caller-supplied `lut`), so the clamp/round math cannot drift
- * between the two call sites — a real risk dual review flagged, since
- * `writeColors` previously reimplemented this same math independently, with
- * nothing to catch the two copies disagreeing after a future edit to just
- * one of them.
+ * `lutSteps` entries. Used by `activity-layout.ts#writeColors` (against a
+ * caller-supplied `lut`) — the only color-write path production actually
+ * calls (`ActivityScene#update`). Pulled out as its own pure function so
+ * that math has one home rather than being reimplemented independently
+ * wherever a rate needs to become a LUT index — a real risk dual review
+ * flagged, since `writeColors` previously duplicated this same math inline,
+ * with nothing to catch it drifting from any other copy after a future edit.
+ *
+ * (`rateToColor`, an earlier single-RGB-triple convenience wrapper around
+ * this function, was removed — thermo-maintainability S2 — once it became
+ * unreachable from any production code path: `writeColors` is the only
+ * caller of this function that ships.)
  *
  * `min === max` (a degenerate/zero-width declared range) maps every rate to
  * the bottom of the scale (index 0) rather than dividing by zero. A
@@ -74,17 +80,4 @@ export const rateToLutIndex = (rate: number, min: number, max: number, lutSteps:
   const t = max > min && Number.isFinite(rate) ? (rate - min) / (max - min) : 0;
   const clamped = t < 0 ? 0 : t > 1 ? 1 : t;
   return Math.round(clamped * (lutSteps - 1));
-};
-
-/**
- * Map `rate` to an RGB triple from `VIRIDIS_LUT`, writing it into
- * `out[offset..offset+2]`. No allocation: `out` is a caller-owned buffer
- * (typically a `THREE.BufferAttribute`'s backing `Float32Array`), reused
- * every call. See `rateToLutIndex` for the clamping/degenerate-range rules.
- */
-export const rateToColor = (rate: number, min: number, max: number, out: Float32Array, offset: number): void => {
-  const lutOffset = rateToLutIndex(rate, min, max, COLORMAP_SIZE) * 3;
-  out[offset] = VIRIDIS_LUT[lutOffset];
-  out[offset + 1] = VIRIDIS_LUT[lutOffset + 1];
-  out[offset + 2] = VIRIDIS_LUT[lutOffset + 2];
 };

@@ -1,5 +1,5 @@
 import type { AgentId } from '../arena/types';
-import type { GraphMode } from '../connectome/format';
+import type { ConnectomeGraph, GraphMode } from '../connectome/format';
 import { createWorkerClient, type WorkerClient } from '../worker/client';
 import { loadArenaArtifacts, type ArenaManifest, type LoadedArenaArtifacts } from './assets';
 import { buildGraphBufferForMode, createWorkerAgentBinding } from './bindings';
@@ -34,8 +34,17 @@ export interface ExperimentControllerCallbacks {
   onStatusChange: (status: ExperimentStatus) => void;
   onTelemetry: (telemetry: ExperimentTelemetry) => void;
   onError: (message: string) => void;
-  /** Fired once the manifest is fetched, independent of whether the subsequent Worker/binding construction below it succeeds — mirrors the ledger panel being able to show manifest info even if the run itself never reaches `ready`. */
-  onManifest: (manifest: ArenaManifest) => void;
+  /**
+   * Fired once the manifest is fetched, independent of whether the
+   * subsequent Worker/binding construction below it succeeds — mirrors the
+   * ledger panel being able to show manifest info even if the run itself
+   * never reaches `ready`. `biologicalGraph` is the already hash-verified,
+   * parsed biological graph `loadArenaArtifacts` produced for this manifest
+   * (`LoadedArenaArtifacts.parsedBiological`) — the host threads it into
+   * `assets.ts#loadPositions` instead of letting that function re-fetch and
+   * re-parse the same artifact a second time (thermo-architecture I1 fix).
+   */
+  onManifest: (manifest: ArenaManifest, biologicalGraph: ConnectomeGraph) => void;
   /**
    * Fired once per agent right after `initialize()` successfully constructs
    * the runner (with each arm's *initial* topology), and again after every
@@ -137,7 +146,7 @@ export class ExperimentController {
     this.manifest = artifacts.manifest;
     this.biologicalGraphBuffer = artifacts.biological;
     this.rewiredGraphBuffer = artifacts.rewired;
-    this.options.callbacks.onManifest(artifacts.manifest);
+    this.options.callbacks.onManifest(artifacts.manifest, artifacts.parsedBiological);
 
     try {
       const left = this.options.createWorker();

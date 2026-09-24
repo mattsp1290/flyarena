@@ -42,7 +42,33 @@
   let rafId: number | undefined;
   let sceneError = $state<string | undefined>(undefined);
   let contextLostMessage = $state<string | undefined>(undefined);
+  // A `$state` record, mutated in place (`lastUpdateTick[agentId] = ...`),
+  // never reassigned wholesale (thermo-architecture S2 fix): a fresh rate
+  // array can arrive up to ~30 Hz per arm, and this debug-only DOM attribute
+  // (see `data-last-update-tick-*` below, read by `tests/e2e/arena.spec.ts`'s
+  // `waitForActivityUpdateTick`) is the only reason it exists. Svelte 5's
+  // `$state` proxy makes a single-property mutation fine-grained-reactive on
+  // its own — the earlier per-tick allocation came from spreading a *new*
+  // object (`{ ...lastUpdateTick, [agentId]: ... }`) on every update, not
+  // from using a record at all, so mutating the existing one in place (the
+  // same pattern `lastRatesSeen` below already uses) removes the allocation
+  // without needing a separate scalar variable, and an `if (agentId ===
+  // 'left') ... else ...` branch, per arm.
   let lastUpdateTick = $state<Record<AgentId, number>>({ left: 0, right: 0 });
+  /**
+   * `runner.supportsActivityStreaming(agentId)` (thermo-architecture S1
+   * fix), checked every frame while the panel is open and mirrored into
+   * `$state` only on change (same discipline as `lastUpdateTick` above):
+   * whether *this arm's current binding* can stream full-neuron rates at
+   * all, as distinct from whether rates simply haven't arrived yet. Every
+   * browser-constructed binding supports it today (`createOracleAgentBinding`,
+   * the one binding type that doesn't, is never reachable from any UI
+   * topology option), so this stays `true` in practice — but if that ever
+   * changes, the panel now shows an honest "streaming unavailable" reason
+   * for that arm instead of leaving it at the ambiguous "No data yet" grey
+   * indefinitely.
+   */
+  let streamingSupported = $state<Record<AgentId, boolean>>({ left: true, right: true });
 
   let destroyed = false;
   let reducedMotion = false;
@@ -103,6 +129,16 @@
   const frame = (nowMs: number): void => {
     if (destroyed || !scene) return;
     try {
+      if (runner) {
+        // Cheap boolean check (no allocation), independent of the
+        // reduced-motion color-update throttle below — support can change
+        // (e.g. across a topology switch) whether or not a fresh rate
+        // happens to be due this frame.
+        for (const agentId of ['left', 'right'] as const) {
+          const supported = runner.supportsActivityStreaming(agentId);
+          if (supported !== streamingSupported[agentId]) streamingSupported[agentId] = supported;
+        }
+      }
       const throttled = reducedMotion && nowMs - lastColorUpdateMs < REDUCED_MOTION_UPDATE_INTERVAL_MS;
       if (!throttled && runner) {
         lastColorUpdateMs = nowMs;
@@ -111,7 +147,7 @@
           if (rates && rates !== lastRatesSeen[agentId]) {
             lastRatesSeen[agentId] = rates;
             scene.update(agentId, rates);
-            lastUpdateTick = { ...lastUpdateTick, [agentId]: telemetry?.tick ?? lastUpdateTick[agentId] };
+            lastUpdateTick[agentId] = telemetry?.tick ?? lastUpdateTick[agentId];
           } else if (!rates && lastRatesSeen[agentId]) {
             // The arm had rates and now doesn't (e.g. `runner.reset()`
             // cleared `latestRates`, or this arm's binding stopped
@@ -202,7 +238,8 @@
       return;
     }
 
-    lastUpdateTick = { left: 0, right: 0 };
+    lastUpdateTick.left = 0;
+    lastUpdateTick.right = 0;
     await runner.setActivityStreaming(true);
     if (isStaleExpand(generation)) {
       // Deliberately does NOT call `teardown()` here: whatever `collapse()`
@@ -273,6 +310,13 @@
       {/if}
     {/if}
 
+    {#if !streamingSupported.left}
+      <p class="coverage streaming-unavailable" role="status">Left arm: streaming unavailable for this arm.</p>
+    {/if}
+    {#if !streamingSupported.right}
+      <p class="coverage streaming-unavailable" role="status">Right arm: streaming unavailable for this arm.</p>
+    {/if}
+
     <div class="canvas-region">
       <canvas
         bind:this={canvasEl}
@@ -283,8 +327,18 @@
         style:visibility={sceneError ? 'hidden' : 'visible'}
       ></canvas>
       {#if sceneError}
-        <div class="canvas-placeholder" role="img" aria-label="Neural activity view unavailable">
-          <p>{sceneError}</p>
+        <!--
+          `role="img"` with a static `aria-label` previously wrapped this
+          box, which tells assistive tech to treat the whole subtree as one
+          image whose accessible name is that fixed string — the actual,
+          specific `sceneError` text inside was never reliably exposed to
+          screen readers, and this wasn't a live region either (thermo
+          maintainability I2). Dropped in favor of `role="alert"` directly
+          on the paragraph carrying the real message, matching the
+          `contextLostMessage` pattern immediately below.
+        -->
+        <div class="canvas-placeholder">
+          <p role="alert">{sceneError}</p>
         </div>
       {/if}
     </div>
@@ -358,6 +412,10 @@
 
   .units {
     color: #74889d;
+  }
+
+  .streaming-unavailable {
+    color: #ffcf8a;
   }
 
   .canvas-region {

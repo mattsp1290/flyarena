@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ExperimentController, type ExperimentControllerCallbacks } from '../../src/lib/experiment/controller';
 import type { AgentId } from '../../src/lib/arena/types';
-import type { GraphMode } from '../../src/lib/connectome/format';
+import type { ConnectomeGraph, GraphMode } from '../../src/lib/connectome/format';
+import type { ArenaManifest } from '../../src/lib/experiment/assets';
 import type { ExperimentStatus } from '../../src/lib/experiment/state';
 import type { WorkerRequest, WorkerResponse } from '../../src/lib/worker/protocol';
 import { createPublicDataFetch, FakeNeuralWorker } from '../helpers/fake-worker';
@@ -100,6 +101,30 @@ describe('ExperimentController#initialize', () => {
     expect(callbacks.statuses).toContain('ready');
     expect(callbacks.topologyApplied).toContainEqual(['left', 'biological']);
     expect(callbacks.topologyApplied).toContainEqual(['right', 'rewired']);
+  });
+
+  it('passes the already-parsed biological graph to onManifest (thermo-architecture I1 fix: callers must not re-fetch/re-parse it)', async () => {
+    const callbacks = createCallbacks();
+    const manifestCalls: Array<[ArenaManifest, ConnectomeGraph]> = [];
+    callbacks.onManifest = (manifest, biologicalGraph) => {
+      manifestCalls.push([manifest, biologicalGraph]);
+    };
+    const controller = new ExperimentController({
+      seed: SEED,
+      totalTicks: TOTAL_TICKS,
+      initialTopology: { left: 'biological', right: 'rewired' },
+      createWorker,
+      callbacks
+    });
+    trackController(controller);
+
+    await controller.initialize();
+
+    expect(manifestCalls).toHaveLength(1);
+    const [manifestArg, biologicalGraphArg] = manifestCalls[0];
+    expect(manifestArg).toBe(controller.getManifest());
+    expect(biologicalGraphArg.biologicalIds.length).toBe(controller.getManifest()?.neuronCount);
+    expect(biologicalGraphArg.metadata.rateMin).toBeLessThanOrEqual(biologicalGraphArg.metadata.rateMax);
   });
 
   it('reports an error and never constructs a runner when an artifact fails its sha256 check', async () => {

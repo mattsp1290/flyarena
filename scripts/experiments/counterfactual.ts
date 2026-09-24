@@ -2,6 +2,7 @@ import { readFile, stat, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { verifyAndDecompressArtifact, type ArenaManifest } from '../../src/lib/experiment/assets';
+import { parseGraphBinary } from '../../src/lib/connectome/format';
 import { prepareGraph } from '../../src/lib/counterfactual/targets';
 import { evidenceHeader, runExperiment } from '../../src/lib/counterfactual/engine';
 import { compareEvidence, readEvidenceRequest, serializeEvidence } from '../../src/lib/counterfactual/evidence';
@@ -42,7 +43,8 @@ const [biological, rewired] = await Promise.all([
   artifact(manifest.artifact).then(b => verifyAndDecompressArtifact(b, manifest)),
   artifact(manifest.rewiredArms.seed0.artifact).then(b => verifyAndDecompressArtifact(b, manifest.rewiredArms.seed0))
 ]);
-const prepared = await prepareGraph({ manifest, biological, rewired }, request.topology);
+const parsedBiological = parseGraphBinary(biological.slice(0));
+const prepared = await prepareGraph({ manifest, biological, rewired, parsedBiological }, request.topology);
 if (input) {
   // Fail before simulation on mismatched model identity, targets, or seeds as well as after it on outcomes.
   const header = evidenceHeader(prepared, request);

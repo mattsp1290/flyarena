@@ -10,7 +10,7 @@
  * `public/data/` files (read via `node:fs`) without a server.
  */
 
-import { parseGraphBinary } from '../connectome/format';
+import { parseGraphBinary, type ConnectomeGraph } from '../connectome/format';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
 
@@ -205,7 +205,7 @@ const fetchJson = async <T>(url: string): Promise<T> => {
   return (await response.json()) as T;
 };
 
-/** Exported for `loadPositions` below (it independently re-fetches the biological graph artifact for its own cross-check — see that function's doc comment) and for tests. */
+/** Exported for `loadPositions` below (fetching its own positions sidecar artifact) and for tests. */
 export const fetchArrayBuffer = async (url: string): Promise<ArrayBuffer> => {
   const response = await fetch(url);
   if (!response.ok) throw new Error(`Failed to fetch ${url}: ${response.status} ${response.statusText}`);
@@ -218,6 +218,15 @@ export interface LoadedArenaArtifacts {
   biological: ArrayBuffer;
   /** Hash-verified, decompressed binary graph buffer for the rewired-seed0 control arm. */
   rewired: ArrayBuffer;
+  /**
+   * The already-parsed biological graph (thermo-architecture I1 fix):
+   * `loadArenaArtifacts` parses this exact graph below purely to cross-check
+   * `neuronCount`/`edgeCount` against the manifest — returning it here lets
+   * `loadPositions` reuse it (`biologicalIds`, `metadata.rateMin`/`rateMax`)
+   * instead of re-fetching, re-verifying, and re-parsing the same artifact a
+   * second time. Callers must not mutate any of its typed-array views.
+   */
+  parsedBiological: ConnectomeGraph;
 }
 
 /**
@@ -303,7 +312,7 @@ export const loadArenaArtifacts = async (
     );
   }
 
-  return { manifest, biological, rewired };
+  return { manifest, biological, rewired, parsedBiological };
 };
 
 /**
@@ -343,7 +352,7 @@ const isFiniteTriple = (value: unknown): value is readonly [number, number, numb
 /**
  * Fetch, hash-verify, and structurally validate the soma-position sidecar
  * artifact the manifest declares (`manifest.positions`), then cross-check it
- * against the real compiled biological graph. Never throws: every failure
+ * against the already-parsed biological graph. Never throws: every failure
  * mode is a returned `status`, so a caller (`App.svelte`) can disable the
  * activity view's toggle with an honest reason instead of failing the whole
  * experiment (positions are optional presentation, unlike the graph
@@ -351,8 +360,16 @@ const isFiniteTriple = (value: unknown): value is readonly [number, number, numb
  *
  * `dataBaseUrl` must be the same value the caller passes to
  * `loadArenaArtifacts` (`${import.meta.env.BASE_URL}data` in production) so
- * both the positions artifact and the graph re-fetch below resolve under the
- * app's real deployment base path (e.g. `/fly/`), not a hardcoded `/data`.
+ * the positions artifact itself resolves under the app's real deployment
+ * base path (e.g. `/fly/`), not a hardcoded `/data`.
+ *
+ * `biologicalGraph` must be the parsed graph `loadArenaArtifacts` already
+ * fetched, hash-verified, and parsed for this same manifest (its
+ * `LoadedArenaArtifacts.parsedBiological`, threaded through
+ * `ExperimentController.initialize()`'s `onManifest` callback to the caller —
+ * see `controller.ts`). Reusing it here (thermo-architecture I1 fix) means
+ * this function no longer re-fetches, re-verifies, or re-parses the graph
+ * artifact itself: it only fetches its own positions sidecar file.
  *
  * Three layers of integrity, all required for `status: 'ok'`:
  * 1. `manifest.positions.sha256` against the fetched bytes' own sha256 —
@@ -360,23 +377,19 @@ const isFiniteTriple = (value: unknown): value is readonly [number, number, numb
  * 2. `positions.graphSha256` against `manifest.gzipSha256` — proves this
  *    positions file was built against *this* compiled graph artifact, not a
  *    stale one left over from an earlier compiler run.
- * 3. `positions.bodyIds` (as decimal strings) against the graph's own
+ * 3. `positions.bodyIds` (as decimal strings) against `biologicalGraph`'s own
  *    `biologicalIds`, element-by-element — the plan's own required check
  *    that this artifact's per-index neuron identity actually lines up with
- *    the graph's. This needs the *parsed* graph, which `assets.ts` does not
- *    otherwise retain past `loadArenaArtifacts` returning — re-fetching and
- *    re-parsing it here (reusing `verifyAndDecompressArtifact`/
- *    `parseGraphBinary`, the same functions `loadArenaArtifacts` uses) is a
- *    second network round trip for the same URL `loadArenaArtifacts` already
- *    fetched, but it happens once, only when the activity view is offered
- *    (not per frame), and the browser's own HTTP cache serves the repeat
- *    request in practice. It also yields `graph.metadata.rateMin`/`rateMax`,
- *    the declared dynamics bounds the activity view's colormap is scaled
- *    against (never a per-frame auto-normalized range — see the plan's
- *    "Color" decision) — returned alongside `positions` on success so no
- *    third fetch/parse is needed just for those two numbers.
+ *    the graph's. `biologicalGraph.metadata.rateMin`/`rateMax` (the declared
+ *    dynamics bounds the activity view's colormap is scaled against — never a
+ *    per-frame auto-normalized range, see the plan's "Color" decision) are
+ *    returned alongside `positions` on success.
  */
-export const loadPositions = async (manifest: ArenaManifest, dataBaseUrl: string): Promise<PositionsLoadResult> => {
+export const loadPositions = async (
+  manifest: ArenaManifest,
+  dataBaseUrl: string,
+  biologicalGraph: ConnectomeGraph
+): Promise<PositionsLoadResult> => {
   const entry = manifest.positions;
   if (!entry) {
     return { status: 'missing', reason: 'The manifest has no positions artifact entry.' };
@@ -523,43 +536,17 @@ export const loadPositions = async (manifest: ArenaManifest, dataBaseUrl: string
     };
   }
 
-  let graphGzip: ArrayBuffer;
-  try {
-    graphGzip = await fetchArrayBuffer(`${dataBaseUrl}/${manifest.artifact}`);
-  } catch (error) {
-    // A transient network failure re-fetching the graph is not itself proof
-    // the positions data is corrupt — report it the same way the sidecar's
-    // own fetch failure is reported above, not as an integrity failure
-    // (dual review finding).
-    return {
-      status: 'missing',
-      reason: `could not re-fetch the biological graph for the positions cross-check: ${error instanceof Error ? error.message : String(error)}`
-    };
-  }
-
-  let graphBinary: ArrayBuffer;
-  let graph: ReturnType<typeof parseGraphBinary>;
-  try {
-    graphBinary = await verifyAndDecompressArtifact(graphGzip, manifest);
-    graph = parseGraphBinary(graphBinary.slice(0));
-  } catch (error) {
+  if (biologicalGraph.biologicalIds.length !== neuronCount) {
     return {
       status: 'invalid',
-      reason: `biological graph re-verification failed during the positions cross-check: ${error instanceof Error ? error.message : String(error)}`
-    };
-  }
-
-  if (graph.biologicalIds.length !== neuronCount) {
-    return {
-      status: 'invalid',
-      reason: `graph biologicalIds length ${graph.biologicalIds.length} does not match neuronCount ${neuronCount}`
+      reason: `graph biologicalIds length ${biologicalGraph.biologicalIds.length} does not match neuronCount ${neuronCount}`
     };
   }
   for (let index = 0; index < neuronCount; index += 1) {
-    if (positions.bodyIds[index] !== graph.biologicalIds[index].toString()) {
+    if (positions.bodyIds[index] !== biologicalGraph.biologicalIds[index].toString()) {
       return {
         status: 'invalid',
-        reason: `bodyIds[${index}] "${positions.bodyIds[index]}" does not match the graph's biologicalIds[${index}] "${graph.biologicalIds[index].toString()}"`
+        reason: `bodyIds[${index}] "${positions.bodyIds[index]}" does not match the graph's biologicalIds[${index}] "${biologicalGraph.biologicalIds[index].toString()}"`
       };
     }
   }
@@ -567,7 +554,7 @@ export const loadPositions = async (manifest: ArenaManifest, dataBaseUrl: string
   return {
     status: 'ok',
     positions: positions as PositionsArtifact,
-    rateMin: graph.metadata.rateMin,
-    rateMax: graph.metadata.rateMax
+    rateMin: biologicalGraph.metadata.rateMin,
+    rateMax: biologicalGraph.metadata.rateMax
   };
 };

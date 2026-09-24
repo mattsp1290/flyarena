@@ -588,8 +588,12 @@ test.describe('anatomical activity view', () => {
     // fallback (not just the arena's, already covered by the
     // 'WebGL-unavailable fallback' describe block) actually rendered.
     const activitySection = page.locator('section.activity');
-    await expect(activitySection.getByRole('img', { name: 'Neural activity view unavailable' })).toBeVisible();
-    await expect(activitySection.getByText(/could not create a WebGL context/i)).toBeVisible();
+    // Thermo-maintainability I2 fix: the dynamic `sceneError` text is exposed
+    // to assistive tech via `role="alert"` (matching the `contextLostMessage`
+    // pattern), not hidden behind a static `role="img"` label — assert the
+    // live region's actual accessible content contains the real reason, not
+    // just that some visible text on the page happens to match it.
+    await expect(activitySection.getByRole('alert')).toContainText(/could not create a WebGL context/i);
     await expect(activityCanvas(page)).toBeHidden();
 
     await startOrResumeButton(page).click();

@@ -2,8 +2,10 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { gunzipSync } from 'node:zlib';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadPositions, type ArenaManifest } from '../../src/lib/experiment/assets';
+import { parseGraphBinary, type ConnectomeGraph } from '../../src/lib/connectome/format';
 import { createPublicDataFetch } from '../helpers/fake-worker';
 
 /**
@@ -11,6 +13,13 @@ import { createPublicDataFetch } from '../helpers/fake-worker';
  * `public/data/malecns-arena-v1.positions.json` and its manifest entry — the
  * same "test against real committed files" discipline
  * `tests/unit/experiment-assets.test.ts` uses for the graph artifacts.
+ *
+ * `loadPositions` no longer fetches/parses the biological graph itself
+ * (thermo-architecture I1 fix) — callers thread in the already-parsed graph.
+ * `biologicalGraph` below is built directly from the real committed
+ * `.bin.gz` artifact (no `fetch` involved), mirroring what
+ * `ExperimentController.initialize()` -> `App.svelte`'s `onManifest` really
+ * hands `loadPositions` in production.
  */
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -20,6 +29,13 @@ const manifest = JSON.parse(
   readFileSync(resolve(publicDataDir, 'malecns-arena-v1.manifest.json'), 'utf-8')
 ) as ArenaManifest;
 
+const biologicalGraph: ConnectomeGraph = (() => {
+  const gzipBytes = readFileSync(resolve(publicDataDir, manifest.artifact));
+  const binary = gunzipSync(gzipBytes);
+  const arrayBuffer = binary.buffer.slice(binary.byteOffset, binary.byteOffset + binary.byteLength);
+  return parseGraphBinary(arrayBuffer);
+})();
+
 afterEach(() => {
   vi.unstubAllGlobals();
 });
@@ -28,7 +44,7 @@ describe('loadPositions', () => {
   it('loads and verifies the real positions artifact, cross-checked against the real compiled graph', async () => {
     vi.stubGlobal('fetch', createPublicDataFetch());
 
-    const result = await loadPositions(manifest, '/data');
+    const result = await loadPositions(manifest, '/data', biologicalGraph);
 
     expect(result.status).toBe('ok');
     if (result.status !== 'ok') throw new Error(`expected ok, got ${result.status}`);
@@ -42,14 +58,14 @@ describe('loadPositions', () => {
 
   it('returns "missing" (never throws) when the manifest has no positions entry', async () => {
     const { positions: _omitted, ...withoutPositions } = manifest;
-    const result = await loadPositions(withoutPositions as ArenaManifest, '/data');
+    const result = await loadPositions(withoutPositions as ArenaManifest, '/data', biologicalGraph);
     expect(result.status).toBe('missing');
   });
 
   it('returns "invalid" when the fetched positions artifact fails its sha256 check', async () => {
     vi.stubGlobal('fetch', createPublicDataFetch({ corrupt: 'malecns-arena-v1.positions.json' }));
 
-    const result = await loadPositions(manifest, '/data');
+    const result = await loadPositions(manifest, '/data', biologicalGraph);
 
     expect(result.status).toBe('invalid');
     if (result.status !== 'invalid') throw new Error('expected invalid');
@@ -83,7 +99,7 @@ describe('loadPositions', () => {
       positions: { ...manifest.positions!, sha256: tamperedSha256 }
     };
 
-    const result = await loadPositions(tamperedManifest, '/data');
+    const result = await loadPositions(tamperedManifest, '/data', biologicalGraph);
 
     expect(result.status).toBe('invalid');
     if (result.status !== 'invalid') throw new Error('expected invalid');
@@ -116,7 +132,7 @@ describe('loadPositions', () => {
       positions: { ...manifest.positions!, sha256: tamperedSha256 }
     };
 
-    const result = await loadPositions(tamperedManifest, '/data');
+    const result = await loadPositions(tamperedManifest, '/data', biologicalGraph);
 
     expect(result.status).toBe('invalid');
     if (result.status !== 'invalid') throw new Error('expected invalid');
@@ -141,7 +157,7 @@ describe('loadPositions', () => {
     });
 
     const tamperedManifest: ArenaManifest = { ...manifest, positions: { ...manifest.positions!, sha256: tamperedSha256 } };
-    const result = await loadPositions(tamperedManifest, '/data');
+    const result = await loadPositions(tamperedManifest, '/data', biologicalGraph);
 
     expect(result.status).toBe('invalid');
     if (result.status !== 'invalid') throw new Error('expected invalid');
@@ -165,7 +181,7 @@ describe('loadPositions', () => {
     });
 
     const tamperedManifest: ArenaManifest = { ...manifest, positions: { ...manifest.positions!, sha256: tamperedSha256 } };
-    const result = await loadPositions(tamperedManifest, '/data');
+    const result = await loadPositions(tamperedManifest, '/data', biologicalGraph);
 
     expect(result.status).toBe('invalid');
     if (result.status !== 'invalid') throw new Error('expected invalid');
@@ -185,27 +201,32 @@ describe('loadPositions', () => {
     });
 
     const tamperedManifest: ArenaManifest = { ...manifest, positions: { ...manifest.positions!, sha256: tamperedSha256 } };
-    const result = await loadPositions(tamperedManifest, '/data');
+    const result = await loadPositions(tamperedManifest, '/data', biologicalGraph);
 
     expect(result.status).toBe('invalid');
     if (result.status !== 'invalid') throw new Error('expected invalid');
     expect(result.reason).toMatch(/not a json object/i);
   });
 
-  it('returns "missing" (not "invalid") when re-fetching the biological graph for the cross-check fails for a transient reason (dual review finding)', async () => {
+  it('never fetches the biological graph artifact itself (thermo-architecture I1 fix: the parsed graph is passed in, not re-fetched)', async () => {
+    const fetchedUrls: string[] = [];
     vi.stubGlobal('fetch', async (input: RequestInfo | URL): Promise<Response> => {
       const url = typeof input === 'string' ? input : input.toString();
-      if (url.endsWith('malecns-arena-v1.bin.gz')) {
-        throw new Error('simulated network failure');
-      }
+      fetchedUrls.push(url);
       return createPublicDataFetch()(input);
     });
 
-    const result = await loadPositions(manifest, '/data');
+    const result = await loadPositions(manifest, '/data', biologicalGraph);
 
-    expect(result.status).toBe('missing');
-    if (result.status !== 'missing') throw new Error('expected missing');
-    expect(result.reason).toMatch(/re-fetch/i);
+    expect(result.status).toBe('ok');
+    // Only the positions sidecar is fetched — the graph artifact (whose
+    // manifest entry is `manifest.artifact`) is never touched by `fetch`,
+    // because `loadPositions` now uses the already-parsed `biologicalGraph`
+    // passed in by the caller instead of re-fetching/re-verifying/
+    // re-parsing it a second time.
+    const graphFetches = fetchedUrls.filter((url) => url.endsWith(manifest.artifact));
+    expect(graphFetches).toHaveLength(0);
+    expect(fetchedUrls.filter((url) => url.endsWith('malecns-arena-v1.positions.json'))).toHaveLength(1);
   });
 
   it('returns "invalid" when the declared roleCounts disagrees with the actual role counts (round-2 review gap)', async () => {
@@ -229,7 +250,7 @@ describe('loadPositions', () => {
     });
 
     const tamperedManifest: ArenaManifest = { ...manifest, positions: { ...manifest.positions!, sha256: tamperedSha256 } };
-    const result = await loadPositions(tamperedManifest, '/data');
+    const result = await loadPositions(tamperedManifest, '/data', biologicalGraph);
 
     expect(result.status).toBe('invalid');
     if (result.status !== 'invalid') throw new Error('expected invalid');
@@ -253,7 +274,7 @@ describe('loadPositions', () => {
     });
 
     const tamperedManifest: ArenaManifest = { ...manifest, positions: { ...manifest.positions!, sha256: tamperedSha256 } };
-    const result = await loadPositions(tamperedManifest, '/data');
+    const result = await loadPositions(tamperedManifest, '/data', biologicalGraph);
 
     expect(result.status).toBe('invalid');
     if (result.status !== 'invalid') throw new Error('expected invalid');

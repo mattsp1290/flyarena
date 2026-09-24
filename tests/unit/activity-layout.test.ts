@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { layoutPositions, partitionByRole, writeColors, type NeuronRole, type PositionSource } from '../../src/lib/render/activity-layout';
+import { POINT_SIZE } from '../../src/lib/render/activity-constants';
 
 describe('layoutPositions', () => {
   it('centers annotated (soma/tosoma) neurons on their centroid and uniformly scales to unit extent', () => {
@@ -86,7 +87,11 @@ describe('layoutPositions', () => {
     for (const xs of byRow.values()) {
       xs.sort((a, b) => a - b);
       for (let i = 1; i < xs.length; i += 1) {
-        expect(xs[i] - xs[i - 1]).toBeGreaterThan(0.05);
+        // Assert against the real `POINT_SIZE` (imported, not a third
+        // hardcoded copy of the threshold — thermo-maintainability S1 fix)
+        // so this regression test actually fails if a future `POINT_SIZE`
+        // change ever shrinks the real point-vs-spacing margin below zero.
+        expect(xs[i] - xs[i - 1]).toBeGreaterThan(POINT_SIZE);
       }
     }
   });

@@ -116,6 +116,35 @@ describe('App renderer lifecycle (ArenaScene mocked)', () => {
   });
 });
 
+describe('App activity view asset loading (thermo-architecture I1 fix: no duplicate graph fetch)', () => {
+  it('fetches the biological graph artifact exactly once, even once the activity panel opens', async () => {
+    const fetchedUrls: string[] = [];
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL): Promise<Response> => {
+      const url = typeof input === 'string' ? input : input.toString();
+      fetchedUrls.push(url);
+      return createPublicDataFetch()(input);
+    });
+
+    render(App);
+    await waitForReady();
+
+    // `loadPositions` (fired from `onManifest`, independent of the panel's
+    // own expand/collapse state) has to resolve `status: 'ok'` before the
+    // "Expand" toggle becomes enabled — waiting for that is what proves the
+    // cross-check against the graph completed without a second fetch.
+    const toggle = await screen.findByRole('button', { name: 'Expand' });
+    await waitFor(() => expect(toggle).toBeEnabled(), { timeout: 5000 });
+
+    // Opening the panel itself renders from data already loaded (no fetch
+    // of its own) — click it anyway to confirm the "no second fetch"
+    // guarantee holds across expand too, not just at manifest-load time.
+    await fireEvent.click(toggle);
+
+    const graphFetches = fetchedUrls.filter((url) => url.endsWith('malecns-arena-v1.bin.gz'));
+    expect(graphFetches).toHaveLength(1);
+  });
+});
+
 describe('App reduced-motion handling', () => {
   it('subscribes to prefers-reduced-motion and forwards changes to the scene, unsubscribing on unmount', async () => {
     const mql = new FakeMediaQueryList('(prefers-reduced-motion: reduce)', false);

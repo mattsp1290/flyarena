@@ -169,13 +169,19 @@
         onError: (message) => {
           if (!destroyed) errorMessage = message;
         },
-        onManifest: (nextManifest) => {
+        onManifest: (nextManifest, biologicalGraph) => {
           if (destroyed) return;
           manifest = nextManifest;
           // Independent of graph-artifact loading/Worker construction below:
           // the activity view's positions are optional presentation, not a
           // Start gate, so this proceeds even if the rest of `initialize()`
           // goes on to fail.
+          //
+          // `biologicalGraph` is the already-verified, already-parsed graph
+          // `controller.initialize()` just produced for this same manifest —
+          // threading it through here (thermo-architecture I1 fix) is what
+          // lets `loadPositions` skip re-fetching/re-verifying/re-parsing the
+          // graph artifact a second time.
           //
           // `loadPositions` documents itself as "never throws", but this
           // `.catch` enforces that contract at the call site too (dual
@@ -184,7 +190,7 @@
           // would become an unhandled rejection and leave `positionsStatus`
           // `undefined` forever, showing "Loading soma positions…" with no
           // way to recover short of a reload.
-          void loadPositions(nextManifest, `${import.meta.env.BASE_URL}data`)
+          void loadPositions(nextManifest, `${import.meta.env.BASE_URL}data`, biologicalGraph)
             .catch(
               (error: unknown): PositionsLoadResult => ({
                 status: 'invalid',

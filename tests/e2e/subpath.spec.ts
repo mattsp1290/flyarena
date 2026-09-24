@@ -7,11 +7,10 @@ test('all views work beneath /fly/ with root asset routes deliberately unavailab
   await page.goto('/fly/');await expect(page.getByRole('status')).toHaveText('ready');
   const manifest=page.getByRole('link',{name:'Compiled artifact manifest (JSON)'});
   await expect(manifest).toHaveAttribute('href','/fly/data/malecns-arena-v1.manifest.json');
-  // WP3: `loadPositions` fetches the positions sidecar (and re-fetches the
-  // graph binary for its own cross-check) under this same /fly/ base path —
-  // if it fell back to the (deliberately 404ing) root /data/ path instead,
-  // the toggle would stay disabled forever and `failed` below would catch
-  // the 404s.
+  // WP3: `loadPositions` fetches the positions sidecar under this same
+  // /fly/ base path — if it fell back to the (deliberately 404ing) root
+  // /data/ path instead, the toggle would stay disabled forever and
+  // `failed` below would catch the 404s.
   await expect(page.locator('section.activity button')).toBeEnabled({timeout:20000});
   await page.getByRole('link',{name:'02 Counterfactual workbench',exact:true}).click();
   await expect(page.getByRole('status')).toHaveText('ready');

@@ -60,12 +60,20 @@ const okPositionsStatus: PositionsLoadResult = {
   rateMax: 1
 };
 
-type MockRunner = ExperimentRunner & { setActivityStreaming: ReturnType<typeof vi.fn>; getLatestRates: ReturnType<typeof vi.fn> };
+type MockRunner = ExperimentRunner & {
+  setActivityStreaming: ReturnType<typeof vi.fn>;
+  getLatestRates: ReturnType<typeof vi.fn>;
+  supportsActivityStreaming: ReturnType<typeof vi.fn>;
+};
 
 const makeRunner = (): MockRunner =>
   ({
     setActivityStreaming: vi.fn(async () => undefined),
-    getLatestRates: vi.fn(() => undefined)
+    getLatestRates: vi.fn(() => undefined),
+    // Every browser-constructed binding supports streaming today — default
+    // to `true` for both arms so existing tests exercising `frame()` are
+    // unaffected; tests exercising the unsupported case override this.
+    supportsActivityStreaming: vi.fn(() => true)
   }) as unknown as MockRunner;
 
 interface Deferred<T> {
@@ -92,6 +100,7 @@ const makeControllableRunner = (): MockRunner & { streamingCalls: Array<Deferred
   return {
     setActivityStreaming,
     getLatestRates: vi.fn(() => undefined),
+    supportsActivityStreaming: vi.fn(() => true),
     streamingCalls
   } as unknown as MockRunner & { streamingCalls: Array<Deferred<void>> };
 };
@@ -234,6 +243,12 @@ describe('ActivityPanel render-loop error guard', () => {
     await waitFor(() => expect(runner.setActivityStreaming).toHaveBeenLastCalledWith(false));
     expect(instances[0].dispose).toHaveBeenCalledTimes(1);
     expect(screen.getByText(/activity view stopped/i)).toBeInTheDocument();
+    // Thermo-maintainability I2: the dynamic error text must be exposed to
+    // assistive tech through a live region (`role="alert"`), not only be
+    // visible text — a `role="img"` wrapper with a static `aria-label`
+    // would pass the `getByText` assertion above while still hiding the
+    // real reason from screen readers.
+    expect(screen.getByRole('alert')).toHaveTextContent(/activity view stopped/i);
     // No further frame was scheduled after the throw.
     expect(rafCallback).toBeUndefined();
 
@@ -307,6 +322,70 @@ describe('ActivityPanel "no data" repaint', () => {
 
     expect(instances[0].clear).toHaveBeenCalledWith('left');
     expect(instances[0].clear).toHaveBeenCalledWith('right');
+
+    rafSpy.mockRestore();
+  });
+});
+
+describe('ActivityPanel streaming-support gating (thermo-architecture S1: wire supportsActivityStreaming into the panel)', () => {
+  it('shows an explicit "streaming unavailable" message for an arm whose current binding does not support it, instead of a silent "No data yet"', async () => {
+    const runner = makeRunner();
+    let rafCallback: FrameRequestCallback | undefined;
+    const rafSpy = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb) => {
+      rafCallback = cb;
+      return 1;
+    });
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => {});
+
+    // Only the right arm's current binding supports streaming.
+    runner.supportsActivityStreaming.mockImplementation((agentId: string) => agentId === 'left');
+
+    render(ActivityPanel, {
+      runner,
+      positionsStatus: okPositionsStatus,
+      telemetry: undefined,
+      topologySwitchPending: false
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    await waitFor(() => expect(instances).toHaveLength(1));
+    await waitFor(() => expect(rafCallback).toBeTypeOf('function'));
+
+    const callback = rafCallback;
+    rafCallback = undefined;
+    callback?.(1000);
+
+    await waitFor(() => expect(screen.getByText(/right arm: streaming unavailable for this arm/i)).toBeInTheDocument());
+    expect(screen.queryByText(/left arm: streaming unavailable for this arm/i)).not.toBeInTheDocument();
+
+    rafSpy.mockRestore();
+  });
+
+  it('shows no "streaming unavailable" message when both arms support streaming (the common case today)', async () => {
+    const runner = makeRunner();
+    let rafCallback: FrameRequestCallback | undefined;
+    const rafSpy = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb) => {
+      rafCallback = cb;
+      return 1;
+    });
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => {});
+
+    render(ActivityPanel, {
+      runner,
+      positionsStatus: okPositionsStatus,
+      telemetry: undefined,
+      topologySwitchPending: false
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    await waitFor(() => expect(instances).toHaveLength(1));
+    await waitFor(() => expect(rafCallback).toBeTypeOf('function'));
+
+    const callback = rafCallback;
+    rafCallback = undefined;
+    callback?.(1000);
+
+    expect(screen.queryByText(/streaming unavailable for this arm/i)).not.toBeInTheDocument();
 
     rafSpy.mockRestore();
   });

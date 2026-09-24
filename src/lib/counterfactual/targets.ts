@@ -7,8 +7,16 @@ export interface PreparedGraph extends Preparation { graph: ConnectomeGraph }
 export async function prepareGraph(assets: LoadedArenaArtifacts, mode: GraphMode): Promise<PreparedGraph> {
   if (!['biological', 'rewired', 'disconnected'].includes(mode)) throw new Error('Unknown topology');
   const source = mode === 'rewired' ? assets.rewired : assets.biological;
-  const graph = mode === 'disconnected'
-    ? createDisconnectedGraph(parseGraphBinary(source.slice(0))) : parseGraphBinary(source.slice(0));
+  // `rewired` has no parsed-graph counterpart on `LoadedArenaArtifacts` (only
+  // the biological arm's parse is threaded through — see `assets.ts`), so it
+  // still parses its own source here. `biological`/`disconnected` reuse
+  // `assets.parsedBiological` instead of re-parsing `assets.biological` a
+  // second time (thermo-architecture I1 fix, code-review follow-up): the
+  // caller (`loadArenaArtifacts`, or a CLI/test fixture matching its
+  // contract) already parsed it once to cross-check `neuronCount`/
+  // `edgeCount`, and that parse would otherwise be silently redone here.
+  const biologicalOrRewired = mode === 'rewired' ? parseGraphBinary(source.slice(0)) : assets.parsedBiological;
+  const graph = mode === 'disconnected' ? createDisconnectedGraph(biologicalOrRewired) : biologicalOrRewired;
   const { metadata: m } = graph;
   if (m.inputChannelCount !== 8 || m.outputPopulationCount !== 3 || m.rateMin > 0 || m.rateMax < 0) {
     throw new Error('Graph is incompatible with arena observations, actions or zero-rate silencing');
