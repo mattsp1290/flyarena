@@ -2,11 +2,19 @@ import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { basename, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import { requireNonNegativeInt, requirePositiveInt, requireValue } from '../training/cli';
 import { atomicWriteFileSync, sha256Hex } from '../training/fsio';
-import { conditionRng, mean, pairedStats, type PairedStats } from '../training/stats';
+import { conditionRng, mean, median, pairedStats, type PairedStats } from '../training/stats';
 import { verifyManifestRoundTrips } from '../null/null-report';
-import type { AtlasEvaluationRaw, AtlasGraphKey, AtlasGraphRaw } from './atlas-evaluate';
+import {
+  DEFAULT_HELD_OUT_COUNT,
+  DEFAULT_HELD_OUT_START,
+  DEFAULT_TICKS,
+  type AtlasEvaluationRaw,
+  type AtlasGraphKey,
+  type AtlasGraphRaw
+} from './atlas-evaluate';
 
 /**
  * `.agents/plans/lesion-atlas/02-atlas-computation.md`'s WP2 report: the
@@ -46,6 +54,16 @@ const DEFAULT_BOOTSTRAP_SEED = 0x4c455349;
 const DEFAULT_BOOTSTRAP_RESAMPLES = 10000;
 /** Benjamini-Hochberg false discovery rate, per neuron, per graph (the plan's "q = 0.05 per graph (1,008 tests)"). */
 const FDR_Q = 0.05;
+/**
+ * `pairedStats`' CI is a 95% CI (`scripts/training/stats.ts`'s `bootstrapCI`),
+ * so 5% of per-neuron CIs are expected to exclude 0 by chance alone even
+ * under a true null. Kept as its own constant, separate from `FDR_Q` above,
+ * even though both happen to be 0.05 today -- they describe two different
+ * things (the CI's nominal miss rate vs. the FDR procedure's target rate)
+ * that could diverge if either is ever tuned independently (a dual-review
+ * finding: `expectedChanceExclusions` was previously computed from `FDR_Q`).
+ */
+const CI_ALPHA = 0.05;
 const TOP_EFFECTS_COUNT = 20;
 /** "Numbers are rounded to 6 significant digits for size" (the plan's artifact-shape row). */
 const SIGNIFICANT_DIGITS = 6;
@@ -214,7 +232,7 @@ const readPositions = (path: string, neuronCount: number, biologicalGraphGzipSha
  * its own data)`, independent of how many other statistics this run
  * computed or in what order.
  */
-const pairedBootstrapPValue = (
+export const pairedBootstrapPValue = (
   a: readonly number[],
   b: readonly number[],
   resamples: number,
@@ -278,7 +296,7 @@ export interface AtlasGraphSummary {
   readonly p95Effect: number;
   /** Neurons whose 95% CI excludes 0 (naive, uncorrected). */
   readonly ciExcludesZeroCount: number;
-  /** `FDR_Q * neuronCount`: the number of chance CI exclusions expected under the null even if every neuron's true effect were 0. */
+  /** `CI_ALPHA * neuronCount`: the number of chance CI exclusions expected under the null even if every neuron's true effect were 0. */
   readonly expectedChanceExclusions: number;
   /** Neurons surviving Benjamini-Hochberg FDR at `q = 0.05`. */
   readonly fdrSignificantCount: number;
@@ -287,9 +305,19 @@ export interface AtlasGraphSummary {
 }
 
 export interface AtlasGraphArtifact {
+  /** The *decompressed binary* sha256 (manifest `binarySha256`/`rewiredArms.seed0.binarySha256`), not the gzip sha (`AtlasGraphRaw.graphGzipSha256`, which only the positions-sidecar cross-check uses). WP3's loader should compare this against the graph it parsed, the same field. */
   readonly graphSha256: string;
   readonly baseline: number;
   readonly effect: readonly number[];
+  /**
+   * `ciLow`/`ciHigh` bracket the paired bootstrap 95% CI. The plan's
+   * statistics section also names a per-neuron `ciCrossesZero`, which is
+   * intentionally not stored here as its own array (kept out of the
+   * artifact shape to stay within the plan's size budget): a consumer
+   * derives it as `ciLow[i] <= 0 && ciHigh[i] >= 0` from these two arrays --
+   * safe because `roundSignificant` preserves sign and never rounds a
+   * nonzero bound down to exactly 0 in this artifact's normal value range.
+   */
   readonly ciLow: readonly number[];
   readonly ciHigh: readonly number[];
   readonly fdrSignificant: readonly boolean[];
@@ -379,11 +407,17 @@ const buildGraphArtifact = (
     ciHigh: ciHigh.map((v) => roundSignificant(v)),
     fdrSignificant,
     summary: {
-      medianEffect: roundSignificant(percentile(sortedEffect, 0.5)),
+      // `median` (scripts/training/stats.ts) averages the two middle
+      // elements for an even-length array, unlike `percentile`'s
+      // nearest-rank method below (kept for p5Effect/p95Effect, where the
+      // plan does not call for interpolation) -- a dual-review finding: this
+      // previously used `percentile(sortedEffect, 0.5)`, which returns the
+      // upper-middle element instead of the true median for an even n.
+      medianEffect: roundSignificant(median(effect)),
       p5Effect: roundSignificant(percentile(sortedEffect, 0.05)),
       p95Effect: roundSignificant(percentile(sortedEffect, 0.95)),
       ciExcludesZeroCount,
-      expectedChanceExclusions: roundSignificant(FDR_Q * n),
+      expectedChanceExclusions: roundSignificant(CI_ALPHA * n),
       fdrSignificantCount,
       topEffects
     }
@@ -479,11 +513,21 @@ export const updateManifestWithLesionAtlas = (
 
 const fmt = (value: number, digits = 4): string => value.toFixed(digits);
 
-const renderGraphSection = (title: string, graph: Readonly<AtlasGraphArtifact>): string => {
+/**
+ * `pairedBootstrapPValue` can only return multiples of `2/resamples` (each
+ * resample contributes `1/resamples`, doubled for the two-sided formula);
+ * `p === 0` means no resample landed on the opposite side, not that the
+ * true p-value is exactly zero. Printing `0.0000` would read as the
+ * stronger claim -- shown as an explicit resolution floor instead, so a
+ * reader never mistakes Monte Carlo resolution for exact significance.
+ */
+const fmtP = (p: number, resamples: number): string => (p === 0 ? `< ${(2 / resamples).toExponential(0)}` : fmt(p, 4));
+
+const renderGraphSection = (title: string, graph: Readonly<AtlasGraphArtifact>, bootstrapResamples: number): string => {
   const topRows = graph.summary.topEffects
     .map(
       (entry) =>
-        `| ${entry.index} | ${entry.bodyId} | ${entry.role} | ${fmt(entry.effect)} | (${fmt(entry.ciLow)}, ${fmt(entry.ciHigh)}) | ${fmt(entry.pValue, 4)} | ${entry.fdrSignificant ? 'yes' : 'no'} |`
+        `| ${entry.index} | ${entry.bodyId} | ${entry.role} | ${fmt(entry.effect)} | (${fmt(entry.ciLow)}, ${fmt(entry.ciHigh)}) | ${fmtP(entry.pValue, bootstrapResamples)} | ${entry.fdrSignificant ? 'yes' : 'no'} |`
     )
     .join('\n');
 
@@ -536,10 +580,16 @@ authored decoder; the right agent is parked (always the zero action). Held-out s
 rewiring-null study uses. The lesion effect for neuron \`i\` is the mean over seeds of
 \`movementScore(lesioned i) - movementScore(baseline)\`, paired by seed, with a 95% bootstrap CI
 (\`scripts/training/stats.ts\`'s \`pairedStats\`, ${artifact.bootstrap.resamples} resamples, seed
-\`${artifact.bootstrap.seed}\`, one independent RNG stream per neuron per graph).
+\`${artifact.bootstrap.seed}\`, one independent RNG stream per neuron per graph). The \`p (bootstrap)\` column in
+the top-effects tables below is a separate two-sided percentile-bootstrap p-value (twice the fraction of
+resampled mean differences on the opposite side of 0 from the observed effect, capped at 1), drawn from its
+own RNG stream independent of the CI's -- a neuron's CI and p-value can therefore disagree near the
+boundary (a CI that just excludes 0 while p is just above 0.05, or the reverse). With
+${artifact.bootstrap.resamples} resamples the p-value's resolution is \`2/${artifact.bootstrap.resamples}\`;
+\`p < ...\` below means no resample crossed to the other side, not that the true p-value is exactly zero.
 
 **Multiple comparisons.** With ${artifact.neuronCount} simultaneous per-neuron CIs per graph, about
-${fmt(artifact.neuronCount * 0.05, 0)} are expected to exclude 0 by chance alone even if every neuron's true
+${fmt(artifact.neuronCount * CI_ALPHA, 0)} are expected to exclude 0 by chance alone even if every neuron's true
 effect were exactly 0. Benjamini-Hochberg FDR control at \`q = 0.05\` (per graph, ${artifact.neuronCount}
 tests) marks which neurons' effects survive that correction (\`fdrSignificant\`); only FDR-surviving neurons
 should be read as reliable effects, not every neuron whose raw CI happens to exclude 0.
@@ -561,8 +611,8 @@ ${timingRow}| Bootstrap resamples | ${artifact.bootstrap.resamples} |
 
 ## Results
 
-${renderGraphSection('Biological', artifact.graphs.biological)}
-${renderGraphSection('Rewired seed 0', artifact.graphs.rewiredSeed0)}
+${renderGraphSection('Biological', artifact.graphs.biological, artifact.bootstrap.resamples)}
+${renderGraphSection('Rewired seed 0', artifact.graphs.rewiredSeed0, artifact.bootstrap.resamples)}
 ## Limitations
 
 - **This model only.** No claim is made that any lesioned neuron "controls" a behavior in the real fly --
@@ -571,7 +621,7 @@ ${renderGraphSection('Rewired seed 0', artifact.graphs.rewiredSeed0)}
   both would not; this atlas does not probe pairs or groups (a stated non-goal, follow-up work).
 - **Full-episode lesions from tick 0**, unlike the interactive counterfactual workbench's warmup fork -- the
   two are not directly comparable measurements.
-- **About ${fmt(artifact.neuronCount * 0.05, 0)} of the per-neuron 95% CIs are expected to exclude 0 by
+- **About ${fmt(artifact.neuronCount * CI_ALPHA, 0)} of the per-neuron 95% CIs are expected to exclude 0 by
   chance per graph** (${artifact.neuronCount} simultaneous tests at the nominal 5% rate) -- only
   FDR-surviving neurons (\`fdrSignificant\`) should be treated as reliable effects.
 - **The opponent is parked** for every episode, matching the null studies' single-agent condition, not a
@@ -587,14 +637,132 @@ ${renderGraphSection('Rewired seed 0', artifact.graphs.rewiredSeed0)}
 // main
 // ---------------------------------------------------------------------------
 
-const guardShippedDefault = (path: string, defaultPath: string, label: string, neuronCount: number): void => {
+/**
+ * Every reason `raw` is not "shipped-grade" -- not just under-covered on
+ * neurons (the calibration-run bug this WP already fixed once), but also a
+ * shorter/cheaper condition than the shipped atlas's. A dual-review finding:
+ * checking neuron coverage alone would still let a full-neuron but
+ * short-seed/short-tick smoke run (`--held-out-count 3 --ticks 100`, which
+ * covers all 1008 neurons in a couple of minutes) pass the guard and
+ * overwrite the shipped artifact with drastically noisier numbers. Computed
+ * directly from `raw` -- before `buildArtifact`'s bootstrap resampling runs
+ * at all -- so an unshippable run is rejected before paying for ~2 x 1008 x
+ * (10000 CI resamples + 10000 p-value resamples) draws, matching this
+ * file's other pre-`buildArtifact` checks below.
+ */
+const rawShippedGradeProblems = (raw: Readonly<AtlasEvaluationRaw>): readonly string[] => {
+  const problems: string[] = [];
+  const biologicalCount = raw.graphs.biological?.lesion.length ?? 0;
+  const rewiredCount = raw.graphs.rewiredSeed0?.lesion.length ?? 0;
+  if (biologicalCount < MIN_NEURONS_FOR_SHIPPED_DEFAULT || rewiredCount < MIN_NEURONS_FOR_SHIPPED_DEFAULT) {
+    problems.push(
+      `covers ${biologicalCount}/${rewiredCount} neurons (biological/rewiredSeed0), shipped requires ` +
+        `${MIN_NEURONS_FOR_SHIPPED_DEFAULT} for both`
+    );
+  }
+  if (raw.seeds.start !== DEFAULT_HELD_OUT_START || raw.seeds.count !== DEFAULT_HELD_OUT_COUNT) {
+    problems.push(`seeds ${raw.seeds.start}+${raw.seeds.count} (shipped: ${DEFAULT_HELD_OUT_START}+${DEFAULT_HELD_OUT_COUNT})`);
+  }
+  if (raw.ticks !== DEFAULT_TICKS) problems.push(`ticks ${raw.ticks} (shipped: ${DEFAULT_TICKS})`);
+  if (raw.substeps !== NEURAL_SUBSTEPS_PER_TICK) {
+    problems.push(`substeps ${raw.substeps} (shipped: ${NEURAL_SUBSTEPS_PER_TICK})`);
+  }
+  return problems;
+};
+
+const guardShippedDefault = (path: string, defaultPath: string, label: string, problems: readonly string[]): void => {
   if (resolve(path) !== resolve(defaultPath)) return;
-  if (neuronCount >= MIN_NEURONS_FOR_SHIPPED_DEFAULT) return;
+  if (problems.length === 0) return;
   throw new Error(
-    `atlas-report: refusing to overwrite the shipped ${label} (${defaultPath}) -- the input covers only ` +
-      `${neuronCount} neuron(s) (the shipped atlas covers all ${MIN_NEURONS_FOR_SHIPPED_DEFAULT}). Pass an ` +
-      'explicit --out/--report-md/--manifest scratch path for a dev/calibration run.'
+    `atlas-report: refusing to overwrite the shipped ${label} (${defaultPath}) -- this run is not shipped-grade: ` +
+      `${problems.join('; ')}. Pass explicit scratch --out/--report-md/--manifest paths for a dev/calibration run.`
   );
+};
+
+/**
+ * `updateManifestWithLesionAtlas` records the artifact as `basename(args.out)`
+ * -- resolved by both the browser and `atlas-evaluate.ts` relative to the
+ * *manifest's own directory* (`dirname(args.manifest)`), never `--out`'s
+ * directory. Without this check, an otherwise shipped-grade run with a
+ * scratch `--out` but the default `--manifest` would pass every other
+ * guard, then leave the shipped manifest pointing at a `public/data/`
+ * filename that does not actually exist there (a dual-review finding).
+ */
+const requireOutBesideManifest = (outPath: string, manifestPath: string): void => {
+  if (resolve(dirname(outPath)) === resolve(dirname(manifestPath))) return;
+  throw new Error(
+    `atlas-report: --out (${outPath}) must be in the same directory as --manifest (${manifestPath}) -- the ` +
+      "manifest records the artifact by basename, resolved relative to its own directory"
+  );
+};
+
+/**
+ * `atlas-evaluate.ts` verifies every graph file's sha256 against the
+ * manifest before scoring anything, but `atlas-raw.json` is a plain file on
+ * disk that can go stale (the manifest recompiled or re-rewired since that
+ * run) or be hand-edited/merged. Without this check, a stale raw evaluation
+ * would publish an artifact whose `graphSha256` no longer matches the
+ * manifest it was just written next to -- caught only later, in the
+ * browser, by WP3's loader (a dual-review finding: this mirrors
+ * `null-report.ts`'s `verifySourceGraphMatchesManifest`, but that function
+ * is specific to the null study's `NullReportArgs`/single source graph, not
+ * reused here). Skips a graph key `raw.graphs` doesn't have -- `buildArtifact`
+ * already gives the clearer "missing biological/rewiredSeed0" error for that.
+ */
+/**
+ * Defense in depth: `pairedStats` throws if a lesioned/baseline pair has
+ * mismatched *lengths*, but says nothing about whether they are actually
+ * the *same seeds in the same order* -- a hand-edited or merged
+ * `atlas-raw.json` with a graph's `heldOutSeeds` reordered or drawn from a
+ * different range than `raw.seeds` would silently pair the wrong episodes
+ * together and publish a nonsensical effect with no error anywhere (a
+ * dual-review finding). `atlas-evaluate.ts` always builds every task's
+ * `heldOutSeeds` from one shared array, so this holds by construction for
+ * its own output -- this only protects a file that reached this point some
+ * other way.
+ */
+const verifyRawSeedsConsistent = (raw: Readonly<AtlasEvaluationRaw>): void => {
+  const expected = Array.from({ length: raw.seeds.count }, (_, i) => raw.seeds.start + i);
+  const sameSeeds = (seeds: readonly number[]): boolean =>
+    seeds.length === expected.length && seeds.every((seed, i) => seed === expected[i]);
+  for (const key of ['biological', 'rewiredSeed0'] as const) {
+    const graph = raw.graphs[key];
+    if (!graph) continue;
+    if (!sameSeeds(graph.heldOutSeeds)) {
+      throw new Error(
+        `atlas-report: ${key}'s heldOutSeeds do not match raw.seeds (${raw.seeds.start}..+${raw.seeds.count})`
+      );
+    }
+    if (graph.baselineMovementScore.length !== expected.length) {
+      throw new Error(`atlas-report: ${key}'s baselineMovementScore length does not match raw.seeds.count`);
+    }
+    for (const entry of graph.lesion) {
+      if (entry.movementScore.length !== expected.length) {
+        throw new Error(`atlas-report: ${key} lesion index ${entry.index}'s movementScore length does not match raw.seeds.count`);
+      }
+    }
+  }
+};
+
+const verifyRawGraphsMatchManifest = (manifestPath: string, raw: Readonly<AtlasEvaluationRaw>): void => {
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
+    readonly binarySha256?: string;
+    readonly rewiredArms?: { readonly seed0?: { readonly binarySha256?: string } };
+  };
+  const expected: Record<AtlasGraphKey, string | undefined> = {
+    biological: manifest.binarySha256,
+    rewiredSeed0: manifest.rewiredArms?.seed0?.binarySha256
+  };
+  for (const key of ['biological', 'rewiredSeed0'] as const) {
+    const graph = raw.graphs[key];
+    if (!graph) continue;
+    if (graph.graphSha256 !== expected[key]) {
+      throw new Error(
+        `atlas-report: raw evaluation's ${key} graphSha256 (${graph.graphSha256}) does not match ${manifestPath} ` +
+          `(${String(expected[key])}) -- stale atlas-raw.json?`
+      );
+    }
+  }
 };
 
 export interface RunAtlasReportResult {
@@ -608,17 +776,26 @@ export const runAtlasReport = (args: Readonly<AtlasReportArgs>): RunAtlasReportR
   const raw = JSON.parse(readFileSync(args.raw, 'utf8')) as AtlasEvaluationRaw;
   const runMeta = resolveRunMeta(args);
 
+  // Every check in this block is cheap (file reads and field comparisons,
+  // no bootstrap resampling) and runs before `buildArtifact`'s ~2 x
+  // neuronCount x (bootstrapResamples x 2) draws below, so an unshippable
+  // or stale run is rejected in milliseconds, not after paying for the
+  // full statistics pass (a dual-review finding).
+  requireOutBesideManifest(args.out, args.manifest);
+  verifyRawSeedsConsistent(raw);
+  verifyRawGraphsMatchManifest(args.manifest, raw);
+  const shippedGradeProblems = rawShippedGradeProblems(raw);
+  guardShippedDefault(args.out, DEFAULT_OUT, 'published artifact', shippedGradeProblems);
+  guardShippedDefault(args.reportMd, DEFAULT_REPORT_MD, 'report', shippedGradeProblems);
+  guardShippedDefault(args.manifest, DEFAULT_MANIFEST, 'manifest', shippedGradeProblems);
+  verifyManifestRoundTrips(args.manifest);
+
   if (!raw.graphs.biological) {
     throw new Error(`atlas-report: ${args.raw} has no biological section`);
   }
   const positions = readPositions(args.positions, raw.neuronCount, raw.graphs.biological.graphGzipSha256);
 
   const artifact = buildArtifact(raw, positions, runMeta, args.bootstrapSeed, args.bootstrapResamples);
-
-  guardShippedDefault(args.out, DEFAULT_OUT, 'published artifact', artifact.neuronCount);
-  guardShippedDefault(args.reportMd, DEFAULT_REPORT_MD, 'report', artifact.neuronCount);
-  guardShippedDefault(args.manifest, DEFAULT_MANIFEST, 'manifest', artifact.neuronCount);
-  verifyManifestRoundTrips(args.manifest);
 
   const artifactContents = JSON.stringify(artifact);
   const artifactSha256 = sha256Hex(artifactContents);

@@ -4,9 +4,10 @@ import { fileURLToPath } from 'node:url';
 import { gunzipSync } from 'node:zlib';
 
 import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
+import { parseGraphBinary } from '../../src/lib/connectome/format';
 import { requireNonNegativeInt, requirePositiveInt, requireValue } from '../training/cli';
 import { atomicWriteFileSync, sha256Hex } from '../training/fsio';
-import type { NullTaskMode } from '../null/null-worker';
+import type { NullSeedResult, NullTaskMode, NullWorkerMessage, NullWorkerTask } from '../null/null-worker';
 import { runShardedEvaluation } from '../null/null-evaluate';
 
 /**
@@ -26,29 +27,49 @@ import { runShardedEvaluation } from '../null/null-evaluate';
  * not-yet-landed refactor. Rather than duplicating its ~150 lines of
  * fork/kill/error-aggregation logic here, this file adapts to its existing
  * (non-generic) shape: `AtlasWorkerTask`/`AtlasSeedResult`/`AtlasWorkerMessage`
- * below are structurally compatible supersets of the `Null*` types (every
- * field `runShardedEvaluation` reads -- `graphId`, `mode`, `path`,
- * `expectedSha256`, `heldOutSeeds`, `ticks` on the way in; `type`, `graphId`,
- * `results[].seed` on the way back -- is present with a compatible type),
- * so `tasks` below type-checks directly as `readonly NullWorkerTask[]` and
- * `runShardedEvaluation`'s own message handling (which only inspects those
- * shared fields, never anything `Null`-specific) works unmodified against
- * `atlas-worker.ts`'s real IPC traffic. `runShardedEvaluation` itself never
- * reads `mode`/`path`/`expectedSha256`/`lesionIndex` -- it only threads
- * `task` opaquely to `child.send(task)` -- so this adapter changes no
- * behavior of the reused function, only supplies it a different worker and
- * a different task list. If a generic `runShardedEvaluation<Task, Result>`
- * lands later, this file's `tasks`/`workerPath` can be handed to it
- * directly and this adapter note can be deleted.
+ * below are structurally compatible supersets of the `Null*` types, so
+ * `tasks` below type-checks directly as `readonly NullWorkerTask[]`.
+ *
+ * What `runShardedEvaluation` actually reads at runtime (verified against
+ * `null-evaluate.ts:306-423`, not merely assumed): on a task, only
+ * `graphId` and `heldOutSeeds`; on a worker message, only `type`, `graphId`,
+ * `results.length`, `results[i].seed`, and `message`. `mode`/`path`/
+ * `expectedSha256`/`ticks`/`lesionIndex` are never read there -- they exist
+ * only so `AtlasWorkerTask` satisfies `NullWorkerTask`'s TypeScript shape
+ * (`mode` in particular carries no meaning for this study; `atlas-worker.ts`
+ * ignores it) and so `atlas-worker.ts` itself has what it needs to load the
+ * right graph and run the right lesion. `runShardedEvaluation` threads the
+ * whole task object opaquely to `child.send(task)`, so this adapter changes
+ * no behavior of the reused function, only supplies it a different worker
+ * and a different task list.
+ *
+ * The compiler only checks this compatibility in the direction tasks flow
+ * (`AtlasWorkerTask[]` into a `readonly NullWorkerTask[]` parameter); the
+ * assertions right below `AtlasWorkerMessage` check the reverse and lateral
+ * directions too, so a future `Null*` shape change that this adapter no
+ * longer actually matches fails to compile here instead of silently
+ * mis-happening in atlas-worker.ts's real IPC traffic. `atlas-worker.ts`
+ * also refuses to run a task with no `lesionIndex` field, so pointing
+ * `workerPath` at the wrong worker (e.g. `null-worker.ts`, by copy-paste or
+ * a future "unify the workers" refactor) fails loudly instead of silently
+ * scoring every task unlesioned. If a generic
+ * `runShardedEvaluation<Task, Result>` lands later, this file's
+ * `tasks`/`workerPath` can be handed to it directly and this whole adapter
+ * note (and the assertions/guard above) can be deleted.
  */
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, '../..');
 
 const DEFAULT_MANIFEST = resolve(repoRoot, 'public/data/malecns-arena-v1.manifest.json');
-const DEFAULT_HELD_OUT_START = 30001;
-const DEFAULT_HELD_OUT_COUNT = 100;
-const DEFAULT_TICKS = 1800;
+// Exported so atlas-report.ts's shipped-artifact guard can require a run to
+// actually match this condition (not merely cover every neuron) before
+// letting it overwrite the shipped public/data/lesion-atlas-v1.json -- the
+// two files would otherwise be free to drift apart on what "shipped-grade"
+// means (a dual-review finding).
+export const DEFAULT_HELD_OUT_START = 30001;
+export const DEFAULT_HELD_OUT_COUNT = 100;
+export const DEFAULT_TICKS = 1800;
 const DEFAULT_SHARDS = 18;
 const DEFAULT_OUT = resolve(repoRoot, 'training/runs/lesion/atlas-raw.json');
 
@@ -127,6 +148,26 @@ export type AtlasWorkerMessage = AtlasWorkerResultMessage | AtlasWorkerErrorMess
 // separate, unrelated study) -- `runShardedEvaluation` only ever reads `type`/`graphId`/`results[].seed`
 // off whatever a worker sends back, so this shape is all it needs.
 
+/**
+ * Compile-time proof that this adapter's shapes stay compatible with the
+ * reused (non-generic) `runShardedEvaluation` in every direction data
+ * actually flows: tasks go from this file into it; messages go from
+ * `atlas-worker.ts`'s real IPC traffic into its own message handler; the
+ * results it returns are what `assembleRaw` reads back out. `tasks` below
+ * already relies on `_TaskCompat`'s direction implicitly (passing
+ * `AtlasWorkerTask[]` where `readonly NullWorkerTask[]` is expected); these
+ * three aliases make all three directions an explicit, named compile error
+ * -- not merely an incidental consequence of one call site's argument type
+ * -- if a future `Null*` shape change ever makes this adapter stop
+ * matching. A type here that fails to satisfy its `extends` bound does not
+ * compile, which is the point: catch the drift here, not in
+ * `atlas-worker.ts`'s real IPC traffic.
+ */
+type AssertExtends<T extends U, U> = T;
+export type _AtlasTaskCompat = AssertExtends<AtlasWorkerTask, NullWorkerTask>;
+export type _AtlasMessageCompat = AssertExtends<AtlasWorkerMessage, NullWorkerMessage>;
+export type _AtlasResultCompat = AssertExtends<AtlasSeedResult, NullSeedResult>;
+
 // ---------------------------------------------------------------------------
 // Manifest
 // ---------------------------------------------------------------------------
@@ -178,7 +219,20 @@ const graphSpecFor = (key: AtlasGraphKey, manifest: ArenaManifestShape, graphsDi
 };
 
 /** Verify every requested graph's decompressed sha256 against the manifest before any shard is forked -- mirrors `null-evaluate.ts`'s `verifyRewiredFiles`/`verifyBiologicalSource` up-front check. */
-const verifyGraphFiles = (specs: readonly GraphSpec[]): void => {
+/**
+ * Verifies sha256 (as before) and, now, also that each graph's own
+ * `neuronCount` agrees with the manifest's -- both graphs feed the same
+ * lesion-index range (`buildTasks` below, sized off `manifest.neuronCount`
+ * alone) and the same `positions.json` body-ID/role lookup at report time,
+ * so a rewired-seed-0 artifact with a different neuron count would silently
+ * mis-lesion or mis-label neurons rather than fail loudly (a dual-review
+ * finding). Parses each graph once here specifically to check this; the
+ * bytes are re-read and re-parsed independently by whichever worker later
+ * scores that graph (`atlas-worker.ts`'s own `loadVerifiedGraphBinary`),
+ * matching `null-evaluate.ts`'s existing "verify up front, workers verify
+ * again independently" pattern.
+ */
+const verifyGraphFiles = (specs: readonly GraphSpec[], expectedNeuronCount: number): void => {
   const mismatches: string[] = [];
   for (const spec of specs) {
     let gzipBytes: Buffer;
@@ -188,9 +242,18 @@ const verifyGraphFiles = (specs: readonly GraphSpec[]): void => {
       mismatches.push(`${spec.key}: cannot read ${spec.path} (${error instanceof Error ? error.message : String(error)})`);
       continue;
     }
-    const actual = sha256Hex(gunzipSync(gzipBytes));
+    const binary = gunzipSync(gzipBytes);
+    const actual = sha256Hex(binary);
     if (actual !== spec.expectedSha256) {
       mismatches.push(`${spec.key}: ${spec.path} decompressed sha256 ${actual} does not match manifest (${spec.expectedSha256})`);
+      continue;
+    }
+    const parsedNeuronCount = parseGraphBinary(binary.buffer.slice(binary.byteOffset, binary.byteOffset + binary.byteLength)).metadata
+      .neuronCount;
+    if (parsedNeuronCount !== expectedNeuronCount) {
+      mismatches.push(
+        `${spec.key}: ${spec.path} has neuronCount ${parsedNeuronCount}, but the manifest's neuronCount is ${expectedNeuronCount}`
+      );
     }
   }
   if (mismatches.length > 0) {
@@ -329,6 +392,17 @@ export interface AtlasEvaluationRaw {
   readonly substeps: number;
   readonly graphs: { readonly biological?: AtlasGraphRaw; readonly rewiredSeed0?: AtlasGraphRaw };
   readonly host: { readonly arch: string; readonly node: string };
+  /**
+   * Present only when `--max-lesions` restricted this run (the
+   * calibration-only escape hatch -- see `AtlasEvaluateArgs.maxLesions`'s
+   * doc comment). Absent on every production/shipped run. This makes a
+   * calibration `atlas-raw.json` self-describing as one, on top of (not
+   * instead of) `atlas-report.ts`'s own `rawShippedGradeProblems` check,
+   * which derives the same fact independently from the actual per-graph
+   * lesion-array length rather than trusting this field (a dual-review
+   * suggestion).
+   */
+  readonly maxLesions?: number;
 }
 
 export const assembleRaw = (
@@ -375,7 +449,8 @@ export const assembleRaw = (
     ticks: args.ticks,
     substeps: NEURAL_SUBSTEPS_PER_TICK,
     graphs,
-    host: { arch: process.arch, node: process.version }
+    host: { arch: process.arch, node: process.version },
+    ...(args.maxLesions !== undefined ? { maxLesions: args.maxLesions } : {})
   };
 };
 
@@ -398,13 +473,23 @@ export const runAtlasEvaluate = async (
   const specs = new Map<AtlasGraphKey, GraphSpec>(
     args.graphs.map((key) => [key, graphSpecFor(key, manifest, graphsDir)])
   );
-  verifyGraphFiles([...specs.values()]);
+  verifyGraphFiles([...specs.values()], manifest.neuronCount);
 
   const tasks = buildTasks(args, specs, manifest.neuronCount);
   const workerPath = fileURLToPath(new URL('./atlas-worker.ts', import.meta.url));
 
   const started = performance.now();
-  const results = await runShardedEvaluation(tasks, args.shards, workerPath);
+  let results: Awaited<ReturnType<typeof runShardedEvaluation>>;
+  try {
+    results = await runShardedEvaluation(tasks, args.shards, workerPath);
+  } catch (error) {
+    // `runShardedEvaluation`'s own thrown messages are prefixed
+    // "null-evaluate: ..." (it is, after all, that module's function) --
+    // re-prefixed here so an atlas-run failure points an operator at this
+    // script, not at the unrelated null study.
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(message.replace(/^null-evaluate:/, 'atlas-evaluate:'));
+  }
   const elapsedMs = performance.now() - started;
   const episodeCount = tasks.length * args.heldOutCount;
   const perEpisodeMs = elapsedMs / episodeCount;

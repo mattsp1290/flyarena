@@ -59,13 +59,27 @@ const runTask = (task: AtlasWorkerTask): readonly AtlasSeedResult[] => {
   const graph = parseGraphBinary(graphBinary);
   const lesion = task.lesionIndex === null ? undefined : Int32Array.of(task.lesionIndex);
 
+  const lesionLabel = task.lesionIndex === null ? 'baseline' : task.lesionIndex;
+
   return task.heldOutSeeds.map((seed) => {
-    const result = runEpisode({
-      seed,
-      ticks: task.ticks,
-      left: { decoder: 'authored', graph, lesion },
-      right: { decoder: 'parked' }
-    });
+    let result;
+    try {
+      result = runEpisode({
+        seed,
+        ticks: task.ticks,
+        left: { decoder: 'authored', graph, lesion },
+        right: { decoder: 'parked' }
+      });
+    } catch (error) {
+      // Any runEpisode failure (a validation throw, an unexpected runtime
+      // error) previously surfaced with whatever message runEpisode itself
+      // produced, with no indication of which graph/lesion/seed in a
+      // ~200,000-episode run hit it -- re-thrown here naming all three, the
+      // same as the non-finite-score check below already does (a
+      // dual-review finding).
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`atlas-worker: graph "${task.graphId}" lesion=${lesionLabel} seed ${seed}: ${message}`);
+    }
     const { movementScore, foodPickups, hazardContacts } = result.left;
     // Same reasoning as null-worker.ts: a NaN/Infinity score would
     // silently become `null` under JSON.stringify and then `0` wherever
@@ -75,7 +89,7 @@ const runTask = (task: AtlasWorkerTask): readonly AtlasSeedResult[] => {
     // criterion.
     if (![movementScore, foodPickups, hazardContacts].every(Number.isFinite)) {
       throw new Error(
-        `atlas-worker: graph "${task.graphId}" lesion=${task.lesionIndex === null ? 'baseline' : task.lesionIndex} ` +
+        `atlas-worker: graph "${task.graphId}" lesion=${lesionLabel} ` +
           `seed ${seed} produced a non-finite score (movementScore=${movementScore}, ` +
           `foodPickups=${foodPickups}, hazardContacts=${hazardContacts})`
       );
@@ -86,6 +100,21 @@ const runTask = (task: AtlasWorkerTask): readonly AtlasSeedResult[] => {
 
 process.on('message', (task: AtlasWorkerTask) => {
   try {
+    // Defends against a mis-wired parent (e.g. `workerPath` pointed at
+    // `null-worker.ts` by copy-paste or a future "unify the workers"
+    // refactor): a plain `NullWorkerTask` has no `lesionIndex` field, so it
+    // would otherwise be scored as an unlesioned episode with no error at
+    // all -- see atlas-evaluate.ts's module doc for the full reasoning. Cast
+    // through `Record<string, unknown>` rather than checking `task` (typed
+    // `AtlasWorkerTask`, which always statically has `lesionIndex`)
+    // directly: TypeScript would otherwise narrow the negative branch to
+    // `never`, since nothing at compile time can make this IPC payload
+    // actually be something else -- the whole point is to check what a
+    // real, untyped `process.on('message', ...)` payload has at runtime.
+    const rawTask = task as unknown as Record<string, unknown>;
+    if (!('lesionIndex' in rawTask)) {
+      throw new Error(`atlas-worker: task "${String(rawTask.graphId)}" has no lesionIndex -- not an atlas task (wrong workerPath?)`);
+    }
     const results = runTask(task);
     const message: AtlasWorkerMessage = { type: 'result', graphId: task.graphId, results };
     process.send?.(message);
