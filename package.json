@@ -19,6 +19,8 @@
     "training:evaluate": "tsx scripts/training/evaluate.ts",
     "experiment:seed-sweep": "tsx scripts/experiments/seed-sweep.ts",
     "experiment:counterfactual": "tsx scripts/experiments/counterfactual.ts",
+    "null:evaluate": "tsx scripts/null/null-evaluate.ts",
+    "null:report": "tsx scripts/null/null-report.ts",
     "test:subpath": "playwright test --config playwright.subpath.config.ts"
   },
   "dependencies": {
