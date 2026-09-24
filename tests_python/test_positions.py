@@ -151,6 +151,46 @@ def test_body_ids_order_matches_graph_biological_ids():
     assert fields["bodyIds"] == ["2001", "2002", "2003", "2004", "2005"]
 
 
+def test_body_id_round_trips_exactly_at_uint64_scale():
+    """`build_positions` emits bodyIds as decimal strings via
+    `str(int(b))` for `b` drawn from `graph.biological_ids`
+    (`np.uint64`) -- never through a float intermediary, so no value above
+    2**53 (float64's exact-integer limit) can lose precision. Verified here
+    directly rather than by code trace alone (thermo-maintainability review
+    suggestion S3): one bodyId at the very top of the uint64 range
+    (2**63 - 1) and one comfortably above the float64 precision limit
+    (2**53 + 1) but well below it, both built with a standalone
+    `compile_graph` call (not `dup_nodes.csv`, whose small fixture IDs
+    wouldn't exercise this range)."""
+    near_uint64_max = 2**63 - 1
+    above_float64_safe_integer = 2**53 + 1
+    node_ids = [near_uint64_max, above_float64_safe_integer]
+
+    edges = pd.DataFrame({"pre": [], "post": [], "weight": []})
+    graph, _stats = compiler.compile_graph(
+        node_ids=node_ids,
+        edges=edges,
+        signs={near_uint64_max: 1, above_float64_safe_integer: 1},
+        input_assignment={},
+        output_assignment={},
+        input_channel_count=1,
+        output_population_count=1,
+        metadata_params=DEFAULT_METADATA_PARAMS,
+    )
+    annotations = pd.DataFrame(
+        [
+            {"bodyId": near_uint64_max, "somaLocation": [1, 2, 3], "tosomaLocation": None},
+            {"bodyId": above_float64_safe_integer, "somaLocation": [4, 5, 6], "tosomaLocation": None},
+        ]
+    )
+
+    fields = positions.build_positions(graph, annotations)
+
+    # compile_graph sorts node_ids ascending, so the smaller id comes first.
+    assert fields["bodyIds"] == [str(above_float64_safe_integer), str(near_uint64_max)]
+    assert fields["bodyIds"] == ["9007199254740993", "9223372036854775807"]
+
+
 def test_role_derivation_matches_graph_channel_and_population_assignment():
     graph = _build_fixture_graph()
     annotations = pd.DataFrame(_default_annotation_rows())

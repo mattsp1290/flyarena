@@ -22,7 +22,15 @@ __pycache__/
 # large (>1 GB) third-party files pulled from the pinned, hash-verified
 # URLs in download.py; only the compiled, small artifact under
 # public/data/ is committed.
+#
+# The trailing-slash form below only matches a real directory named
+# data/raw; a worktree convenience symlink (top-level `data`, or
+# `data/raw`) is a different entry type and slips past it. The
+# no-trailing-slash /data rule below matches the top-level `data` path
+# regardless of whether it's a symlink, file, or directory, so it can
+# never be staged.
 data/raw/
+/data
 
 # scripts/training/export-traces.ts output for non-default (--graph/
 # --substeps/--include-world) runs: never committed, see the exporter's

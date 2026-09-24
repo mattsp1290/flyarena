@@ -43,7 +43,7 @@ import pyarrow.feather as feather
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import binfmt  # noqa: E402
 import rewire  # noqa: E402
-from download import SOURCE_FILES  # noqa: E402
+from download import SOURCE_FILES, _sha256_of_file  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RAW_DATA_DIR = REPO_ROOT / "data" / "raw"
@@ -66,14 +66,6 @@ UNITS = "dataset voxel units (unverified)"
 POSITION_SOURCE_SOMA = "soma"
 POSITION_SOURCE_TOSOMA = "tosoma"
 POSITION_SOURCE_NONE = "none"
-
-
-def _sha256_of_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(1 << 20), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _pinned_annotations_sha256() -> str:
