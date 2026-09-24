@@ -322,8 +322,6 @@ const BIO_TRAINER_SEED_SPREAD_LABEL =
   'variance at a fixed trainer seed (bioPercentile, above); no overlap-based conclusion may be drawn ' +
   'from comparing the two.';
 
-const SHIPPED_REPLICA_TRAINER_SEED = 101;
-
 /** `trained-readout-v1.manifest.json`'s `gpuRerunFitnessDelta` field -- see `TrainedSection.bigqGpuRerunFitnessDelta`'s doc comment. */
 const readBigqGpuRerunFitnessDelta = (manifestPath: string): number => {
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { gpuRerunFitnessDelta?: unknown };
@@ -340,18 +338,44 @@ const readBigqGpuRerunFitnessDelta = (manifestPath: string): number => {
  * collide with, the authored section's own per-graph labels (`graphStats`
  * in `null-stats.ts`, keyed by `(bootstrapSeed, label)` — see
  * `conditionRng`'s doc comment in `../training/stats.ts`).
+ *
+ * `authoredSeeds`/`authoredTicks`/`authoredSubsteps` come from the SAME
+ * `authored.json` the artifact's own authored sections were built from
+ * (`runNullReport` passes `raw.seeds`/`raw.ticks`/`raw.substeps` from its
+ * own `buildArtifact` call). The generated report's own prose states the
+ * trained section uses "the same held-out seeds ... T ... K" as the
+ * authored null above — this asserts that claim is actually true of the
+ * two input files being merged, rather than only being true by convention
+ * (a dual-review finding: nothing previously compared the two).
  */
 export const buildTrainedSection = (
   raw: Readonly<NullTrainedEvaluationRaw>,
   bootstrapSeed: number,
   bootstrapResamples: number,
-  bigqGpuRerunFitnessDelta: number
+  bigqGpuRerunFitnessDelta: number,
+  authoredSeeds: { readonly start: number; readonly count: number },
+  authoredTicks: number,
+  authoredSubsteps: number
 ): TrainedSection => {
   if (raw.version !== 1) {
     throw new Error(`null-report: trained.json has unsupported version ${String(raw.version)}, expected 1`);
   }
   if (raw.rewired.length === 0) throw new Error('null-report: trained.json has no rewired entries');
   if (raw.biological.length === 0) throw new Error('null-report: trained.json has no biological entries');
+  if (raw.seeds.start !== authoredSeeds.start || raw.seeds.count !== authoredSeeds.count) {
+    throw new Error(
+      `null-report: trained.json's held-out seeds (${raw.seeds.start}..${raw.seeds.start + raw.seeds.count - 1}) ` +
+        `do not match authored.json's (${authoredSeeds.start}..${authoredSeeds.start + authoredSeeds.count - 1})`
+    );
+  }
+  if (raw.ticks !== authoredTicks) {
+    throw new Error(`null-report: trained.json's ticks (${raw.ticks}) do not match authored.json's (${authoredTicks})`);
+  }
+  if (raw.substeps !== authoredSubsteps) {
+    throw new Error(
+      `null-report: trained.json's substeps (${raw.substeps}) do not match authored.json's (${authoredSubsteps})`
+    );
+  }
 
   const rewiredStats = raw.rewired.map((entry) => ({
     entry,
@@ -370,10 +394,17 @@ export const buildTrainedSection = (
   const nullValues = rewiredStats.map(({ stats }) => stats.mean);
   const summary = nullSummary(nullValues);
 
-  const shippedBio = biologicalStats.find(({ entry }) => entry.trainerSeed === SHIPPED_REPLICA_TRAINER_SEED);
+  // The percentile below compares biological against the null at the SAME
+  // trainer seed the null's 20 rewired readouts were themselves trained at
+  // (`raw.replicaSeed`) — not a separately hard-coded "101" convention that
+  // could silently drift from `--replica-seed` (a dual-review finding: an
+  // earlier version used a module-level `SHIPPED_REPLICA_TRAINER_SEED = 101`
+  // constant here, disconnected from `raw.replicaSeed`).
+  const shippedBio = biologicalStats.find(({ entry }) => entry.trainerSeed === raw.replicaSeed);
   if (!shippedBio) {
     throw new Error(
-      `null-report: trained.json has no biological trainer-seed-${SHIPPED_REPLICA_TRAINER_SEED} entry (the shipped replica)`
+      `null-report: trained.json has no biological trainer-seed-${raw.replicaSeed} entry (raw.replicaSeed, the ` +
+        'trainer seed every rewired readout was trained at)'
     );
   }
   const rank = rankStatistics(nullValues, shippedBio.stats.mean);
@@ -743,7 +774,7 @@ ${renderTrainedBiologicalTable(trained)}
 | Null std | ${fmt(trained.null.std)} |
 | Null 2.5–97.5% | ${fmt(trained.null.p2_5)} .. ${fmt(trained.null.p97_5)} |
 | Null IQR | ${fmt(trained.null.iqr)} |
-| Biological (trainer seed 101) percentile among the ${trained.rewired.length} rewired trained scores | ${pct(trained.bioPercentile)} |
+| Biological (trainer seed ${trained.replicaSeed}) percentile among the ${trained.rewired.length} rewired trained scores | ${pct(trained.bioPercentile)} |
 | Percentile resolution (1/n) | ${pct(trained.percentileResolution)} |
 | Rank statistic p_low | ${fmt(trained.pLow, 4)} |
 | Rank statistic p_high | ${fmt(trained.pHigh, 4)} |${timingRow}
@@ -757,20 +788,26 @@ distinguishable at this sample size.
 
 ### Trainer-seed variance context
 
-Biological trained scores across the three \`flyarena-bigq\` replicas (trainer seeds 101/202/303) span
+Biological trained scores across the ${trained.biological.length} \`flyarena-bigq\` replicas (trainer seeds
+${[...trained.biological].map((e) => e.trainerSeed).sort((a, b) => a - b).join('/')}) span
 \`${fmt(trained.bioTrainerSeedSpread.min)}\` to \`${fmt(trained.bioTrainerSeedSpread.max)}\`
 (range \`${fmt(trained.bioTrainerSeedSpread.range)}\`) — **${trained.bioTrainerSeedSpread.label}** — at the
 *same* biological topology. For context on how large this kind of noise alone can be: the merged
 [\`trained-readout-v1.manifest.json\`](../public/data/trained-readout-v1.manifest.json)'s recorded CUDA
 rerun of the shipped biological replica moved TS held-out \`trained\` fitness by
 \`${fmt(trained.bigqGpuRerunFitnessDelta)}\` (rerun minus original, that report's sign convention) —
-comparable in magnitude to the trainer-seed spread above, and outside that replica's own 95% CI (see that
-report's Limitations). **This spread is not comparable to the ${pct(trained.bioPercentile)} percentile
-above**: the spread measures trainer-seed/run-to-run noise at *fixed* topology; the percentile measures
-where one topology (biological, at one trainer seed) falls among ${trained.rewired.length} different
-topologies, each at the *same* one trainer seed. Whether these two numbers happen to overlap, and neither's
-size relative to the other, supports any conclusion about topology "mattering more or less" than
-trainer-seed noise.
+${
+  trained.bioTrainerSeedSpread.range > 0
+    ? `${(Math.abs(trained.bigqGpuRerunFitnessDelta) / trained.bioTrainerSeedSpread.range).toFixed(2)}x the ` +
+      'trainer-seed spread recorded above (see that report\'s own Limitations for the CI comparison)'
+    : "the trainer-seed spread recorded above is zero in this run's data, so no ratio is computed"
+} — a magnitude comparison offered only as context for how large trainer-seed/run-to-run noise can be, not
+a claim that the two numbers should match. **This spread is not comparable to the ${pct(trained.bioPercentile)}
+percentile above**: the spread measures trainer-seed/run-to-run noise at *fixed* topology; the percentile
+measures where one topology (biological, at trainer seed ${trained.replicaSeed}) falls among
+${trained.rewired.length} different topologies, each at the *same* one trainer seed. Whether these two
+numbers happen to overlap, and neither's size relative to the other, supports any conclusion about topology
+"mattering more or less" than trainer-seed noise.
 `;
 };
 
@@ -991,7 +1028,10 @@ export const runNullReport = (args: Readonly<NullReportArgs>): RunNullReportResu
       trainedRaw,
       args.bootstrapSeed,
       args.bootstrapResamples,
-      readBigqGpuRerunFitnessDelta(args.trainedReadoutManifest)
+      readBigqGpuRerunFitnessDelta(args.trainedReadoutManifest),
+      raw.seeds,
+      raw.ticks,
+      raw.substeps
     );
     const timing = resolveTrainedTiming(args.trained);
     artifact = { ...authoredArtifact, trained: { ...trainedSection, ...(timing ? { timing } : {}) } };

@@ -30,21 +30,24 @@
 #      see this plan's "Key decisions"), writing
 #      <trained-out>/seed<s>/{theta_final.npy,config.json,env.json,generations.csv}.
 #
-# Resumable: a seed whose <trained-out>/seed<s>/theta_final.npy already
-# exists is skipped entirely (export-arms is not re-run for it either).
+# Resumable: a seed whose <trained-out>/seed<s>/config.json already exists
+# is skipped entirely (export-arms is not re-run for it either).
 # Fail-fast (`set -euo pipefail`): the first failed step aborts the whole
 # script immediately, leaving every earlier seed's completed run directory
 # untouched. `flyarena-train` itself deletes any pre-existing config.json in
-# its --out directory before training and writes its own config.json LAST
-# (training/src/flyarena_training/cli.py's run_training), so an
-# interrupted/killed run can never leave a *complete-looking* run directory
-# behind -- theta_final.npy alone existing but config.json missing is exactly
-# the signature of an interrupted run, and the resumability check above only
-# ever looks at theta_final.npy, which np.save writes non-atomically. Recovery
-# from a truncated/corrupt theta_final.npy (caught downstream by
-# null-trained-evaluate.ts, which fails loudly on a short/malformed .npy):
-# delete that seed's <trained-out>/seed<s>/ directory and rerun this script;
-# it regenerates only that seed.
+# its --out directory BEFORE training (training/src/flyarena_training/cli.py's
+# run_training) and writes theta_final.npy/theta_best.npy FIRST, config.json
+# LAST -- so config.json's existence, not theta_final.npy's, is the true
+# "this run finished" signal. (A dual-review finding: an earlier version of
+# this script checked theta_final.npy instead, which np.save writes
+# non-atomically and BEFORE config.json -- a run killed between those two
+# writes would have been treated as complete and skipped forever, even
+# though config.json describes the OLD run, not this one, or is simply
+# missing.) Recovery from a truncated/corrupt theta_final.npy (caught
+# downstream by null-trained-evaluate.ts, which fails loudly on a
+# short/malformed .npy, or by this same resumability check if config.json
+# itself never got written): delete that seed's <trained-out>/seed<s>/
+# directory and rerun this script; it regenerates only that seed.
 #
 # Usage:
 #   scripts/null/train-sample.sh
@@ -131,11 +134,33 @@ fi
 # "Assumption: NEURAL_SUBSTEPS_PER_TICK ... is read at run time, not
 # hard-coded."
 substeps_file="src/lib/connectome/constants.ts"
-substeps="$(grep -oP 'export const NEURAL_SUBSTEPS_PER_TICK = \K[0-9]+' "$substeps_file")"
+# `|| true`: under `set -e`, a failed `grep -oP` (no match) would otherwise
+# abort the script right here with no message, skipping the `-z` check below
+# entirely -- a dual-review finding. `|| true` lets a no-match fall through
+# to that check instead, which reports a clear, specific error.
+substeps="$(grep -oP 'export const NEURAL_SUBSTEPS_PER_TICK = \K[0-9]+' "$substeps_file" || true)"
 if [[ -z "$substeps" ]]; then
   echo "train-sample.sh: could not read NEURAL_SUBSTEPS_PER_TICK from $substeps_file" >&2
   exit 1
 fi
+
+# `run.sh` (training/scripts/run.sh) `cd`s into training/ before `exec`ing
+# `uv run`, so any relative path this script hands to `flyarena-train` must
+# first be resolved against `repo_root`, not left relative (it would then
+# resolve against training/ instead). An ALREADY-absolute path (an operator
+# passing an absolute --arms-out/--trained-out/--graph) must be returned
+# unchanged -- naively prefixing `repo_root` onto an absolute path produces
+# a broken `<repo_root>/<absolute path>` (a dual-review finding: an earlier
+# version always prefixed `${repo_root}/`, which is correct only for the
+# relative-path default case).
+to_abs_path() {
+  local p="$1"
+  if [[ "$p" == /* ]]; then
+    printf '%s\n' "$p"
+  else
+    printf '%s\n' "${repo_root}/${p}"
+  fi
+}
 
 export PATH="${HOME}/.nvm/versions/node/v22.22.3/bin:${PATH}"
 
@@ -170,10 +195,10 @@ fi
 
 for (( seed = seed_start; seed < seed_start + seed_count; seed += 1 )); do
   seed_out="${trained_out}/seed${seed}"
-  theta_path="${seed_out}/theta_final.npy"
+  config_path="${seed_out}/config.json"
 
-  if [[ -f "$theta_path" ]]; then
-    echo "train-sample.sh: seed ${seed}: ${theta_path} already exists -- skipping (resumable)"
+  if [[ -f "$config_path" ]]; then
+    echo "train-sample.sh: seed ${seed}: ${config_path} already exists -- skipping (resumable)"
     continue
   fi
 
@@ -210,7 +235,7 @@ for (( seed = seed_start; seed < seed_start + seed_count; seed += 1 )); do
   echo "train-sample.sh: seed ${seed}: training (population=${population} elites=${elites} generations=${generations})"
   "${repo_root}/training/scripts/run.sh" flyarena-train \
     --arm rewired \
-    --graph "${repo_root}/${bundle_path}" \
+    --graph "$(to_abs_path "$bundle_path")" \
     --replica-seed "$replica_seed" \
     --substeps "$substeps" \
     --hidden-size "$hidden_size" \
@@ -222,7 +247,7 @@ for (( seed = seed_start; seed < seed_start + seed_count; seed += 1 )); do
     --alpha "$alpha" \
     --std-floor "$std_floor" \
     --init-std "$init_std" \
-    --out "${repo_root}/${seed_out}"
+    --out "$(to_abs_path "$seed_out")"
 
   echo "train-sample.sh: seed ${seed}: done"
 done

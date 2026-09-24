@@ -1,8 +1,9 @@
 import { readFileSync } from 'node:fs';
 
+import type { ArmName } from '../training/arms';
 import { computeArmBundleSha256, deserializeArmBundle, type SerializedArmBundle } from '../training/export-arms';
 import { runEpisode } from '../training/episode';
-import { readRunDir } from '../training/run-dir';
+import { readRunDir, type LoadedRun } from '../training/run-dir';
 import type { NullSeedResult, NullWorkerMessage } from './null-worker';
 
 /**
@@ -31,6 +32,22 @@ export interface NullTrainedWorkerTask {
   readonly armBundlePath: string;
   readonly heldOutSeeds: readonly number[];
   readonly ticks: number;
+  /**
+   * Structural identity this run directory must actually have, verified in
+   * `runTask` before it is scored (mirroring `evaluate.ts`'s
+   * `validateRunSubsteps`/`validateRunArmBundleSha256`, which this script
+   * previously did not replicate — a dual-review finding). A run directory
+   * this script silently trusted without these checks could be scored
+   * against the wrong trainer seed, arm, substep count, or hidden size with
+   * no error anywhere: `runEpisode` happily runs `trained` at whatever
+   * `substeps` it is given (defaulting to `NEURAL_SUBSTEPS_PER_TICK` if
+   * omitted — `episode.ts`), so a stale/mismatched run would be scored
+   * "successfully" at the wrong K rather than failing loudly.
+   */
+  readonly expectedArm: ArmName;
+  readonly expectedTrainerSeed: number;
+  readonly expectedSubsteps: number;
+  readonly expectedHiddenSize: number;
 }
 
 /**
@@ -48,9 +65,48 @@ const loadVerifiedBundle = (path: string): SerializedArmBundle => {
   return bundle;
 };
 
-const runTask = (task: NullTrainedWorkerTask): readonly NullSeedResult[] => {
+/**
+ * Every field a run directory's `config.json` must actually have for this
+ * task to be the run this script's caller believes it is scoring. Unlike
+ * `reconcileCemConfig` in `null-trained-evaluate.ts` (which only *warns* on
+ * a CEM-hyperparameter mismatch, matching `run-dir.ts`'s existing
+ * `deriveTrainingBlock` precedent for informational reconciliation), a
+ * mismatch on any of these four fields means this run directory is not
+ * structurally what it was asked to be -- scoring it anyway would silently
+ * publish a number for the wrong arm/trainer-seed/substep-count/hidden-size,
+ * so each one is a hard failure, not a warning.
+ */
+const assertRunMatchesExpectedIdentity = (run: Readonly<LoadedRun>, task: Readonly<NullTrainedWorkerTask>): void => {
+  if (run.config.arm !== task.expectedArm) {
+    throw new Error(
+      `null-trained-worker: ${task.runDir}/config.json has arm "${run.config.arm}", expected "${task.expectedArm}"`
+    );
+  }
+  if (run.config.trainerSeed !== task.expectedTrainerSeed) {
+    throw new Error(
+      `null-trained-worker: ${task.runDir}/config.json has trainerSeed ${run.config.trainerSeed}, expected ${task.expectedTrainerSeed}`
+    );
+  }
+  if (run.config.substeps !== task.expectedSubsteps) {
+    throw new Error(
+      `null-trained-worker: ${task.runDir}/config.json was trained at substeps=${run.config.substeps}, but this ` +
+        `evaluation expects substeps=${task.expectedSubsteps} (NEURAL_SUBSTEPS_PER_TICK) -- a rerun trained at a ` +
+        'different substep count would otherwise be silently scored as if it were a like-for-like comparison'
+    );
+  }
+  if (run.config.H !== task.expectedHiddenSize) {
+    throw new Error(
+      `null-trained-worker: ${task.runDir}/config.json has H=${run.config.H}, expected ${task.expectedHiddenSize}`
+    );
+  }
+};
+
+/** Exported so tests can exercise the run-directory/bundle validation and scoring logic directly, without going through `node:child_process.fork`'s IPC wire protocol. */
+export const runTask = (task: NullTrainedWorkerTask): readonly NullSeedResult[] => {
   const run = readRunDir(task.runDir);
   const bundle = loadVerifiedBundle(task.armBundlePath);
+
+  assertRunMatchesExpectedIdentity(run, task);
 
   // `config.armBundleSha256` is required present for every run this study
   // trains (flyarena-train always writes it -- REQUIRED_BUNDLE_FIELDS in
@@ -75,6 +131,13 @@ const runTask = (task: NullTrainedWorkerTask): readonly NullSeedResult[] => {
     const result = runEpisode({
       seed,
       ticks: task.ticks,
+      // Explicit, not omitted-and-defaulted: `episode.ts` defaults
+      // `substeps` to `NEURAL_SUBSTEPS_PER_TICK` when omitted, which would
+      // happen to be correct for every run this study trains but would mask
+      // the very mismatch `assertRunMatchesExpectedIdentity` above already
+      // caught -- passing it explicitly means a future change to the
+      // default can never silently change what this scores at.
+      substeps: task.expectedSubsteps,
       left: { decoder: 'trained', graph, weights: run.weights },
       right: { decoder: 'parked' }
     });

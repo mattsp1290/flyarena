@@ -120,19 +120,6 @@ export interface Histogram {
 }
 
 /**
- * `binCount` equal-width bins spanning `[min(values), max(values)]`
- * (the plan's "30 equal-width histogram bins over
- * `[min(N ∪ {bio, disc}), max(N ∪ {bio, disc})]`" — the caller passes that
- * union in as `range`, but `values` (what gets *counted*) should normally be
- * `N` alone: a dual-review pass caught that an earlier version counted the
- * union too, so the published "null distribution of 500 rewired graphs"
- * histogram silently included the biological and disconnected scores as
- * extra bars (`sum(counts) === 502`, not 500) — see `null-report.ts`'s
- * `buildArtifact` for how `range` and `values` are now passed separately.
- * A single-point span (every value identical) puts every value in the
- * first bin rather than dividing by zero.
- */
-/**
  * The finest percentile granularity an `n`-point null distribution can
  * express: with `n = 20` rewired trained replicas
  * (`.agents/plans/rewiring-null/03-trained-sample.md`'s "with n = 20 the
@@ -173,6 +160,19 @@ export const trainerSeedSpread = (values: readonly number[]): TrainerSeedSpread 
   return { min, max, range: max - min };
 };
 
+/**
+ * `binCount` equal-width bins spanning `[min(values), max(values)]`
+ * (the plan's "30 equal-width histogram bins over
+ * `[min(N ∪ {bio, disc}), max(N ∪ {bio, disc})]`" — the caller passes that
+ * union in as `range`, but `values` (what gets *counted*) should normally be
+ * `N` alone: a dual-review pass caught that an earlier version counted the
+ * union too, so the published "null distribution of 500 rewired graphs"
+ * histogram silently included the biological and disconnected scores as
+ * extra bars (`sum(counts) === 502`, not 500) — see `null-report.ts`'s
+ * `buildArtifact` for how `range` and `values` are now passed separately.
+ * A single-point span (every value identical) puts every value in the
+ * first bin rather than dividing by zero.
+ */
 export const buildHistogram = (
   values: readonly number[],
   binCount = DEFAULT_HISTOGRAM_BINS,

@@ -55,6 +55,8 @@ const DEFAULT_REWIRED_SEED_START = 0;
 const DEFAULT_REWIRED_SEED_COUNT = 20;
 const DEFAULT_REPLICA_SEED = 101;
 const DEFAULT_BIOLOGICAL_TRAINER_SEEDS = [101, 202, 303] as const;
+/** Matches `training/src/flyarena_training/cli.py`'s `DEFAULT_HIDDEN_SIZE` / `train-sample.sh`'s own `--hidden-size` default. */
+const DEFAULT_HIDDEN_SIZE = 16;
 const DEFAULT_REWIRED_TRAINED_DIR = resolve(repoRoot, 'training/runs/null/trained');
 const DEFAULT_REWIRED_ARMS_DIR = resolve(repoRoot, 'training/runs/null/arms');
 const DEFAULT_BIOLOGICAL_RUNS_DIR = resolve(repoRoot, 'training/runs/production');
@@ -77,6 +79,8 @@ export interface NullTrainedEvaluateArgs {
   readonly heldOutStart: number;
   readonly heldOutCount: number;
   readonly ticks: number;
+  /** H -- must match every scored run's own `config.json` `H` (see `null-trained-worker.ts`'s `assertRunMatchesExpectedIdentity`). */
+  readonly hiddenSize: number;
   readonly shards: number;
   readonly out: string;
 }
@@ -105,6 +109,7 @@ export const parseNullTrainedEvaluateArgs = (argv: readonly string[]): NullTrain
   let heldOutStart = DEFAULT_HELD_OUT_START;
   let heldOutCount = DEFAULT_HELD_OUT_COUNT;
   let ticks = DEFAULT_TICKS;
+  let hiddenSize = DEFAULT_HIDDEN_SIZE;
   let shards = DEFAULT_SHARDS;
   let out = DEFAULT_OUT;
 
@@ -144,6 +149,9 @@ export const parseNullTrainedEvaluateArgs = (argv: readonly string[]): NullTrain
     } else if (flag === '--ticks') {
       ticks = requirePositiveInt(flag, argv[index + 1]);
       index += 2;
+    } else if (flag === '--hidden-size') {
+      hiddenSize = requirePositiveInt(flag, argv[index + 1]);
+      index += 2;
     } else if (flag === '--shards') {
       shards = requirePositiveInt(flag, argv[index + 1]);
       index += 2;
@@ -169,6 +177,7 @@ export const parseNullTrainedEvaluateArgs = (argv: readonly string[]): NullTrain
     heldOutStart,
     heldOutCount,
     ticks,
+    hiddenSize,
     shards,
     out
   };
@@ -257,7 +266,17 @@ export const buildTasks = (args: Readonly<NullTrainedEvaluateArgs>): NullTrained
     const armBundlePath = resolve(bundleDir, 'rewired.json');
     requireFile(armBundlePath, `rewired seed ${seed} arm bundle`);
     const graphId = `rewired-${seed}`;
-    tasks.push({ graphId, runDir, armBundlePath, heldOutSeeds, ticks: args.ticks });
+    tasks.push({
+      graphId,
+      runDir,
+      armBundlePath,
+      heldOutSeeds,
+      ticks: args.ticks,
+      expectedArm: 'rewired',
+      expectedTrainerSeed: args.replicaSeed,
+      expectedSubsteps: NEURAL_SUBSTEPS_PER_TICK,
+      expectedHiddenSize: args.hiddenSize
+    });
     bundlePathsByGraphId.set(graphId, armBundlePath);
   }
 
@@ -270,7 +289,17 @@ export const buildTasks = (args: Readonly<NullTrainedEvaluateArgs>): NullTrained
     requireFile(resolve(runDir, 'config.json'), `biological trainer seed ${trainerSeed} config.json`);
     requireFile(resolve(runDir, 'theta_final.npy'), `biological trainer seed ${trainerSeed} theta_final.npy`);
     const graphId = `biological-${trainerSeed}`;
-    tasks.push({ graphId, runDir, armBundlePath: biologicalArmBundlePath, heldOutSeeds, ticks: args.ticks });
+    tasks.push({
+      graphId,
+      runDir,
+      armBundlePath: biologicalArmBundlePath,
+      heldOutSeeds,
+      ticks: args.ticks,
+      expectedArm: 'biological',
+      expectedTrainerSeed: trainerSeed,
+      expectedSubsteps: NEURAL_SUBSTEPS_PER_TICK,
+      expectedHiddenSize: args.hiddenSize
+    });
     bundlePathsByGraphId.set(graphId, biologicalArmBundlePath);
   }
 
