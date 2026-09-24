@@ -1,24 +1,26 @@
 """CEM (cross-entropy method) trainer: the seeded, GPU-batched optimization
 loop over a pluggable vectorized `evaluate(theta_batch, seeds) -> fitness`
 (WP3, `.agents/plans/trained-readout/03-cem-training.md`). This module owns
-the CEM defaults, the elite-selection/smoothing update, and the seed-sampling
-policy (training seeds per generation, validation seeds, and the held-out
-assertion) laid out in the plan's "CEM (defaults, calibrate in WP3)" and
-"Seed policy" sections. `rollout.py`'s `evaluate_fitness` is the one
-pluggable `evaluate` function this module calls; this module never itself
-decides how an episode is simulated.
+the CEM defaults and the elite-selection/smoothing update laid out in the
+plan's "CEM (defaults, calibrate in WP3)" section. Seed policy (training
+seeds per generation, validation seeds, and the held-out assertion) lives in
+`seeds.py`, which this module imports; `rollout.py`'s `evaluate_fitness` is
+the one pluggable `evaluate` function this module calls, and this module
+never itself decides how an episode is simulated nor imports `rollout.py`
+(so importing `cem.py` alone never pulls in the world/sensors/model/readout
+simulation stack).
 
 Reproducibility (03-cem-training.md's "Reproducibility" section): on CPU, the
 same `trainer_seed`, `evaluate`, and `CemConfig` reproduce `theta_final`
 bit-identically, because every source of randomness here (candidate sampling
 via a `torch.Generator` seeded once from `trainer_seed`, and seed sampling
-via `numpy.random.default_rng(trainer_seed + generation)`) is deterministic
-given the same seed and device. On CUDA, elite selection is a hard rank cut,
-so GPU-kernel nondeterminism can compound across generations; that is
-measured and recorded as informational (not gated) by `test_cem.py`'s GPU
-rerun test, which prints `theta_final`'s max-abs diff across two CUDA runs —
-`env.json` itself does not carry that field (it is a training-config
-manifest, not a comparison across two runs).
+via `seeds.sample_training_seeds`) is deterministic given the same seed and
+device. On CUDA, elite selection is a hard rank cut, so GPU-kernel
+nondeterminism can compound across generations; that is measured and
+recorded as informational (not gated) by `test_cem.py`'s GPU rerun test,
+which prints `theta_final`'s max-abs diff across two CUDA runs — `env.json`
+itself does not carry that field (it is a training-config manifest, not a
+comparison across two runs).
 """
 from __future__ import annotations
 
@@ -26,18 +28,18 @@ import math
 from dataclasses import dataclass
 from typing import Callable, Sequence
 
-import numpy as np
 import torch
 
-from .rollout import assert_no_held_out_seeds
+from .seeds import (
+    TRAINING_SEED_HIGH,
+    TRAINING_SEED_LOW,
+    VALIDATION_SEED_COUNT,
+    VALIDATION_SEED_START,
+    assert_no_held_out_seeds,
+    sample_training_seeds,
+)
 
 EvaluateFn = Callable[[torch.Tensor, Sequence[int]], torch.Tensor]
-
-# Seed policy (03-cem-training.md's "Seed policy" table).
-TRAINING_SEED_LOW = 1
-TRAINING_SEED_HIGH = 10000
-VALIDATION_SEED_START = 20001
-VALIDATION_SEED_COUNT = 64
 
 
 @dataclass(frozen=True)
@@ -131,23 +133,6 @@ class CemResult:
     theta_best: torch.Tensor
     best_validation_fitness: float
     history: list[GenerationRecord]
-
-
-def sample_training_seeds(
-    trainer_seed: int,
-    generation: int,
-    count: int,
-    low: int = TRAINING_SEED_LOW,
-    high: int = TRAINING_SEED_HIGH,
-) -> list[int]:
-    """`count` training seeds for one generation, sampled without
-    replacement from `numpy.random.default_rng(trainer_seed + generation)`
-    over `[low, high]` inclusive (03-cem-training.md's "Seed policy" table,
-    training row: "seeds 1...10000, sampled E = 16 per generation from
-    numpy.random.default_rng(trainer_seed + generation)")."""
-    rng = np.random.default_rng(trainer_seed + generation)
-    seeds = rng.choice(np.arange(low, high + 1), size=count, replace=False)
-    return [int(seed) for seed in seeds]
 
 
 def validation_seeds(config: CemConfig) -> list[int]:

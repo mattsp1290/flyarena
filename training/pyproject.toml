@@ -12,10 +12,9 @@ dependencies = [
     # WP2's change surface (`.agents/plans/trained-readout/02-gpu-port-and-parity.md`)
     # lists numpy as a required dependency; this port's batched world/sensor
     # step (world.py, sensors.py) uses plain torch tensors directly, so
-    # numpy is currently unused directly but kept per the plan's explicit
-    # dependency list — reserved for WP3's CEM statistics (e.g.
-    # `numpy.random.default_rng` for the seed-sampling policy the plan
-    # specifies, `.agents/plans/trained-readout/03-cem-training.md`).
+    # numpy was unused directly at WP2. WP3's seed-sampling policy
+    # (`seeds.py`'s `sample_training_seeds`, via `numpy.random.default_rng`)
+    # now uses it directly.
     "numpy>=1.26,<3",
 ]
 

@@ -30,6 +30,7 @@ from flyarena_training.cem import CemConfig, run_cem
 from flyarena_training.graph import load_graph_json, output_neuron_indices
 from flyarena_training.readout import readout_parameter_count
 from flyarena_training.rollout import assert_no_held_out_seeds, build_rollout_env, evaluate_fitness
+from flyarena_training.seeds import sample_training_seeds
 
 # training/tests/test_cem.py -> training/ -> repo root
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -223,6 +224,150 @@ def test_cem_alpha_weights_the_new_elite_estimate():
     assert torch.allclose(result.theta_final, expected_mean, atol=1e-6), (
         f"expected alpha to weight the NEW elite estimate: {result.theta_final} != {expected_mean}"
     )
+
+
+def test_cem_update_with_multiple_elites_matches_hand_computed_mean_and_std():
+    """Regression test for `run_cem`'s elite-selection/smoothing update with
+    `elites > 1` (review suggestion: every existing update-formula test used
+    `elites=1`, so an off-by-one in the `topk` count, or an accidental
+    `population`-sized elite set, would not be caught). `P=4`, `elites=2`,
+    2 generations, a deterministic `evaluate` that always ranks candidates
+    1 and 3 as the winners (independent of candidate value, isolating the
+    CEM update from the rollout, and deliberately not candidates 0/1 so an
+    accidental "first N candidates" bug would also be caught).
+
+    Hand-computes the expected `mean`/`std` trajectory by replaying the
+    exact same `torch.Generator` draw sequence and update formula `run_cem`
+    uses (population std for the elite std, `alpha` weighting the *new*
+    elite estimate for both `mean` and `std`, `std` floored at
+    `config.std_floor`). `std_floor=5.0` is set far above the naturally
+    smoothed std at `init_std=0.5` (verified: the unclamped smoothed std is
+    ~0.2-0.5 in generation 0), so the floor clamp is guaranteed to fire —
+    exercising that path, not just the smoothing arithmetic — and generation
+    1's candidates are drawn using the *clamped* std, so a wrong or missing
+    clamp would change generation 1's candidates and therefore
+    `theta_final`, not just an intermediate value this test can't observe
+    directly (`CemResult` does not expose `std`)."""
+    theta_dim = 3
+    trainer_seed = 11
+    alpha = 0.7
+    init_mean = 0.0
+    init_std = 0.5
+    std_floor = 5.0
+    population = 4
+    elites = 2
+    config = CemConfig(
+        population=population,
+        elites=elites,
+        generations=2,
+        alpha=alpha,
+        init_std=init_std,
+        init_mean=init_mean,
+        std_floor=std_floor,
+    )
+
+    fitness_by_index = torch.tensor([1.0, 4.0, 2.0, 3.0])  # candidates 1, 3 win every generation
+
+    def evaluate(theta_batch: torch.Tensor, seeds) -> torch.Tensor:
+        if theta_batch.shape[0] == 1:
+            return torch.zeros(1)  # the validation call (mean only); value unused by this test
+        return fitness_by_index
+
+    result = run_cem(theta_dim, evaluate, config, trainer_seed=trainer_seed, device="cpu")
+
+    # Reference implementation: same generator seed, same per-generation
+    # sequential torch.randn(population, theta_dim) draw run_cem makes, same
+    # elite indices ([1, 3], matching fitness_by_index's top-2), same
+    # smoothing/floor formula.
+    generator = torch.Generator(device="cpu").manual_seed(trainer_seed)
+    mean = torch.full((theta_dim,), init_mean)
+    std = torch.full((theta_dim,), init_std)
+    for _ in range(config.generations):
+        noise = torch.randn(population, theta_dim, generator=generator, dtype=torch.float32)
+        candidates = mean.unsqueeze(0) + noise * std.unsqueeze(0)
+        elite_candidates = candidates[[1, 3]]
+        new_mean = elite_candidates.mean(dim=0)
+        new_std = elite_candidates.std(dim=0, unbiased=False)
+        mean = alpha * new_mean + (1 - alpha) * mean
+        std = (alpha * new_std + (1 - alpha) * std).clamp(min=std_floor)
+
+    assert std.eq(std_floor).all(), "test setup must force the std_floor clamp to fire (see docstring)"
+    assert torch.allclose(result.theta_final, mean, atol=1e-6), (
+        f"multi-elite CEM update mismatch: {result.theta_final} != hand-computed {mean}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Seed policy: replica independence (review Important finding).
+# ---------------------------------------------------------------------------
+
+
+def test_sample_training_seeds_is_replica_independent_across_defaults():
+    """Regression test for the review's Important replica-independence
+    finding: the plan's literal `numpy.random.default_rng(trainer_seed +
+    generation)` formula aliases whenever two replicas' `trainer_seed`s
+    differ by less than `G` -- at the plan's own default replica seeds
+    (101, 202, 303) and `G=150`, replica 101's generation `g >= 101` drew
+    EXACTLY the same 16-seed training set as replica 202's generation
+    `g - 101` (49/150 = 32.7% of generations for each adjacent pair, per the
+    review's empirical table), undercutting the plan's "R = 3 independent
+    trainer_seed values per arm" framing.
+
+    `seeds.sample_training_seeds` keys `numpy.random.default_rng` on the
+    entropy tuple `[trainer_seed, generation]` instead (see `seeds.py`'s doc
+    comment) -- this test asserts that fix directly: for every pair of the
+    plan's default replica seeds, no generation's training-seed set
+    (`g in [0, G)`) for one replica ever equals ANY generation's
+    training-seed set for another replica (compared as an unordered set,
+    since the old formula's collision was drawing the identical 16-seed
+    set, not merely the identical list order). It also re-confirms held-out
+    isolation still holds under the new formula (`assert_no_held_out_seeds`
+    does not raise for any sampled seed), and sanity-checks that the OLD
+    formula would still exhibit the exact 49/150 collision count the review
+    measured -- so this test would actually fail if the fix were reverted or
+    never applied, not just vacuously pass."""
+    trainer_seeds = (101, 202, 303)
+    generations = 150
+    e = 16
+
+    seed_sets_by_trainer_seed: dict[int, list[frozenset[int]]] = {}
+    for trainer_seed in trainer_seeds:
+        per_generation: list[frozenset[int]] = []
+        for generation in range(generations):
+            sampled = sample_training_seeds(trainer_seed, generation, e)
+            assert len(sampled) == e
+            assert len(set(sampled)) == e, "sampled without replacement"
+            assert_no_held_out_seeds(sampled)  # held-out isolation still holds
+            per_generation.append(frozenset(sampled))
+        seed_sets_by_trainer_seed[trainer_seed] = per_generation
+
+    for i, seed_a in enumerate(trainer_seeds):
+        for seed_b in trainer_seeds[i + 1 :]:
+            sets_a = seed_sets_by_trainer_seed[seed_a]
+            sets_b = seed_sets_by_trainer_seed[seed_b]
+            for generation_a, set_a in enumerate(sets_a):
+                for generation_b, set_b in enumerate(sets_b):
+                    assert set_a != set_b, (
+                        f"trainer_seed={seed_a} generation={generation_a} drew the same training-seed "
+                        f"set as trainer_seed={seed_b} generation={generation_b}: {sorted(set_a)}"
+                    )
+
+    # Sanity check: the OLD (reverted) formula should still show the review's
+    # measured 49/150 collision count between adjacent replica pairs -- this
+    # confirms the assertions above are actually exercising the fix, not
+    # passing vacuously for an unrelated reason.
+    def _old_formula_seed_set(trainer_seed: int, generation: int) -> frozenset[int]:
+        rng = np.random.default_rng(trainer_seed + generation)
+        return frozenset(int(s) for s in rng.choice(np.arange(1, 10001), size=e, replace=False))
+
+    old_collisions_101_202 = sum(
+        1 for g in range(101, generations) if _old_formula_seed_set(101, g) == _old_formula_seed_set(202, g - 101)
+    )
+    old_collisions_202_303 = sum(
+        1 for g in range(101, generations) if _old_formula_seed_set(202, g) == _old_formula_seed_set(303, g - 101)
+    )
+    assert old_collisions_101_202 == 49
+    assert old_collisions_202_303 == 49
 
 
 # ---------------------------------------------------------------------------

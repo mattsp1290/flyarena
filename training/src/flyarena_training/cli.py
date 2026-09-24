@@ -38,9 +38,10 @@ import torch
 
 from . import PRECISION_APPLIED  # noqa: F401  (import applies TF32/determinism settings)
 from .cem import CemConfig, CemResult, run_cem
-from .graph import load_graph_json, output_neuron_indices
+from .graph import ConnectomeGraph, load_graph_json, output_neuron_indices
 from .readout import readout_parameter_count
-from .rollout import HELD_OUT_SEED_COUNT, HELD_OUT_SEED_START, build_rollout_env, evaluate_fitness
+from .rollout import build_rollout_env, evaluate_fitness
+from .seeds import HELD_OUT_SEED_COUNT, HELD_OUT_SEED_START
 
 ARM_NAMES: tuple[str, ...] = ("biological", "rewired", "disconnected")
 
@@ -162,19 +163,13 @@ def _resolve_substeps(graph_source: str, explicit_substeps: int | None) -> int:
     )
 
 
-def run_training(args: argparse.Namespace) -> TrainingResult:
-    """Core training logic, separated from CLI parsing/`main` (same
-    `runExportArms`/`runEvaluate` convention `scripts/training/export-arms.ts`
-    and `evaluate.ts` use), so tests can call it in-process."""
-    # Validate every flag that becomes a `run-dir.ts` RunConfig field before
-    # any I/O or training starts (see REQUIRED_BUNDLE_FIELDS's doc comment).
-    _require_positive_int("--replica-seed", args.trainer_seed)
-    _require_positive_int("--hidden-size", args.hidden_size)
-    _require_positive_int("--ticks", args.ticks)
-    if args.substeps is not None:
-        _require_positive_int("--substeps", args.substeps)
-
-    graph_path = Path(args.graph)
+def _load_and_validate_bundle(graph_path: Path, arm: str) -> dict:
+    """Loads `--graph`'s bundle JSON and validates it looks like a real
+    `export-arms.ts` bundle: file exists, is a JSON object, has every
+    `REQUIRED_BUNDLE_FIELDS` entry (non-empty for the hash fields), a
+    supported `formatVersion`, and an `arm` matching `--arm`. Pure function
+    of a path and a string — independently testable without touching
+    `torch`/`graph.py`."""
     if not graph_path.exists():
         raise FileNotFoundError(f"--graph bundle not found: {graph_path}")
     raw_bundle = json.loads(graph_path.read_text())
@@ -198,24 +193,29 @@ def run_training(args: argparse.Namespace) -> TrainingResult:
             raise ValueError(f"--graph {graph_path}: bundle field {hash_field!r} must be a non-empty string")
     if raw_bundle["formatVersion"] != 1:
         raise ValueError(f"--graph {graph_path} has unsupported bundle formatVersion {raw_bundle['formatVersion']!r}")
-    if raw_bundle["arm"] != args.arm:
-        raise ValueError(f"--arm {args.arm!r} does not match the bundle's own arm {raw_bundle['arm']!r} ({graph_path})")
+    if raw_bundle["arm"] != arm:
+        raise ValueError(f"--arm {arm!r} does not match the bundle's own arm {raw_bundle['arm']!r} ({graph_path})")
 
     graph_source = raw_bundle["graphSource"]
     if graph_source not in ("artifact", "trace-graph-fixture"):
         raise ValueError(f"--graph {graph_path} has unsupported graphSource {graph_source!r}")
-    substeps = _resolve_substeps(graph_source, args.substeps)
 
-    device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return raw_bundle
 
+
+def _resolve_graph(
+    raw_bundle: dict, graph_path: Path, device: torch.device
+) -> tuple[ConnectomeGraph, int]:
+    """Loads the graph a validated bundle points to and cross-checks the
+    bundle's self-declared `D`/`outputNeuronIndices` against what
+    `output_neuron_indices` actually computes from the loaded graph arrays —
+    a free guard against a corrupted/mismatched bundle or a Python/TS
+    divergence, since the two are otherwise never compared. Returns the
+    loaded graph and `D`."""
     graph = load_graph_json(graph_path, device=device)
     d = int(output_neuron_indices(graph).numel())
     if d <= 0:
         raise ValueError(f"--graph {graph_path} has no output-assigned neurons (D=0); cannot train a readout")
-    # Cross-check the bundle's self-declared D/outputNeuronIndices against
-    # what this loader actually computed from the graph arrays — a free
-    # guard against a corrupted/mismatched bundle or a Python/TS divergence
-    # in `output_neuron_indices`, since the two are otherwise never compared.
     bundle_indices = list(raw_bundle["outputNeuronIndices"])
     computed_indices = output_neuron_indices(graph).tolist()
     if raw_bundle["D"] != d or bundle_indices != computed_indices:
@@ -223,6 +223,113 @@ def run_training(args: argparse.Namespace) -> TrainingResult:
             f"--graph {graph_path}: bundle D={raw_bundle['D']!r}/outputNeuronIndices disagree with the "
             f"graph's own outputPopulationIndex (computed D={d}); bundle may be stale or corrupted"
         )
+    return graph, d
+
+
+def _build_run_config(
+    args: argparse.Namespace,
+    raw_bundle: dict,
+    d: int,
+    substeps: int,
+    parameter_count: int,
+    cem_config: CemConfig,
+    result: CemResult,
+) -> dict:
+    """The `config.json` payload: `run-dir.ts`'s required `RunConfig` fields
+    plus informational hyperparameters/seed-set/provenance fields (the
+    plan's "config.json records every hyperparameter, the seed sets, D, H,
+    the parameter count, and the arm name"). Pure function of already-
+    computed values — trivially unit-testable without running CEM."""
+    return {
+        # RunConfig fields (scripts/training/run-dir.ts) — required.
+        "arm": args.arm,
+        "trainerSeed": args.trainer_seed,
+        "D": d,
+        "H": args.hidden_size,
+        "parameterCount": parameter_count,
+        "substeps": substeps,
+        # `armBundleSha256` is required present now that REQUIRED_BUNDLE_FIELDS
+        # gates every bundle load: evaluate.ts's loadArmGraphs cross-checks it
+        # against the loaded bundle's own sha256 (its "trained against the
+        # right bundle" integrity check), so this field must never be
+        # silently dropped for being `None`.
+        "armBundleSha256": raw_bundle["sha256"],
+        # Every hyperparameter, the seed sets, and provenance (informational;
+        # not read by run-dir.ts/evaluate.ts, but recorded per the plan:
+        # "config.json records every hyperparameter, the seed sets, D, H,
+        # the parameter count, and the arm name").
+        "graphId": raw_bundle["graphId"],
+        "graphSource": raw_bundle["graphSource"],
+        "graphArtifactSha256": raw_bundle["graphArtifactSha256"],
+        "ticks": args.ticks,
+        "population": cem_config.population,
+        "elites": cem_config.elites,
+        "generations": cem_config.generations,
+        "alpha": cem_config.alpha,
+        "stdFloor": cem_config.std_floor,
+        "initStd": cem_config.init_std,
+        "trainingSeedsPerGeneration": cem_config.training_seeds_per_generation,
+        "trainingSeedRange": [cem_config.training_seed_low, cem_config.training_seed_high],
+        # Recorded explicitly (not just implied by the CLI's source code)
+        # because this deliberately deviates from the plan's literal
+        # `trainer_seed + generation` formula — see `seeds.py`'s and
+        # `README.md`'s "Replica training-seed independence" sections.
+        "trainingSeedRng": "default_rng([trainerSeed, generation])",
+        "validationSeedRange": [
+            cem_config.validation_seed_start,
+            cem_config.validation_seed_start + cem_config.validation_seed_count - 1,
+        ],
+        "heldOutSeedRange": [HELD_OUT_SEED_START, HELD_OUT_SEED_START + HELD_OUT_SEED_COUNT - 1],
+        "bestValidationFitness": result.best_validation_fitness,
+    }
+
+
+def _capture_env_info(device: torch.device, raw_bundle: dict, wall_seconds: float, history: list) -> dict:
+    """The `env.json` payload: torch/CUDA versions, device name, git rev,
+    graph bundle provenance, precision flags, and wall time. Pure function
+    of already-computed values — independently testable without running a
+    full (if tiny) training loop first."""
+    return {
+        "torchVersion": torch.__version__,
+        "cudaAvailable": torch.cuda.is_available(),
+        "cudaVersion": torch.version.cuda,
+        "deviceName": torch.cuda.get_device_name(device) if device.type == "cuda" else (platform.processor() or platform.machine()),
+        "device": str(device),
+        "gitRev": _git_rev(),
+        "graphBundleSha256": raw_bundle["sha256"],
+        "graphArtifactSha256": raw_bundle["graphArtifactSha256"],
+        "precision": {
+            "cudaMatmulAllowTf32": torch.backends.cuda.matmul.allow_tf32,
+            "cudnnAllowTf32": torch.backends.cudnn.allow_tf32,
+            "float32MatmulPrecision": torch.get_float32_matmul_precision(),
+            "deterministicAlgorithms": torch.are_deterministic_algorithms_enabled(),
+        },
+        "wallSeconds": wall_seconds,
+        "wallSecondsPerGeneration": wall_seconds / len(history),
+    }
+
+
+def run_training(args: argparse.Namespace) -> TrainingResult:
+    """Core training logic, separated from CLI parsing/`main` (same
+    `runExportArms`/`runEvaluate` convention `scripts/training/export-arms.ts`
+    and `evaluate.ts` use), so tests can call it in-process. A thin
+    orchestrator: validate flags -> load bundle -> resolve graph -> build
+    env/CEM config -> run CEM -> write outputs (via the helpers above)."""
+    # Validate every flag that becomes a `run-dir.ts` RunConfig field before
+    # any I/O or training starts (see REQUIRED_BUNDLE_FIELDS's doc comment).
+    _require_positive_int("--replica-seed", args.trainer_seed)
+    _require_positive_int("--hidden-size", args.hidden_size)
+    _require_positive_int("--ticks", args.ticks)
+    if args.substeps is not None:
+        _require_positive_int("--substeps", args.substeps)
+
+    graph_path = Path(args.graph)
+    raw_bundle = _load_and_validate_bundle(graph_path, args.arm)
+    substeps = _resolve_substeps(raw_bundle["graphSource"], args.substeps)
+
+    device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    graph, d = _resolve_graph(raw_bundle, graph_path, device)
     parameter_count = readout_parameter_count(d, args.hidden_size)
 
     env = build_rollout_env(graph, device=device)
@@ -275,43 +382,7 @@ def run_training(args: argparse.Namespace) -> TrainingResult:
     theta_final = result.theta_final.detach().to("cpu", dtype=torch.float32).numpy()
     theta_best = result.theta_best.detach().to("cpu", dtype=torch.float32).numpy()
 
-    config = {
-        # RunConfig fields (scripts/training/run-dir.ts) — required.
-        "arm": args.arm,
-        "trainerSeed": args.trainer_seed,
-        "D": d,
-        "H": args.hidden_size,
-        "parameterCount": parameter_count,
-        "substeps": substeps,
-        # `armBundleSha256` is required present now that REQUIRED_BUNDLE_FIELDS
-        # gates every bundle load: evaluate.ts's loadArmGraphs cross-checks it
-        # against the loaded bundle's own sha256 (its "trained against the
-        # right bundle" integrity check), so this field must never be
-        # silently dropped for being `None`.
-        "armBundleSha256": raw_bundle["sha256"],
-        # Every hyperparameter, the seed sets, and provenance (informational;
-        # not read by run-dir.ts/evaluate.ts, but recorded per the plan:
-        # "config.json records every hyperparameter, the seed sets, D, H,
-        # the parameter count, and the arm name").
-        "graphId": raw_bundle["graphId"],
-        "graphSource": graph_source,
-        "graphArtifactSha256": raw_bundle["graphArtifactSha256"],
-        "ticks": args.ticks,
-        "population": cem_config.population,
-        "elites": cem_config.elites,
-        "generations": cem_config.generations,
-        "alpha": cem_config.alpha,
-        "stdFloor": cem_config.std_floor,
-        "initStd": cem_config.init_std,
-        "trainingSeedsPerGeneration": cem_config.training_seeds_per_generation,
-        "trainingSeedRange": [cem_config.training_seed_low, cem_config.training_seed_high],
-        "validationSeedRange": [
-            cem_config.validation_seed_start,
-            cem_config.validation_seed_start + cem_config.validation_seed_count - 1,
-        ],
-        "heldOutSeedRange": [HELD_OUT_SEED_START, HELD_OUT_SEED_START + HELD_OUT_SEED_COUNT - 1],
-        "bestValidationFitness": result.best_validation_fitness,
-    }
+    config = _build_run_config(args, raw_bundle, d, substeps, parameter_count, cem_config, result)
 
     # Written in this order — theta/csv/env, then config.json LAST — so that
     # a failure partway through (disk full, a write error) can never leave a
@@ -332,24 +403,7 @@ def run_training(args: argparse.Namespace) -> TrainingResult:
         for record in result.history:
             handle.write(f"{record.generation},{record.mean_fitness},{record.max_fitness},{record.validation_fitness}\n")
 
-    env_info = {
-        "torchVersion": torch.__version__,
-        "cudaAvailable": torch.cuda.is_available(),
-        "cudaVersion": torch.version.cuda,
-        "deviceName": torch.cuda.get_device_name(device) if device.type == "cuda" else (platform.processor() or platform.machine()),
-        "device": str(device),
-        "gitRev": _git_rev(),
-        "graphBundleSha256": raw_bundle["sha256"],
-        "graphArtifactSha256": raw_bundle["graphArtifactSha256"],
-        "precision": {
-            "cudaMatmulAllowTf32": torch.backends.cuda.matmul.allow_tf32,
-            "cudnnAllowTf32": torch.backends.cudnn.allow_tf32,
-            "float32MatmulPrecision": torch.get_float32_matmul_precision(),
-            "deterministicAlgorithms": torch.are_deterministic_algorithms_enabled(),
-        },
-        "wallSeconds": wall_seconds,
-        "wallSecondsPerGeneration": wall_seconds / len(result.history),
-    }
+    env_info = _capture_env_info(device, raw_bundle, wall_seconds, result.history)
     env_path = out_dir / "env.json"
     # allow_nan=False: fail here, in Python, rather than writing a token
     # (`NaN`/`Infinity`/`-Infinity`) that `JSON.parse` in `run-dir.ts` rejects

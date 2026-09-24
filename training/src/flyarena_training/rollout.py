@@ -9,9 +9,10 @@ candidate fitness is the mean over `E` seeds of `left`'s final
 
 This module owns exactly one thing: given a batch of flat `theta` vectors and
 a list of seeds, run the episodes and return fitness. It does not decide
-which seeds to draw (that is `cem.py`'s "Seed policy" job) or how CEM updates
-its search distribution (also `cem.py`). It does, however, refuse to score a
-held-out seed on its own (`assert_no_held_out_seeds`), so a caller cannot
+which seeds to draw (that is `seeds.py`'s job, consumed by `cem.py`'s "Seed
+policy" loop) or how CEM updates its search distribution (`cem.py`). It
+does, however, refuse to score a held-out seed on its own
+(`assert_no_held_out_seeds`, imported from `seeds.py`), so a caller cannot
 accidentally leak one into a batch even by bypassing `cem.py`'s own seed
 sampling.
 """
@@ -25,31 +26,10 @@ import torch
 from .config import ARENA_CONFIG, ArenaConfig
 from .graph import ConnectomeGraph, output_neuron_indices
 from .model import PreparedGraph, create_model_state, run_substeps
-from .readout import ReadoutWeights, gather_output_rates, readout_forward
+from .readout import ReadoutWeights, gather_output_rates, readout_forward, readout_parameter_count
+from .seeds import HELD_OUT_SEED_COUNT, HELD_OUT_SEED_START, assert_no_held_out_seeds
 from .sensors import observe_batch
 from .world import create_world_batch, step_world_batched
-
-# Held-out seed range (`03-cem-training.md`'s "Seed policy" table: seeds
-# 30001..30100, reserved for WP4's authoritative evaluation). Defined here
-# (not only in `cem.py`) so `evaluate_fitness` itself refuses to score a
-# held-out seed even if called directly, independent of `cem.py`'s own
-# seed-sampling policy — "the trainer asserts that no held-out seed enters
-# any batch" (03-cem-training.md).
-HELD_OUT_SEED_START = 30001
-HELD_OUT_SEED_COUNT = 100
-HELD_OUT_SEED_END = HELD_OUT_SEED_START + HELD_OUT_SEED_COUNT - 1
-
-
-def assert_no_held_out_seeds(seeds: Sequence[int]) -> None:
-    """Raise `AssertionError` naming the offending seed if any element of
-    `seeds` falls in `[HELD_OUT_SEED_START, HELD_OUT_SEED_END]`."""
-    for seed in seeds:
-        if HELD_OUT_SEED_START <= seed <= HELD_OUT_SEED_END:
-            raise AssertionError(
-                f"seed {seed} is in the held-out range [{HELD_OUT_SEED_START}, {HELD_OUT_SEED_END}]; "
-                "held-out seeds are reserved for WP4's authoritative evaluation and must never enter "
-                "a CEM training or validation batch"
-            )
 
 
 def theta_batch_to_readout_weights(theta: torch.Tensor, input_size: int, hidden_size: int) -> ReadoutWeights:
@@ -62,7 +42,7 @@ def theta_batch_to_readout_weights(theta: torch.Tensor, input_size: int, hidden_
     if theta.ndim != 2:
         raise ValueError(f"theta must be 2-D [P, parameterCount], got shape {tuple(theta.shape)}")
     p = theta.shape[0]
-    expected = hidden_size * input_size + hidden_size + 3 * hidden_size + 3
+    expected = readout_parameter_count(input_size, hidden_size)
     if theta.shape[1] != expected:
         raise ValueError(
             f"theta has parameterCount {theta.shape[1]}, expected {expected} for "

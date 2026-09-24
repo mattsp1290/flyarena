@@ -423,11 +423,16 @@ Two other review findings, both fixed alongside the batching work above:
 
 Seeded, GPU-batched cross-entropy method (CEM) trainer for the readout MLP
 (`.agents/plans/trained-readout/03-cem-training.md`). New modules:
-`flyarena_training/cem.py` (the CEM optimizer and seed-sampling policy),
-`flyarena_training/rollout.py` (batched episode rollout: world + observe +
-model + readout + decode, `evaluate(theta_batch, seeds) -> fitness`), and
-`flyarena_training/cli.py` (the `flyarena-train` entry point, registered in
-`pyproject.toml`'s `[project.scripts]`). Tests: `tests/test_cem.py`.
+`flyarena_training/cem.py` (the CEM optimizer: elite selection and the
+mean/std smoothing update), `flyarena_training/seeds.py` (the seed policy —
+training/validation/held-out ranges, per-generation training-seed sampling,
+and the held-out guard — imported by both `cem.py` and `rollout.py`, neither
+of which imports the other), `flyarena_training/rollout.py` (batched episode
+rollout: world + observe + model + readout + decode, `evaluate(theta_batch,
+seeds) -> fitness`), and `flyarena_training/cli.py` (the `flyarena-train`
+entry point, registered in `pyproject.toml`'s `[project.scripts]`; a thin
+orchestrator over `_load_and_validate_bundle`/`_resolve_graph`/
+`_build_run_config`/`_capture_env_info`). Tests: `tests/test_cem.py`.
 
 ### Usage
 
@@ -479,12 +484,14 @@ Population 256, elites 32, generations 150, smoothing α=0.7 on mean and std,
 std floor 0.02, init std 0.5, `E=16` training seeds per generation (`B = P ×
 E = 4096`), hidden size `H=16` — all CLI-overridable, defaults matching
 03-cem-training.md's table exactly. Training seeds: `E` sampled without
-replacement per generation from `numpy.random.default_rng(trainer_seed +
-generation)` over `[1, 10000]`. Validation seeds: the fixed range
+replacement per generation from `seeds.sample_training_seeds`
+(`numpy.random.default_rng([trainer_seed, generation])` over `[1, 10000]` —
+see "Replica training-seed independence" below for why this deviates from
+the plan's literal formula). Validation seeds: the fixed range
 `[20001, 20064]`, evaluated on the CEM mean (not the population) every
 generation, used only to track the best-ever candidate by validation
 fitness — never to select elites. Held-out seeds `[30001, 30100]` are never
-sampled by either policy; `rollout.assert_no_held_out_seeds` is called
+sampled by either policy; `seeds.assert_no_held_out_seeds` is called
 before every training and validation batch regardless (defense in depth —
 see `test_cem_held_out_injection_fires_the_assertion` and
 `test_evaluate_fitness_held_out_seed_raises`). The published candidate is
@@ -500,21 +507,40 @@ Rubinstein 2005, "A Tutorial on the Cross-Entropy Method"): `α` weights the
 search distribution 70% of the way toward each generation's elites. Pinned
 by `test_cem_alpha_weights_the_new_elite_estimate`.
 
-**Replica training-seed overlap (a property of the plan's own formula, not a
-bug):** because `sample_training_seeds` keys `numpy.random.default_rng` on
-`trainer_seed + generation`, two replicas whose `trainer_seed`s differ by
-`< generations` share part of their training-seed curriculum — e.g. at the
+**Replica training-seed independence (deliberate deviation from the plan's
+literal formula):** 03-cem-training.md's "Seed policy" table specifies
+`numpy.random.default_rng(trainer_seed + generation)` (a scalar sum) for
+per-generation training-seed sampling. That literal formula aliases whenever
+two replicas' `trainer_seed`s differ by less than `G` — at the plan's own
 default replica seeds 101/202/303 and `G=150`, replica 101's generation
-`g >= 101` draws exactly the seed set replica 202 draws at generation
-`g - 101` (about a third of each pair's 150 generations). The candidate
-noise stream is still independent per replica (`torch.Generator` seeded from
-`trainer_seed` alone), so replicas are not identical, but WP4/WP5 should not
-treat the three replicas' training curricula as fully independent samples
-when interpreting cross-replica variance. This implements 03-cem-training.md's
-seed-policy formula exactly as written; changing the RNG keying (e.g. to
-`np.random.default_rng([trainer_seed, generation])`, a `SeedSequence`
-entropy tuple with no aliasing) is a plan-level decision, not something this
-work package changes unilaterally.
+`g >= 101` drew *exactly* the same 16-seed training set as replica 202's
+generation `g - 101` (49/150 = 32.7% of generations for each adjacent pair,
+confirmed empirically across three review passes), which directly
+contradicts the plan's own "R = 3 independent trainer_seed values per arm"
+framing (`.agents/plans/trained-readout/00-overview.md:43`) — two of the
+three replica pairs would not be drawing from independent Monte Carlo
+training curricula for roughly a third of their generations.
+
+`seeds.sample_training_seeds` therefore keys `numpy.random.default_rng` on
+the two-element entropy tuple `[trainer_seed, generation]`
+(`numpy.random.SeedSequence` semantics) instead of the literal scalar sum.
+This is a deliberate deviation from the plan's literal text, made to honor
+the plan's own *stated intent* of three independent replicas, which the
+literal formula fails to deliver. It changes no other behavior: same
+function signature, same per-generation determinism (the CPU bit-identity
+gate — see "Reproducibility" below — still passes with the new formula), and
+the same `[1, 10000]` training-seed range disjoint from held-out. The
+candidate noise stream was already independent per replica under either
+formula (`torch.Generator` seeded from `trainer_seed` alone, with no
+`+ generation` term). `test_sample_training_seeds_is_replica_independent_across_defaults`
+(`tests/test_cem.py`) asserts no generation of any of the three default
+replicas ever draws the same 16-seed training set as any generation of
+either of the other two, and that held-out isolation still holds; it also
+sanity-checks that the old formula would still show the reviewed 49/150
+collision count, so the test would fail if this fix were ever reverted.
+`config.json`'s `trainingSeedRng` field records the formula in effect
+(`"default_rng([trainerSeed, generation])"`) for any run this trainer
+writes.
 
 ### Reproducibility (measured)
 
@@ -593,6 +619,11 @@ Verified passing on this host.
   (`numpy.random.default_rng(...).choice(..., replace=False)`): the plan
   specifies the RNG but not replacement; sampling without replacement avoids
   wasting part of the `E`-seed batch on a duplicate episode.
+- **Training-seed RNG is keyed on `[trainer_seed, generation]`, not the
+  plan's literal `trainer_seed + generation`:** see "Replica training-seed
+  independence" above — the literal scalar-sum formula aliases between
+  replicas and contradicts the plan's own "3 independent replicas" intent,
+  so this trainer honors that intent instead of the literal formula.
 - **`--out` write ordering, not full atomic publish:** `cli.py` creates
   `--out` before training (fails fast on a bad path), immediately removes
   any `config.json` already there (so a *reused* `--out` can't leave an old
