@@ -1,7 +1,6 @@
 # Behavior atlas validation
 
-Status: implementation, maintainability review and integrated verification complete.
-Deployment verification remains in progress.
+Status: implemented, reviewed, merged, deployed and verified.
 
 ## Planning and hardware
 
@@ -100,4 +99,39 @@ Desktop and 390-pixel mobile renders were inspected. Buttons, controller summari
 controls, playback and labels remained readable without horizontal overflow.
 The atlas probe now starts on the same seed as the displayed replay.
 
-Still pending: merge to main, deployment and public browser smoke.
+## Merge and deployed release
+
+Main was fast-forwarded to tested implementation commit
+`fa6f5b788c7a0f06862e9a0696790550f0369387`. Deployment ran from its clean isolated
+worktree after review and merge, using the existing script without beans or
+backend changes. HEAD and tracked cleanliness were checked before and after.
+
+`./scripts/deploy.sh` activated release `20260924T205159Z-da5c2ca56a70` and verified
+public HTML and every emitted asset byte-for-byte. The previous release remains
+available via the documented release-symlink rollback procedure. Connection
+settings remain exclusively in ignored `.env` files.
+
+The actual public Chromium journey loaded all 30 controllers, matched the atlas
+manifest to the local artifact, ran controller 1316 with output-group silencing
+on eight seeds (fork 120, horizon 180), exported evidence, scrubbed the paired
+replay, checked a 390-pixel viewport, and returned to a ready Arena. No page or
+HTTP errors occurred. The exported public evidence passed the existing numerical
+comparison with maximum absolute error 7.11e-15 and zero above-budget leaves;
+it was correctly labeled numerically close, not exact reproduction.
+
+The first public smoke attempt exposed a timing-sensitive test selector: exact
+label text included populated option text. The select's accessible role/name was
+correct and the product was ready. The test now selects by combobox role/name;
+no deployed application change was necessary. All five atlas browser tests passed
+again with the corrected selector.
+
+Additional CLI checks rejected altered controller weights, atlas hash, graph hash,
+target neuron IDs and scores. These checks start from an exactly reproduced
+Node-generated export, so their failures are attributable to the tampering.
+
+The final verifier on the integrated implementation exactly reproduced all 30
+controllers, all discovery metrics, held-out controls and replay frames. All seven
+implementation-plan success criteria are satisfied.
+
+A following documentation/test-only commit records this evidence; it does not
+change the application code deployed from `fa6f5b7`.

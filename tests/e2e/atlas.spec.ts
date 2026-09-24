@@ -43,7 +43,7 @@ test('discover, replay, intervene and verify selected-controller evidence', asyn
   expect(comparison.maxAbsoluteError).toBeLessThan(1e-12);
   await map.getByRole('button').last().click();
   await expect(page.getByRole('region', { name: 'Counterfactual results' })).toHaveCount(0);
-  await page.getByLabel('Silence group', { exact: true }).selectOption('output');
+  await page.getByRole('combobox', { name: 'Silence group', exact: true }).selectOption('output');
   await page.getByRole('button', { name: 'Use quick probe settings' }).click();
   await page.getByLabel('Fork tick', { exact: true }).fill('60');
   await page.getByRole('button', { name: 'Fork & compare' }).click();
