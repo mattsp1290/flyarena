@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { COLORMAP_SIZE, VIRIDIS_LUT, rateToColor } from '../../src/lib/render/colormap';
+import { COLORMAP_SIZE, VIRIDIS_LUT, rateToColor, rateToLutIndex } from '../../src/lib/render/colormap';
+import { writeColors } from '../../src/lib/render/activity-layout';
 
 describe('VIRIDIS_LUT', () => {
   it('has 256 RGB entries, every channel in [0, 1]', () => {
@@ -59,5 +60,40 @@ describe('rateToColor', () => {
     rateToColor(2, 0, 10, outLow, 0);
     rateToColor(8, 0, 10, outHigh, 0);
     expect(Array.from(outLow)).not.toEqual(Array.from(outHigh));
+  });
+
+  it('never lightens/darkens non-monotonically: every step from LUT[i] to LUT[i+1] moves luminance the same direction overall', () => {
+    // A real property of viridis (dark purple -> bright yellow): overall
+    // luminance rises from end to end. Checked against the LUT endpoints
+    // rather than every adjacent pair (a real viridis table dips slightly
+    // in places), so this catches a badly wrong/reversed table without
+    // being overly strict about the exact curve shape.
+    const luminance = (r: number, g: number, b: number): number => 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    const first = luminance(VIRIDIS_LUT[0], VIRIDIS_LUT[1], VIRIDIS_LUT[2]);
+    const lastOffset = (COLORMAP_SIZE - 1) * 3;
+    const last = luminance(VIRIDIS_LUT[lastOffset], VIRIDIS_LUT[lastOffset + 1], VIRIDIS_LUT[lastOffset + 2]);
+    expect(last).toBeGreaterThan(first);
+  });
+
+  it('treats a non-finite rate the same as the degenerate zero-width range (maps to index 0, never NaN)', () => {
+    expect(rateToLutIndex(Number.NaN, 0, 10, 256)).toBe(0);
+    expect(rateToLutIndex(Number.POSITIVE_INFINITY, 0, 10, 256)).toBe(0);
+    expect(Number.isFinite(rateToLutIndex(Number.NaN, 0, 10, 256))).toBe(true);
+
+    const out = new Float32Array(3);
+    rateToColor(Number.NaN, 0, 10, out, 0);
+    for (const value of out) expect(Number.isFinite(value)).toBe(true);
+  });
+
+  it('writeColors (with VIRIDIS_LUT) and rateToColor agree for every rate — the two color paths cannot silently drift apart', () => {
+    const rates = Float32Array.from({ length: 101 }, (_, i) => -0.2 + i * 0.014);
+    const indices = Int32Array.from(rates.keys());
+    const viaWriteColors = new Float32Array(rates.length * 3);
+    writeColors(rates, indices, 0, 1, VIRIDIS_LUT, viaWriteColors);
+
+    const viaRateToColor = new Float32Array(rates.length * 3);
+    rates.forEach((rate, k) => rateToColor(rate, 0, 1, viaRateToColor, k * 3));
+
+    expect(Array.from(viaWriteColors)).toEqual(Array.from(viaRateToColor));
   });
 });

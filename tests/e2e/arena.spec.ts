@@ -165,6 +165,34 @@ test.describe('asset load and readiness', () => {
     // page-wide text match resolves to more than one element.
     await expect(page.locator('.ledger')).toContainText(`${manifest.neuronCount} / ${manifest.edgeCount}`);
   });
+
+  test('the sidebar (controls/telemetry/ledger) stays beside the arena, not pushed below the activity panel (layout regression)', async ({
+    page
+  }) => {
+    // Dual review finding: the activity panel's `.activity { grid-column: 1
+    // / -1 }` used to make CSS grid's sparse auto-placement push
+    // `aside.sidebar` into a third row *below* the activity panel, leaving
+    // the whole column next to the arena empty — Start/Pause/Reset,
+    // telemetry, and the ledger all fell below the fold. Confirmed by
+    // measuring real layout boxes at a desktop viewport, not just checking
+    // that the elements exist.
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.goto('/');
+    await waitForReady(page);
+
+    const arenaBox = await page.locator('section.arena').boundingBox();
+    const sidebarBox = await page.locator('aside.sidebar').boundingBox();
+    const activityBox = await page.locator('section.activity').boundingBox();
+    if (!arenaBox || !sidebarBox || !activityBox) throw new Error('Expected all three layout regions to have a bounding box');
+
+    // The sidebar sits to the right of the arena (same row), not below it.
+    expect(sidebarBox.x).toBeGreaterThan(arenaBox.x + arenaBox.width - 1);
+    expect(Math.abs(sidebarBox.y - arenaBox.y)).toBeLessThan(4);
+    // The activity panel sits below the arena, in the arena's own column
+    // (not spanning under the sidebar too).
+    expect(activityBox.y).toBeGreaterThan(arenaBox.y + arenaBox.height - 1);
+    expect(activityBox.x).toBeCloseTo(arenaBox.x, 0);
+  });
 });
 
 test.describe('controls: start/pause/reset', () => {
@@ -357,6 +385,11 @@ test.describe('anatomical activity view', () => {
     await expect(page.getByText(/^Positioned:/)).toContainText(
       `${positionsManifest.coverage.soma} soma, ${positionsManifest.coverage.tosoma} soma-tract, ${positionsManifest.coverage.none} unavailable`
     );
+    // The "position unavailable" strip must actually be labeled in-product
+    // (docs/model-ledger.md's own claim), not just disclosed as a bare
+    // count — regression coverage for a dual-review finding.
+    await expect(page.getByText(/position unavailable/i)).toBeVisible();
+    await expect(page.getByText(new RegExp(`${positionsManifest.coverage.none} neurons with no soma`))).toBeVisible();
 
     await startOrResumeButton(page).click();
     await waitForTick(page, 10);
@@ -380,22 +413,35 @@ test.describe('anatomical activity view', () => {
     // protocol-level proof the plan's "close -> no rates messages" gate
     // asks for, not just a DOM proxy for it.
     const workers: import('@playwright/test').Worker[] = [];
+    // Collected (not fire-and-forget) so the test can `Promise.all` them
+    // before trusting any count read below — otherwise a read racing an
+    // unlanded patch would see `undefined` for that Worker, and a real leak
+    // on that one arm could pass unnoticed (dual review finding).
+    const patchPromises: Array<Promise<unknown>> = [];
     page.on('worker', (worker) => {
       workers.push(worker);
-      void worker.evaluate(() => {
-        const scope = self as unknown as { postMessage: (...args: unknown[]) => void; __rateMessageCount: number };
-        scope.__rateMessageCount = 0;
-        const original = scope.postMessage.bind(scope);
-        scope.postMessage = (...args: unknown[]) => {
-          const data = args[0] as { type?: string; rates?: unknown } | undefined;
-          if (data && data.type === 'step' && 'rates' in data) scope.__rateMessageCount += 1;
-          return original(...args);
-        };
-      });
+      patchPromises.push(
+        worker.evaluate(() => {
+          const scope = self as unknown as { postMessage: (...args: unknown[]) => void; __rateMessageCount: number };
+          scope.__rateMessageCount = 0;
+          const original = scope.postMessage.bind(scope);
+          scope.postMessage = (...args: unknown[]) => {
+            const data = args[0] as { type?: string; rates?: unknown } | undefined;
+            if (data && data.type === 'step' && 'rates' in data) scope.__rateMessageCount += 1;
+            return original(...args);
+          };
+        })
+      );
     });
 
     await page.goto('/');
     await waitForReady(page);
+    // Both dedicated neural Workers are constructed during `initialize()`,
+    // well before `ready` — safe to require exactly two and await their
+    // patches landing before any count read is trusted.
+    await expect.poll(() => workers.length, { timeout: 10_000 }).toBe(2);
+    await Promise.all(patchPromises);
+
     await expandActivityPanel(page);
     await startOrResumeButton(page).click();
     await waitForActivityUpdateTick(page, 'left', 1);
@@ -407,9 +453,11 @@ test.describe('anatomical activity view', () => {
           worker.evaluate(() => (self as unknown as { __rateMessageCount: number }).__rateMessageCount)
         )
       );
+    const readTick = (): Promise<number> =>
+      page.evaluate(() => Number(document.body.textContent?.match(/Tick (\d+) \/ \d+/)?.[1] ?? NaN));
 
     const countsWhileOpen = await readCounts();
-    expect(countsWhileOpen.some((count) => count > 0)).toBe(true);
+    expect(countsWhileOpen.every((count) => typeof count === 'number' && count > 0)).toBe(true);
 
     await activityToggle(page).click();
     await expect(activityToggle(page)).toHaveText(/expand/i);
@@ -419,7 +467,13 @@ test.describe('anatomical activity view', () => {
     expect(await page.locator('canvas[aria-label="Neural activity at soma positions"]').count()).toBe(0);
 
     const countsAtCollapse = await readCounts();
-    await waitForTick(page, 40);
+    // Relative to the tick observed *at* collapse, not an absolute
+    // threshold: an absolute `waitForTick(page, 40)` can already be in the
+    // past by the time collapse happens on a slow runner, which would let
+    // this whole assertion pass without ever observing a post-collapse
+    // window (dual review finding).
+    const tickAtCollapse = await readTick();
+    await waitForTick(page, tickAtCollapse + 30);
     const countsAfterMoreTicks = await readCounts();
     expect(countsAfterMoreTicks).toEqual(countsAtCollapse);
 

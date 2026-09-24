@@ -12,6 +12,7 @@
  * `xyz`/`positionSource`/`role` arrays (degree-preserving rewiring keeps the
  * node set; only connections differ), so one layout/partition serves both.
  */
+import { rateToLutIndex } from './colormap';
 
 export type PositionSource = 'soma' | 'tosoma' | 'none';
 export type NeuronRole = 'sensory' | 'bridge' | 'descending';
@@ -31,6 +32,18 @@ export interface PositionLayout {
  */
 const STRIP_Y = -1.35;
 const STRIP_Z = 0;
+/**
+ * Minimum on-screen gap between adjacent strip points, along both the
+ * strip's X spread and its row spacing. Kept at least as large as
+ * `ActivityScene.ts`'s point sprite size (0.045 normalized units) so a
+ * real-sized unavailable set (165 of 1,008 neurons in the shipped MaleCNS
+ * data) wraps into multiple rows instead of cramming into one row where
+ * points overlap into an unreadable smear — a real, reproduced problem with
+ * an earlier single-row version of this layout.
+ */
+const STRIP_MIN_SPACING = 0.06;
+/** Matches the main cloud's `[-1, 1]` centered/scaled extent (see below). */
+const STRIP_WIDTH = 2;
 
 /**
  * Center soma-annotated neurons (`positionSource` is `'soma'` or `'tosoma'`)
@@ -98,13 +111,21 @@ export const layoutPositions = (
     points[offset + 2] = (point[2] - centerZ) * scale;
   }
 
+  // Wrap the strip into multiple rows (rather than one long row) once there
+  // are more unavailable neurons than fit at `STRIP_MIN_SPACING` across
+  // `STRIP_WIDTH` — see that constant's doc comment.
   const unavailableCount = unavailable.length;
+  const perRow = Math.max(1, Math.floor(STRIP_WIDTH / STRIP_MIN_SPACING) + 1);
+  const rowCount = Math.max(1, Math.ceil(unavailableCount / perRow));
   for (let slot = 0; slot < unavailableCount; slot += 1) {
     const index = unavailable[slot];
     const offset = index * 3;
-    const t = unavailableCount > 1 ? slot / (unavailableCount - 1) : 0.5;
-    points[offset] = -1 + 2 * t;
-    points[offset + 1] = STRIP_Y;
+    const row = Math.floor(slot / perRow);
+    const col = slot % perRow;
+    const countInThisRow = row === rowCount - 1 ? unavailableCount - row * perRow : perRow;
+    const t = countInThisRow > 1 ? col / (countInThisRow - 1) : 0.5;
+    points[offset] = -1 + STRIP_WIDTH * t;
+    points[offset + 1] = STRIP_Y - row * STRIP_MIN_SPACING;
     points[offset + 2] = STRIP_Z;
   }
 
@@ -154,10 +175,15 @@ export const partitionByRole = (role: readonly NeuronRole[]): RolePartition => {
  * Write RGB colors for `indices` (each a neuron index into `rates`) into
  * `out`, in the same order as `indices` — `out[k*3..k*3+2]` for
  * `indices[k]`. No allocation: `lut` and `out` are both caller-owned
- * buffers. `lut` must have `256 * 3` entries (`colormap.ts#VIRIDIS_LUT`'s
- * shape); accepting it as a parameter rather than importing the concrete
- * colormap keeps this function testable against a synthetic table without a
- * dependency on `colormap.ts`.
+ * buffers, and `lut` can be any table shaped `steps * 3` (not necessarily
+ * `colormap.ts#VIRIDIS_LUT`) — accepting it as a parameter rather than
+ * hard-coding the concrete colormap keeps this function testable against a
+ * synthetic table. It shares its clamp/rounding math with
+ * `colormap.ts#rateToColor` via `rateToLutIndex` (a pure `(rate, min, max,
+ * steps) -> index` function with no dependency on any concrete LUT data),
+ * so the two color paths cannot silently disagree after a future edit to
+ * just one of them — a real risk an earlier, independently-duplicated
+ * version of this math had.
  */
 export const writeColors = (
   rates: Float32Array,
@@ -170,10 +196,7 @@ export const writeColors = (
   const lutSteps = lut.length / 3;
   for (let k = 0; k < indices.length; k += 1) {
     const neuron = indices[k];
-    const rate = rates[neuron];
-    const t = max > min ? (rate - min) / (max - min) : 0;
-    const clamped = t < 0 ? 0 : t > 1 ? 1 : t;
-    const lutIndex = Math.round(clamped * (lutSteps - 1)) * 3;
+    const lutIndex = rateToLutIndex(rates[neuron], min, max, lutSteps) * 3;
     const outOffset = k * 3;
     out[outOffset] = lut[lutIndex];
     out[outOffset + 1] = lut[lutIndex + 1];

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte';
+  import { onDestroy, tick } from 'svelte';
   import type { AgentId } from '../arena/types';
   import type { PositionsLoadResult } from '../experiment/assets';
   import type { ExperimentRunner, ExperimentTelemetry } from '../experiment/runner';
@@ -49,6 +49,19 @@
   let reducedMotionQuery: MediaQueryList | undefined;
   const lastRatesSeen: Record<AgentId, Float32Array | undefined> = { left: undefined, right: undefined };
   let lastColorUpdateMs = 0;
+  /**
+   * Bumped by every `expand()` call and by `collapse()`/`onDestroy`; each
+   * `expand()` invocation captures its own value and checks it after every
+   * `await` (dual review finding). Without this, a fast Expand -> Collapse
+   * -> Expand can resume a superseded `expand()` call after a *newer* one
+   * has already built (or is building) its own scene — the stale call would
+   * either build a second `ActivityScene` on the same canvas (leaking the
+   * first renderer/`ResizeObserver`/listeners) or start a second rAF loop
+   * rendering over the current scene. `isStaleExpand()` is the single check
+   * every resume point uses.
+   */
+  let openGeneration = 0;
+  const isStaleExpand = (generation: number): boolean => destroyed || generation !== openGeneration;
   /** Reduced-motion color-update cadence cap (plan: "at most 5 times per second"). */
   const REDUCED_MOTION_UPDATE_INTERVAL_MS = 200;
 
@@ -57,12 +70,16 @@
     if (!positionsStatus) return 'Loading soma positions…';
     if (positionsStatus.status === 'missing') return `Positions unavailable: ${positionsStatus.reason}`;
     if (positionsStatus.status === 'invalid') return `Positions failed an integrity check: ${positionsStatus.reason}`;
+    // positionsStatus.status === 'ok' past this point.
+    if (topologySwitchPending) return 'Waiting for the topology switch to finish…';
+    if (!runner) return 'Waiting for the experiment to finish loading…';
     return undefined;
   });
   const toggleDisabled = $derived(topologySwitchPending || (!expanded && (!canExpand || !runner)));
 
   const handleReducedMotionChange = (event: MediaQueryListEvent): void => {
     reducedMotion = event.matches;
+    scene?.setReducedMotion(event.matches);
   };
 
   const stopLoop = (): void => {
@@ -85,24 +102,44 @@
 
   const frame = (nowMs: number): void => {
     if (destroyed || !scene) return;
-    const throttled = reducedMotion && nowMs - lastColorUpdateMs < REDUCED_MOTION_UPDATE_INTERVAL_MS;
-    if (!throttled && runner) {
-      lastColorUpdateMs = nowMs;
-      for (const agentId of ['left', 'right'] as const) {
-        const rates = runner.getLatestRates(agentId);
-        if (rates && rates !== lastRatesSeen[agentId]) {
-          lastRatesSeen[agentId] = rates;
-          scene.update(agentId, rates);
-          lastUpdateTick = { ...lastUpdateTick, [agentId]: telemetry?.tick ?? lastUpdateTick[agentId] };
+    try {
+      const throttled = reducedMotion && nowMs - lastColorUpdateMs < REDUCED_MOTION_UPDATE_INTERVAL_MS;
+      if (!throttled && runner) {
+        lastColorUpdateMs = nowMs;
+        for (const agentId of ['left', 'right'] as const) {
+          const rates = runner.getLatestRates(agentId);
+          if (rates && rates !== lastRatesSeen[agentId]) {
+            lastRatesSeen[agentId] = rates;
+            scene.update(agentId, rates);
+            lastUpdateTick = { ...lastUpdateTick, [agentId]: telemetry?.tick ?? lastUpdateTick[agentId] };
+          } else if (!rates && lastRatesSeen[agentId]) {
+            // The arm had rates and now doesn't (e.g. `runner.reset()`
+            // cleared `latestRates`, or this arm's binding stopped
+            // supporting streaming mid-topology-switch) — repaint it to the
+            // neutral "no data" color rather than leaving the previous
+            // run's final colors on screen under a "Computed rate" label
+            // that no longer describes them.
+            lastRatesSeen[agentId] = undefined;
+            scene.clear(agentId);
+          }
         }
       }
+      scene.render(nowMs);
+    } catch (error) {
+      // Mirrors `App.svelte`'s own render-loop guard (`frame`'s doc
+      // comment there): a throw here must not just silently freeze the
+      // canvas on its last frame while streaming quietly stays on.
+      console.error('Activity view render loop stopped unexpectedly', error);
+      sceneError = `The activity view stopped: ${error instanceof Error ? error.message : String(error)}`;
+      teardown();
+      return;
     }
-    scene.render(nowMs);
     rafId = requestAnimationFrame(frame);
   };
 
   const expand = async (): Promise<void> => {
     if (!runner || !positionsStatus || positionsStatus.status !== 'ok') return;
+    const generation = ++openGeneration;
     expanded = true;
     sceneError = undefined;
     contextLostMessage = undefined;
@@ -111,7 +148,7 @@
     try {
       module = await import('../render/ActivityScene');
     } catch (error) {
-      if (destroyed) return;
+      if (isStaleExpand(generation)) return;
       // Deliberately leaves `expanded` true: the fallback placeholder below
       // only renders inside the `{#if expanded}` block, matching
       // `App.svelte`'s own WebGL-unavailable fallback, which stays visible
@@ -121,7 +158,14 @@
       sceneError = `The activity renderer failed to load (${error instanceof Error ? error.message : String(error)}).`;
       return;
     }
-    if (destroyed || !canvasEl) return;
+    if (isStaleExpand(generation)) return;
+    // `expanded = true` (set above) only *schedules* the `{#if expanded}`
+    // canvas to mount — `await tick()` flushes that pending DOM update so
+    // `canvasEl` is deterministically bound by the time it's read below,
+    // rather than relying on the dynamic `import()` having already yielded
+    // enough microtasks for Svelte's own effect flush to land first.
+    await tick();
+    if (isStaleExpand(generation) || !canvasEl) return;
 
     reducedMotionQuery = window.matchMedia?.('(prefers-reduced-motion: reduce)');
     reducedMotion = reducedMotionQuery?.matches ?? false;
@@ -140,7 +184,12 @@
         reducedMotion,
         onContextLost: () => {
           contextLostMessage = 'Activity view lost its graphics context — collapse and reopen to retry.';
-          teardown();
+          // Deferred, matching `App.svelte`'s equivalent `ArenaScene`
+          // handling: `teardown()` -> `scene.dispose()` -> `renderer.dispose()`
+          // would otherwise run synchronously from inside the
+          // `webglcontextlost` event's own dispatch, removing Three's own
+          // listener for that same event mid-dispatch.
+          queueMicrotask(() => teardown());
         }
       });
     } catch (error) {
@@ -155,14 +204,22 @@
 
     lastUpdateTick = { left: 0, right: 0 };
     await runner.setActivityStreaming(true);
-    if (destroyed) {
-      teardown();
+    if (isStaleExpand(generation)) {
+      // Deliberately does NOT call `teardown()` here: whatever `collapse()`
+      // call invalidated this generation already tore down *this* call's
+      // own scene (it was still the current `scene` at the moment that
+      // collapse ran, since nothing else can assign `scene` without an
+      // `await` in between). A later `expand()` may by now already own a
+      // newer scene of its own — calling `teardown()` again here would
+      // dispose *that* one out from under it instead of anything this call
+      // built.
       return;
     }
     rafId = requestAnimationFrame(frame);
   };
 
   const collapse = (): void => {
+    openGeneration += 1;
     expanded = false;
     teardown();
   };
@@ -207,6 +264,13 @@
         {positionsStatus.positions.coverage.none} unavailable
         <span class="units">(units: {positionsStatus.positions.units})</span>
       </p>
+      {#if positionsStatus.positions.coverage.none > 0}
+        <p class="coverage strip-label">
+          The row of points along the bottom of each arm is the
+          <strong>position unavailable</strong> strip — {positionsStatus.positions.coverage.none} neurons with no soma
+          annotation, laid out for visibility only. It is not an anatomical location.
+        </p>
+      {/if}
     {/if}
 
     <div class="canvas-region">
@@ -248,10 +312,16 @@
 
 <style>
   /* `App.svelte`'s `<main>` is a two-column grid (arena + sidebar); this
-     panel spans both columns and sits below the arena, per the plan's
-     placement (`03-activity-view.md`). */
+     panel sits directly below the arena, in the arena's own column, per the
+     plan's placement (`03-activity-view.md`). Deliberately column 1 only
+     (not `1 / -1`): a full-width span here pushes the sidebar's sparse
+     grid auto-placement down into a third row below this panel instead of
+     staying beside the arena — see `.sidebar`'s own comment in
+     `src/app.css`, which pins it back to column 2 to compensate either way,
+     but staying out of its way here keeps the two rules from having to
+     agree on which one "wins". */
   .activity {
-    grid-column: 1 / -1;
+    grid-column: 1;
   }
 
   .reason {
@@ -278,9 +348,17 @@
   }
 
   .canvas-region {
+    /* Sizing (a definite `height`, not `aspect-ratio`) comes from the
+       shared, unscoped `.canvas-region` rule in `src/app.css` — the same
+       one `App.svelte`'s arena canvas uses, and for the same reason (see
+       that rule's own comment): a definite height is what lets the canvas
+       element's percentage height resolve at all, so `ActivityScene.resize()`
+       sizes it correctly instead of the canvas growing unboundedly on
+       repeated resizes. An `aspect-ratio` declared here would be silently
+       overridden by that definite height and do nothing, so it is
+       deliberately omitted rather than left in as dead CSS. */
     position: relative;
     margin-top: 0.8rem;
-    aspect-ratio: 16 / 9;
     border-radius: 0.6rem;
     overflow: hidden;
     background: #05070c;

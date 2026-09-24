@@ -176,9 +176,24 @@
           // the activity view's positions are optional presentation, not a
           // Start gate, so this proceeds even if the rest of `initialize()`
           // goes on to fail.
-          void loadPositions(nextManifest, `${import.meta.env.BASE_URL}data`).then((result) => {
-            if (!destroyed) positionsStatus = result;
-          });
+          //
+          // `loadPositions` documents itself as "never throws", but this
+          // `.catch` enforces that contract at the call site too (dual
+          // review finding) — without it, an unexpected throw anywhere in
+          // its chain (a future edit, or `sha256Hex`/`crypto.subtle` itself)
+          // would become an unhandled rejection and leave `positionsStatus`
+          // `undefined` forever, showing "Loading soma positions…" with no
+          // way to recover short of a reload.
+          void loadPositions(nextManifest, `${import.meta.env.BASE_URL}data`)
+            .catch(
+              (error: unknown): PositionsLoadResult => ({
+                status: 'invalid',
+                reason: `unexpected error while loading positions: ${error instanceof Error ? error.message : String(error)}`
+              })
+            )
+            .then((result) => {
+              if (!destroyed) positionsStatus = result;
+            });
         },
         onTopologyApplied: (agentId, mode) => {
           if (destroyed) return;

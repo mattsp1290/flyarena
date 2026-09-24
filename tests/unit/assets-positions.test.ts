@@ -122,4 +122,89 @@ describe('loadPositions', () => {
     if (result.status !== 'invalid') throw new Error('expected invalid');
     expect(result.reason).toMatch(/xyz/);
   });
+
+  it('returns "invalid" when the declared coverage disagrees with the actual positionSource counts (dual review finding)', async () => {
+    const real = JSON.parse(readFileSync(resolve(publicDataDir, 'malecns-arena-v1.positions.json'), 'utf-8')) as {
+      coverage: { soma: number; tosoma: number; none: number };
+      [key: string]: unknown;
+    };
+    const tampered = { ...real, coverage: { ...real.coverage, soma: real.coverage.soma + 1, none: real.coverage.none - 1 } };
+    const tamperedBytes = Buffer.from(JSON.stringify(tampered));
+    const tamperedSha256 = createHash('sha256').update(tamperedBytes).digest('hex');
+
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL): Promise<Response> => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('malecns-arena-v1.positions.json')) {
+        return new Response(tamperedBytes, { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return createPublicDataFetch()(input);
+    });
+
+    const tamperedManifest: ArenaManifest = { ...manifest, positions: { ...manifest.positions!, sha256: tamperedSha256 } };
+    const result = await loadPositions(tamperedManifest, '/data');
+
+    expect(result.status).toBe('invalid');
+    if (result.status !== 'invalid') throw new Error('expected invalid');
+    expect(result.reason).toMatch(/coverage/i);
+  });
+
+  it('returns "invalid" when units does not disclose that they are unverified', async () => {
+    const real = JSON.parse(readFileSync(resolve(publicDataDir, 'malecns-arena-v1.positions.json'), 'utf-8')) as {
+      [key: string]: unknown;
+    };
+    const tampered = { ...real, units: 'meters' };
+    const tamperedBytes = Buffer.from(JSON.stringify(tampered));
+    const tamperedSha256 = createHash('sha256').update(tamperedBytes).digest('hex');
+
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL): Promise<Response> => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('malecns-arena-v1.positions.json')) {
+        return new Response(tamperedBytes, { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return createPublicDataFetch()(input);
+    });
+
+    const tamperedManifest: ArenaManifest = { ...manifest, positions: { ...manifest.positions!, sha256: tamperedSha256 } };
+    const result = await loadPositions(tamperedManifest, '/data');
+
+    expect(result.status).toBe('invalid');
+    if (result.status !== 'invalid') throw new Error('expected invalid');
+    expect(result.reason).toMatch(/units/i);
+  });
+
+  it('returns "invalid" (never throws) when the hash-matched positions file is valid JSON but not an object (e.g. null)', async () => {
+    const tamperedBytes = Buffer.from('null');
+    const tamperedSha256 = createHash('sha256').update(tamperedBytes).digest('hex');
+
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL): Promise<Response> => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('malecns-arena-v1.positions.json')) {
+        return new Response(tamperedBytes, { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return createPublicDataFetch()(input);
+    });
+
+    const tamperedManifest: ArenaManifest = { ...manifest, positions: { ...manifest.positions!, sha256: tamperedSha256 } };
+    const result = await loadPositions(tamperedManifest, '/data');
+
+    expect(result.status).toBe('invalid');
+    if (result.status !== 'invalid') throw new Error('expected invalid');
+    expect(result.reason).toMatch(/not a json object/i);
+  });
+
+  it('returns "missing" (not "invalid") when re-fetching the biological graph for the cross-check fails for a transient reason (dual review finding)', async () => {
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL): Promise<Response> => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('malecns-arena-v1.bin.gz')) {
+        throw new Error('simulated network failure');
+      }
+      return createPublicDataFetch()(input);
+    });
+
+    const result = await loadPositions(manifest, '/data');
+
+    expect(result.status).toBe('missing');
+    if (result.status !== 'missing') throw new Error('expected missing');
+    expect(result.reason).toMatch(/re-fetch/i);
+  });
 });

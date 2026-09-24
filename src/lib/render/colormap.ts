@@ -53,18 +53,37 @@ const buildViridisLut = (): Float32Array => {
 export const VIRIDIS_LUT: Float32Array = buildViridisLut();
 
 /**
- * Map `rate` (clamped to `[min, max]`) to an RGB triple from `VIRIDIS_LUT`,
- * writing it into `out[offset..offset+2]`. No allocation: `out` is a
- * caller-owned buffer (typically a `THREE.BufferAttribute`'s backing
- * `Float32Array`), reused every call. `min === max` (a degenerate/zero-width
- * declared range) maps every rate to the bottom of the scale (`LUT[0]`)
- * rather than dividing by zero.
+ * Map `rate` (clamped to `[min, max]`) to an index into an LUT with
+ * `lutSteps` entries. Shared by `rateToColor` below (against
+ * `VIRIDIS_LUT`/`COLORMAP_SIZE`) and `activity-layout.ts#writeColors`
+ * (against a caller-supplied `lut`), so the clamp/round math cannot drift
+ * between the two call sites — a real risk dual review flagged, since
+ * `writeColors` previously reimplemented this same math independently, with
+ * nothing to catch the two copies disagreeing after a future edit to just
+ * one of them.
+ *
+ * `min === max` (a degenerate/zero-width declared range) maps every rate to
+ * the bottom of the scale (index 0) rather than dividing by zero. A
+ * non-finite `rate` (`NaN`, `+-Infinity` — should never happen given a
+ * validated graph, but a single bad neuron must not corrupt its point's
+ * color into `NaN`) is treated the same way as `min === max`: both
+ * comparisons below are false for `NaN`, which `Number.isFinite` here
+ * forces to the safe `t = 0` branch instead.
+ */
+export const rateToLutIndex = (rate: number, min: number, max: number, lutSteps: number): number => {
+  const t = max > min && Number.isFinite(rate) ? (rate - min) / (max - min) : 0;
+  const clamped = t < 0 ? 0 : t > 1 ? 1 : t;
+  return Math.round(clamped * (lutSteps - 1));
+};
+
+/**
+ * Map `rate` to an RGB triple from `VIRIDIS_LUT`, writing it into
+ * `out[offset..offset+2]`. No allocation: `out` is a caller-owned buffer
+ * (typically a `THREE.BufferAttribute`'s backing `Float32Array`), reused
+ * every call. See `rateToLutIndex` for the clamping/degenerate-range rules.
  */
 export const rateToColor = (rate: number, min: number, max: number, out: Float32Array, offset: number): void => {
-  const t = max > min ? (rate - min) / (max - min) : 0;
-  const clamped = t < 0 ? 0 : t > 1 ? 1 : t;
-  const index = Math.round(clamped * (COLORMAP_SIZE - 1));
-  const lutOffset = index * 3;
+  const lutOffset = rateToLutIndex(rate, min, max, COLORMAP_SIZE) * 3;
   out[offset] = VIRIDIS_LUT[lutOffset];
   out[offset + 1] = VIRIDIS_LUT[lutOffset + 1];
   out[offset + 2] = VIRIDIS_LUT[lutOffset + 2];

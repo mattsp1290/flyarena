@@ -53,6 +53,19 @@ export class ActivitySceneUnavailableError extends Error {
 const ARM_OFFSET = 1.7;
 const POINT_SIZE = 0.045;
 const ROLES: readonly NeuronRole[] = ['sensory', 'bridge', 'descending'];
+/**
+ * Neutral "no computed rate yet" color: a mid grey, deliberately outside
+ * `VIRIDIS_LUT`'s hue range (which runs dark purple to yellow) so it can
+ * never be mistaken for a real low/high rate reading. Used before the first
+ * `update()` for an arm (points would otherwise default to `(0, 0, 0)` —
+ * black, indistinguishable from the scene's near-black background, i.e. the
+ * view would look empty rather than "not yet streaming") and again whenever
+ * `clear()` is called (e.g. after `ExperimentRunner#reset()` clears
+ * `latestRates` — see `ActivityPanel.svelte`'s `frame()`), so a stale
+ * previous run's colors are never left on screen under a "Computed rate"
+ * label that no longer describes them.
+ */
+const NO_DATA_COLOR: readonly [number, number, number] = [0.32, 0.35, 0.4];
 type PointShape = 'circle' | 'square' | 'triangle';
 const ROLE_SHAPE: Record<NeuronRole, PointShape> = {
   sensory: 'circle',
@@ -227,6 +240,14 @@ export class ActivityScene {
         positionArray[destination + 2] = basePositions[source + 2];
       }
       const colorArray = new Float32Array(indices.length * 3);
+      // Start every point at the neutral "no data" color rather than the
+      // typed array's zero-fill default (0, 0, 0 — black, invisible against
+      // the near-black background) — see `NO_DATA_COLOR`'s doc comment.
+      for (let component = 0; component < colorArray.length; component += 3) {
+        colorArray[component] = NO_DATA_COLOR[0];
+        colorArray[component + 1] = NO_DATA_COLOR[1];
+        colorArray[component + 2] = NO_DATA_COLOR[2];
+      }
       const geometry = new THREE.BufferGeometry();
       geometry.setAttribute('position', new THREE.BufferAttribute(positionArray, 3));
       const colorAttribute = new THREE.BufferAttribute(colorArray, 3);
@@ -263,6 +284,27 @@ export class ActivityScene {
       const group = arm.roles[role];
       writeColors(rates, group.indices, this.rateMin, this.rateMax, VIRIDIS_LUT, group.colorAttribute.array as Float32Array);
       group.colorAttribute.needsUpdate = true;
+    }
+  }
+
+  /**
+   * Repaint `agentId`'s points back to the neutral "no data" color (see
+   * `NO_DATA_COLOR`) — the counterpart to `update()`, for when this arm no
+   * longer has fresh rates to show (e.g. `ExperimentRunner#reset()` cleared
+   * `latestRates`; the host calls this instead of leaving the previous
+   * run's final colors on screen — see `ActivityPanel.svelte`'s `frame()`).
+   */
+  clear(agentId: AgentId): void {
+    if (this.disposed || this.contextLost) return;
+    const arm = this.arms[agentId];
+    for (const role of ROLES) {
+      const array = arm.roles[role].colorAttribute.array as Float32Array;
+      for (let component = 0; component < array.length; component += 3) {
+        array[component] = NO_DATA_COLOR[0];
+        array[component + 1] = NO_DATA_COLOR[1];
+        array[component + 2] = NO_DATA_COLOR[2];
+      }
+      arm.roles[role].colorAttribute.needsUpdate = true;
     }
   }
 

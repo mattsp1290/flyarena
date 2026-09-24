@@ -406,6 +406,13 @@ export const loadPositions = async (manifest: ArenaManifest, dataBaseUrl: string
       reason: `positions artifact is not valid JSON: ${error instanceof Error ? error.message : String(error)}`
     };
   }
+  // A hash-matched file can still be valid JSON that isn't an object at all
+  // (e.g. `null`, a bare number, or an array) — dereferencing `.bodyIds`
+  // below on a non-object throws instead of returning a status, breaking
+  // this function's own "never throws" contract (dual review finding).
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return { status: 'invalid', reason: 'positions artifact is not a JSON object' };
+  }
 
   const positions = parsed as Partial<PositionsArtifact>;
   if (
@@ -431,8 +438,17 @@ export const loadPositions = async (manifest: ArenaManifest, dataBaseUrl: string
     };
   }
 
+  // Counted alongside the per-index validation below (free — the loop
+  // already visits every index) so the coverage/roleCounts numbers the UI
+  // displays (`ActivityPanel.svelte`'s "Positioned: N soma, ..." line) can
+  // be checked against what the arrays actually contain, not merely taken
+  // on the producer's word (dual review finding: an unvalidated `coverage`
+  // could lie relative to the real data, and a missing one would throw
+  // inside the panel's template instead of failing this loader honestly).
+  const countedCoverage = { soma: 0, tosoma: 0, none: 0 };
+  const countedRoles = { sensory: 0, bridge: 0, descending: 0 };
   for (let index = 0; index < neuronCount; index += 1) {
-    const source = positions.positionSource[index];
+    const source: 'soma' | 'tosoma' | 'none' = positions.positionSource[index];
     const point = positions.xyz[index];
     if (source !== 'soma' && source !== 'tosoma' && source !== 'none') {
       return { status: 'invalid', reason: `positionSource[${index}] "${String(source)}" is not soma/tosoma/none` };
@@ -448,10 +464,56 @@ export const loadPositions = async (manifest: ArenaManifest, dataBaseUrl: string
     } else if (!isFiniteTriple(point)) {
       return { status: 'invalid', reason: `xyz[${index}] is missing/malformed for positionSource "${source}"` };
     }
-    const role = positions.role[index];
+    countedCoverage[source] += 1;
+    const role: 'sensory' | 'bridge' | 'descending' = positions.role[index];
     if (role !== 'sensory' && role !== 'bridge' && role !== 'descending') {
       return { status: 'invalid', reason: `role[${index}] "${String(role)}" is not sensory/bridge/descending` };
     }
+    countedRoles[role] += 1;
+  }
+
+  const coverageMatches = (
+    value: unknown
+  ): value is { soma: number; tosoma: number; none: number } =>
+    typeof value === 'object' &&
+    value !== null &&
+    (value as Record<string, unknown>).soma === countedCoverage.soma &&
+    (value as Record<string, unknown>).tosoma === countedCoverage.tosoma &&
+    (value as Record<string, unknown>).none === countedCoverage.none;
+  if (!coverageMatches(positions.coverage)) {
+    return {
+      status: 'invalid',
+      reason: `positions.coverage does not match the actual positionSource counts (${JSON.stringify(countedCoverage)})`
+    };
+  }
+  // The manifest carries its own copy of the same counts (WP1's ledger
+  // output) — cross-check it too, so a generator bug that updates one copy
+  // and not the other is caught here rather than only showing up as two
+  // disagreeing numbers somewhere in the product.
+  if (entry.coverage && !coverageMatches(entry.coverage)) {
+    return {
+      status: 'invalid',
+      reason: `manifest positions.coverage does not match the actual positionSource counts (${JSON.stringify(countedCoverage)})`
+    };
+  }
+  const roleCountsMatch =
+    typeof positions.roleCounts === 'object' &&
+    positions.roleCounts !== null &&
+    (positions.roleCounts as Record<string, unknown>).sensory === countedRoles.sensory &&
+    (positions.roleCounts as Record<string, unknown>).bridge === countedRoles.bridge &&
+    (positions.roleCounts as Record<string, unknown>).descending === countedRoles.descending;
+  if (!roleCountsMatch) {
+    return {
+      status: 'invalid',
+      reason: `positions.roleCounts does not match the actual role counts (${JSON.stringify(countedRoles)})`
+    };
+  }
+  // The "unverified units" disclosure is a non-negotiable honesty label
+  // (see this file's own doc comment on `PositionsArtifact.units`) — a
+  // missing/malformed `units` string must fail closed, not silently render
+  // "(units: undefined)".
+  if (typeof positions.units !== 'string' || !/unverified/i.test(positions.units)) {
+    return { status: 'invalid', reason: 'positions.units is missing or does not disclose that units are unverified' };
   }
 
   if (positions.graphSha256 !== manifest.gzipSha256) {
@@ -465,8 +527,12 @@ export const loadPositions = async (manifest: ArenaManifest, dataBaseUrl: string
   try {
     graphGzip = await fetchArrayBuffer(`${dataBaseUrl}/${manifest.artifact}`);
   } catch (error) {
+    // A transient network failure re-fetching the graph is not itself proof
+    // the positions data is corrupt — report it the same way the sidecar's
+    // own fetch failure is reported above, not as an integrity failure
+    // (dual review finding).
     return {
-      status: 'invalid',
+      status: 'missing',
       reason: `could not re-fetch the biological graph for the positions cross-check: ${error instanceof Error ? error.message : String(error)}`
     };
   }

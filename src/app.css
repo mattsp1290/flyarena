@@ -163,6 +163,19 @@ main {
   display: grid;
   gap: 1rem;
   align-content: start;
+  /* WP3 added a second row-1 item (`.activity`, the anatomical activity
+     panel — see `ActivityPanel.svelte`) that spans only column 1, sitting
+     below the arena. Without an explicit placement here, CSS grid's sparse
+     auto-placement algorithm advances its placement cursor forward past
+     row 1 once `.activity` claims the rest of row 1 in column 1, and never
+     revisits row 1 column 2 — so the sidebar (next in DOM order, with no
+     explicit placement of its own) would land in row 3 column 1, *below*
+     `.activity`, leaving the entire column-2 slot next to the arena empty
+     for the whole page (confirmed in a real browser during review). Pinning
+     it to column 2 across both rows keeps it beside the arena, exactly
+     where it sat before this panel was added. */
+  grid-column: 2;
+  grid-row: 1 / span 2;
 }
 
 .sidebar .panel {
@@ -231,5 +244,10 @@ dd,
 
   .canvas-region {
     height: 19rem;
+  }
+
+  .sidebar {
+    grid-column: auto;
+    grid-row: auto;
   }
 }

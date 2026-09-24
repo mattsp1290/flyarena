@@ -62,6 +62,35 @@ describe('layoutPositions', () => {
     expect(Array.from(unavailableIdx)).toEqual([1]);
   });
 
+  it('wraps a large unavailable set into multiple rows so points do not overlap (regression: 165 real neurons used to cram into one unreadable row)', () => {
+    const count = 165;
+    const xyz: Array<readonly [number, number, number] | null> = new Array(count).fill(null);
+    const positionSource: PositionSource[] = new Array(count).fill('none');
+    const { points, unavailableIdx } = layoutPositions(xyz, positionSource);
+
+    expect(unavailableIdx.length).toBe(count);
+    const ys = new Set<number>();
+    for (let index = 0; index < count; index += 1) ys.add(points[index * 3 + 1]);
+    // More than one distinct row (Y level) — the strip actually wrapped.
+    expect(ys.size).toBeGreaterThan(1);
+
+    // No two points within the same row sit closer than the minimum spacing
+    // (grouping by Y level, then checking sorted X gaps).
+    const byRow = new Map<number, number[]>();
+    for (let index = 0; index < count; index += 1) {
+      const y = points[index * 3 + 1];
+      const xs = byRow.get(y) ?? [];
+      xs.push(points[index * 3]);
+      byRow.set(y, xs);
+    }
+    for (const xs of byRow.values()) {
+      xs.sort((a, b) => a - b);
+      for (let i = 1; i < xs.length; i += 1) {
+        expect(xs[i] - xs[i - 1]).toBeGreaterThan(0.05);
+      }
+    }
+  });
+
   it('handles an all-unavailable input without producing NaN/Infinity', () => {
     const xyz: ReadonlyArray<readonly [number, number, number] | null> = [null, null, null];
     const positionSource: readonly PositionSource[] = ['none', 'none', 'none'];
