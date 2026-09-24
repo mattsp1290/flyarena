@@ -117,6 +117,25 @@ class TransferComputation:
 PRODUCTION_T_SHAPE = (len(OUTPUT_POPULATION_INDEX), len(OBSERVATION_CHANNEL_INDEX))
 
 
+def _finite_or_none(value: float) -> float | None:
+    """`np.linalg.cond` returns `inf` (never `nan`, and never raises) for a
+    singular or numerically singular matrix -- independent of whether
+    `np.linalg.solve` on the *same* matrix succeeds or raises `LinAlgError`
+    (they use different LAPACK routines: `cond`'s SVD-based ratio can hit a
+    floating-point `inf` for a matrix `solve`'s LU decomposition still finds
+    *a* numerical solution for). `graph_io.canonical_json_text` writes with
+    `allow_nan=False`, so a non-finite `conditionNumber` reaching the result
+    dict crashes the whole batch at JSON-write time, well after every graph
+    has already been computed -- a round-2 dual-review finding, whose fix
+    only normalized the `LinAlgError` branch; a round-3 finding caught that
+    `cond` can return `inf` even when `solve` *succeeds*, which the round-2
+    fix missed. Extracted as its own function (rather than inlined at the
+    one call site) specifically so it has a direct unit test independent of
+    constructing a real matrix with this exact, LAPACK-implementation-
+    dependent "solve succeeds but cond is inf" property."""
+    return value if np.isfinite(value) else None
+
+
 def _compute_transfer(
     matrices: DenseGraphMatrices,
     leak_rate: float,
@@ -131,17 +150,28 @@ def _compute_transfer(
 
     system_matrix = leak_rate * np.eye(neuron_count, dtype=np.float64) - global_gain * A
 
+    # `condition_number is None` is ambiguous on its own -- it means "not
+    # applicable" for an empty graph (`neuron_count == 0`) but "non-finite,
+    # i.e. as ill-conditioned as it gets" for a non-empty one (see
+    # `_finite_or_none`'s doc comment). `condition_number_non_finite` keeps
+    # those two cases distinct for the `ill_conditioned` computation below.
+    condition_number_non_finite = False
     if neuron_count == 0:
         condition_number = None
         singular = False
         steady_state_map = np.zeros((0, B.shape[1]), dtype=np.float64)
         eig_A = np.zeros((0,), dtype=np.complex128)
     else:
+        # See `_finite_or_none`'s doc comment for why this must be
+        # normalized here, unconditionally, before either branch below runs
+        # -- not only in the `LinAlgError` branch (that was round-2's fix;
+        # round-3 found it was incomplete).
         raw_condition_number = float(np.linalg.cond(system_matrix))
+        condition_number = _finite_or_none(raw_condition_number)
+        condition_number_non_finite = condition_number is None
         try:
             steady_state_map = np.linalg.solve(system_matrix, B)
             singular = False
-            condition_number = raw_condition_number
         except np.linalg.LinAlgError:
             # The plan's policy for a bad graph is to flag and exclude it,
             # not to abort the whole batch (`illConditioned` already does
@@ -153,24 +183,15 @@ def _compute_transfer(
             # multi-hour work in the same batch (a dual-review finding).
             steady_state_map = np.full((neuron_count, B.shape[1]), np.nan, dtype=np.float64)
             singular = True
-            # `np.linalg.cond` does not itself raise on an exactly singular
-            # matrix -- it returns `inf` (a valid float, no exception) --
-            # so `raw_condition_number` here is `inf`, not `nan`. Reporting
-            # it as `None` (not `inf`) matters: `graph_io.canonical_json_text`
-            # writes with `allow_nan=False` (a *different* dual-review
-            # finding, from the same review round as this `singular`
-            # handling), and `json.dumps` treats `Infinity` the same as
-            # `NaN` -- it would raise at write time, *after* the whole
-            # batch's `ProcessPoolExecutor` pool has already finished,
-            # losing every other graph's result in the same run. A
-            # round-2 dual-review finding: this exact interaction was
-            # missed when the two fixes were made independently.
-            condition_number = None
         eig_A = np.linalg.eigvals(A)
 
     T = O @ steady_state_map  # (outputPopulationCount, inputChannelCount)
 
-    ill_conditioned = singular or (condition_number is not None and condition_number > ILL_CONDITIONED_THRESHOLD)
+    ill_conditioned = (
+        singular
+        or condition_number_non_finite
+        or (condition_number is not None and condition_number > ILL_CONDITIONED_THRESHOLD)
+    )
 
     spectral_abscissa = float(global_gain * np.max(eig_A.real)) if eig_A.size > 0 else 0.0
     stable = (not singular) and spectral_abscissa < leak_rate

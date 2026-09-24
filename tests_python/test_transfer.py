@@ -32,6 +32,7 @@ from transfer import (  # noqa: E402
     OBSERVATION_CHANNEL_INDEX,
     OUTPUT_POPULATION_INDEX,
     _compute_transfer,
+    _finite_or_none,
     transfer_matrix,
 )
 
@@ -462,6 +463,47 @@ def test_transfer_cli_is_byte_identical_across_worker_counts():
         # this only re-confirms the Python side actually wrote a sha that
         # differs from a tampered one, i.e. the check has something to catch).
         assert manifest["graphs"]["biological"]["graphBinarySha256"] != manifest["graphs"]["rewired-0"]["graphBinarySha256"]
+
+
+def test_finite_or_none():
+    assert _finite_or_none(4.8) == 4.8
+    assert _finite_or_none(0.0) == 0.0
+    assert _finite_or_none(float("inf")) is None
+    assert _finite_or_none(float("-inf")) is None
+    assert _finite_or_none(float("nan")) is None
+
+
+def test_non_finite_condition_number_is_flagged_even_when_solve_succeeds(monkeypatch):
+    # Round-3 dual-review finding: round-2's fix only normalized
+    # `conditionNumber` inside the `LinAlgError` branch, but `np.linalg.cond`
+    # can return `inf` while `np.linalg.solve` on the *same* matrix still
+    # succeeds (they use different LAPACK routines -- `cond`'s SVD-based
+    # ratio can hit a floating-point `inf` for a matrix `solve`'s LU
+    # decomposition still finds *a* numerical solution for). Reproducing
+    # that exact combination with a real matrix is LAPACK-implementation-
+    # dependent and not reliably portable, so this monkeypatches
+    # `np.linalg.cond` to return `inf` while leaving the well-conditioned
+    # 3-neuron hand graph's own `np.linalg.solve` call untouched (it
+    # succeeds normally) -- directly reproducing "solve succeeds, cond is
+    # non-finite" without depending on finding a real matrix with that
+    # property.
+    import transfer as transfer_module
+
+    graph = _make_three_neuron_graph(leak_rate=0.35, global_gain=0.5, a=1.5, b=0.75, c=2.0, w_in=1.0, w_out=1.0)
+    matrices = build_dense_matrices(graph)
+
+    monkeypatch.setattr(transfer_module.np.linalg, "cond", lambda _matrix: float("inf"))
+    computation = _compute_transfer(matrices, leak_rate=0.35, global_gain=0.5, timestep_seconds=1.0 / 30.0, strict_shape=False)
+    result = computation.result
+
+    assert result["singular"] is False  # solve genuinely succeeded
+    assert result["conditionNumber"] is None  # not the raw inf
+    assert result["illConditioned"] is True
+    assert result["T"] is not None  # solve succeeded, so T is still reported
+
+    # The actual failure mode this test reproduces: canonical_json_text must
+    # not raise even though solve succeeded and only cond() was non-finite.
+    canonical_json_text(result)
 
 
 def test_singular_system_is_flagged_and_serializable():
