@@ -75,9 +75,30 @@ const createDeferred = <T = void>(): { promise: Promise<T>; resolve: (value: T) 
  * silently turning a currently-passing test flaky; a poll that only
  * resolves once the condition is actually observed true has no such
  * failure mode — it simply takes as long as it takes.
+ *
+ * `timeoutMs` (bb45 follow-up: this helper previously had no timeout of its
+ * own) bounds that "as long as it takes" promise: a genuinely stuck
+ * predicate — e.g. a real regression that leaves the runner parked in
+ * `running` forever — must fail this specific `waitUntil` call with a clear
+ * timeout error inside its own test's timeout window, rather than silently
+ * riding on Vitest's own per-test timeout (which would report a generic
+ * "test timed out" against whichever assertion happened to be pending, with
+ * no indication *which* condition never became true).
+ *
+ * The default must stay clearly below Vitest's own default per-test timeout
+ * (5000ms; `vite.config.ts` does not override `test.testTimeout`) — both
+ * dual-review passes independently caught an earlier version of this default
+ * (5000ms, matching Vitest's own default exactly) as unable to ever win that
+ * race: `waitUntil`'s internal timer and the outer test timer both start
+ * close together, so the outer one — reporting a generic "Test timed out",
+ * not this function's named error — would always fire first or tie. 2000ms
+ * leaves the outer timeout a comfortable multi-second margin to still apply
+ * to whatever the test does *after* a `waitUntil` call resolves.
  */
-const waitUntil = (predicate: () => boolean): Promise<void> =>
-  new Promise((resolve) => {
+const WAIT_UNTIL_DEFAULT_TIMEOUT_MS = 2000;
+
+const waitUntil = (predicate: () => boolean, timeoutMs = WAIT_UNTIL_DEFAULT_TIMEOUT_MS): Promise<void> =>
+  new Promise((resolve, reject) => {
     if (predicate()) {
       resolve();
       return;
@@ -85,9 +106,14 @@ const waitUntil = (predicate: () => boolean): Promise<void> =>
     const poll = setInterval(() => {
       if (predicate()) {
         clearInterval(poll);
+        clearTimeout(timeout);
         resolve();
       }
     }, 1);
+    const timeout = setTimeout(() => {
+      clearInterval(poll);
+      reject(new Error(`waitUntil: predicate did not become true within ${timeoutMs}ms`));
+    }, timeoutMs);
   });
 
 describe('NEURAL_SUBSTEPS_PER_TICK', () => {
@@ -155,6 +181,125 @@ describe('ExperimentRunner determinism', () => {
     expect(slow.tick).toBe(totalTicks);
     expect(fast.tick).toBe(totalTicks);
     expect(slow.hash).toBe(fast.hash);
+  });
+
+  /**
+   * WP7 item 2: an irregular render-frame cadence must not change the final
+   * simulation state. `getSnapshot(nowMs)` is `ExperimentRunner`'s one
+   * concession to the renderer — see `docs/architecture.md`'s closed-loop
+   * contract, "Rendering is decoupled from the fixed simulation timestep" —
+   * and is documented as read-only/interpolation-only. This is a direct
+   * regression test for that contract: calling it at an unpredictable
+   * cadence (simulating a browser tab whose `requestAnimationFrame` rate is
+   * jittering, throttled, or backgrounded) *genuinely concurrently* with the
+   * real tick loop must produce a byte-identical replay hash to a run where
+   * it is never called at all.
+   *
+   * Both dual-review passes independently caught a real bug in an earlier
+   * version of this test: with `targetTickIntervalMs: 0` and no per-step
+   * latency, `ExperimentRunner#runLoop` never awaits a real timer (`delay()`
+   * — see `runner.ts` — is only called when `targetTickIntervalMs > 0`), so
+   * all `totalTicks` ticks resolve as one uninterrupted microtask chain.
+   * Since JS always drains the entire microtask queue before running any
+   * macrotask (`setTimeout`), a frame sampler built on `setTimeout` — as an
+   * earlier version of this test was — could not fire even once until
+   * *after* the run had already reached `finished`, making the whole test
+   * vacuous (independently confirmed by both reviewers with a throwaway
+   * probe: exactly one frame, at the final tick). The fix here is the same
+   * one both reviews suggested: give both runs a tiny deterministic
+   * per-step latency (`simulatedLatencyMs`, already `bindings.ts`'s
+   * supported test-only hook — see the randomized-Worker-latency test
+   * above), which forces a real macrotask yield every tick so the
+   * `setTimeout`-based frame sampler can genuinely interleave. The test then
+   * *asserts* that interleaving actually happened (`midRunFrameCount`) —
+   * the whole point of the fix — so this test cannot silently regress back
+   * to vacuous again without failing on its own guard.
+   */
+  it('an irregular (deterministic) render-frame sampling cadence — genuinely concurrent getSnapshot() calls — does not change the final tick, score, or replay hash', async () => {
+    const seed = 0x9911;
+    const totalTicks = 100;
+    /**
+     * Small, fixed 0-2ms per-step latency: forces one macrotask yield per
+     * tick (see the doc comment above) without meaningfully slowing the test
+     * down. A *factory* rather than one shared closure: `runWithFrameSampling`
+     * calls this once per run, and the two runs execute concurrently
+     * (`Promise.all` below) — a single shared mutable counter would let the
+     * two runs race for draws from the same sequence, silently making each
+     * run's own per-tick latency non-deterministic relative to the other run
+     * (still bounded 0-2ms either way, but no longer "identical for both
+     * runs" as intended). Two independent generators, each seeded the same,
+     * give each run its own deterministic 0-2ms sequence regardless of how
+     * the two runs happen to interleave.
+     */
+    const createStepLatencyMs = (): (() => number) => {
+      let stepLatencySeed = 0x5eed;
+      return () => {
+        stepLatencySeed = (stepLatencySeed * 1103515245 + 12345) >>> 0;
+        // `% 3` (not `% 2`): once `stepLatencySeed` grows past ~2^26, this
+        // LCG's multiply exceeds `Number.MAX_SAFE_INTEGER`, so JS's float64
+        // arithmetic silently loses precision in the *lowest* bits — `% 2`
+        // (probing only the single lowest bit) empirically locked to a
+        // constant 0 for this seed/multiplier pair, which produced zero
+        // real delays and made the whole test vacuous again (caught while
+        // implementing this exact fix). `% 3` draws on more of the value's
+        // remaining entropy and reliably still varies; the existing
+        // randomized-Worker-latency test above uses the same modulus
+        // pattern for the same reason.
+        return stepLatencySeed % 3;
+      };
+    };
+
+    const runWithFrameSampling = async (
+      sampleFrames: boolean
+    ): Promise<{ hash: string; tick: number; midRunFrameCount: number }> => {
+      const runner = new ExperimentRunner({
+        seed,
+        totalTicks,
+        agents: buildFixtureAgents(0x51, createStepLatencyMs()),
+        targetTickIntervalMs: 0
+      });
+      let frameCount = 0;
+      const ticksAtFrame: number[] = [];
+      let frameTimer: ReturnType<typeof setTimeout> | undefined;
+      if (sampleFrames) {
+        // An irregular, non-periodic cadence — not a fixed rAF-like interval
+        // — is the point: a real backgrounded/throttled tab's frame timing
+        // is not periodic either. Still fully deterministic (a fixed
+        // arithmetic sequence), which is what makes the hash comparison
+        // below meaningful across repeated test runs.
+        const scheduleNextFrame = (): void => {
+          frameTimer = setTimeout(() => {
+            frameCount += 1;
+            ticksAtFrame.push(runner.getWorld().tick);
+            // Read-only per this class's contract; the return value is
+            // deliberately discarded — only the *call* (and its potential
+            // side effects, if the contract were ever violated) matters here.
+            void runner.getSnapshot(performance.now() + ((frameCount * 37) % 23));
+            if (runner.getStatus() !== 'finished' && runner.getStatus() !== 'error') scheduleNextFrame();
+          }, frameCount % 3);
+        };
+        scheduleNextFrame();
+      }
+      try {
+        await runToFinished(runner);
+      } finally {
+        if (frameTimer) clearTimeout(frameTimer);
+      }
+      const world = runner.getWorld();
+      const midRunFrameCount = ticksAtFrame.filter((tick) => tick > 0 && tick < totalTicks).length;
+      return { hash: hashReplaySummary(createReplaySummary(world)), tick: world.tick, midRunFrameCount };
+    };
+
+    const [withFrames, withoutFrames] = await Promise.all([
+      runWithFrameSampling(true),
+      runWithFrameSampling(false)
+    ]);
+    expect(withFrames.tick).toBe(totalTicks);
+    expect(withoutFrames.tick).toBe(totalTicks);
+    // The guard against this test silently going vacuous again: frames must
+    // have genuinely landed *during* the run, not only once at/after the end.
+    expect(withFrames.midRunFrameCount).toBeGreaterThan(10);
+    expect(withFrames.hash).toBe(withoutFrames.hash);
   });
 });
 

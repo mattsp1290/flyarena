@@ -12,11 +12,12 @@
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "test": "vitest",
     "test:unit": "vitest run",
-    "test:e2e": "playwright test --pass-with-no-tests",
+    "test:e2e": "playwright test",
     "preview": "vite preview --host 127.0.0.1",
     "training:traces": "tsx scripts/training/export-traces.ts",
     "training:export-arms": "tsx scripts/training/export-arms.ts",
-    "training:evaluate": "tsx scripts/training/evaluate.ts"
+    "training:evaluate": "tsx scripts/training/evaluate.ts",
+    "experiment:seed-sweep": "tsx scripts/experiments/seed-sweep.ts"
   },
   "dependencies": {
     "svelte": "^5.57.1",

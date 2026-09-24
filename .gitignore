@@ -28,3 +28,8 @@ data/raw/
 # --substeps/--include-world) runs: never committed, see the exporter's
 # doc comment and its --out overwrite guard.
 training/runs/
+
+# scripts/experiments/seed-sweep.ts raw per-seed output: descriptive study
+# data, regenerable on demand (npm run experiment:seed-sweep); only the
+# small hand-written summary at docs/seed-sweep.md is committed.
+scripts/experiments/out/

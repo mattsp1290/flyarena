@@ -175,6 +175,112 @@ describe('ExperimentController#changeTopology', () => {
     expect(runner?.getTelemetry().agents.left.topology).toBe('biological');
     runner?.pause();
   });
+
+  /**
+   * bb45 follow-up: a switch requested before `initialize()` has produced a
+   * runner (e.g. a stray/racy call while assets are still loading) must be a
+   * silent no-op — see `changeTopology`'s own guard (`if (!this.runner || ...)
+   * return;`) — rather than throwing or getting queued for once a runner
+   * eventually exists.
+   */
+  it('switch-before-runner-exists: is a no-op with no callback effects when called while initialize() is still in flight', async () => {
+    const callbacks = createCallbacks();
+    const controller = new ExperimentController({
+      seed: SEED,
+      totalTicks: TOTAL_TICKS,
+      initialTopology: { left: 'biological', right: 'rewired' },
+      createWorker,
+      callbacks
+    });
+
+    // Deliberately not awaited yet: `initialize()` is genuinely in flight
+    // (assets still fetching/verifying, no runner/workerClients/manifest
+    // constructed yet) at the moment `changeTopology` is called below.
+    const initializing = controller.initialize();
+    expect(controller.getRunner()).toBeUndefined();
+    controller.changeTopology('left', 'disconnected');
+
+    expect(callbacks.switchCounts).toHaveLength(0);
+    expect(callbacks.topologyApplied).toHaveLength(0);
+    expect(callbacks.errors).toHaveLength(0);
+
+    // The in-flight initialize() must still be able to complete normally
+    // afterward — the earlier no-op call must not have left any partial
+    // state (e.g. a topology mutation) behind.
+    await initializing;
+    expect(controller.getRunner()).toBeDefined();
+    expect(controller.getRunner()?.getTelemetry().agents.left.topology).toBe('biological');
+  });
+
+  /**
+   * bb45 follow-up: `dispose()` called while a topology switch's own
+   * dispose->rebuild chain is still in flight must not throw, must not apply
+   * the in-flight switch, and must still leave `dispose()` itself idempotent
+   * afterward.
+   *
+   * A dual review pass caught that an earlier version of this test's
+   * assertions (no reported error, no 'disconnected' applied) held true
+   * *regardless* of whether `changeTopology`'s own `destroyed` guards existed
+   * at all: `controller.dispose()` terminates the arm's `WorkerClient`
+   * before the switch chain's first `await client.dispose()` ever settles,
+   * so that call rejects immediately on its own (`WorkerClientError: Worker
+   * client has been terminated` — `worker/client.ts`), and the chain never
+   * reaches any of `changeTopology`'s own guards at all. (The chain's catch
+   * block *would* still be a no-op even without its own `if (this.destroyed)
+   * return;` check, because `ExperimentRunner#fail()` has its own,
+   * independent disposed-check — real defense-in-depth, not a redundant
+   * line to delete.) So the two assertions below alone do not isolate
+   * `changeTopology`'s guards specifically. What *does* discriminate them:
+   * the `finally` block's `topologySwitchCount`/`onTopologySwitchCountChange`
+   * bookkeeping is gated by its own `if (!this.destroyed)` — remove only
+   * that one and this test's `switchCounts`/`statuses` assertions below
+   * would fail, because a stray post-dispose callback would fire. This test
+   * is kept as a full-contract regression test for the dispose-mid-switch
+   * scenario (every layer, not one isolated line) rather than a
+   * single-guard unit test — see the finally-guard assertions for the one
+   * part of that contract this scenario can actually isolate.
+   */
+  it('dispose-mid-switch: disposing while a topology switch is in flight does not throw, reports no further callbacks, and the switch never applies', async () => {
+    const { controller, callbacks } = await setUp();
+    const runner = controller.getRunner();
+    expect(runner).toBeDefined();
+
+    controller.changeTopology('left', 'disconnected');
+    // Synchronously incremented before any awaited work begins (same
+    // guarantee the passing "switches an arm" test above relies on) — so
+    // dispose() below reliably races a switch that has already started.
+    expect(callbacks.switchCounts.at(-1)?.left).toBe(1);
+    const switchCountsBeforeDispose = callbacks.switchCounts.length;
+    const statusesBeforeDispose = callbacks.statuses.length;
+
+    expect(() => controller.dispose()).not.toThrow();
+    // Idempotent even while the switch chain's own .then()/.finally() have
+    // not yet settled.
+    expect(() => controller.dispose()).not.toThrow();
+
+    // A macrotask (not a fixed real-time margin) is enough here: the switch
+    // chain's rejection (see the doc comment above) and every one of its
+    // `.then()`/`.catch()`/`.finally()` continuations are plain microtasks,
+    // which JS always fully drains before running any macrotask — so by the
+    // time this `setTimeout(0)` callback runs, the whole chain has already
+    // settled, deterministically, with no guessed wall-clock delay needed.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(callbacks.errors).toHaveLength(0);
+    // No further switch-count callback after dispose() — this is the one
+    // assertion in this test that actually isolates a single guard: the
+    // chain's `finally` block's own `if (!this.destroyed)` check around its
+    // `topologySwitchCount`/`onTopologySwitchCountChange` bookkeeping (see
+    // this test's doc comment for why the other two assertions below do
+    // not equally isolate a specific guard).
+    expect(callbacks.switchCounts).toHaveLength(switchCountsBeforeDispose);
+    // No further status callback either (e.g. a stray 'error' from a
+    // post-dispose `runner.fail()` call that shouldn't have happened).
+    expect(callbacks.statuses).toHaveLength(statusesBeforeDispose);
+    // The switch to 'disconnected' must never have been reported as applied.
+    const leftApplied = callbacks.topologyApplied.filter(([agentId]) => agentId === 'left');
+    expect(leftApplied.find(([, mode]) => mode === 'disconnected')).toBeUndefined();
+  });
 });
 
 describe('ExperimentController#dispose', () => {
