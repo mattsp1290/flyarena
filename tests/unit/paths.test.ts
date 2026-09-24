@@ -7,11 +7,11 @@ import { publicAssetUrl } from '../../src/lib/paths';
  * instead of a hard-coded leading slash, so the app keeps working whether
  * it's served from the origin root or from a non-root deployment path like
  * `/fly/` (see `src/lib/paths.ts`'s doc comment and
- * `.agents/deployment.md`). `base` is exercised directly via the parameter
- * here rather than by mocking `import.meta.env`, which stays exercised
- * separately by the default-argument behavior asserted below (Vitest/jsdom
- * resolves `import.meta.env.BASE_URL` to `'/'`, matching every other
- * root-base test in this suite).
+ * `.agents/deployment.md`). Most tests below exercise `base` directly via
+ * the explicit parameter; the nested `describe` at the bottom instead
+ * mocks `import.meta.env.BASE_URL` (via `vi.stubEnv`) to cover the
+ * *default* argument specifically — see that block's own comment for why
+ * that's a separate, necessary case.
  */
 describe('publicAssetUrl', () => {
   it('joins a relative path onto a root base ("/") with exactly one slash', () => {
@@ -44,15 +44,15 @@ describe('publicAssetUrl', () => {
       vi.unstubAllEnvs();
     });
 
-    // A review pass caught that the two tests above ("defaults to
-    // import.meta.env.BASE_URL...") only ever exercise Vitest's own root
-    // base ('/'), which is indistinguishable from the pre-fix hard-coded
-    // '/data' default — they'd still pass on a reverted, buggy
-    // implementation. `vi.stubEnv` (Vitest also special-cases
-    // `import.meta.env`, not just `process.env` — confirmed directly here)
-    // actually changes what the default argument resolves to, so this is
-    // the one test in this file that would fail if `publicAssetUrl` ever
-    // stopped reading `import.meta.env.BASE_URL` for its default.
+    // The "defaults to import.meta.env.BASE_URL..." test above only ever
+    // exercises Vitest's own root base ('/'), which is indistinguishable
+    // from a hard-coded '/data' default — it would still pass on a
+    // reverted, buggy implementation. `vi.stubEnv` (Vitest also
+    // special-cases `import.meta.env`, not just `process.env` — confirmed
+    // directly here) actually changes what the default argument resolves
+    // to, so this is the one test in this file that would fail if
+    // `publicAssetUrl` ever stopped reading `import.meta.env.BASE_URL` for
+    // its default.
     it('resolves against a stubbed non-root BASE_URL when no base argument is given', () => {
       vi.stubEnv('BASE_URL', '/fly/');
       expect(publicAssetUrl('data')).toBe('/fly/data');

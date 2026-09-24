@@ -55,9 +55,11 @@ const waitForReady = (page: Page): Promise<void> =>
  */
 const gotoFlyBase = async (page: Page, baseURL: string): Promise<void> => {
   const response = await page.goto('');
+  expect(response, 'page.goto(\'\') must produce a navigation response').not.toBeNull();
   await expect(page).toHaveURL(baseURL);
+  const redirectedFrom = response!.request().redirectedFrom();
   expect(
-    response?.request().redirectedFrom(),
+    redirectedFrom?.url() ?? null,
     'navigation must land on baseURL directly, not via a server redirect (see this function\'s doc comment)'
   ).toBeNull();
 };
