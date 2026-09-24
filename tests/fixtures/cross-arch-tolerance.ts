@@ -51,17 +51,33 @@
  * single-`Math.*`-call float64 ULP perturbation swept across every call
  * `buildGoldenFiles` makes touched up to 28 leaves in one seed file (`sin`
  * calls, whose result feeds `stepWorld`'s heading integration and so
- * compounds across ticks) — every one of those leaves differed by at most
- * ~5.2e-16 relative, i.e. still pure float64 noise, just spread over more
- * leaves than the single-leaf case that motivated `MAX_INEXACT_LEAVES` in
- * the first place. `LEAF_NOISE_FLOOR_REL`/`LEAF_NOISE_FLOOR_ABS` below (not
- * `MAX_INEXACT_LEAVES` itself) is what absorbs this: a leaf only counts
- * toward the budget if its difference clears both floors, which the
- * measured noise (≤ 5.2e-16 relative) never does but every measured
- * float32-ULP-scale regression comfortably does (the weakest single-edge
- * perturbation measured still left 44 leaves above the floor in its worst
- * seed file, and every other measured regression left hundreds to
- * thousands).
+ * compounds across ticks); the noisiest leaf found in that sweep (a
+ * cancellation in a small-magnitude `observations` value) differed by
+ * ~5.7e-16 absolute / ~2.9e-14 relative — still pure float64 noise, not a
+ * behavior difference, just spread over more leaves and a larger relative
+ * magnitude than the single-leaf case above. `LEAF_NOISE_FLOOR_REL`/
+ * `LEAF_NOISE_FLOOR_ABS` below (not `MAX_INEXACT_LEAVES` itself) is what
+ * absorbs this — round 3 (below) has the corrected, code-verified numbers
+ * for exactly how, since the relative-only headroom this paragraph might
+ * suggest (~2.9e-14 vs. a 1e-13 floor: under 4x) is not what actually
+ * excludes it; the *absolute* floor does, with ~150x headroom.
+ *
+ * Round 3 (further empirical stress-testing during review) corrected two
+ * numbers from the round-2 measurement above once checked directly against
+ * the AND-combined floor rule the code implements
+ * (`relDiff > LEAF_NOISE_FLOOR_REL && absDiff > LEAF_NOISE_FLOOR_ABS`):
+ * the worst measured noise leaf is ~2.9e-14 relative / ~5.7e-16 absolute
+ * (not ~5.2e-16 relative as first estimated from a narrower sample), and
+ * it is excluded because it fails the *absolute* floor (~150x headroom),
+ * not because of relative headroom (which is only ~3-4x at 2.9e-14 vs.
+ * 1e-13 — thin on its own, which is exactly why the rule is AND, not OR
+ * or relative-only: see `LEAF_NOISE_FLOOR_REL`'s doc comment). Separately,
+ * the "weakest measured regression" figure of "44 leaves" was a
+ * relative-only count; under the actual AND rule, the single weakest
+ * (edge, seed-file) pair measured is 7 above-floor leaves in one file —
+ * still caught overall only because the *other* seed files for that same
+ * edge change (304 to 907 leaves each) exceed the budget; see
+ * `MAX_INEXACT_LEAVES`'s doc comment for the corrected full picture.
  *
  * This gate is also arch-only, not OS- or Node/V8-version-aware: a
  * darwin-arm64 contributor, or a future Node upgrade on the generating
@@ -103,9 +119,12 @@ export const GOLDEN_GENERATING_NODE = 'v22.22.3';
  * change: verified empirically (`fix/golden-cross-arch` PR review) that a
  * single float32-ULP change to one graph edge weight, or a `globalGain *
  * (1 + 1e-7)` change, is *individually* within this tolerance on every
- * affected leaf, yet touches hundreds to thousands of leaves per seed file
- * (as few as 50 in the weakest single-edge case measured, and 700+ in most
- * cases). `MAX_INEXACT_LEAVES` below (gated by `LEAF_NOISE_FLOOR_REL`/
+ * affected leaf, yet touches dozens to thousands of leaves per seed file
+ * (measured per-file range: as low as 7 in the single weakest
+ * (edge, seed-file) pair — still caught overall because that same edge's
+ * *other* seed files land at 304-907 — up to ~2,200 in most cases; see
+ * `MAX_INEXACT_LEAVES`'s doc comment for the full, corrected numbers).
+ * `MAX_INEXACT_LEAVES` below (gated by `LEAF_NOISE_FLOOR_REL`/
  * `LEAF_NOISE_FLOOR_ABS`, not by this tolerance) is the primary defense
  * against that class of regression off `GOLDEN_GENERATING_ARCH`; this
  * per-leaf tolerance is a backstop against smaller, non-dense drift.
@@ -117,13 +136,21 @@ export const FLOAT_REL_TOLERANCE = 1e-6;
  * A numeric leaf only counts toward `MAX_INEXACT_LEAVES` if its difference
  * clears *both* floors below (relative AND absolute — the absolute floor
  * guards near-zero leaves, where a tiny absolute difference can be a huge
- * relative one without being behaviorally significant). Sized with ~200x
- * headroom over the worst measured float64 cross-arch noise (~5.2e-16
- * relative, from a `Math.sin` call inside `world.ts`'s feedback loop — see
- * this file's header comment) and comfortably under every measured
- * float32-ULP-scale regression signature (the weakest case still left 44
- * leaves above this floor in its worst seed file; most left hundreds to
- * thousands).
+ * relative one without being behaviorally significant). The AND is
+ * load-bearing, not redundant with using either floor alone: the worst
+ * measured float64 cross-arch noise leaf (a cancellation in a
+ * small-magnitude `observations` value, from a `Math.sin` call inside
+ * `world.ts`'s feedback loop — see this file's header comment) was ~5.7e-16
+ * absolute but ~2.9e-14 *relative* — only ~3-4x under this relative floor,
+ * thin margin on its own. It is reliably excluded by the *absolute* floor
+ * instead, which has ~150x headroom over that same leaf's absolute
+ * difference. Do not change this to an OR, or drop the absolute half,
+ * without re-measuring: either would reintroduce the round-2 false
+ * positive (dense but sub-relative-floor noise from `world.ts`'s feedback
+ * loop tripping `MAX_INEXACT_LEAVES` on a legitimate fixture refresh).
+ * Every measured float32-ULP-scale regression clears both floors
+ * comfortably (typically 1e-7 relative or denser) — see
+ * `MAX_INEXACT_LEAVES`'s doc comment for the corrected per-file counts.
  */
 export const LEAF_NOISE_FLOOR_REL = 1e-13;
 export const LEAF_NOISE_FLOOR_ABS = 1e-13;
@@ -133,19 +160,31 @@ export const LEAF_NOISE_FLOOR_ABS = 1e-13;
  * sparse: the measured divergence (this file's header comment) touched at
  * most one numeric leaf in any single committed file at the single-value
  * level, and even the denser world-feedback case (up to 28 leaves in one
- * profiled `sin` call, all ≤ 5.2e-16 relative) stays under the floor and so
- * is not counted at all. A real float32-ULP-scale regression is dense
- * *and* clears the floor — verified empirically (`fix/golden-cross-arch`
- * PR review) that a single float32-ULP change to one graph edge weight,
- * the same change applied to every edge weight, and a `globalGain * (1 +
- * 1e-7)` change each leave 44 to 2,200 above-floor numeric leaves per seed
- * file, while passing `FLOAT_ABS_TOLERANCE`/`FLOAT_REL_TOLERANCE` on every
- * individual leaf. Capping the count of above-floor, not-bit-identical
- * numeric leaves (`diffCloseEnough`'s `inexactLeaves`) — on top of the
- * per-leaf tolerance — is what makes the tolerant comparison path able to
- * catch a dense regression that per-leaf tolerance alone would miss, while
- * still tolerating genuine cross-arch drift, sparse or not, as long as it
- * stays under the noise floor.
+ * profiled `sin` call, worst leaf ~5.7e-16 absolute / ~2.9e-14 relative)
+ * stays under the floor (see `LEAF_NOISE_FLOOR_REL`'s doc comment for why
+ * the *absolute* floor, not the relative one, is what actually excludes
+ * it) and so is not counted at all. A real float32-ULP-scale regression is
+ * dense *and* clears the floor on most affected leaves — verified
+ * empirically (`fix/golden-cross-arch` PR review) by perturbing every one
+ * of the 107 graph edge weights and every `inputWeight`/`outputWeight`
+ * entry by one float32 ULP, one at a time: 104 of 107 single-edge changes
+ * left at least one seed file with 88-1,663 above-floor leaves (comfortably
+ * over budget); the single weakest measured (edge, seed-file) *pair* left
+ * only 7 above-floor leaves in one file (under budget in that one file
+ * alone) but the *same* edge change left its other three seed files at
+ * 304-907 above-floor leaves each, so the overall check (which fails if
+ * *any* committed file exceeds the budget) still catches it. Every
+ * `inputWeight`/`outputWeight` entry perturbed left at least 464
+ * above-floor leaves in its worst seed file. (The 3 of 107 edges that
+ * escape entirely change 2 or fewer leaves under *any* rule, including the
+ * pre-noise-floor one — the noise floor is not what lets them through, and
+ * they are still caught by the byte-exact path on `GOLDEN_GENERATING_ARCH`.)
+ * Capping the count of above-floor, not-bit-identical numeric leaves
+ * (`diffCloseEnough`'s `inexactLeaves`) — on top of the per-leaf tolerance
+ * — is what makes the tolerant comparison path able to catch a dense
+ * regression that per-leaf tolerance alone would miss, while still
+ * tolerating genuine cross-arch drift, sparse or not, as long as it stays
+ * under the noise floor.
  */
 export const MAX_INEXACT_LEAVES = 8;
 

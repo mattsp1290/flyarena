@@ -68,12 +68,20 @@ const GOLDEN_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '../fixtures
  * recorded on `GOLDEN_GENERATING_ARCH`, fed into `goldenFinalLeftScore`'s
  * local `stepWorld` replay, versus `result.left`'s action values, freshly
  * decoded from this run's own `observeAgent` -> model -> `decodeAction`
- * pipeline (which rounds to `Float32Array` at `state.rate`/`outputs`
- * before `decodeAction`, unlike `stepWorld`'s float64 state). So a
- * cross-arch flip here requires a `sensors.ts` divergence large enough to
- * cross a `Float32Array` rounding boundary in `outputs` -- narrower than
- * `golden-traces.test.ts`'s exposure (which also directly records raw
- * float64 `observations`), and consistent with this comparison matching
+ * pipeline. That pipeline's `observeAgent` reads the *local* world's
+ * position/heading -- which the local `createWorld`/`stepWorld` produced
+ * using this run's own `Math.sin`/`Math.cos`/`Math.hypot` results, not
+ * `GOLDEN_GENERATING_ARCH`'s -- so `world.ts` divergence in this run's own
+ * trajectory reaches `runEpisode`'s fresh observations exactly as it does
+ * for `golden-traces.test.ts`, not just `sensors.ts`'s direct calls; it
+ * only stops mattering once decoded into `outputs`, which rounds to
+ * `Float32Array` at `state.rate`/`outputs` before `decodeAction` (unlike
+ * `stepWorld`'s own float64 state). So a cross-arch flip here requires a
+ * `sensors.ts`- or `world.ts`-driven divergence in the fresh run's own
+ * trajectory large enough to cross a `Float32Array` rounding boundary in
+ * `outputs` -- narrower than `golden-traces.test.ts`'s exposure (which
+ * also directly records raw float64 `observations`, with no rounding
+ * boundary to cross), and consistent with this comparison matching
  * exactly (0 mismatches, every committed seed) on the real x86_64 CI
  * runner even before this file's tolerance fallback existed (measured
  * during the `fix/golden-cross-arch` PR). Still not a structural
