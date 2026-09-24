@@ -1,10 +1,16 @@
 import type { NeuralModelState } from './model';
 
 /**
- * Compact per-step summary of network activity. This is deliberately not a
- * per-neuron snapshot: the Worker runtime returns only this summary plus
- * action features, never the full `rate` array, so the main thread never
- * receives full-neuron state each frame.
+ * Compact per-step summary of network activity. This remains a summary, not
+ * a per-neuron snapshot: `computeTelemetry` itself never returns the full
+ * `rate` array, and a caller gets one regardless of this. The Worker
+ * protocol has a *separate*, opt-in full-neuron channel for the anatomical
+ * activity view — `StepWorkerSuccess.rates` (`worker/protocol.ts`), sent
+ * only while a caller has enabled it via `set-activity` (default off, and
+ * always off again after a fresh `init`). With that view closed, the main
+ * thread still never receives full-neuron state each frame, exactly as
+ * before; with it open, `rates` is additive to (not a replacement for) this
+ * summary, which every caller keeps receiving unconditionally either way.
  */
 export interface NeuralTelemetry {
   meanRate: number;

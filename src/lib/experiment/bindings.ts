@@ -138,16 +138,32 @@ export const createWorkerAgentBinding = async (
 
   const step: AgentBinding['step'] = async (input) => {
     const result = await client.step(input.channelValues, input.substeps);
-    return { actionFeatures: result.actionFeatures, telemetry: result.telemetry };
+    return {
+      actionFeatures: result.actionFeatures,
+      telemetry: result.telemetry,
+      // Conditional spread (not `rates: result.rates`): a disabled response
+      // has no `rates` key on the wire at all (see `StepWorkerSuccess.rates`'s
+      // doc comment), and this keeps `AgentStepResult` matching that exactly
+      // — `'rates' in result` is `false` rather than `true` with an
+      // `undefined` value, so a downstream `!('rates' in result)` check
+      // (the closed-view contract's own assertion) behaves the same at this
+      // layer as it does directly against the Worker response.
+      ...(result.rates ? { rates: result.rates } : {})
+    };
   };
 
   const reset: AgentBinding['reset'] = async () => {
     await client.reset();
   };
 
+  const setActivity: AgentBinding['setActivity'] = async (enabled) => {
+    await client.setActivity(enabled);
+  };
+
   return {
     step,
     reset,
+    setActivity,
     info: {
       topology: mode,
       neuronCount: initResult.neuronCount,

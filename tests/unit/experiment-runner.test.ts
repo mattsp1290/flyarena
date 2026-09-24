@@ -10,14 +10,16 @@ import {
   parseGraphBinary,
   type GraphMode
 } from '../../src/lib/connectome/format';
-import { createOracleAgentBinding } from '../../src/lib/experiment/bindings';
+import { createOracleAgentBinding, createWorkerAgentBinding } from '../../src/lib/experiment/bindings';
 import {
   computeMedian,
   ExperimentRunner,
   NEURAL_SUBSTEPS_PER_TICK,
   type AgentBinding
 } from '../../src/lib/experiment/runner';
+import { createWorkerClient } from '../../src/lib/worker/client';
 import { createRandomGraph } from '../fixtures/tiny-graph';
+import { FakeNeuralWorker } from '../helpers/fake-worker';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const publicDataDir = resolve(here, '../../public/data');
@@ -300,6 +302,47 @@ describe('ExperimentRunner determinism', () => {
     // have genuinely landed *during* the run, not only once at/after the end.
     expect(withFrames.midRunFrameCount).toBeGreaterThan(10);
     expect(withFrames.hash).toBe(withoutFrames.hash);
+  });
+
+  /**
+   * WP2 stop/go gate: with the activity view closed, the closed-loop
+   * simulation must be byte-for-byte unaffected by whether the anatomical
+   * activity view happens to be open. `rates` only ever augments
+   * `AgentStepResult`/`StepWorkerSuccess` (it plays no role in `decodeAction`
+   * or `stepWorld`), so this only needs `WorkerClient`-backed bindings (the
+   * oracle binding has no `setActivity` at all, and its dynamics are already
+   * covered by the determinism tests above) to prove streaming toggling
+   * never perturbs the deterministic replay hash.
+   */
+  it('replay hash is identical with activity streaming enabled vs disabled', async () => {
+    const seed = 0x8899;
+    const totalTicks = 80;
+    const graph = createRandomGraph(0x88, { neuronCount: 20, inputChannelCount: 8, outputPopulationCount: 3 });
+    const buffer = encodeGraphBinary(graph);
+
+    const buildWorkerAgents = async (): Promise<Record<'left' | 'right', AgentBinding>> => {
+      const leftClient = createWorkerClient(new FakeNeuralWorker());
+      const rightClient = createWorkerClient(new FakeNeuralWorker());
+      const [left, right] = await Promise.all([
+        createWorkerAgentBinding(leftClient, buffer.slice(0), 'biological'),
+        createWorkerAgentBinding(rightClient, buffer.slice(0), 'biological')
+      ]);
+      return { left, right };
+    };
+
+    const runWithStreaming = async (streaming: boolean): Promise<string> => {
+      const agents = await buildWorkerAgents();
+      const runner = new ExperimentRunner({ seed, totalTicks, agents, targetTickIntervalMs: 0 });
+      if (streaming) await runner.setActivityStreaming(true);
+      await runToFinished(runner);
+      return hashReplaySummary(createReplaySummary(runner.getWorld()));
+    };
+
+    const [withStreaming, withoutStreaming] = await Promise.all([
+      runWithStreaming(true),
+      runWithStreaming(false)
+    ]);
+    expect(withStreaming).toBe(withoutStreaming);
   });
 });
 
@@ -700,5 +743,133 @@ describe('ExperimentRunner pause/resume/reset', () => {
     runner.start();
     await runToFinished(runner);
     expect(runner.getStatus()).toBe('finished');
+  });
+});
+
+describe('ExperimentRunner activity streaming', () => {
+  const buildWorkerAgents = async (
+    buffer: ArrayBuffer
+  ): Promise<Record<'left' | 'right', AgentBinding>> => {
+    const leftClient = createWorkerClient(new FakeNeuralWorker());
+    const rightClient = createWorkerClient(new FakeNeuralWorker());
+    const [left, right] = await Promise.all([
+      createWorkerAgentBinding(leftClient, buffer.slice(0), 'biological'),
+      createWorkerAgentBinding(rightClient, buffer.slice(0), 'biological')
+    ]);
+    return { left, right };
+  };
+
+  /**
+   * Wraps `binding.step` with a small real (`setTimeout`-based) per-call
+   * delay. With `targetTickIntervalMs: 0` and no delay at all, a
+   * `FakeNeuralWorker`-backed run's entire microtask chain (every tick's
+   * `postMessage` round trip is `queueMicrotask`-based, not a real timer)
+   * drains to completion *before* any macrotask — including a polling
+   * `setInterval`, per this file's own `waitUntil`/`runToFinished` — ever
+   * gets a chance to run (see the randomized-Worker-latency determinism test
+   * above for the same underlying mechanism, there used deliberately; here
+   * it would make a "catch the run mid-flight" assertion vacuous instead,
+   * since by the time any poll fires the run has already reached
+   * `finished`). A tiny fixed delay forces a real macrotask yield every
+   * tick, so a test can actually observe an in-progress run.
+   */
+  const withStepDelay = (binding: AgentBinding, delayMs: number): AgentBinding => ({
+    ...binding,
+    step: async (input) => {
+      await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+      return binding.step(input);
+    }
+  });
+
+  it('isActivityStreaming/getLatestRates start off, and reflect setActivityStreaming(true) once ticks run', async () => {
+    const graph = createRandomGraph(0x9a, { neuronCount: 20, inputChannelCount: 8, outputPopulationCount: 3 });
+    const buffer = encodeGraphBinary(graph);
+    const built = await buildWorkerAgents(buffer);
+    const agents: Record<'left' | 'right', AgentBinding> = {
+      left: withStepDelay(built.left, 5),
+      right: withStepDelay(built.right, 5)
+    };
+    const runner = new ExperimentRunner({ seed: 1, totalTicks: 200, agents, targetTickIntervalMs: 0 });
+
+    expect(runner.isActivityStreaming()).toBe(false);
+    expect(runner.getLatestRates('left')).toBeUndefined();
+    expect(runner.getLatestRates('right')).toBeUndefined();
+
+    await runner.setActivityStreaming(true);
+    expect(runner.isActivityStreaming()).toBe(true);
+    // Setting the flag does not itself run a tick; no rates exist yet.
+    expect(runner.getLatestRates('left')).toBeUndefined();
+
+    runner.start();
+    await waitUntil(() => runner.getLatestRates('left') !== undefined && runner.getLatestRates('right') !== undefined);
+    const firstLeft = runner.getLatestRates('left');
+    expect(firstLeft).toHaveLength(graph.metadata.neuronCount);
+    expect(runner.getLatestRates('right')).toHaveLength(graph.metadata.neuronCount);
+    // The run must still genuinely be in flight (not already `finished`) at
+    // this point — otherwise the next assertion (the reference changing
+    // tick to tick) would pass vacuously because no further tick will ever
+    // run. `totalTicks: 200` at 5ms/step/arm gives ample headroom over
+    // `waitUntil`'s 2s default budget for this to hold reliably.
+    expect(runner.getStatus()).toBe('running');
+
+    // Replaced, not accumulated: the array reference (and contents, for a
+    // biological arm whose recurrent drive keeps evolving) changes tick to
+    // tick rather than being mutated in place or reused stale.
+    await waitUntil(() => {
+      const next = runner.getLatestRates('left');
+      return next !== undefined && next !== firstLeft;
+    });
+
+    runner.pause();
+    await runner.setActivityStreaming(false);
+    expect(runner.isActivityStreaming()).toBe(false);
+    // Disabling clears the stored snapshot — a closed view must never render
+    // stale pre-disable data if it briefly re-reads state before unmounting.
+    expect(runner.getLatestRates('left')).toBeUndefined();
+    expect(runner.getLatestRates('right')).toBeUndefined();
+  });
+
+  it('reset() keeps the current streaming setting but clears the stale pre-reset rates snapshot', async () => {
+    const graph = createRandomGraph(0x9b, { neuronCount: 16, inputChannelCount: 8, outputPopulationCount: 3 });
+    const buffer = encodeGraphBinary(graph);
+    const agents = await buildWorkerAgents(buffer);
+    const runner = new ExperimentRunner({ seed: 2, totalTicks: 500, agents, targetTickIntervalMs: 0 });
+
+    await runner.setActivityStreaming(true);
+    runner.start();
+    await waitUntil(() => runner.getLatestRates('left') !== undefined);
+
+    runner.reset();
+    expect(runner.getStatus()).toBe('ready');
+    // The streaming *setting* survives a reset (only the world/neural state
+    // resets) — this is what lets a topology switch (which always implies a
+    // reset) be recovered by the controller re-issuing set-activity, rather
+    // than silently dropping the user's choice.
+    expect(runner.isActivityStreaming()).toBe(true);
+    // But the stale snapshot from before the reset must not linger.
+    expect(runner.getLatestRates('left')).toBeUndefined();
+
+    runner.start();
+    await waitUntil(() => runner.getLatestRates('left') !== undefined);
+    expect(runner.getLatestRates('left')).toHaveLength(graph.metadata.neuronCount);
+  });
+
+  it('setActivityStreaming never rejects even when a binding has no setActivity (the oracle binding)', async () => {
+    const graph = createRandomGraph(0x9c, { neuronCount: 12, inputChannelCount: 8, outputPopulationCount: 3 });
+    const buffer = encodeGraphBinary(graph);
+    const agents: Record<'left' | 'right', AgentBinding> = {
+      left: createOracleAgentBinding({ graphBuffer: buffer.slice(0), mode: 'biological' }),
+      right: createOracleAgentBinding({ graphBuffer: buffer.slice(0), mode: 'biological' })
+    };
+    const runner = new ExperimentRunner({ seed: 3, totalTicks: 10, agents, targetTickIntervalMs: 0 });
+
+    await expect(runner.setActivityStreaming(true)).resolves.toBeUndefined();
+    expect(runner.isActivityStreaming()).toBe(true);
+    // No binding ever produces rates (the oracle binding has no `setActivity`
+    // to enable it), so `getLatestRates` stays `undefined` — not an error.
+    runner.start();
+    await runToFinished(runner);
+    expect(runner.getLatestRates('left')).toBeUndefined();
+    expect(runner.getLatestRates('right')).toBeUndefined();
   });
 });

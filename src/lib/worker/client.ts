@@ -3,6 +3,7 @@ import type {
   DisposeWorkerSuccess,
   InitWorkerSuccess,
   ResetWorkerSuccess,
+  SetActivityWorkerSuccess,
   StepWorkerSuccess,
   WorkerRequest,
   WorkerResponse
@@ -53,8 +54,11 @@ export class WorkerClientError extends Error {
 export interface WorkerClient {
   init: (graphBuffer: ArrayBuffer, mode?: GraphMode) => Promise<InitWorkerSuccess>;
   reset: () => Promise<ResetWorkerSuccess>;
+  /** Resolves with the full `StepWorkerSuccess`, including `rates` when activity streaming is currently enabled. */
   step: (channelValues: ArrayLike<number>, substeps: number) => Promise<StepWorkerSuccess>;
   dispose: () => Promise<DisposeWorkerSuccess>;
+  /** Toggles whether subsequent `step` responses include the full per-neuron `rates` vector; rejects with `not-initialized` before `init`. */
+  setActivity: (enabled: boolean) => Promise<SetActivityWorkerSuccess>;
   /** Detach listeners and, if the underlying worker supports it, terminate it. Rejects every in-flight request. */
   terminate: () => void;
 }
@@ -147,6 +151,8 @@ export const createWorkerClient = (worker: WorkerLike): WorkerClient => {
     step: (channelValues, substeps) =>
       send<StepWorkerSuccess>({ type: 'step', requestId: nextRequestId(), channelValues, substeps }),
     dispose: () => send<DisposeWorkerSuccess>({ type: 'dispose', requestId: nextRequestId() }),
+    setActivity: (enabled) =>
+      send<SetActivityWorkerSuccess>({ type: 'set-activity', requestId: nextRequestId(), enabled }),
     terminate: () => {
       if (terminated) return;
       terminated = true;

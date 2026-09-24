@@ -216,6 +216,17 @@ export class ExperimentController {
           const binding = await createWorkerAgentBinding(client, buffer, mode, graphBinarySha256);
           if (this.destroyed || !this.runner) return;
           this.runner.setAgentBinding(agentId, binding);
+          // The rebuilt binding's Worker starts with activity streaming off
+          // (a fresh `init`, per `neural.worker.ts`'s "always false" note),
+          // even though this arm may have been streaming right before the
+          // switch. Re-issue it on the *new* binding directly — not via
+          // `runner.setActivityStreaming`, which would redundantly re-toggle
+          // the other, untouched arm too — before the arm is used again, so
+          // the activity view's stream never silently drops for this arm
+          // across a topology switch.
+          if (this.runner.isActivityStreaming()) {
+            await binding.setActivity?.(true);
+          }
           this.options.callbacks.onTelemetry(this.runner.getTelemetry());
           this.options.callbacks.onTopologyApplied(agentId, mode);
         } catch (error) {

@@ -3,6 +3,7 @@ import { ExperimentController, type ExperimentControllerCallbacks } from '../../
 import type { AgentId } from '../../src/lib/arena/types';
 import type { GraphMode } from '../../src/lib/connectome/format';
 import type { ExperimentStatus } from '../../src/lib/experiment/state';
+import type { WorkerRequest, WorkerResponse } from '../../src/lib/worker/protocol';
 import { createPublicDataFetch, FakeNeuralWorker } from '../helpers/fake-worker';
 
 /**
@@ -280,6 +281,153 @@ describe('ExperimentController#changeTopology', () => {
     // The switch to 'disconnected' must never have been reported as applied.
     const leftApplied = callbacks.topologyApplied.filter(([agentId]) => agentId === 'left');
     expect(leftApplied.find(([, mode]) => mode === 'disconnected')).toBeUndefined();
+  });
+});
+
+/**
+ * A `FakeNeuralWorker`-shaped wrapper that can hold a single in-flight
+ * `dispose` request's delivery until the test releases it, so a test can
+ * deterministically land inside `changeTopology`'s dispose -> rebuild window
+ * instead of guessing at raw microtask-hop counts against `FakeNeuralWorker`'s
+ * own `queueMicrotask`-based delivery. Every other request type (including
+ * the rebuilt binding's own `init`) is forwarded to the inner
+ * `FakeNeuralWorker` immediately, undelayed.
+ */
+class GatedDisposeWorker {
+  private readonly inner = new FakeNeuralWorker();
+  private gate: Promise<void> | undefined;
+  private release: (() => void) | undefined;
+  terminated = false;
+
+  /** The next `dispose` request posted to this worker will not be forwarded to the inner worker until `releaseDispose()` is called. */
+  gateNextDispose(): void {
+    this.gate = new Promise((resolve) => {
+      this.release = resolve;
+    });
+  }
+
+  releaseDispose(): void {
+    this.release?.();
+  }
+
+  postMessage(message: WorkerRequest, transfer?: Transferable[]): void {
+    if (message.type === 'dispose' && this.gate) {
+      const gate = this.gate;
+      this.gate = undefined;
+      void gate.then(() => this.inner.postMessage(message, transfer));
+      return;
+    }
+    this.inner.postMessage(message, transfer);
+  }
+
+  addEventListener(type: string, listener: (event: MessageEvent<WorkerResponse>) => void): void {
+    this.inner.addEventListener(type, listener);
+  }
+
+  removeEventListener(type: string, listener: (event: MessageEvent<WorkerResponse>) => void): void {
+    this.inner.removeEventListener(type, listener);
+  }
+
+  terminate(): void {
+    this.terminated = true;
+    this.inner.terminate();
+  }
+}
+
+describe('ExperimentController activity streaming', () => {
+  const setUp = async () => {
+    const callbacks = createCallbacks();
+    const controller = new ExperimentController({
+      seed: SEED,
+      totalTicks: TOTAL_TICKS,
+      initialTopology: { left: 'biological', right: 'rewired' },
+      createWorker,
+      callbacks
+    });
+    await controller.initialize();
+    return { controller, callbacks };
+  };
+
+  it("changeTopology re-issues set-activity(true) on the rebuilt binding when streaming was already on, and getLatestRates resumes for that arm", async () => {
+    const { controller } = await setUp();
+    const runner = controller.getRunner();
+    expect(runner).toBeDefined();
+
+    await runner!.setActivityStreaming(true);
+    expect(runner!.isActivityStreaming()).toBe(true);
+
+    controller.changeTopology('right', 'disconnected');
+    await vi.waitFor(() => expect(runner!.getTelemetry().agents.right.topology).toBe('disconnected'));
+
+    // The rebuilt binding's Worker started this fresh `init` with activity
+    // off (see `neural.worker.ts`'s "always false after init" note); this is
+    // the controller's own re-apply (`changeTopology`'s
+    // `binding.setActivity?.(true)` call) actually having landed.
+    expect(runner!.isActivityStreaming()).toBe(true);
+    runner!.start();
+    await vi.waitFor(() => expect(runner!.getLatestRates('right')).toBeDefined());
+    await vi.waitFor(() => expect(runner!.getLatestRates('left')).toBeDefined());
+    expect(runner!.getLatestRates('right')).toHaveLength(runner!.getTelemetry().agents.right.neuronCount);
+  });
+
+  /**
+   * bb45-style race test: `runner.setActivityStreaming(true)` issued while
+   * `changeTopology`'s own dispose -> rebuild chain is genuinely in flight
+   * for the same arm. `setActivityStreaming`'s `setActivity` call against
+   * the arm's *old*, disposing binding is expected to fail (caught and
+   * logged inside `ExperimentRunner`, per its doc comment — never rejects to
+   * this test); what this test actually verifies is that neither promise
+   * ever rejects unhandled, and that the streaming flag and the rebuilt
+   * binding's Worker both end up consistently "on" once the dust settles —
+   * exactly what `controller.ts#changeTopology`'s own re-apply step exists
+   * to guarantee, independent of how the two calls happened to interleave.
+   */
+  it('setActivityStreaming(true) racing changeTopology resolves without an unhandled rejection, and streaming is active on both arms afterward', async () => {
+    let gatedWorker: GatedDisposeWorker | undefined;
+    let createCount = 0;
+    const createGatedWorker = (): Worker => {
+      createCount += 1;
+      if (createCount === 1) {
+        gatedWorker = new GatedDisposeWorker();
+        return gatedWorker as unknown as Worker;
+      }
+      return new FakeNeuralWorker() as unknown as Worker;
+    };
+
+    const callbacks = createCallbacks();
+    const controller = new ExperimentController({
+      seed: SEED,
+      totalTicks: TOTAL_TICKS,
+      initialTopology: { left: 'biological', right: 'rewired' },
+      createWorker: createGatedWorker,
+      callbacks
+    });
+    await controller.initialize();
+    const runner = controller.getRunner();
+    expect(runner).toBeDefined();
+    expect(gatedWorker).toBeDefined();
+
+    // The left arm's Worker (the one `createGatedWorker` hands out first,
+    // matching `initialize()`'s `left`-then-`right` construction order) will
+    // hold its next `dispose` response, so `changeTopology('left', ...)`
+    // below is reliably still mid-flight (dispose sent, not yet resolved,
+    // `init` not yet reached) for the whole window between the two calls
+    // that follow.
+    gatedWorker!.gateNextDispose();
+
+    controller.changeTopology('left', 'disconnected');
+    const streamingPromise = runner!.setActivityStreaming(true);
+    gatedWorker!.releaseDispose();
+
+    await expect(streamingPromise).resolves.toBeUndefined();
+    await vi.waitFor(() => expect(runner!.getTelemetry().agents.left.topology).toBe('disconnected'));
+
+    expect(runner!.isActivityStreaming()).toBe(true);
+    expect(callbacks.errors).toHaveLength(0);
+
+    runner!.start();
+    await vi.waitFor(() => expect(runner!.getLatestRates('left')).toBeDefined());
+    await vi.waitFor(() => expect(runner!.getLatestRates('right')).toBeDefined());
   });
 });
 

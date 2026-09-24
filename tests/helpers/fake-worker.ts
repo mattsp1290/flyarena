@@ -26,8 +26,14 @@ export class FakeNeuralWorker {
     const cloned = structuredClone(message);
     queueMicrotask(() => {
       if (this.terminated) return;
-      const response = structuredClone(handleWorkerRequest(this.runtime, cloned));
-      this.dispatch('message', new MessageEvent('message', { data: response }));
+      // `structuredClone` on `{ response, transfer }` clones `response` (and
+      // whatever `transfer` references, e.g. a streamed `rates.buffer`)
+      // exactly the way a real Worker's own outbound `postMessage(response,
+      // transfer)` would — the `transfer` list is not itself sent, only
+      // consulted by the transfer/clone algorithm, so only `.response` needs
+      // dispatching here.
+      const { response } = handleWorkerRequest(this.runtime, cloned);
+      this.dispatch('message', new MessageEvent('message', { data: structuredClone(response) }));
     });
   }
 
