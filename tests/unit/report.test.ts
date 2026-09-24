@@ -333,6 +333,8 @@ describe('nearInputIndependentPolicyArms / the near-input-independent finding se
     arms,
     armPairs: [],
     sideBySide: [],
+    training: null,
+    gpuRerun: null,
     warnings: []
   });
 
@@ -429,6 +431,13 @@ describe('nearInputIndependentPolicyArms / the near-input-independent finding se
       markdown.indexOf('## What this does not show')
     );
     expect(findingSection).not.toMatch(/\bbetter\b|\bsuperior\b|\boutperform|\bbeats\b|\babove\b/i);
+
+    // The fixed disconnected-arm output is [tanh,tanh,sigmoid](w2·tanh(b1)+b2)
+    // — a function of the learned w2 weight matrix as well as b1/b2 — so the
+    // finding must not claim it came "entirely" from bias terms alone
+    // (thermo-methodology review finding I1).
+    expect(findingSection).toContain('learned weights and biases');
+    expect(findingSection).not.toContain('entirely from its learned bias terms');
   });
 
   it('does NOT flag an arm whose trained/silenced scores are empirically identical but the graph does not structurally guarantee a zero input (e.g. saturated units)', () => {
@@ -467,5 +476,159 @@ describe('nearInputIndependentPolicyArms / the near-input-independent finding se
       )
     });
     expect(structurallyZeroReadoutInputArms(r)).toEqual([]);
+  });
+});
+
+/**
+ * WP5 acceptance (`05-production-run.md`): "If the rerun's TS held-out mean
+ * falls outside the original replica's 95% CI, the report must say so under
+ * limitations." Exercised directly against constructed report fixtures
+ * (mirroring the real production numbers: biological replica 101's trained
+ * mean 62.9627, CI [58.9467, 67.4333], replica-to-replica spread
+ * 62.9627/72.2304/62.7420) rather than a real CUDA rerun.
+ */
+describe('GPU-rerun disclosure (Limitations)', () => {
+  const stats = (mean: number, ci95: readonly [number, number]) => ({ n: 100, mean, median: mean, std: 1, ci95 });
+  const paired = (meanDifference: number, ci95: readonly [number, number]) => ({ n: 100, meanDifference, ci95 });
+
+  const biologicalReplica = (trainedMean: number, ci95: readonly [number, number]): ArmReplicaReport => ({
+    H: 16,
+    parameterCount: 835,
+    weightsSha256: 'deadbeef',
+    env: null,
+    trained: stats(trainedMean, ci95),
+    silenced: stats(0, [-1, 1]),
+    pairedTrainedVsAuthored: paired(trainedMean, ci95),
+    pairedTrainedVsSilenced: paired(trainedMean, ci95)
+  });
+
+  const biologicalArm: ArmReport = {
+    D: 48,
+    provenance: undefined,
+    armBundleSha256: undefined,
+    authored: stats(0, [-1, 1]),
+    replicas: {
+      '101': biologicalReplica(62.9627, [58.9467, 67.4333]),
+      '202': biologicalReplica(72.2304, [67.7213, 76.9312]),
+      '303': biologicalReplica(62.742, [58.339, 67.3297])
+    },
+    structurallyZeroInput: false
+  };
+
+  const baseEvaluation: EvaluationReport['evaluation'] = {
+    ticks: 1800,
+    substeps: 4,
+    heldOutSeeds: { start: 30001, count: 100 },
+    bootstrap: { resamples: 10000, seed: 1 },
+    opponentParked: true
+  };
+
+  const reportWithGpuRerun = (gpuRerun: EvaluationReport['gpuRerun']): EvaluationReport => ({
+    formatVersion: 1,
+    graph: { source: 'artifact', path: 'public/data/malecns-arena-v1.bin.gz', sha256: 'x' },
+    evaluation: baseEvaluation,
+    arms: { biological: biologicalArm },
+    armPairs: [],
+    sideBySide: [],
+    training: null,
+    gpuRerun,
+    warnings: []
+  });
+
+  const limitationsSection = (markdown: string): string =>
+    markdown.slice(markdown.indexOf('## Limitations'), markdown.indexOf('## What this does not show'));
+
+  it('discloses the rerun mean, original mean/CI, and signed delta when the rerun mean falls outside the original CI', () => {
+    const r = reportWithGpuRerun({
+      arm: 'biological',
+      trainerSeed: 101,
+      heldOutMean: 69.3167302171514,
+      maxAbsDiff: 2.1496901512145996,
+      fitnessDelta: 6.354025749714424,
+      outsideOriginalCi: true
+    });
+    const limitations = limitationsSection(renderReportMarkdown(r));
+    expect(limitations).toContain('outside');
+    expect(limitations).toContain('69.3167');
+    expect(limitations).toContain('62.9627');
+    expect(limitations).toContain('58.9467');
+    expect(limitations).toContain('67.4333');
+    expect(limitations).toContain('+6.3540');
+    expect(limitations).toContain('rerun minus original');
+    expect(limitations).toContain('not bit-reproducible');
+    expect(limitations).toMatch(/between-replica spread/);
+  });
+
+  it('states the non-reproducibility/replica-spread note but not an "outside" claim when the rerun mean falls inside the original CI', () => {
+    const r = reportWithGpuRerun({
+      arm: 'biological',
+      trainerSeed: 101,
+      heldOutMean: 63.5,
+      maxAbsDiff: 0.01,
+      fitnessDelta: 0.5373,
+      outsideOriginalCi: false
+    });
+    const limitations = limitationsSection(renderReportMarkdown(r));
+    expect(limitations).not.toContain('outside');
+    expect(limitations).toContain('not bit-reproducible');
+    expect(limitations).toMatch(/between-replica spread/);
+    expect(limitations).toContain('+0.5373');
+  });
+
+  it('discloses neither claim when no GPU rerun was measured', () => {
+    const r = reportWithGpuRerun(null);
+    const markdown = renderReportMarkdown(r);
+    expect(markdown).not.toMatch(/gpu|cuda|rerun/i);
+  });
+});
+
+/**
+ * `05-production-run.md` step 3: population is reduced from the plan's
+ * default 256 to 128 when a calibration run projects total wall time
+ * exceeding a 12-hour budget. Disclosed in the Method section, generated
+ * from the manifest `training` block (not hard-coded).
+ */
+describe('CEM population disclosure (Method)', () => {
+  const baseEvaluation: EvaluationReport['evaluation'] = {
+    ticks: 1800,
+    substeps: 4,
+    heldOutSeeds: { start: 30001, count: 100 },
+    bootstrap: { resamples: 10000, seed: 1 },
+    opponentParked: true
+  };
+
+  const reportWithTraining = (training: Readonly<Record<string, unknown>> | null): EvaluationReport => ({
+    formatVersion: 1,
+    graph: { source: 'artifact', path: 'public/data/malecns-arena-v1.bin.gz', sha256: 'x' },
+    evaluation: baseEvaluation,
+    arms: {},
+    armPairs: [],
+    sideBySide: [],
+    training,
+    gpuRerun: null,
+    warnings: []
+  });
+
+  const methodSection = (markdown: string): string =>
+    markdown.slice(markdown.indexOf('## Method'), markdown.indexOf('## Parameter accounting'));
+
+  it('discloses a population reduced from the plan default (256) to 128', () => {
+    const markdown = renderReportMarkdown(reportWithTraining({ population: 128 }));
+    const method = methodSection(markdown);
+    expect(method).toContain('128');
+    expect(method).toContain('256');
+    expect(method).toContain('reduced');
+  });
+
+  it('does not disclose anything when population matches the plan default (256)', () => {
+    const markdown = renderReportMarkdown(reportWithTraining({ population: 256 }));
+    const method = methodSection(markdown);
+    expect(method).not.toContain('reduced from the plan');
+  });
+
+  it('does not disclose anything when no training block was recorded', () => {
+    const markdown = renderReportMarkdown(reportWithTraining(null));
+    const method = methodSection(markdown);
+    expect(method).not.toContain('reduced from the plan');
   });
 });

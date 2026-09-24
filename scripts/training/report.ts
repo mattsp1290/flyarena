@@ -67,6 +67,37 @@ export interface SideBySideReport {
   readonly pairedLeftMinusRight: PairedStats;
 }
 
+/**
+ * One CUDA rerun of one already-evaluated replica's training, measured and
+ * recorded as informational (never a gate) per `05-production-run.md`'s WP5
+ * acceptance criterion: "its max-abs `theta_final` diff and its TS held-out
+ * fitness difference are recorded in the manifest as `gpuRerunMaxAbsDiff` /
+ * `gpuRerunFitnessDelta`. If the rerun's TS held-out mean falls outside the
+ * original replica's 95% CI, the report must say so under limitations."
+ * Computed once by `evaluate.ts`'s `runEvaluate` (scoring `--gpu-rerun-run`
+ * itself over the same held-out seeds as the original replica, and diffing
+ * its raw parameters against the original's) and threaded into both
+ * `report.json` (via this field) and the manifest, so there is exactly one
+ * computation, not a report-side and a manifest-side copy that could drift.
+ */
+export interface GpuRerunReport {
+  readonly arm: ArmName;
+  readonly trainerSeed: number;
+  /** This evaluator's own TS held-out mean for the GPU-rerun weights, over the same held-out seeds as the original replica's `trained` condition. */
+  readonly heldOutMean: number;
+  /** Max absolute per-parameter difference between the original and GPU-rerun `theta_final` arrays. */
+  readonly maxAbsDiff: number;
+  /**
+   * Sign convention: **rerun minus original** — `heldOutMean` minus the
+   * original replica's `trained.mean`. Positive means the GPU rerun's
+   * held-out mean exceeded the original (CPU) run's; negative means it
+   * scored lower.
+   */
+  readonly fitnessDelta: number;
+  /** Whether `heldOutMean` falls outside the original replica's `trained.ci95`. */
+  readonly outsideOriginalCi: boolean;
+}
+
 export interface EvaluationReport {
   readonly formatVersion: 1;
   readonly graph: {
@@ -85,6 +116,10 @@ export interface EvaluationReport {
   readonly arms: Readonly<Record<string, ArmReport>>;
   readonly armPairs: readonly ArmPairReport[];
   readonly sideBySide: readonly SideBySideReport[];
+  /** The shipped replicas' reconciled CEM config (manifest's `training` block); `null` when none was recorded. See `run-dir.ts`'s `deriveTrainingBlock`. */
+  readonly training: Readonly<Record<string, unknown>> | null;
+  /** See `GpuRerunReport`; `null` when no `--gpu-rerun-run` was given. */
+  readonly gpuRerun: GpuRerunReport | null;
   readonly warnings: readonly string[];
 }
 
@@ -121,6 +156,8 @@ const replicasInOrder = (arm: ArmReport): Array<[number, ArmReplicaReport]> =>
 /** Fixed-precision, locale-independent number formatting so table cells are deterministic and diffable. */
 const fmt = (value: number): string => value.toFixed(4);
 const fmtCI = (ci95: readonly [number, number]): string => `[${fmt(ci95[0])}, ${fmt(ci95[1])}]`;
+/** Like `fmt`, but with an explicit `+`/`-` sign — for values whose sign is itself load-bearing (a signed delta). */
+const fmtSigned = (value: number): string => `${value >= 0 ? '+' : ''}${fmt(value)}`;
 
 const mdTable = (headers: readonly string[], rows: ReadonlyArray<readonly string[]>): string => {
   const headerRow = `| ${headers.join(' | ')} |`;
@@ -131,6 +168,17 @@ const mdTable = (headers: readonly string[], rows: ReadonlyArray<readonly string
 
 /** `10000` -> `10,000`, without depending on `toLocaleString`'s ICU-dependent behavior (deterministic, plain ASCII). */
 const thousands = (n: number): string => n.toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+
+/**
+ * `03-cem-training.md`'s stated default CEM population. `05-production-run.md`
+ * step 3: "If projected total time for 3 arms × 3 replicas exceeds 12 hours,
+ * reduce P to 128 before reducing G. Record the change in the manifest's CEM
+ * config." Used only to detect and disclose a deviation from this default —
+ * `renderMethod` never asserts *why* a given run's population differs beyond
+ * this documented policy.
+ */
+const PLAN_DEFAULT_CEM_POPULATION = 256;
+const CALIBRATION_REDUCED_CEM_POPULATION = 128;
 
 const renderMethod = (report: EvaluationReport): string => {
   const { evaluation, graph } = report;
@@ -159,6 +207,16 @@ const renderMethod = (report: EvaluationReport): string => {
     '',
     `Graph source: \`${graph.source}\`${graph.path ? ` (\`${graph.path}\`)` : ''}, sha256 \`${graph.sha256}\`.`
   ];
+  const population = report.training?.population;
+  if (typeof population === 'number' && population !== PLAN_DEFAULT_CEM_POPULATION) {
+    lines.push(
+      '',
+      `CEM population for the shipped replicas was ${population}, reduced from the plan's default of ` +
+        `${PLAN_DEFAULT_CEM_POPULATION}; per \`05-production-run.md\` step 3, population is reduced to ` +
+        `${CALIBRATION_REDUCED_CEM_POPULATION} when a calibration run projects total wall time across all arms/` +
+        'replicas exceeding a 12-hour budget (see the manifest `training` block for the full CEM config).'
+    );
+  }
   return lines.join('\n');
 };
 
@@ -369,6 +427,56 @@ const renderSideBySide = (report: EvaluationReport): string => {
 const DEFAULT_HELD_OUT_START = 30001;
 const DEFAULT_HELD_OUT_COUNT = 100;
 
+/**
+ * WP5 acceptance (`05-production-run.md`): "If the rerun's TS held-out mean
+ * falls outside the original replica's 95% CI, the report must say so under
+ * limitations." Beyond the letter of that criterion, a GPU rerun — whichever
+ * way it lands relative to the CI — is evidence that GPU training is not
+ * bit-reproducible, and its drift should be read against the arm's own
+ * replica-to-replica spread (the more honest measure of how precisely this
+ * method's score is known) rather than against a single replica's bootstrap
+ * CI, which only captures held-out-seed sampling variance and says nothing
+ * about retraining variance or hardware nondeterminism. Returns `[]` when no
+ * `--gpu-rerun-run` was given.
+ */
+const renderGpuRerunLimitationBullets = (report: EvaluationReport): string[] => {
+  const gpuRerun = report.gpuRerun;
+  if (!gpuRerun) return [];
+  const armReport = report.arms[gpuRerun.arm];
+  const replica = armReport?.replicas[String(gpuRerun.trainerSeed)];
+  const bullets: string[] = [];
+
+  if (gpuRerun.outsideOriginalCi && replica) {
+    bullets.push(
+      `- A CUDA rerun of the shipped ${gpuRerun.arm} replica (trainer seed ${gpuRerun.trainerSeed}) produced a ` +
+        `TS held-out \`trained\` mean of ${fmt(gpuRerun.heldOutMean)}, vs. the original run's mean of ` +
+        `${fmt(replica.trained.mean)} and its own 95% CI ${fmtCI(replica.trained.ci95)} (\`gpuRerunFitnessDelta\` ` +
+        `${fmtSigned(gpuRerun.fitnessDelta)}, sign convention rerun minus original: positive means the GPU rerun ` +
+        `scored higher) — the rerun mean falls **outside** that CI.`
+    );
+  }
+
+  const replicaMeans = armReport ? replicasInOrder(armReport).map(([seed, r]) => [seed, r.trained.mean] as const) : [];
+  const spreadDescriptor = (() => {
+    if (replicaMeans.length < 2) return '';
+    const means = replicaMeans.map(([, mean]) => mean);
+    const spread = Math.max(...means) - Math.min(...means);
+    const quoted = replicaMeans.map(([seed, mean]) => `${fmt(mean)} (${seed})`).join(' / ');
+    if (spread === 0) return ` (this arm's replicas all scored identically: ${quoted})`;
+    const ratio = Math.abs(gpuRerun.fitnessDelta) / spread;
+    const descriptor = ratio >= 1 ? 'at least as large as' : ratio >= 0.5 ? 'comparable in size to' : 'smaller than';
+    return ` ${descriptor} this arm's ${fmt(spread)}-point between-replica spread (${quoted})`;
+  })();
+  bullets.push(
+    "- GPU training is not bit-reproducible: this rerun's drift (`gpuRerunFitnessDelta` " +
+      `${fmtSigned(gpuRerun.fitnessDelta)}, rerun minus original) is${spreadDescriptor}, so a single replica's ` +
+      "bootstrap 95% CI should not be read as bounding how precisely this method's score is known for that arm — " +
+      "the replica-to-replica spread is the more honest measure of this method's uncertainty than any one " +
+      'replica’s CI.'
+  );
+  return bullets;
+};
+
 const renderLimitations = (report: EvaluationReport): string => {
   const { evaluation } = report;
   const heldOutRange = `${evaluation.heldOutSeeds.start}–${
@@ -390,7 +498,8 @@ const renderLimitations = (report: EvaluationReport): string => {
       'test or superiority claim is made or implied.',
     '- The `silenced` control forces the trained readout’s input vector to zero every tick; it does ' +
       'not silence the recurrent connectome dynamics themselves.',
-    heldOutBullet
+    heldOutBullet,
+    ...renderGpuRerunLimitationBullets(report)
   ];
   if (report.warnings.length > 0) {
     bullets.push('- This run recorded the following warnings:');
@@ -450,9 +559,10 @@ const renderStructurallyZeroReadoutInputFinding = (report: Readonly<EvaluationRe
       'independent of weights or seeds. Every replica’s `trained` and `silenced` scores were also ' +
       'numerically identical on every held-out seed (paired difference exactly 0, 95% CI exactly ' +
       '[0, 0]), consistent with that guarantee. For that arm, `trained` and `silenced` computed the ' +
-      'identical function; whatever score the readout achieved came entirely from its learned bias ' +
-      'terms — a fixed, input-independent action — never from sensory information. This finding is ' +
-      'descriptive only: it does not rank or compare arms against each other.'
+      'identical function; whatever score the readout achieved came from a fixed, input-independent ' +
+      'action determined entirely by the readout’s learned weights and biases (applied to a ' +
+      'structurally zero input) — never from sensory information. This finding is descriptive only: ' +
+      'it does not rank or compare arms against each other.'
   ].join('\n');
 };
 

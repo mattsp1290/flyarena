@@ -31,7 +31,7 @@ describe('parseEvaluateArgs', () => {
     expect(args.ticks).toBe(10);
   });
 
-  it('parses --parity-* and --gpu-rerun-* flags', () => {
+  it('parses --parity-* and --gpu-rerun-run flags', () => {
     const args = parseEvaluateArgs([
       '--runs',
       'a',
@@ -41,16 +41,13 @@ describe('parseEvaluateArgs', () => {
       '4',
       '--parity-passed-at',
       '2026-09-24T00:00:00Z',
-      '--gpu-rerun-max-abs-diff',
-      '0.0012',
-      '--gpu-rerun-fitness-delta',
-      '-3.5'
+      '--gpu-rerun-run',
+      'training/runs/production/biological-101-gpurerun'
     ]);
     expect(args.parityGraphSha256).toBe('deadbeef');
     expect(args.parityK).toBe(4);
     expect(args.parityPassedAt).toBe('2026-09-24T00:00:00Z');
-    expect(args.gpuRerunMaxAbsDiff).toBeCloseTo(0.0012);
-    expect(args.gpuRerunFitnessDelta).toBeCloseTo(-3.5);
+    expect(args.gpuRerunRunDir).toBe('training/runs/production/biological-101-gpurerun');
   });
 
   it('rejects a partial set of --parity-* flags', () => {
@@ -60,31 +57,8 @@ describe('parseEvaluateArgs', () => {
     ).toThrow(/together/);
   });
 
-  it('rejects a negative --gpu-rerun-max-abs-diff', () => {
-    expect(() => parseEvaluateArgs(['--runs', 'a', '--gpu-rerun-max-abs-diff', '-1'])).toThrow(/non-negative/);
-  });
-
-  it('accepts a negative --gpu-rerun-fitness-delta (a signed difference), passed alongside --gpu-rerun-max-abs-diff', () => {
-    const args = parseEvaluateArgs([
-      '--runs',
-      'a',
-      '--gpu-rerun-max-abs-diff',
-      '0.5',
-      '--gpu-rerun-fitness-delta',
-      '-2.5'
-    ]);
-    expect(args.gpuRerunFitnessDelta).toBeCloseTo(-2.5);
-  });
-
-  it('rejects either --gpu-rerun-* flag passed alone (both or neither: they come from one CUDA rerun)', () => {
-    expect(() => parseEvaluateArgs(['--runs', 'a', '--gpu-rerun-max-abs-diff', '0.5'])).toThrow(/together/);
-    expect(() => parseEvaluateArgs(['--runs', 'a', '--gpu-rerun-fitness-delta', '-2.5'])).toThrow(/together/);
-  });
-
-  it('requireFloat rejects an empty/whitespace --gpu-rerun-fitness-delta rather than silently recording 0', () => {
-    expect(() =>
-      parseEvaluateArgs(['--runs', 'a', '--gpu-rerun-max-abs-diff', '0', '--gpu-rerun-fitness-delta', ''])
-    ).toThrow(/finite number/);
+  it('requires a value for --gpu-rerun-run', () => {
+    expect(() => parseEvaluateArgs(['--runs', 'a', '--gpu-rerun-run'])).toThrow(/requires a value/);
   });
 });
 
@@ -224,6 +198,24 @@ describe('runEvaluate (tiny fixture, trace graph)', () => {
         weightSeed += 17;
       }
 
+      // A GPU-rerun run dir sharing the SAME arm/trainerSeed as one of
+      // --runs' own entries (biological/101) — --gpu-rerun-run must be
+      // scored by the evaluator itself (over the same held-out seeds/graph)
+      // rather than trusting a hand-computed number, and its maxAbsDiff is
+      // computed directly against the matching original run's weights.
+      const gpuRerunDir = join(root, 'runs', 'biological-101-gpurerun');
+      writeTinyRunDir({
+        dir: gpuRerunDir,
+        arm: 'biological',
+        trainerSeed: 101,
+        D,
+        H,
+        substeps: TRACE_SUBSTEPS,
+        weightSeed: 999,
+        includeEnv: true,
+        cemConfig
+      });
+
       // --parity-graph-sha256 must equal the graph actually being evaluated
       // (evaluate.ts now throws otherwise — see the "throws when
       // --parity-graph-sha256 does not match the evaluated graph" test
@@ -237,8 +229,7 @@ describe('runEvaluate (tiny fixture, trace graph)', () => {
         parityGraphSha256: realGraphSha256,
         parityK: 4,
         parityPassedAt: '2026-09-24T00:00:00Z',
-        gpuRerunMaxAbsDiff: 0.0007,
-        gpuRerunFitnessDelta: -1.25
+        gpuRerunRunDir: gpuRerunDir
       };
       const result = runEvaluate(args);
       expect(result.artifactWritten).toBe(true);
@@ -250,8 +241,11 @@ describe('runEvaluate (tiny fixture, trace graph)', () => {
       const manifest = JSON.parse(readFileSync(resolve(outDir, 'trained-readout-v1.manifest.json'), 'utf8')) as {
         training: Record<string, unknown> | null;
         parity: { graphSha: string; K: number; passedAt: string } | null;
+        gpuRerunHeldOutMean: number | null;
         gpuRerunMaxAbsDiff: number | null;
         gpuRerunFitnessDelta: number | null;
+        gpuRerunFitnessDeltaSignConvention: string | null;
+        gpuRerunOutsideOriginalCi: boolean | null;
       };
       expect(manifest.training).toMatchObject({
         population: 128,
@@ -260,8 +254,48 @@ describe('runEvaluate (tiny fixture, trace graph)', () => {
         trainingSeedRng: 'default_rng([trainerSeed, generation])'
       });
       expect(manifest.parity).toEqual({ graphSha: realGraphSha256, K: 4, passedAt: '2026-09-24T00:00:00Z' });
-      expect(manifest.gpuRerunMaxAbsDiff).toBeCloseTo(0.0007);
-      expect(manifest.gpuRerunFitnessDelta).toBeCloseTo(-1.25);
+      // The gpurerun dir's weights (weightSeed 999) differ from the
+      // original's (weightSeed 1), so this evaluator-computed diff must be
+      // strictly positive — not a hand-typed placeholder.
+      expect(manifest.gpuRerunMaxAbsDiff).not.toBeNull();
+      expect(manifest.gpuRerunMaxAbsDiff as number).toBeGreaterThan(0);
+      expect(typeof manifest.gpuRerunHeldOutMean).toBe('number');
+      expect(typeof manifest.gpuRerunFitnessDelta).toBe('number');
+      expect(manifest.gpuRerunFitnessDeltaSignConvention).toBe('rerun minus original (positive = GPU rerun scored higher)');
+      expect(typeof manifest.gpuRerunOutsideOriginalCi).toBe('boolean');
+
+      const report = JSON.parse(readFileSync(resolve(outDir, 'trained-readout-v1.report.json'), 'utf8')) as {
+        gpuRerun: { arm: string; trainerSeed: number; heldOutMean: number; maxAbsDiff: number; fitnessDelta: number } | null;
+      };
+      expect(report.gpuRerun).not.toBeNull();
+      expect(report.gpuRerun?.arm).toBe('biological');
+      expect(report.gpuRerun?.trainerSeed).toBe(101);
+      expect(report.gpuRerun?.heldOutMean).toBeCloseTo(manifest.gpuRerunHeldOutMean as number);
+      expect(report.gpuRerun?.maxAbsDiff).toBeCloseTo(manifest.gpuRerunMaxAbsDiff as number);
+      expect(report.gpuRerun?.fitnessDelta).toBeCloseTo(manifest.gpuRerunFitnessDelta as number);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('throws when --gpu-rerun-run declares an arm/trainerSeed not present among --runs', () => {
+    const { root, armsDir, runDirs } = buildFixture();
+    try {
+      const graph = createTraceGraph();
+      const D = outputNeuronIndices(graph).length;
+      const gpuRerunDir = join(root, 'runs', 'biological-202-gpurerun');
+      writeTinyRunDir({
+        dir: gpuRerunDir,
+        arm: 'biological',
+        trainerSeed: 202, // buildFixture only writes trainerSeed 101 runs
+        D,
+        H: 4,
+        substeps: TRACE_SUBSTEPS,
+        weightSeed: 999
+      });
+      const outDir = join(root, 'out-gpu-rerun-mismatch');
+      const args: EvaluateArgs = { ...baseArgs(armsDir, runDirs, outDir), gpuRerunRunDir: gpuRerunDir };
+      expect(() => runEvaluate(args)).toThrow(/no matching run was passed via --runs/);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -345,13 +379,19 @@ describe('runEvaluate (tiny fixture, trace graph)', () => {
       expect(result.warnings).toEqual([]);
       const manifest = JSON.parse(readFileSync(resolve(outDir, 'trained-readout-v1.manifest.json'), 'utf8')) as {
         parity: unknown;
+        gpuRerunHeldOutMean: unknown;
         gpuRerunMaxAbsDiff: unknown;
         gpuRerunFitnessDelta: unknown;
+        gpuRerunFitnessDeltaSignConvention: unknown;
+        gpuRerunOutsideOriginalCi: unknown;
         training: unknown;
       };
       expect(manifest.parity).toBeNull();
+      expect(manifest.gpuRerunHeldOutMean).toBeNull();
       expect(manifest.gpuRerunMaxAbsDiff).toBeNull();
       expect(manifest.gpuRerunFitnessDelta).toBeNull();
+      expect(manifest.gpuRerunFitnessDeltaSignConvention).toBeNull();
+      expect(manifest.gpuRerunOutsideOriginalCi).toBeNull();
       // No cemConfig fields were written by the tiny fixture runs (buildFixture doesn't pass cemConfig).
       expect(manifest.training).toBeNull();
     } finally {

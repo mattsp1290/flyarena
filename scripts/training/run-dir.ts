@@ -145,3 +145,100 @@ export const readRunDir = (dir: string): LoadedRun => {
 
   return { dir, config: runConfig, weights, weightsSha256, env };
 };
+
+// ---------------------------------------------------------------------------
+// CEM-config reconciliation (manifest `training` block)
+// ---------------------------------------------------------------------------
+
+/**
+ * CEM hyperparameters + training-seed RNG policy fields carried from a
+ * `RunConfig` into the manifest's `training` block
+ * (`05-production-run.md` step 4: every arm's replica-0 run must share an
+ * identical config except `--arm`/`--replica-seed`). Module-level (not
+ * declared inside `deriveTrainingBlock`) since the field list is fixed and
+ * doesn't depend on any call's arguments — no reason to re-create it per call.
+ */
+export const CEM_CONFIG_FIELDS = [
+  'population',
+  'elites',
+  'generations',
+  'alpha',
+  'stdFloor',
+  'initStd',
+  'trainingSeedsPerGeneration',
+  'trainingSeedRange',
+  'trainingSeedRng',
+  'validationSeedRange',
+  'heldOutSeedRange'
+] as const;
+
+/** A candidate whose every `CEM_CONFIG_FIELDS` value is `undefined` — an arm with no recorded CEM hyperparameters at all. */
+export const isEmptyCemConfig = (candidate: Readonly<Record<string, unknown>>): boolean =>
+  Object.values(candidate).every((value) => value === undefined);
+
+export interface TrainingBlockResult {
+  readonly trainingBlock: Record<string, unknown> | null;
+  readonly warnings: readonly string[];
+}
+
+/**
+ * Reconciles each arm's shipped-replica (trainerSeed 101) CEM config into
+ * one manifest `training` block. Picks the first `ARM_NAMES`-order arm that
+ * actually HAS a recorded (non-empty) config as the baseline — not merely
+ * the first arm seen — so an arm with an older/tiny run dir lacking these
+ * fields (all `undefined`) is skipped when picking the baseline rather than
+ * adopted as one, and never silently discards a later arm's real, present
+ * config (a single forward pass over `ARM_NAMES` could only compare each arm
+ * against a baseline established by an *earlier* arm, so an early arm with
+ * no recorded config would never get flagged even when a later arm does have
+ * one, and would wrongly become the — empty — baseline). Any other arm whose
+ * candidate disagrees with the baseline produces a warning rather than
+ * silently overwriting or being dropped.
+ *
+ * Extracted from `evaluate.ts`'s `runEvaluate` (thermo-maintainability
+ * review: this was previously ~62 lines inlined in an already ~540-line
+ * function) as a pure function of `shippedConfig` so it can be unit-tested
+ * directly against constructed maps, without spinning up full run
+ * directories and calling the entire evaluation pipeline.
+ */
+export const deriveTrainingBlock = (
+  shippedConfig: Readonly<Partial<Record<ArmName, RunConfig>>>
+): TrainingBlockResult => {
+  const warnings: string[] = [];
+
+  const cemCandidates: Partial<Record<ArmName, Record<string, unknown>>> = {};
+  for (const arm of ARM_NAMES) {
+    const config = shippedConfig[arm];
+    if (!config) continue;
+    const candidate: Record<string, unknown> = {};
+    for (const field of CEM_CONFIG_FIELDS) candidate[field] = config[field];
+    cemCandidates[arm] = candidate;
+  }
+  const armsWithShippedConfig = ARM_NAMES.filter((arm) => cemCandidates[arm] !== undefined);
+  const trainingBlockSourceArm = armsWithShippedConfig.find((arm) => !isEmptyCemConfig(cemCandidates[arm]!)) ?? null;
+  const trainingBlock: Record<string, unknown> | null =
+    trainingBlockSourceArm !== null ? cemCandidates[trainingBlockSourceArm]! : null;
+
+  for (const arm of armsWithShippedConfig) {
+    const candidate = cemCandidates[arm]!;
+    if (isEmptyCemConfig(candidate)) {
+      if (trainingBlockSourceArm !== null) {
+        warnings.push(
+          `arm "${arm}" replica 0's config.json has no recorded CEM hyperparameters, while arm ` +
+            `"${trainingBlockSourceArm}" does; manifest's training block cannot include arm "${arm}"'s values.`
+        );
+      }
+      continue;
+    }
+    if (arm === trainingBlockSourceArm) continue; // it IS the baseline; nothing to compare it against
+    if (JSON.stringify(candidate) !== JSON.stringify(trainingBlock)) {
+      warnings.push(
+        `arm "${arm}" replica 0's CEM config/training-seed policy differs from arm ` +
+          `"${trainingBlockSourceArm}"'s (run must use identical config except --arm/--replica-seed); ` +
+          `manifest's training block reports arm "${trainingBlockSourceArm}"'s, not this one.`
+      );
+    }
+  }
+
+  return { trainingBlock, warnings };
+};

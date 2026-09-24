@@ -23,8 +23,8 @@ import {
 } from './export-arms';
 import { runEpisode } from './episode';
 import { TRACE_SUBSTEPS } from './export-traces';
-import { requireFloat, requireNonNegativeInt, requirePositiveInt, requireValue } from './cli';
-import { readRunDir, type LoadedRun } from './run-dir';
+import { requireNonNegativeInt, requirePositiveInt, requireValue } from './cli';
+import { deriveTrainingBlock, readRunDir, type LoadedRun } from './run-dir';
 import { conditionRng, conditionStats, pairedStats } from './stats';
 import {
   renderReportMarkdown,
@@ -32,6 +32,7 @@ import {
   type ArmReplicaReport,
   type ArmReport,
   type EvaluationReport,
+  type GpuRerunReport,
   type SideBySideReport
 } from './report';
 
@@ -218,13 +219,23 @@ export interface EvaluateArgs {
   /** ISO-8601 timestamp the parity suite passed at (recorded by hand from the run, not computed here). */
   readonly parityPassedAt?: string;
   /**
-   * One CUDA rerun of one replica's training, measured and recorded as
-   * informational (never a gate) per 05's acceptance criterion: "its max-abs
-   * `theta_final` diff and its TS held-out fitness difference are recorded
-   * in the manifest as `gpuRerunMaxAbsDiff` / `gpuRerunFitnessDelta`".
+   * One CUDA rerun of one replica's training (`05-production-run.md`'s WP5
+   * acceptance: "its max-abs `theta_final` diff and its TS held-out fitness
+   * difference are recorded in the manifest as `gpuRerunMaxAbsDiff` /
+   * `gpuRerunFitnessDelta`"), given as a run directory sharing the SAME
+   * arm/trainerSeed as one of `--runs`' own entries (the "original" run this
+   * rerun is compared against) — same `config.json`/`theta_final.npy`
+   * contract as `--runs`. This evaluator scores it itself, over the same
+   * held-out seeds/graph/ticks used for that arm's `trained` condition, and
+   * diffs its raw parameters against the original's directly, rather than
+   * trusting a hand-computed number: preferred over a manually-supplied mean
+   * because the resulting numbers are authoritative (this evaluator, not a
+   * human, computed them) and reproducible (rerunning this exact command
+   * reproduces them byte-for-byte, like everything else this evaluator
+   * writes). See `report.ts`'s `GpuRerunReport` for the computed fields
+   * (including `fitnessDelta`'s sign convention: rerun minus original).
    */
-  readonly gpuRerunMaxAbsDiff?: number;
-  readonly gpuRerunFitnessDelta?: number;
+  readonly gpuRerunRunDir?: string;
 }
 
 const DEFAULT_OUT_DIR = 'public/data';
@@ -253,8 +264,7 @@ export const parseEvaluateArgs = (argv: readonly string[]): EvaluateArgs => {
   let parityGraphSha256: string | undefined;
   let parityK: number | undefined;
   let parityPassedAt: string | undefined;
-  let gpuRerunMaxAbsDiff: number | undefined;
-  let gpuRerunFitnessDelta: number | undefined;
+  let gpuRerunRunDir: string | undefined;
 
   let index = 0;
   while (index < argv.length) {
@@ -308,11 +318,8 @@ export const parseEvaluateArgs = (argv: readonly string[]): EvaluateArgs => {
     } else if (flag === '--parity-passed-at') {
       parityPassedAt = requireValue(flag, argv[index + 1]);
       index += 2;
-    } else if (flag === '--gpu-rerun-max-abs-diff') {
-      gpuRerunMaxAbsDiff = requireFloat(flag, argv[index + 1]);
-      index += 2;
-    } else if (flag === '--gpu-rerun-fitness-delta') {
-      gpuRerunFitnessDelta = requireFloat(flag, argv[index + 1]);
+    } else if (flag === '--gpu-rerun-run') {
+      gpuRerunRunDir = requireValue(flag, argv[index + 1]);
       index += 2;
     } else {
       throw new Error(`Unknown argument: ${flag}`);
@@ -326,16 +333,6 @@ export const parseEvaluateArgs = (argv: readonly string[]): EvaluateArgs => {
     throw new Error(
       '--parity-graph-sha256/--parity-k/--parity-passed-at must be passed together (all three or none), ' +
         'so the manifest never records a partial parity gate result'
-    );
-  }
-  if (gpuRerunMaxAbsDiff !== undefined && gpuRerunMaxAbsDiff < 0) {
-    throw new Error(`--gpu-rerun-max-abs-diff must be non-negative, got ${gpuRerunMaxAbsDiff}`);
-  }
-  const gpuRerunFlagsGiven = [gpuRerunMaxAbsDiff, gpuRerunFitnessDelta].filter((v) => v !== undefined).length;
-  if (gpuRerunFlagsGiven === 1) {
-    throw new Error(
-      '--gpu-rerun-max-abs-diff/--gpu-rerun-fitness-delta must be passed together (both or neither): they ' +
-        'come from one CUDA rerun measurement, so recording only one would publish a partial result'
     );
   }
 
@@ -355,8 +352,7 @@ export const parseEvaluateArgs = (argv: readonly string[]): EvaluateArgs => {
     parityGraphSha256,
     parityK,
     parityPassedAt,
-    gpuRerunMaxAbsDiff,
-    gpuRerunFitnessDelta
+    gpuRerunRunDir
   };
 };
 
@@ -747,91 +743,100 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
 
   // CEM hyperparameters + training-seed RNG policy: every arm's replica-0
   // run is required to share an identical config except --arm/--replica-seed
-  // (`05-production-run.md` step 4), so this reports one representative and
-  // flags any arm whose recorded hyperparameters actually disagree with it
-  // (or has none recorded at all), rather than silently publishing whichever
-  // arm happened to load last. The representative is the first ARM_NAMES
-  // entry that actually HAS a recorded config — not merely the first arm
-  // seen — so an arm with an older/tiny run dir lacking these fields (all
-  // `undefined`) is skipped when picking the baseline rather than adopted as
-  // one, and never silently discards a later arm's real, present config
-  // (review finding: adopting the first-seen arm unconditionally could pick
-  // an empty baseline, "differ" against every real config that follows, and
-  // then null the whole block out because the adopted baseline itself was
-  // empty — dropping every arm's real data with a misleading warning).
-  const CEM_CONFIG_FIELDS = [
-    'population',
-    'elites',
-    'generations',
-    'alpha',
-    'stdFloor',
-    'initStd',
-    'trainingSeedsPerGeneration',
-    'trainingSeedRange',
-    'trainingSeedRng',
-    'validationSeedRange',
-    'heldOutSeedRange'
-  ] as const;
-  const isEmptyCemConfig = (candidate: Readonly<Record<string, unknown>>): boolean =>
-    Object.values(candidate).every((value) => value === undefined);
+  // (`05-production-run.md` step 4). Extracted to `run-dir.ts`'s
+  // `deriveTrainingBlock` (pure function of `shippedConfig`) so it can be
+  // unit-tested directly, without the full `runEvaluate` pipeline
+  // (thermo-maintainability review: this was previously ~62 lines inlined
+  // here).
+  const { trainingBlock, warnings: trainingBlockWarnings } = deriveTrainingBlock(shippedConfig);
+  warnings.push(...trainingBlockWarnings);
 
-  // Two passes, deliberately: a single forward pass over ARM_NAMES can only
-  // compare each arm against a baseline established by an *earlier* arm, so
-  // an early arm with no recorded config (e.g. "biological", first in
-  // ARM_NAMES order) would never get flagged even when a *later* arm (e.g.
-  // "rewired") does have one — the loop reaches the empty arm before any
-  // baseline exists to contrast it against. Computing every arm's candidate
-  // first, then picking the baseline as the first *non-empty* one regardless
-  // of position, makes the warning (and the published `training` block)
-  // independent of which arm happens to come first in ARM_NAMES.
-  const cemCandidates: Partial<Record<ArmName, Record<string, unknown>>> = {};
-  for (const arm of ARM_NAMES) {
-    const config = shippedConfig[arm];
-    if (!config) continue;
-    const candidate: Record<string, unknown> = {};
-    for (const field of CEM_CONFIG_FIELDS) candidate[field] = config[field];
-    cemCandidates[arm] = candidate;
-  }
-  const armsWithShippedConfig = ARM_NAMES.filter((arm) => cemCandidates[arm] !== undefined);
-  const trainingBlockSourceArm =
-    armsWithShippedConfig.find((arm) => !isEmptyCemConfig(cemCandidates[arm]!)) ?? null;
-  const trainingBlock: Record<string, unknown> | null =
-    trainingBlockSourceArm !== null ? cemCandidates[trainingBlockSourceArm]! : null;
-
-  for (const arm of armsWithShippedConfig) {
-    const candidate = cemCandidates[arm]!;
-    if (isEmptyCemConfig(candidate)) {
-      if (trainingBlockSourceArm !== null) {
-        warnings.push(
-          `arm "${arm}" replica 0's config.json has no recorded CEM hyperparameters, while arm ` +
-            `"${trainingBlockSourceArm}" does; manifest's training block cannot include arm "${arm}"'s values.`
-        );
-      }
-      continue;
-    }
-    if (arm === trainingBlockSourceArm) continue; // it IS the baseline; nothing to compare it against
-    if (JSON.stringify(candidate) !== JSON.stringify(trainingBlock)) {
-      warnings.push(
-        `arm "${arm}" replica 0's CEM config/training-seed policy differs from arm ` +
-          `"${trainingBlockSourceArm}"'s (run must use identical config except --arm/--replica-seed); ` +
-          `manifest's training block reports arm "${trainingBlockSourceArm}"'s, not this one.`
-      );
-    }
-  }
+  // The WP5 real-graph parity gate (`05-production-run.md` step 2a /
+  // acceptance): all three `--parity-*` flags or none (enforced in
+  // `parseEvaluateArgs`), so this condition is just "were they given at
+  // all" — computed once and reused for both the missing-parity warning
+  // below and the manifest `parity` object's construction.
+  const parityGiven =
+    args.parityGraphSha256 !== undefined && args.parityK !== undefined && args.parityPassedAt !== undefined;
 
   // Real-graph (production) evaluation must record the WP5 parity gate that
   // is supposed to have passed before any production CEM run
   // (`05-production-run.md` step 2a / acceptance) — flagged here, not
   // silently omitted, when the shipped artifact is actually being written.
-  if (graphIdentity.graphSource === 'artifact' && complete) {
-    const parityGiven =
-      args.parityGraphSha256 !== undefined && args.parityK !== undefined && args.parityPassedAt !== undefined;
-    if (!parityGiven) {
-      warnings.push(
-        'manifest omits the parity block: pass --parity-graph-sha256/--parity-k/--parity-passed-at to ' +
-          'record the WP5 real-graph parity gate result.'
+  if (graphIdentity.graphSource === 'artifact' && complete && !parityGiven) {
+    warnings.push(
+      'manifest omits the parity block: pass --parity-graph-sha256/--parity-k/--parity-passed-at to ' +
+        'record the WP5 real-graph parity gate result.'
+    );
+  }
+
+  // One CUDA rerun of one already-`--runs`-loaded replica's training
+  // (`05-production-run.md`'s WP5 acceptance). `--gpu-rerun-run` shares the
+  // SAME arm/trainerSeed as one of `--runs`' own entries — the "original"
+  // run to compare against — so this evaluator can score it itself (over
+  // the identical held-out seeds/graph/ticks already used for that arm's
+  // `trained` condition) and diff its raw parameters against the original's
+  // directly, rather than trusting a hand-computed number.
+  let gpuRerun: GpuRerunReport | null = null;
+  if (args.gpuRerunRunDir !== undefined) {
+    const rerunRun = readRunDir(args.gpuRerunRunDir);
+    const rerunArm = rerunRun.config.arm;
+    const rerunTrainerSeed = rerunRun.config.trainerSeed;
+    const originalRun = armReplicas.get(rerunArm)?.get(rerunTrainerSeed);
+    if (!originalRun) {
+      throw new Error(
+        `evaluate: --gpu-rerun-run ${args.gpuRerunRunDir} declares arm "${rerunArm}" trainerSeed ` +
+          `${rerunTrainerSeed}, but no matching run was passed via --runs to compare it against.`
       );
     }
+    if (rerunRun.config.D !== originalRun.config.D || rerunRun.config.H !== originalRun.config.H) {
+      throw new Error(
+        `evaluate: --gpu-rerun-run ${args.gpuRerunRunDir} has D=${rerunRun.config.D}/H=${rerunRun.config.H}, ` +
+          `which does not match the original run's D=${originalRun.config.D}/H=${originalRun.config.H}`
+      );
+    }
+    const rerunGraph = armGraphs[rerunArm];
+    if (!rerunGraph) throw new Error(`evaluate: arm "${rerunArm}" graph is not loaded for --gpu-rerun-run`);
+    validateReadoutWeights(rerunRun.weights, rerunGraph);
+
+    const rerunScores = heldOutSeeds.map(
+      (seed) =>
+        runEpisode({
+          seed,
+          ticks: args.ticks,
+          substeps: args.substeps,
+          left: { decoder: 'trained', graph: rerunGraph, weights: rerunRun.weights },
+          right: { decoder: 'parked' }
+        }).left.movementScore
+    );
+    const heldOutMean = rerunScores.reduce((sum, score) => sum + score, 0) / rerunScores.length;
+
+    let maxAbsDiff = 0;
+    const parameterPairs: ReadonlyArray<readonly [Float32Array, Float32Array]> = [
+      [originalRun.weights.w1, rerunRun.weights.w1],
+      [originalRun.weights.b1, rerunRun.weights.b1],
+      [originalRun.weights.w2, rerunRun.weights.w2],
+      [originalRun.weights.b2, rerunRun.weights.b2]
+    ];
+    for (const [original, rerun] of parameterPairs) {
+      for (let i = 0; i < original.length; i += 1) {
+        maxAbsDiff = Math.max(maxAbsDiff, Math.abs(original[i] - rerun[i]));
+      }
+    }
+
+    // Original replica's already-computed `trained` stats (armsReport was
+    // built above, before this block runs) — the comparison point for both
+    // the sign-conventioned delta and the outside-CI check.
+    const originalTrained = armsReport[rerunArm]!.replicas[String(rerunTrainerSeed)]!.trained;
+    gpuRerun = {
+      arm: rerunArm,
+      trainerSeed: rerunTrainerSeed,
+      heldOutMean,
+      maxAbsDiff,
+      // Sign convention: rerun minus original (positive = GPU rerun scored higher).
+      fitnessDelta: heldOutMean - originalTrained.mean,
+      outsideOriginalCi: heldOutMean < originalTrained.ci95[0] || heldOutMean > originalTrained.ci95[1]
+    };
   }
 
   const report: EvaluationReport = {
@@ -851,6 +856,8 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
     arms: armsReport,
     armPairs,
     sideBySide,
+    training: trainingBlock,
+    gpuRerun,
     warnings
   };
 
@@ -920,13 +927,23 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
        * `null` when not passed (see the "manifest omits the parity block"
        * warning above).
        */
-      parity:
-        args.parityGraphSha256 !== undefined && args.parityK !== undefined && args.parityPassedAt !== undefined
-          ? { graphSha: args.parityGraphSha256, K: args.parityK, passedAt: args.parityPassedAt }
-          : null,
-      /** One CUDA rerun of one replica's training, informational only (never a gate); `null` when not measured/passed. */
-      gpuRerunMaxAbsDiff: args.gpuRerunMaxAbsDiff ?? null,
-      gpuRerunFitnessDelta: args.gpuRerunFitnessDelta ?? null
+      parity: parityGiven
+        ? { graphSha: args.parityGraphSha256, K: args.parityK, passedAt: args.parityPassedAt }
+        : null,
+      /**
+       * One CUDA rerun of one replica's training (see `EvaluateArgs.gpuRerunRunDir`'s
+       * doc comment / `report.ts`'s `GpuRerunReport`), informational only
+       * (never a gate); every field `null` when `--gpu-rerun-run` was not
+       * given. `gpuRerunFitnessDelta`'s sign convention: **rerun minus
+       * original** — positive means the GPU rerun's held-out mean exceeded
+       * the original (CPU) run's.
+       */
+      gpuRerunHeldOutMean: gpuRerun?.heldOutMean ?? null,
+      gpuRerunMaxAbsDiff: gpuRerun?.maxAbsDiff ?? null,
+      gpuRerunFitnessDelta: gpuRerun?.fitnessDelta ?? null,
+      gpuRerunFitnessDeltaSignConvention:
+        gpuRerun !== null ? 'rerun minus original (positive = GPU rerun scored higher)' : null,
+      gpuRerunOutsideOriginalCi: gpuRerun?.outsideOriginalCi ?? null
     };
     writeFileSync(resolve(outDir, 'trained-readout-v1.manifest.json'), JSON.stringify(manifest));
     artifactWritten = true;
