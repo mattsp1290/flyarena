@@ -58,15 +58,30 @@ const GOLDEN_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '../fixtures
  * comment for the measured divergence — so the comparison below is exact
  * only on `GOLDEN_GENERATING_ARCH` and tolerance-based everywhere else.
  *
- * Unlike the trace columns in `golden-traces.test.ts` (which round-trip
- * through `Float32Array` on the way to `actions`), `stepWorld` here runs
- * entirely in float64 and its own `Math.sin`/`Math.cos`/`Math.hypot` calls
- * (`arena/world.ts`) are not protected by that rounding. Empirically, on
- * the real x86_64 CI runner this comparison matched exactly (0 mismatches,
- * every committed seed) even before this file's tolerance fallback existed
- * — see the `fix/golden-cross-arch` PR — but that is an observation for
- * these four seeds, not a structural guarantee; see
- * `cross-arch-tolerance.ts`'s doc comment for the caveat.
+ * Where the actual cross-arch risk is here, precisely: both
+ * `goldenFinalLeftScore` and `runEpisode` call `stepWorld` on *this* run's
+ * own architecture — `stepWorld` itself is not being compared across
+ * machines, so its `Math.sin`/`Math.cos`/`Math.hypot` calls (`arena/world.ts`)
+ * are not a source of divergence *within this comparison* the way they are
+ * for `golden-traces.test.ts`'s cross-machine byte comparison. The only
+ * cross-arch input is `trace.actions` itself: static committed numbers,
+ * recorded on `GOLDEN_GENERATING_ARCH`, fed into `goldenFinalLeftScore`'s
+ * local `stepWorld` replay, versus `result.left`'s action values, freshly
+ * decoded from this run's own `observeAgent` -> model -> `decodeAction`
+ * pipeline (which rounds to `Float32Array` at `state.rate`/`outputs`
+ * before `decodeAction`, unlike `stepWorld`'s float64 state). So a
+ * cross-arch flip here requires a `sensors.ts` divergence large enough to
+ * cross a `Float32Array` rounding boundary in `outputs` -- narrower than
+ * `golden-traces.test.ts`'s exposure (which also directly records raw
+ * float64 `observations`), and consistent with this comparison matching
+ * exactly (0 mismatches, every committed seed) on the real x86_64 CI
+ * runner even before this file's tolerance fallback existed (measured
+ * during the `fix/golden-cross-arch` PR). Still not a structural
+ * guarantee for a future fixture refresh; see `cross-arch-tolerance.ts`'s
+ * doc comment for the caveat and the `LEAF_NOISE_FLOOR_REL`/
+ * `LEAF_NOISE_FLOOR_ABS` mechanism, which this file does not use (an
+ * `AgentScore` has only 2 float leaves, too few for a leaf-count budget to
+ * add meaningful protection over the tolerance check alone).
  */
 const goldenFinalLeftScore = (seed: number): AgentScore => {
   const trace = JSON.parse(

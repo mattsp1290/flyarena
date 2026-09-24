@@ -13,9 +13,12 @@
  * tolerance below is sized from.
  *
  * Measured on GitHub's `ubuntu-latest` (x86_64) runner against the
- * committed arm64 fixtures (`fix/golden-cross-arch` PR diagnostic run,
- * since removed — see that PR's description for the raw report): one
- * `observations` value (out of 4 committed seeds x 60 ticks x 8 channels)
+ * committed arm64 fixtures (`fix/golden-cross-arch` PR review, diagnostic
+ * script since removed from the tree but still reachable at commit
+ * `537ade4` if this branch's history survives; the numbers themselves are
+ * restated here and in `docs/architecture.md` so nothing load-bearing
+ * depends on that history surviving a squash-merge): one `observations`
+ * value (out of 4 committed seeds x 60 ticks x 8 channels)
  * differed by ~2.8e-17 absolute / ~3.1e-16 relative — about one float64 ULP
  * — and it did not propagate further in that run: every downstream column
  * (`ratesAfter`, `outputs`, `actions`) round-trips through `Float32Array`
@@ -35,11 +38,30 @@
  * so a perturbation that crosses a discrete threshold (a food pickup, a
  * hazard contact, a respawn) surfaces as an integer mismatch no tolerance
  * absorbs; (2) `MAX_INEXACT_LEAVES` bounds how many numeric leaves may
- * differ at all, so a *dense* divergence (the signature of a real behavior
- * regression, not sparse cross-arch noise) still fails loudly even where
- * every individual leaf is within tolerance. If either trips after a
- * legitimate fixture refresh, re-measure on the real target runner before
- * assuming it's a behavior regression — see `docs/architecture.md`.
+ * differ *above the noise floor* at all, so a *dense* divergence (the
+ * signature of a real behavior regression, not sparse cross-arch noise)
+ * still fails loudly even where every individual leaf is within tolerance.
+ * If either trips after a legitimate fixture refresh, re-measure on the
+ * real target runner before assuming it's a behavior regression — see
+ * `docs/architecture.md`.
+ *
+ * A second, independently-measured cross-arch effect (`fix/golden-cross-arch`
+ * PR review round 2) refines this: `world.ts`'s float64 feedback loop means
+ * cross-arch noise is not always as sparse as the one-leaf case above. A
+ * single-`Math.*`-call float64 ULP perturbation swept across every call
+ * `buildGoldenFiles` makes touched up to 28 leaves in one seed file (`sin`
+ * calls, whose result feeds `stepWorld`'s heading integration and so
+ * compounds across ticks) — every one of those leaves differed by at most
+ * ~5.2e-16 relative, i.e. still pure float64 noise, just spread over more
+ * leaves than the single-leaf case that motivated `MAX_INEXACT_LEAVES` in
+ * the first place. `LEAF_NOISE_FLOOR_REL`/`LEAF_NOISE_FLOOR_ABS` below (not
+ * `MAX_INEXACT_LEAVES` itself) is what absorbs this: a leaf only counts
+ * toward the budget if its difference clears both floors, which the
+ * measured noise (≤ 5.2e-16 relative) never does but every measured
+ * float32-ULP-scale regression comfortably does (the weakest single-edge
+ * perturbation measured still left 44 leaves above the floor in its worst
+ * seed file, and every other measured regression left hundreds to
+ * thousands).
  *
  * This gate is also arch-only, not OS- or Node/V8-version-aware: a
  * darwin-arm64 contributor, or a future Node upgrade on the generating
@@ -77,31 +99,53 @@ export const GOLDEN_GENERATING_NODE = 'v22.22.3';
  * relative) a double-precision perturbation this small could in principle
  * trigger downstream in an untested seed/tick/channel combination.
  *
- * This tolerance alone is *not* sufficient to rule out a real behavior change:
- * verified empirically (`fix/golden-cross-arch` PR review) that a single
- * float32-ULP change to one graph edge weight, or a `globalGain * (1 +
- * 1e-7)` change, is *individually* within this tolerance on every affected
- * leaf, yet touches 700+ leaves per seed file. `MAX_INEXACT_LEAVES` below
- * is what catches that class of regression; this tolerance alone only
- * protects against per-leaf noise of roughly this magnitude.
+ * This tolerance alone is *not* sufficient to rule out a real behavior
+ * change: verified empirically (`fix/golden-cross-arch` PR review) that a
+ * single float32-ULP change to one graph edge weight, or a `globalGain *
+ * (1 + 1e-7)` change, is *individually* within this tolerance on every
+ * affected leaf, yet touches hundreds to thousands of leaves per seed file
+ * (as few as 50 in the weakest single-edge case measured, and 700+ in most
+ * cases). `MAX_INEXACT_LEAVES` below (gated by `LEAF_NOISE_FLOOR_REL`/
+ * `LEAF_NOISE_FLOOR_ABS`, not by this tolerance) is the primary defense
+ * against that class of regression off `GOLDEN_GENERATING_ARCH`; this
+ * per-leaf tolerance is a backstop against smaller, non-dense drift.
  */
 export const FLOAT_ABS_TOLERANCE = 1e-6;
 export const FLOAT_REL_TOLERANCE = 1e-6;
 
 /**
- * Cross-arch drift is sparse: the measured divergence (this file's doc
- * comment) touched at most one numeric leaf in any single committed file.
- * A real float32-ULP-scale regression is dense — verified empirically
- * (`fix/golden-cross-arch` PR review) that a single float32-ULP change to
- * one graph edge weight, the same change applied to every edge weight, and
- * a `globalGain * (1 + 1e-7)` change each touch 700 to 2,200 numeric leaves
- * per seed file, while passing `FLOAT_ABS_TOLERANCE`/`FLOAT_REL_TOLERANCE`
- * on every individual leaf. Capping the count of not-bit-identical numeric
- * leaves (`diffCloseEnough`'s `inexactLeaves`) — on top of the per-leaf
- * tolerance — is what makes the tolerant comparison path able to catch a
- * dense regression that per-leaf tolerance alone would miss, while still
- * tolerating genuine sparse cross-arch drift with an 8x headroom over the
- * observed maximum of one leaf per file.
+ * A numeric leaf only counts toward `MAX_INEXACT_LEAVES` if its difference
+ * clears *both* floors below (relative AND absolute — the absolute floor
+ * guards near-zero leaves, where a tiny absolute difference can be a huge
+ * relative one without being behaviorally significant). Sized with ~200x
+ * headroom over the worst measured float64 cross-arch noise (~5.2e-16
+ * relative, from a `Math.sin` call inside `world.ts`'s feedback loop — see
+ * this file's header comment) and comfortably under every measured
+ * float32-ULP-scale regression signature (the weakest case still left 44
+ * leaves above this floor in its worst seed file; most left hundreds to
+ * thousands).
+ */
+export const LEAF_NOISE_FLOOR_REL = 1e-13;
+export const LEAF_NOISE_FLOOR_ABS = 1e-13;
+
+/**
+ * Cross-arch noise, above `LEAF_NOISE_FLOOR_REL`/`LEAF_NOISE_FLOOR_ABS`, is
+ * sparse: the measured divergence (this file's header comment) touched at
+ * most one numeric leaf in any single committed file at the single-value
+ * level, and even the denser world-feedback case (up to 28 leaves in one
+ * profiled `sin` call, all ≤ 5.2e-16 relative) stays under the floor and so
+ * is not counted at all. A real float32-ULP-scale regression is dense
+ * *and* clears the floor — verified empirically (`fix/golden-cross-arch`
+ * PR review) that a single float32-ULP change to one graph edge weight,
+ * the same change applied to every edge weight, and a `globalGain * (1 +
+ * 1e-7)` change each leave 44 to 2,200 above-floor numeric leaves per seed
+ * file, while passing `FLOAT_ABS_TOLERANCE`/`FLOAT_REL_TOLERANCE` on every
+ * individual leaf. Capping the count of above-floor, not-bit-identical
+ * numeric leaves (`diffCloseEnough`'s `inexactLeaves`) — on top of the
+ * per-leaf tolerance — is what makes the tolerant comparison path able to
+ * catch a dense regression that per-leaf tolerance alone would miss, while
+ * still tolerating genuine cross-arch drift, sparse or not, as long as it
+ * stays under the noise floor.
  */
 export const MAX_INEXACT_LEAVES = 8;
 
@@ -132,11 +176,11 @@ export interface CloseEnoughDiff {
   /** Human-readable mismatch description per divergent leaf/structural difference. */
   mismatches: string[];
   /**
-   * Count of numeric leaf pairs that were not bit-identical (`expected !==
-   * actual`), whether or not they were within `numbersCloseEnough`'s
-   * tolerance. Compare against `MAX_INEXACT_LEAVES` to catch a dense
-   * sub-tolerance regression that `mismatches` alone would miss — see this
-   * file's doc comment.
+   * Count of numeric leaf pairs that were not bit-identical AND cleared
+   * `LEAF_NOISE_FLOOR_REL`/`LEAF_NOISE_FLOOR_ABS`, whether or not they were
+   * within `numbersCloseEnough`'s tolerance. Compare against
+   * `MAX_INEXACT_LEAVES` to catch a dense sub-tolerance regression that
+   * `mismatches` alone would miss — see this file's doc comment.
    */
   inexactLeaves: number;
 }
@@ -149,16 +193,26 @@ const walk = (
   countInexactLeaf: () => void
 ): void => {
   if (typeof expected === 'number' && typeof actual === 'number') {
-    if (expected !== actual) countInexactLeaf();
-    if (!numbersCloseEnough(expected, actual)) {
+    // `Object.is` (not just `!==`) so NaN/NaN is never miscounted as a
+    // difference -- NaN cannot occur in this schema today, but this keeps
+    // the leaf count meaningful if it ever does.
+    const bitIdentical = Object.is(expected, actual) || expected === actual;
+    if (!bitIdentical) {
       const absDiff = Math.abs(expected - actual);
       const scale = Math.max(Math.abs(expected), Math.abs(actual));
       const relDiff = scale > 0 ? absDiff / scale : absDiff;
-      mismatches.push(
-        `${path}: expected ${expected}, got ${actual} (abs diff ${absDiff}, rel diff ${relDiff}, ` +
-          `over tolerance abs<=${FLOAT_ABS_TOLERANCE} or rel<=${FLOAT_REL_TOLERANCE}, or an ` +
-          'integer field requiring an exact match)'
-      );
+      // Only count toward MAX_INEXACT_LEAVES if the difference clears the
+      // float64 noise floor -- see LEAF_NOISE_FLOOR_REL/ABS's doc comment.
+      // A leaf within the floor is indistinguishable from cross-arch Math.*
+      // rounding noise and must not count as regression evidence.
+      if (relDiff > LEAF_NOISE_FLOOR_REL && absDiff > LEAF_NOISE_FLOOR_ABS) countInexactLeaf();
+      if (!numbersCloseEnough(expected, actual)) {
+        mismatches.push(
+          `${path}: expected ${expected}, got ${actual} (abs diff ${absDiff}, rel diff ${relDiff}, ` +
+            `over tolerance abs<=${FLOAT_ABS_TOLERANCE} or rel<=${FLOAT_REL_TOLERANCE}, or an ` +
+            'integer field requiring an exact match)'
+        );
+      }
     }
     return;
   }
@@ -214,9 +268,10 @@ const walk = (
 /**
  * Recursive structural comparison built on `numbersCloseEnough`: numbers
  * use the tolerance rule above (and are counted in `inexactLeaves` when not
- * bit-identical, regardless of tolerance), strings/booleans/array
- * lengths/object key sets must always match exactly. `path` seeds the
- * mismatch labels (typically a filename or a short root label).
+ * bit-identical and above the noise floor, regardless of tolerance),
+ * strings/booleans/array lengths/object key sets must always match exactly.
+ * `path` seeds the mismatch labels (typically a filename or a short root
+ * label).
  */
 export const diffCloseEnough = (expected: unknown, actual: unknown, path: string): CloseEnoughDiff => {
   const mismatches: string[] = [];

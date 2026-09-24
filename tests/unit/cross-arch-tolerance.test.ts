@@ -3,6 +3,8 @@ import {
   diffCloseEnough,
   FLOAT_ABS_TOLERANCE,
   FLOAT_REL_TOLERANCE,
+  LEAF_NOISE_FLOOR_ABS,
+  LEAF_NOISE_FLOOR_REL,
   MAX_INEXACT_LEAVES,
   numbersCloseEnough
 } from '../fixtures/cross-arch-tolerance';
@@ -59,10 +61,44 @@ describe('diffCloseEnough', () => {
     expect(result.inexactLeaves).toBe(0);
   });
 
-  it('counts a sub-tolerance float leaf as inexact but not a mismatch', () => {
-    const result = diffCloseEnough({ x: 0.5 }, { x: 0.5 + Number.EPSILON }, 'root');
+  it('counts a sub-tolerance, above-noise-floor float leaf as inexact but not a mismatch', () => {
+    // Relative nudge (1e-9) chosen to sit strictly between LEAF_NOISE_FLOOR_REL
+    // (1e-13) and FLOAT_REL_TOLERANCE (1e-6): above the floor (counted as an
+    // inexact leaf) but under the tolerance (not a mismatch).
+    const result = diffCloseEnough({ x: 0.5 }, { x: 0.5 * (1 + 1e-9) }, 'root');
     expect(result.mismatches).toEqual([]);
     expect(result.inexactLeaves).toBe(1);
+  });
+
+  it('does not count a leaf within the float64 noise floor, even though it differs bit-for-bit', () => {
+    // A single float64 ULP -- the scale of the measured real cross-arch
+    // drift (~3e-16 relative) -- must stay under LEAF_NOISE_FLOOR_REL/ABS
+    // (1e-13) and therefore not count toward MAX_INEXACT_LEAVES. This is
+    // what stops world.ts's float64 feedback loop (measured to spread a
+    // single perturbed Math.sin call's noise across up to 28 leaves in one
+    // profiled case, `fix/golden-cross-arch` PR round 2) from tripping the
+    // dense-regression budget on pure noise.
+    const x = 0.08954558536141353;
+    const result = diffCloseEnough({ x }, { x: x + Number.EPSILON * x }, 'root');
+    expect(result.mismatches).toEqual([]);
+    expect(result.inexactLeaves).toBe(0);
+  });
+
+  it('counts a leaf just above the noise floor', () => {
+    const x = 1.5;
+    const perturbed = x * (1 + LEAF_NOISE_FLOOR_REL * 10);
+    const result = diffCloseEnough({ x }, { x: perturbed }, 'root');
+    expect(result.mismatches).toEqual([]);
+    expect(result.inexactLeaves).toBe(1);
+  });
+
+  it('does not count a near-zero leaf with a large relative but tiny absolute difference', () => {
+    // expected is (near) zero: even a "100% relative" difference must stay
+    // uncounted if it is absolutely tiny -- otherwise a leaf that legitimately
+    // rounds to ~0 on one architecture and to a denormal-scale value on
+    // another would falsely count as a dense-regression signal.
+    const result = diffCloseEnough({ x: 0 }, { x: LEAF_NOISE_FLOOR_ABS / 10 }, 'root');
+    expect(result.inexactLeaves).toBe(0);
   });
 
   it('reports an over-tolerance float leaf as a mismatch', () => {

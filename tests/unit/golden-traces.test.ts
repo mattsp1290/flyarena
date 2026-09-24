@@ -92,19 +92,12 @@ describe('golden trace regeneration', () => {
         }
       }
 
-      // Dense-regression gate: see MAX_INEXACT_LEAVES's doc comment. Sparse
-      // cross-arch drift stays under budget; a real behavior change touches
-      // hundreds to thousands of leaves and trips this even when every
-      // individual leaf is within FLOAT_ABS_TOLERANCE/FLOAT_REL_TOLERANCE.
-      expect(
-        overBudget,
-        'One or more golden files have more not-bit-identical numeric leaves than the measured ' +
-          `cross-arch drift budget allows (measured drift: at most 1 leaf per file; budget ` +
-          `${MAX_INEXACT_LEAVES}). This usually means a real behavior change, not architecture noise ` +
-          `-- regenerate deliberately on ${GOLDEN_GENERATING_ARCH} and review the diff before ` +
-          `committing:\n${overBudget.join('\n')}`
-      ).toEqual([]);
-
+      // Per-leaf tolerance failures first: when both this and the budget
+      // check below would fail, this shows the concrete `expected`/`actual`
+      // values, which is the more useful starting point for diagnosis. A
+      // dense regression whose leaves each individually stay within
+      // FLOAT_ABS_TOLERANCE/FLOAT_REL_TOLERANCE produces no mismatches here
+      // (that's exactly the case the budget check below exists to catch).
       const shown = allMismatches.slice(0, MAX_REPORTED_MISMATCHES);
       const omitted = allMismatches.length - shown.length;
       expect(
@@ -114,6 +107,24 @@ describe('golden trace regeneration', () => {
           `abs<=${FLOAT_ABS_TOLERANCE} or rel<=${FLOAT_REL_TOLERANCE}). Showing ${shown.length} of ` +
           `${allMismatches.length}:\n${shown.join('\n')}` +
           (omitted > 0 ? `\n... and ${omitted} more` : '')
+      ).toEqual([]);
+
+      // Dense-regression gate: see MAX_INEXACT_LEAVES's doc comment. Leaves
+      // within LEAF_NOISE_FLOOR_REL/LEAF_NOISE_FLOOR_ABS of the committed
+      // value never count here at all (measured cross-arch noise, including
+      // world.ts's float64 feedback loop, stays under that floor); a real
+      // behavior change leaves many leaves above it and trips this even
+      // when every individual leaf is within FLOAT_ABS_TOLERANCE/
+      // FLOAT_REL_TOLERANCE. If this fails, check the magnitude of the
+      // above-floor differences (re-run with a temporary console.log of
+      // `diffCloseEnough`'s output) before assuming a regression: this
+      // budget is sized from a finite set of measurements, not a proof.
+      expect(
+        overBudget,
+        'One or more golden files have more above-noise-floor, not-bit-identical numeric leaves ' +
+          `than the measured cross-arch drift budget allows (every measured cross-arch noise case ` +
+          `stayed under budget; every measured float32-ULP-scale regression exceeded it). Budget ` +
+          `${MAX_INEXACT_LEAVES}:\n${overBudget.join('\n')}`
       ).toEqual([]);
     }
 
