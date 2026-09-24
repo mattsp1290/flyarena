@@ -142,13 +142,15 @@ const createParkedRunner = (): AgentRunner => ({
 });
 
 /**
- * Throws unless `lesion` is sorted strictly ascending (which also rules out
- * duplicates) and every index is in `[0, neuronCount)`. Order does not
- * change the numeric result -- zeroing a set of indices is
- * order-independent -- but `AgentEpisodeConfig.lesion`'s documented contract
- * is a sorted, unique, in-range `Int32Array`, and enforcing it here catches
- * a caller's indexing bug (an out-of-range or repeated neuron id) instead of
- * silently zeroing the wrong -- or the same -- neuron twice.
+ * Throws unless `lesion` (already confirmed a real `Int32Array` and copied
+ * by the caller -- see `createNeuralRunner`'s authored branch) is sorted
+ * strictly ascending (which also rules out duplicates) with every index in
+ * `[0, neuronCount)`. Order does not change the numeric result -- zeroing a
+ * set of indices is order-independent -- but `AgentEpisodeConfig.lesion`'s
+ * documented contract is a sorted, unique, in-range `Int32Array`, and
+ * enforcing it here catches a caller's indexing bug (an out-of-range or
+ * repeated neuron id) instead of silently zeroing the wrong -- or no --
+ * neuron.
  */
 const validateLesionIndices = (agentId: AgentId, lesion: Int32Array, neuronCount: number): void => {
   for (let i = 0; i < lesion.length; i += 1) {
@@ -188,7 +190,21 @@ const createNeuralRunner = (
 
   if (config.decoder === 'authored') {
     if (config.lesion) {
-      const lesion = config.lesion;
+      // The `instanceof` check runs on the caller's own value, *before* the
+      // defensive copy below: `Int32Array.from` on a non-`Int32Array`
+      // array-like (e.g. a plain `{0: 7}` object, which is what an
+      // `Int32Array` can turn into after a naive JSON/IPC round trip --
+      // WP2's sharded worker pattern will need to serialize lesion index
+      // sets) has no `length` and silently copies zero elements rather than
+      // throwing, which would make this guard vacuous if it ran on the
+      // copy instead.
+      if (!(config.lesion instanceof Int32Array)) {
+        throw new Error(`episode: agent "${agentId}" lesion must be an Int32Array`);
+      }
+      // Copied, not a reference to the caller's array: the runner must not
+      // be exposed to a caller mutating (or reusing for a different agent)
+      // the array it originally passed in after `runEpisode` has started.
+      const lesion = Int32Array.from(config.lesion);
       validateLesionIndices(agentId, lesion, graph.metadata.neuronCount);
       return {
         // Explicit substep loop mirroring `stepBranch`
@@ -197,9 +213,12 @@ const createNeuralRunner = (
         // agent's own last tick left there, exactly as `stepBranch` clears
         // a fork's carried-over state before its first scatter), then for
         // every substep call `stepModel` and zero the lesioned rates again,
-        // then `aggregateOutputs`. No allocation per tick -- `lesion` is
-        // read-only and reused across every call, matching this file's
-        // existing per-agent buffer reuse.
+        // then `aggregateOutputs`. The lesion-zeroing loops themselves
+        // allocate nothing per tick -- `lesion` is read-only and reused
+        // across every call -- matching this file's existing per-agent
+        // buffer reuse (`observeAgent`/`Array.from(outputs)` below still
+        // allocate per tick, exactly as the unlesioned path above already
+        // does; this option does not change that).
         step: (world) => {
           const observation = observeAgent(world, agentId);
           for (let i = 0; i < lesion.length; i += 1) state.rate[lesion[i]] = 0;
@@ -262,6 +281,14 @@ const createAgentRunner = (
   // the error fires before any decoder-specific "requires a graph/weights"
   // check -- a lesion on the wrong decoder kind is a caller error regardless
   // of what else the config is missing.
+  //
+  // TODO(.agents/plans/lesion-atlas/01-lesion-episodes.md): if
+  // `EpisodeDecoderKind` ever grows `authored-flip-*` kinds (the
+  // null-explanation plan's WP1, not yet merged as of this WP), this gate
+  // and the `config.decoder === 'authored'` branch in createNeuralRunner
+  // must both widen to include them -- lesion must work identically for
+  // every authored-family decoder, and this hard-coded `!== 'authored'`
+  // check would otherwise wrongly reject them.
   if (config.lesion && config.decoder !== 'authored') {
     throw new Error(
       `episode: agent "${agentId}" decoder "${config.decoder}" does not support lesion ` +

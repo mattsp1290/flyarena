@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { decodeAction } from '../../src/lib/arena/actions';
 import { createWorld } from '../../src/lib/arena/world';
@@ -35,16 +35,21 @@ const SEEDS: readonly number[] = [30001, 30002, 30003];
 
 let prepared: PreparedGraph;
 
-// Stubbed once for the whole file (never unstubbed -- no other test here
-// needs the real `fetch`, and vite.config.ts sets no `restoreMocks`/
-// `unstubGlobals` option that would tear it down between `it`s), matching
-// how `loadArenaArtifacts`/`prepareGraph` are always driven in these tests:
-// through the real production loader against the real committed artifact
-// under `public/data`, not a hand-rolled fixture graph.
+// Stubbed once for the whole file, matching how `loadArenaArtifacts`/
+// `prepareGraph` are always driven in these tests: through the real
+// production loader against the real committed artifact under
+// `public/data`, not a hand-rolled fixture graph. Explicitly unstubbed in
+// `afterAll` (vite.config.ts sets no `restoreMocks`/`unstubGlobals` option
+// that would do this automatically) so a stray leftover global stub can
+// never leak into a later test file sharing this worker.
 beforeAll(async () => {
   vi.stubGlobal('fetch', createPublicDataFetch());
   const assets = await loadArenaArtifacts('/data');
   prepared = await prepareGraph(assets, 'biological');
+});
+
+afterAll(() => {
+  vi.unstubAllGlobals();
 });
 
 /** Decoded action + final left score for `runEpisode` with an authored lesion. */
@@ -76,6 +81,12 @@ const runEpisodeLesion = (
  * immediately after each `stepBranch` call recovers the exact same action
  * that call fed into `stepWorld`, without reimplementing any of
  * `stepBranch`'s internals.
+ *
+ * `stepBranch` always runs exactly `NEURAL_SUBSTEPS_PER_TICK` substeps (it
+ * imports the constant directly, with no parameter to override it) --
+ * `runEpisodeLesion` above must therefore always be called with
+ * `substeps: NEURAL_SUBSTEPS_PER_TICK` for a comparison against this
+ * function to be meaningful; every call site below does.
  */
 const runEngineLesion = (
   graph: ConnectomeGraph,
@@ -92,6 +103,32 @@ const runEngineLesion = (
   const left = branch.world.agents.find((agent) => agent.id === 'left');
   if (!left) throw new Error('missing left agent');
   return { actions, score: left.score };
+};
+
+/**
+ * Baseline (unlesioned) left decoded actions, for the nontriviality guard
+ * below: a lesion parity test that never checked its lesion actually did
+ * anything could pass vacuously if a future regression made `runEpisode`
+ * silently ignore `lesion` altogether, since an ignored lesion would still
+ * match `stepBranch`'s *unlesioned* behavior... except `stepBranch` above is
+ * always called with the real `target`, so that specific regression is
+ * already covered structurally. This baseline instead catches the
+ * complementary failure: `stepBranch` itself silently no-op'ing (e.g. a
+ * future edit dropping its target loop) in a way that still happens to
+ * equal `runEpisode`'s lesioned output -- comparing both sides against a
+ * true unlesioned run makes that impossible to miss.
+ */
+const runUnlesionedLeftActions = (graph: Readonly<ConnectomeGraph>, seed: number, ticks: number): DecodedAction[] => {
+  const actions: DecodedAction[] = [];
+  runEpisode({
+    seed,
+    ticks,
+    substeps: NEURAL_SUBSTEPS_PER_TICK,
+    left: { decoder: 'authored', graph },
+    right: { decoder: 'parked' },
+    onTick: (_tick, tickActions) => actions.push(tickActions.left)
+  });
+  return actions;
 };
 
 describe('runEpisode lesion parity vs the counterfactual engine (real biological artifact)', () => {
@@ -111,6 +148,13 @@ describe('runEpisode lesion parity vs the counterfactual engine (real biological
           expect(episode.actions).toHaveLength(TICKS);
           expect(episode.actions).toEqual(engine.actions);
           expect(episode.score).toEqual(engine.score);
+
+          // Nontriviality guard: the lesion must actually change at least
+          // one tick's decoded action versus an unlesioned run, or a
+          // passing comparison above could just mean both paths
+          // independently produced the same (unlesioned-equivalent) result.
+          const baseline = runUnlesionedLeftActions(prepared.graph, seed, TICKS);
+          expect(episode.actions).not.toEqual(baseline);
         },
         15_000
       );
@@ -132,6 +176,9 @@ describe('runEpisode lesion parity vs the counterfactual engine: singleton lesio
 
     expect(episode.actions).toEqual(engine.actions);
     expect(episode.score).toEqual(engine.score);
+
+    const baseline = runUnlesionedLeftActions(prepared.graph, seed, TICKS);
+    expect(episode.actions).not.toEqual(baseline);
   }, 15_000);
 
   it('one bridge neuron lesioned alone matches stepBranch with a one-element target', () => {
@@ -145,6 +192,9 @@ describe('runEpisode lesion parity vs the counterfactual engine: singleton lesio
 
     expect(episode.actions).toEqual(engine.actions);
     expect(episode.score).toEqual(engine.score);
+
+    const baseline = runUnlesionedLeftActions(prepared.graph, seed, TICKS);
+    expect(episode.actions).not.toEqual(baseline);
   }, 15_000);
 });
 
@@ -227,6 +277,21 @@ describe('runEpisode lesion: decoder gating', () => {
       })
     ).toThrow(/sorted ascending and unique/);
   });
+
+  it('throws when lesion is not really an Int32Array (e.g. a plain-object stand-in from a JSON/IPC round trip)', () => {
+    expect(() =>
+      runEpisode({
+        seed: 1,
+        ticks: 1,
+        // Cast through unknown: TypeScript would reject this at the call
+        // site, but a WP2 worker deserializing a lesion set across a
+        // process boundary bypasses that static guarantee, so the runtime
+        // check must catch it too.
+        left: { decoder: 'authored', graph, lesion: { 0: 7, length: 1 } as unknown as Int32Array },
+        right: { decoder: 'parked' }
+      })
+    ).toThrow(/must be an Int32Array/);
+  });
 });
 
 describe('runEpisode lesion: no-op and full-population edge cases (trace graph)', () => {
@@ -268,5 +333,49 @@ describe('runEpisode lesion: no-op and full-population edge cases (trace graph)'
     // the agent via its own decoded action (any nonzero score here would
     // have to come from spawn defaults, not from this run).
     expect(result.left.distanceTravelled).toBe(0);
+  });
+});
+
+/**
+ * `createAgentRunner`/`createNeuralRunner` are agent-generic (indexed by
+ * `agentId`, not hard-coded to `'left'`), unlike `stepBranch` -- which only
+ * ever observes/lesions `'left'` and hard-codes `right` to the zero action
+ * (`src/lib/counterfactual/engine.ts`). So `right.lesion` has no engine
+ * counterpart to compare against (there is no production use for it either
+ * -- WP2's atlas condition is always "authored decoder on the side under
+ * test, opponent parked" -- but the option is not restricted to `left`
+ * either, and a bug that silently applied `left`'s lesion state to `right`,
+ * or vice versa, would not be caught by any test above, since every test
+ * above only ever lesions `left`). This block drives both agents as
+ * `authored` -- left unlesioned, right fully output-lesioned -- and checks
+ * each side independently: left keeps producing real (nonzero on some tick)
+ * actions, right's action is exactly zero every tick, matching this file's
+ * "lesioning every output neuron gives a zero action" case above but for
+ * the other agent slot.
+ */
+describe('runEpisode lesion: applies independently per agent (trace graph)', () => {
+  it('a lesion on the right agent zeroes only the right agent\'s action, leaving the unlesioned left agent unaffected', () => {
+    const graph = createTraceGraph();
+    const lesion = outputNeuronIndices(graph);
+    expect(lesion.length).toBeGreaterThan(0);
+
+    const leftActions: DecodedAction[] = [];
+    const rightActions: DecodedAction[] = [];
+    runEpisode({
+      seed: 11,
+      ticks: 30,
+      left: { decoder: 'authored', graph },
+      right: { decoder: 'authored', graph, lesion },
+      onTick: (_tick, actions) => {
+        leftActions.push(actions.left);
+        rightActions.push(actions.right);
+      }
+    });
+
+    expect(rightActions).toHaveLength(30);
+    for (const action of rightActions) {
+      expect(action).toEqual({ thrust: 0, yaw: 0, brake: 0 });
+    }
+    expect(leftActions.some((action) => action.thrust !== 0 || action.yaw !== 0 || action.brake !== 0)).toBe(true);
   });
 });
