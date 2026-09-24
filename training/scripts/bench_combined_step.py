@@ -14,6 +14,13 @@ than re-measuring the model, which was already batched before this fix.
 `step_world_batched` + `observe_batch` (dense tensor ops) + the same
 model+readout step.
 
+Also reports the isolated cost of `validate_world_batch` (run by default
+inside `step_world_batched`, matching TS `stepWorld` always calling
+`validateStepState`): the same "after" pipeline with `validate=True` vs
+`validate=False`, to measure the CUDA host-sync overhead of the invariant
+checks (thermo-fix-verification review finding: fused from ~11 sequential
+per-check syncs into one).
+
 Usage: `uv run python scripts/bench_combined_step.py` (from `training/`).
 Requires CUDA (skips with a message otherwise, matching `test_gpu.py`'s
 convention).
@@ -58,7 +65,7 @@ def _random_readout_weights(input_size: int, hidden_size: int, batch_size: int, 
     )
 
 
-def _bench_after(device: torch.device) -> float:
+def _bench_after(device: torch.device, validate: bool = True) -> float:
     graph = load_graph_json(GRAPH_PATH, device=device)
     prepared = PreparedGraph(graph, device)
     indices = output_neuron_indices(graph)
@@ -74,7 +81,7 @@ def _bench_after(device: torch.device) -> float:
         readout_out = readout_forward(weights, gathered)
         left_action = decode_action_batch(readout_out.double(), BATCH_SIZE, device)
         right_action = torch.zeros_like(left_action)
-        return step_world_batched(state, {"left": left_action, "right": right_action}, ARENA_CONFIG)
+        return step_world_batched(state, {"left": left_action, "right": right_action}, ARENA_CONFIG, validate=validate)
 
     for _ in range(WARMUP_TICKS):
         state = one_tick(state)
@@ -145,6 +152,17 @@ def main() -> None:
     print(f"AFTER (fully batched world/observe/model/readout), B={BATCH_SIZE}:")
     print(f"  {after_ticks_per_s:.2f} ticks/s, {after_item_ticks:.0f} item-ticks/s")
     print(f"Speedup: {after_item_ticks / before_item_ticks:.1f}x")
+
+    # `validate_world_batch` cost, in isolation: same fully-batched pipeline,
+    # `step_world_batched`'s default `validate=True` vs the `validate=False`
+    # escape hatch (thermo-fix-verification review finding: ~11 sequential
+    # `if tensor.any():` host syncs fused into one `.any()` reduction).
+    validate_true_ticks_per_s = _bench_after(device, validate=True)
+    validate_false_ticks_per_s = _bench_after(device, validate=False)
+    print(f"\nvalidate_world_batch cost (fully batched pipeline), B={BATCH_SIZE}:")
+    print(f"  validate=True:  {validate_true_ticks_per_s:.2f} ticks/s")
+    print(f"  validate=False: {validate_false_ticks_per_s:.2f} ticks/s")
+    print(f"  slowdown from validation: {validate_false_ticks_per_s / validate_true_ticks_per_s:.2f}x")
 
     # WP3 wall-time re-estimate at the plan's declared defaults.
     p, e, g, t, runs = 256, 16, 150, 1800, 9

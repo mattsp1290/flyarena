@@ -521,19 +521,30 @@ def validate_world_batch(state: WorldBatch, config: ArenaConfig = ARENA_CONFIG) 
     ULP even when they represent the same value; TS's own in-process
     `Object.is` check never faces that round trip. `schemaVersion` is not
     tracked by this port (nothing here ever sees a different one), so it is
-    not checked."""
-    if (state.tick < 0).any():
-        raise ValueError("Invalid world clock state: tick is negative for at least one batch item")
+    not checked.
 
-    expected_time = state.tick.to(state.time_seconds.dtype) * config.fixed_delta_seconds
-    if not torch.isfinite(state.time_seconds).all() or not torch.isfinite(expected_time).all():
-        raise ValueError("Invalid world clock state: time_seconds or tick * fixed_delta_seconds is not finite")
-    if ((state.time_seconds - expected_time).abs() > 1e-9).any():
-        raise ValueError(
-            "Invalid world clock state: time_seconds does not match tick * fixed_delta_seconds "
-            "for at least one batch item"
-        )
-
+    Every individual invariant below used to be its own `if (<tensor
+    op>).any(): raise ...` statement. Evaluating an `if` on a tensor forces
+    an implicit host sync (the boolean reduction has to be pulled off-device
+    to answer the `if`), so that form issued on the order of 10 separate
+    host<->device round trips per call — measured, calling this function
+    alone in a tight loop with no other queued GPU work, at a 1.48x
+    throughput cost on CUDA (773.9 vs 1146.5 ticks/s, B=4096, GB10; see
+    `training/README.md`'s "validate_world_batch host-sync fusion" section).
+    Every check below is instead computed as an on-device boolean tensor (no
+    sync — reductions like `.all()`/`.any()` stay on device until something
+    converts them to a Python `bool`), stacked into one tensor, and reduced
+    with a single `.any()` that is synced exactly once. Only when that fused
+    check is `True` do we re-run the checks individually (the same sequence
+    this function used to always run) to recover which one failed and raise
+    its specific message; that fallback path only ever executes once
+    validation has already failed, so its extra syncs are free in the common
+    (valid) case. Note: `scripts/bench_combined_step.py`'s validate=True/False
+    comparison measures this cost *within* the full training pipeline (world
+    step + observe + model substeps + readout), where other queued GPU work
+    already dominates a sync's wall-clock cost — there, this fusion measures
+    as a wash (~1.14-1.15x either way; see the README section above), even
+    though it still cuts the sync count from ~11 to 1."""
     numeric_fields = (
         ("agent_position", state.agent_position),
         ("agent_velocity", state.agent_velocity),
@@ -544,16 +555,53 @@ def validate_world_batch(state: WorldBatch, config: ArenaConfig = ARENA_CONFIG) 
         ("hazard_position", state.hazard_position),
         ("hazard_velocity", state.hazard_velocity),
     )
+    expected_time = state.tick.to(state.time_seconds.dtype) * config.fixed_delta_seconds
+    speed = torch.hypot(state.agent_velocity[..., 0], state.agent_velocity[..., 1])
+
+    any_failed = torch.stack(
+        [
+            (state.tick < 0).any(),
+            ~torch.isfinite(state.time_seconds).all(),
+            ~torch.isfinite(expected_time).all(),
+            ((state.time_seconds - expected_time).abs() > 1e-9).any(),
+            *(~torch.isfinite(tensor).all() for _, tensor in numeric_fields),
+            (speed > config.max_speed * (1 + 1e-12)).any(),
+            (state.agent_food_pickups < 0).any(),
+            (state.agent_hazard_contacts < 0).any(),
+        ]
+    ).any()
+    if not any_failed:
+        return
+
+    # Fallback: re-run the checks individually to build the specific error
+    # message. Only reached once `any_failed` is True (validation already
+    # failed), so the extra host syncs here don't cost anything in the
+    # common (valid) path.
+    if (state.tick < 0).any():
+        raise ValueError("Invalid world clock state: tick is negative for at least one batch item")
+    if not torch.isfinite(state.time_seconds).all() or not torch.isfinite(expected_time).all():
+        raise ValueError("Invalid world clock state: time_seconds or tick * fixed_delta_seconds is not finite")
+    if ((state.time_seconds - expected_time).abs() > 1e-9).any():
+        raise ValueError(
+            "Invalid world clock state: time_seconds does not match tick * fixed_delta_seconds "
+            "for at least one batch item"
+        )
     for name, tensor in numeric_fields:
         if not torch.isfinite(tensor).all():
             raise ValueError(f"Invalid world state numeric value: non-finite value found in {name}")
-
-    speed = torch.hypot(state.agent_velocity[..., 0], state.agent_velocity[..., 1])
     if (speed > config.max_speed * (1 + 1e-12)).any():
         raise ValueError("Invalid world state numeric value: agent speed exceeds max_speed")
-
     if (state.agent_food_pickups < 0).any() or (state.agent_hazard_contacts < 0).any():
         raise ValueError("Invalid world state numeric value: negative food_pickups or hazard_contacts count")
+    # Unreachable unless the fused `any_failed` condition list above and this
+    # fallback sequence have drifted out of sync (e.g. a check added to one
+    # but not the other) — a bug in this function, not a data problem. Fail
+    # loudly instead of silently returning as if validation had passed.
+    raise AssertionError(
+        "validate_world_batch: fused check reported a failure but no individual "
+        "check raised; the fused condition list and the fallback checks have "
+        "drifted out of sync"
+    )
 
 
 def step_world_batched(

@@ -169,3 +169,57 @@ def test_step_world_batched_can_skip_validation():
     state.time_seconds[0] = 999.0
     # Should not raise: validation explicitly disabled.
     step_world_batched(state, {}, validate=False)
+
+
+def test_validate_world_batch_rejects_negative_tick():
+    state = world_batch_from_items(create_world([1]), device="cpu")
+    state.tick[0] = -1
+    with pytest.raises(ValueError, match="tick is negative"):
+        validate_world_batch(state, ARENA_CONFIG)
+
+
+def test_validate_world_batch_rejects_non_finite_time_seconds():
+    state = world_batch_from_items(create_world([1]), device="cpu")
+    state.time_seconds[0] = float("nan")
+    with pytest.raises(ValueError, match="time_seconds"):
+        validate_world_batch(state, ARENA_CONFIG)
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "agent_velocity",
+        "agent_heading",
+        "agent_distance_travelled",
+        "agent_movement_score",
+        "food_position",
+        "hazard_position",
+        "hazard_velocity",
+    ],
+)
+def test_validate_world_batch_rejects_non_finite_numeric_field(field_name):
+    """Every `numeric_fields` entry in `validate_world_batch` (`world.py`)
+    must still be individually checked after the fused-boolean-reduction
+    refactor (thermo-fix-verification review finding: ~11 sequential host
+    syncs fused into one) — `agent_position` is covered by
+    `test_validate_world_batch_rejects_non_finite_position` above; this
+    parametrizes the rest."""
+    state = world_batch_from_items(create_world([1]), device="cpu")
+    tensor = getattr(state, field_name)
+    tensor.view(-1)[0] = float("nan")
+    with pytest.raises(ValueError, match=field_name):
+        validate_world_batch(state, ARENA_CONFIG)
+
+
+def test_validate_world_batch_rejects_negative_food_pickups():
+    state = world_batch_from_items(create_world([1]), device="cpu")
+    state.agent_food_pickups[0, 0] = -1
+    with pytest.raises(ValueError, match="food_pickups"):
+        validate_world_batch(state, ARENA_CONFIG)
+
+
+def test_validate_world_batch_rejects_negative_hazard_contacts():
+    state = world_batch_from_items(create_world([1]), device="cpu")
+    state.agent_hazard_contacts[0, 0] = -1
+    with pytest.raises(ValueError, match="hazard_contacts"):
+        validate_world_batch(state, ARENA_CONFIG)

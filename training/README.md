@@ -323,15 +323,67 @@ a slightly lower per-item rate is expected.)
 | Per run (`G = 150`) | ~7.7–8.5 h | ~0.23 h |
 | All 9 runs | **~70–77 h (≈3 days)** | **~2.0–2.1 h** |
 
-This does not include per-tick GPU↔CPU synchronization from
-`validate_world_batch` (on by default in `step_world_batched`, matching
-`stepWorld` always calling `validateStepState`; pass `validate=False` in a
-rollout loop that already trusts its state) or WP3's own CEM bookkeeping
-(elite selection, seed sampling) — both still TODO for WP3 — but the
+This includes `validate_world_batch`'s per-tick GPU↔CPU synchronization (on
+by default in `step_world_batched`, matching `stepWorld` always calling
+`validateStepState`); see "`validate_world_batch` host-sync fusion" below
+for its now-measured, now-fused cost. It does not include WP3's own CEM
+bookkeeping (elite selection, seed sampling) — still TODO for WP3 — but the
 Python-object-churn bottleneck the first review pass identified is gone,
 and the batched pipeline is fast enough for WP3's calibration loop (many
 short, iterable runs), which the plan's "Unresolved decisions" table
 requires and the pre-fix architecture could not deliver.
+
+### `validate_world_batch` host-sync fusion (thermo-fix-verification review)
+
+A review pass found `validate_world_batch` written as ~11 sequential Python
+`if (<tensor op>).any(): raise ...` statements. Evaluating `if` on a tensor
+forces an implicit host sync (the boolean reduction has to be pulled off
+the GPU to answer the `if`), so the function issued on the order of 10
+separate host↔device round trips per call instead of one; the reviewer
+measured this **in isolation** (calling only `validate_world_batch` in a
+tight loop, no other queued GPU work) at a 1.48x throughput cost (773.9 vs
+1146.5 ticks/s, B=4096, CUDA, GB10). Fixed: every invariant is now computed
+as an on-device boolean tensor (no sync), stacked, and reduced with a single
+`.any()` that syncs exactly once; only on failure does it fall back to
+re-running the checks individually to recover which one failed and raise
+its original, specific message (see `world.py`'s `validate_world_batch`
+docstring).
+
+Before/after benchmark (`training/scripts/bench_combined_step.py`), CUDA,
+`B = 4096`, `trace-graph` fixture, full combined pipeline (world-step +
+observe + rate-model + readout), `validate=True` vs `validate=False`, run
+against both the pre-fix (sequential-`if`) and post-fix (fused) versions of
+`validate_world_batch`:
+
+```
+PRE-FIX (sequential `if tensor.any():`), validate_world_batch cost:
+  validate=True:  332.97 ticks/s
+  validate=False: 383.25 ticks/s
+  slowdown from validation: 1.15x
+
+POST-FIX (fused single .any() reduction), validate_world_batch cost:
+  validate=True:  329.90 ticks/s
+  validate=False: 375.62 ticks/s
+  slowdown from validation: 1.14x
+```
+
+(A second post-fix run measured 332.67/383.38 ticks/s, 1.15x — consistent
+with the pre-fix number.) **The fusion does not measurably change
+end-to-end throughput within this pipeline** — both versions cost about
+1.14–1.15x. This is not a wasted fix: it still cuts `validate_world_batch`
+from ~11 host↔device round trips to 1 (confirmed by code inspection and by
+the reviewer's isolated 1.48x measurement, which specifically isolated
+those syncs from other GPU work), and it removes the risk noted below of
+the two check lists drifting apart. But in the *full* pipeline, `torch`'s
+async CUDA queue means a sync mostly waits for already-queued kernels
+(model substeps, readout MLP) to finish rather than adding its own
+proportional cost — so with substantial other GPU work already queued
+every tick, going from ~11 syncs to 1 barely changes wall-clock time here.
+The reviewer's larger 1.48x number is real, but it is specific to calling
+`validate_world_batch` back-to-back with no other GPU work between calls
+(e.g. a validation-heavy inner loop), not to this training pipeline's
+per-tick cost. `validate=False` remains available for a rollout loop that
+already trusts its state and wants to skip the sync entirely.
 
 ## Hardening (this fix)
 
@@ -339,14 +391,27 @@ Two other review findings, both fixed alongside the batching work above:
 
 - **`validate_world_batch`** (`world.py`) ports TS `stepWorld`'s
   `validateStepState` guard (finite-value + clock-consistency checks) as a
-  batched, cheap `torch.isfinite(...).all()`-based check, run by default at
-  the start of every `step_world_batched` call (matching `stepWorld` always
-  calling `validateStepState`); pass `validate=False` to skip it in a
-  perf-critical rollout loop. See `tests/test_world_batch.py`'s
+  batched, cheap check, run by default at the start of every
+  `step_world_batched` call (matching `stepWorld` always calling
+  `validateStepState`); pass `validate=False` to skip it in a perf-critical
+  rollout loop. Every invariant is computed as an on-device boolean tensor
+  and reduced with a single fused `.any()` (one host sync in the common,
+  valid case) instead of ~11 sequential `if tensor.any():` syncs; see
+  "`validate_world_batch` host-sync fusion" above for the measured cost.
+  See `tests/test_world_batch.py`'s
   `test_validate_world_batch_*`/`test_step_world_batched_*` tests.
-- **`graph.load_graph_json`** now validates the loaded JSON (required keys,
-  array lengths against `neuronCount`/`edgeCount`, index bounds, finite
-  values, `presynapticOffsets`' CSR invariants) and raises
+- **`graph.load_graph_json`** validates the loaded JSON to parity with the
+  canonical validators (`docs/graph-format.md`'s "Validation a reader must
+  perform", `src/lib/connectome/format.ts`'s `validateGraph`,
+  `scripts/data/binfmt.py`'s `validate_graph`): required keys, array lengths
+  against `neuronCount`/`edgeCount`, `formatVersion` compatibility, index
+  bounds (including channel/population ranges), finite values,
+  `contactMagnitudes` finite-and-positive, `presynapticOffsets`' CSR
+  invariants (starts at 0, non-decreasing, ends at `edgeCount`), per-row
+  strictly-increasing `postsynapticIndices` (duplicate/out-of-order edge
+  rejection), `presynapticSigns` exactly ±1, and metadata semantic bounds
+  (`timestepSeconds > 0`, `leakRate >= 0`, `rateMin <= rateMax`,
+  `inputClampMin <= inputClampMax`, `globalGain >= 0`). Raises
   `InvalidGraphJsonError` (a `ValueError`, mirroring `scripts/data/binfmt.py`'s
   `InvalidGraphError` convention) naming the malformed field, instead of a
   bare `KeyError` at the load site or an opaque shape mismatch several
