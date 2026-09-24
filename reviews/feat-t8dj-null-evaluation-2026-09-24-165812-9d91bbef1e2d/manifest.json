@@ -1,0 +1,35 @@
+{
+  "schema_version": "review-v1",
+  "branch": "feat/t8dj-null-evaluation",
+  "base_ref": "main",
+  "head_sha": "9d91bbef1e2d94d36cdf5a577037348258077299",
+  "pass": true,
+  "reviewers": [
+    {"slug": "correctness-sentinel", "display_name": "Correctness Sentinel", "role": "Hunts for logic errors, race conditions, and determinism/correctness bugs in the sharded evaluation and statistics pipeline."},
+    {"slug": "maintainability-scout", "display_name": "Maintainability Scout", "role": "Independent second reviewer focused on subtle edge cases, implicit assumptions, and long-term maintainability."}
+  ],
+  "rounds": [
+    {
+      "round": 1,
+      "reviewed_sha": "9d91bbef1e2d94d36cdf5a577037348258077299",
+      "verdicts": { "correctness-sentinel": "REQUEST_CHANGES", "maintainability-scout": "REQUEST_CHANGES" },
+      "important_findings": { "correctness-sentinel": 6, "maintainability-scout": 9 },
+      "remediation_commit": "f482a64"
+    },
+    {
+      "round": 2,
+      "note": "Follow-up verification pass on the round-1 fix commit (f482a64) + data commit (57b8a33), not a full fresh review. Each reviewer independently found one new Important issue beyond confirming round 1's items were fixed.",
+      "verdicts": { "correctness-sentinel": "REQUEST_CHANGES", "maintainability-scout": "REQUEST_CHANGES" },
+      "new_findings": [
+        "Both reviewers independently found: null-evaluate.ts/null-report.ts derived a '<path>.run.json' sidecar path via `path.replace(/\\.json$/, '.run.json')`, which silently no-ops (returns the input unchanged) when the path doesn't end in '.json' -- for null-evaluate.ts this meant a non-.json --out would have the sidecar write overwrite the just-written authored.json. Fixed: both functions now throw on a non-.json input, and --out/--authored are validated to end in .json at parse time.",
+        "maintainability-scout: the manifest round-trip safety check ran only inside updateManifestWithRewiringNull (called after the artifact was already written), so a failed check left a new rewiring-null-v1.json on disk with no manifest entry. Fixed: the check is now a separate exported function (verifyManifestRoundTrips) run as a preflight before any write."
+      ],
+      "also_fixed_opportunistically": [
+        "Report-side finite-score guard in buildArtifact (defense in depth for a hand-edited authored.json, beyond the worker-side guard from round 1)",
+        "child.on('exit')'s cleanExit no longer treats code===0 as clean when a task was still inFlight",
+        "Stale doc comment claiming null-report.ts takes its own --shards flag unconditionally"
+      ]
+    }
+  ],
+  "final_state": "All Important findings from both rounds (2 reviewers x 2 rounds) addressed with code fixes and regression tests. Verified after the final round: npm run check (0 errors), npm run test:unit (488 passed, 1 skip), npm run build (clean), uv run --locked pytest tests_python (66 passed), null:evaluate+null:report rerun twice produces byte-identical public/data/rewiring-null-v1.json/docs/rewiring-null-report.md/manifest.json. No third AI review round was run on round 2's fixes; closed out via the automated verification above plus manual diffing of the regenerated artifacts."
+}
