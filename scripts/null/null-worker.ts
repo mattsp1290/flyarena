@@ -131,10 +131,33 @@ const graphFromTask = (task: NullWorkerTask, graphBinary: ArrayBuffer) => {
   return parseGraphBinary(modeBuffer);
 };
 
+/**
+ * `NullWorkerTask` crosses a `fork`/IPC boundary (`JSON.stringify`/
+ * `process.send`, per this file's own header comment) where TypeScript's
+ * compile-time typing doesn't protect the runtime value -- an IPC payload
+ * is just JSON on the wire. In practice every real task is built by
+ * `null-evaluate.ts`'s `buildTasks`, which only ever assigns a
+ * CLI-flag-validated `args.decoder`, so this isn't reachable through the
+ * shipped driver today -- but a stray/corrupted IPC payload must fail with
+ * an actionable error here rather than reaching `runEpisode`'s own generic
+ * `unknown decoder` throw with no task/graph context (a reviewer finding,
+ * still open from the prior review round's S7).
+ */
+const validateTaskDecoder = (decoder: unknown): NullDecoderKind | undefined => {
+  if (decoder === undefined) return undefined;
+  if (typeof decoder !== 'string' || !(NULL_DECODER_KINDS as readonly string[]).includes(decoder)) {
+    throw new Error(
+      `null-worker: task.decoder is not a recognized NullDecoderKind: ${JSON.stringify(decoder)} ` +
+        `(expected one of ${NULL_DECODER_KINDS.join(', ')}, or undefined)`
+    );
+  }
+  return decoder as NullDecoderKind;
+};
+
 const runTask = (task: NullWorkerTask): readonly NullSeedResult[] => {
   const graphBinary = loadVerifiedGraphBinary(task.path, task.expectedSha256);
   const graph = graphFromTask(task, graphBinary);
-  const decoder = task.decoder ?? 'authored';
+  const decoder = validateTaskDecoder(task.decoder) ?? 'authored';
 
   return task.heldOutSeeds.map((seed) => {
     const result = runEpisode({

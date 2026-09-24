@@ -62,15 +62,16 @@ import {
  * `authored-flip-thrust`/`authored-flip-yaw`/`authored-flip-both`: the
  * authored family's decoder-convention-check variants
  * (`.agents/plans/null-explanation/01-decoder-variants.md` WP1) — identical
- * to `authored` except that, after `runSubsteps`/`runLesionedSubsteps` fills
- * the raw `outputs` buffer and before `decodeAction`, the thrust and/or yaw
- * entries (`OUTPUT_POPULATION.thrust`/`.yaw`, `src/lib/arena/actions.ts`)
- * are negated. Brake is never flipped. These exist to test whether the
- * authored decoder's fixed sign convention (as opposed to the biological
- * connectome's topology) explains the rewiring-null study's below-null
- * biological score; they are not a claim about which convention is
- * "correct" and never change the shipped `decodeAction`/`aggregateOutputs`
- * path itself.
+ * to `authored` except that, after `runLesionedSubsteps` fills the raw
+ * `outputs` buffer (the only call site the flip is ever applied at — see
+ * `createNeuralRunner`'s `step`, below) and before `decodeAction`, the
+ * thrust and/or yaw entries (`OUTPUT_POPULATION.thrust`/`.yaw`,
+ * `src/lib/arena/actions.ts`) are negated. Brake is never flipped. These
+ * exist to test whether the authored decoder's fixed sign convention (as
+ * opposed to the biological connectome's topology) explains the
+ * rewiring-null study's below-null biological score; they are not a claim
+ * about which convention is "correct" and never change the shipped
+ * `decodeAction`/`aggregateOutputs` path itself.
  * `trained`: `readoutForward` on the real per-neuron output rates ->
  * `decodeAction`.
  * `silenced`: `readoutForward` fed an all-zero input vector every tick

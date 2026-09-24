@@ -5,8 +5,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { NullEvaluationRaw, NullGraphRaw } from '../../scripts/null/null-evaluate';
 import type { NullTrainedEvaluationRaw } from '../../scripts/null/null-trained-evaluate';
+import type { NullDecoderKind } from '../../scripts/null/null-worker';
 import {
-  CONDITION_LABELS,
   DEFAULT_MANIFEST,
   DEFAULT_OUT,
   DEFAULT_REPORT_MD,
@@ -18,6 +18,7 @@ import {
   verifyManifestRoundTrips,
   type NullReportArgs
 } from '../../scripts/null/null-report';
+import { CONDITION_LABELS } from '../../scripts/null/null-report-variant';
 
 /**
  * Coverage for `scripts/null/null-report.ts` — a dual-review pass on the
@@ -241,16 +242,30 @@ describe('buildArtifact', () => {
     expect(withTiming.timing).toEqual({ elapsedMs: 100, perEpisodeMs: 2 });
   });
 
-  it('defaults condition to the authored label when omitted', () => {
+  it('derives condition from raw.decoder, defaulting to the authored label when absent', () => {
     const artifact = buildArtifact(buildRaw(), args, runMeta);
     expect(artifact.condition).toBe('authored, opponent parked');
   });
 
-  it('takes condition as an explicit parameter for each decoder-variant label', () => {
+  it('derives condition from raw.decoder for each decoder-variant label, not a caller-threaded parameter', () => {
     for (const decoder of ['authored', 'authored-flip-thrust', 'authored-flip-yaw', 'authored-flip-both'] as const) {
-      const artifact = buildArtifact(buildRaw({ decoder }), args, runMeta, CONDITION_LABELS[decoder]);
+      const artifact = buildArtifact(buildRaw({ decoder }), args, runMeta);
       expect(artifact.condition).toBe(CONDITION_LABELS[decoder]);
     }
+  });
+
+  it('throws on an unrecognized raw.decoder rather than silently defaulting to the authored label', () => {
+    // Regression test for a thermo-maintainability finding: buildArtifact
+    // used to take `condition` as a separate parameter with a
+    // silently-wrong-if-forgotten default, so an unrecognized raw.decoder
+    // would never have been caught here at all (only by runNullReport's own,
+    // now-removed, duplicate validation). Deriving condition from raw.decoder
+    // internally means buildArtifact itself must reject this.
+    const raw: NullEvaluationRaw = {
+      ...buildRaw(),
+      decoder: 'authored-flip-brake' as unknown as NullDecoderKind
+    };
+    expect(() => buildArtifact(raw, args, runMeta)).toThrow(/unrecognized decoder/);
   });
 });
 

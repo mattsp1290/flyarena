@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
-import { basename, dirname, resolve, sep } from 'node:path';
+import { basename, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { requireNonNegativeInt, requirePositiveInt, requireValue } from '../training/cli';
@@ -16,9 +16,10 @@ import {
   type NullSummary
 } from './null-stats';
 import type { NullEvaluationRaw, NullGraphRaw } from './null-evaluate';
-import type { NullDecoderKind } from './null-worker';
 import { buildTrainedSection, renderTrainedSection, type TrainedSection } from './null-report-trained';
+import { guardVariantOutPath, resolveCondition, type RewiringNullCondition } from './null-report-variant';
 import type { NullTrainedEvaluationRaw } from './null-trained-evaluate';
+import type { NullDecoderKind } from './null-worker';
 
 /**
  * `.agents/plans/rewiring-null/02-authored-null-evaluation.md`'s
@@ -241,28 +242,6 @@ export interface RewiredEntry extends ScoredEntry {
   readonly attempts: number;
 }
 
-/**
- * Every condition `buildArtifact` can label a run with — the authored
- * condition (unchanged wording, so the shipped `rewiring-null-v1.json` stays
- * byte-identical) plus the three decoder-convention-check variants
- * (`.agents/plans/null-explanation/01-decoder-variants.md` WP1). See
- * `CONDITION_LABELS` for the `NullDecoderKind -> RewiringNullCondition`
- * mapping.
- */
-export type RewiringNullCondition =
-  | 'authored, opponent parked'
-  | 'authored (thrust flipped), opponent parked'
-  | 'authored (yaw flipped), opponent parked'
-  | 'authored (thrust and yaw flipped), opponent parked';
-
-/** `NullDecoderKind -> RewiringNullCondition`, the single source of truth `runNullReport` uses to pick `buildArtifact`'s `condition` argument from `raw.decoder`. */
-export const CONDITION_LABELS: Record<NullDecoderKind, RewiringNullCondition> = {
-  authored: 'authored, opponent parked',
-  'authored-flip-thrust': 'authored (thrust flipped), opponent parked',
-  'authored-flip-yaw': 'authored (yaw flipped), opponent parked',
-  'authored-flip-both': 'authored (thrust and yaw flipped), opponent parked'
-};
-
 export interface RewiringNullArtifact {
   readonly version: 1;
   readonly condition: RewiringNullCondition;
@@ -391,12 +370,20 @@ const sameSeeds = (a: readonly number[], b: readonly number[]): boolean =>
 export const buildArtifact = (
   raw: Readonly<NullEvaluationRaw>,
   args: Readonly<NullReportArgs>,
-  runMeta: Readonly<RunMeta>,
-  condition: RewiringNullCondition = 'authored, opponent parked'
+  runMeta: Readonly<RunMeta>
 ): RewiringNullArtifact => {
   if (raw.version !== 1) {
     throw new Error(`null-report: ${args.authored} has unsupported version ${String(raw.version)}, expected 1`);
   }
+  // Derived from raw.decoder itself (via null-report-variant.ts's
+  // resolveCondition), not threaded in by the caller -- a thermo-nuclear
+  // maintainability finding: an earlier version took `condition` as a
+  // separate parameter with a silently-wrong-if-forgotten default, so it
+  // could disagree with what `raw.decoder` actually says. Deriving it here
+  // makes that structurally impossible: a single source of truth instead of
+  // two places (this default and runNullReport's own validation) that had
+  // to agree.
+  const condition = resolveCondition(raw.decoder as NullDecoderKind | null | undefined, args.authored);
   if (!raw.biological || !raw.disconnected) {
     throw new Error(
       `null-report: ${args.authored} has no biological/disconnected section ` +
@@ -736,71 +723,32 @@ const verifySourceGraphMatchesManifest = (
   }
 };
 
-/**
- * `--variant-out` is otherwise unconstrained (see `runNullReport`'s variant
- * branch, which deliberately skips `guardShippedDefault`) -- without this
- * check, `--variant-out public/data/rewiring-null-v1.json` (or the report
- * markdown, the manifest, or even `--authored`'s own input file) would
- * silently overwrite a shipped/input path with a decoder-variant artifact, a
- * dual-review finding on this WP. `.json` is required for the same reason
- * `--out`/`--authored` require it elsewhere in this module: a caller that
- * strips a trailing `.json` for a sidecar path must never collide.
- */
-const guardVariantOutPath = (variantOut: string, authoredPath: string): void => {
-  if (!variantOut.endsWith('.json')) {
-    throw new Error(`null-report: --variant-out must end with ".json" (got "${variantOut}")`);
-  }
-  const resolved = resolve(variantOut);
-  const forbidden: readonly [string, string][] = [
-    [DEFAULT_OUT, 'the shipped published artifact'],
-    [DEFAULT_REPORT_MD, 'the shipped report markdown'],
-    [DEFAULT_MANIFEST, 'the shipped manifest'],
-    [authoredPath, 'its own --authored input']
-  ];
-  for (const [path, label] of forbidden) {
-    if (resolved === resolve(path)) {
-      throw new Error(`null-report: --variant-out must not resolve to ${label} (${path})`);
-    }
-  }
-  // Named-path checks above only ever catch the specific shipped files this
-  // module itself knows about; `public/` and `docs/` both hold other
-  // tracked, shipped JSON this study doesn't touch (trained-readout-v1.json,
-  // the ledger, positions, lab-benchmark.json, ...) that a copy-pasted or
-  // typo'd path could still land on, and a named list would never keep up
-  // with future shipped files anyway (a reviewer finding). Block the whole
-  // tree instead.
-  for (const shippedDir of [resolve(repoRoot, 'public'), resolve(repoRoot, 'docs')]) {
-    if (resolved === shippedDir || resolved.startsWith(shippedDir + sep)) {
-      throw new Error(`null-report: --variant-out must not be under ${shippedDir} (a shipped tree)`);
-    }
-  }
-};
-
 export const runNullReport = (args: Readonly<NullReportArgs>): RunNullReportResult => {
   const raw = JSON.parse(readFileSync(args.authored, 'utf8')) as NullEvaluationRaw;
   // Missing (or explicitly null, from a hand-edited/corrupted file) on any
   // authored.json produced before this field existed (see
   // NullEvaluationRaw.decoder's doc comment) -- treated as 'authored', the
-  // only value every such file could ever have meant. Anything else that
-  // isn't a recognized NullDecoderKind throws rather than silently producing
-  // a variant artifact with no `condition` (a dual-review finding).
+  // only value every such file could ever have meant. Only read here for
+  // the shipped-path gate immediately below -- validating it is a
+  // recognized NullDecoderKind (and deriving the published `condition`
+  // label from it) is now buildArtifact's job, via
+  // null-report-variant.ts's resolveCondition (a thermo-nuclear
+  // maintainability finding: this used to be duplicated in both places).
   const rawDecoder = raw.decoder as NullDecoderKind | null | undefined;
   const decoder: NullDecoderKind = rawDecoder ?? 'authored';
-  // Object.hasOwn (not `in`, which walks the prototype chain) -- a
-  // hand-edited/corrupted authored.json with `"decoder": "toString"` or
-  // `"constructor"` must be rejected as unrecognized, not silently resolve
-  // to a function inherited from Object.prototype (a reviewer finding).
-  if (!Object.hasOwn(CONDITION_LABELS, decoder)) {
-    throw new Error(`null-report: ${args.authored} has an unrecognized decoder "${String(decoder)}"`);
-  }
-  const condition = CONDITION_LABELS[decoder];
 
   // A new check alongside guardShippedDefault below (a dual-review-style
   // finding this WP predeclares): guardShippedDefault only looks at the
   // rewired count, so a non-authored run with a full 500-graph rewired
   // count would otherwise sail past it and overwrite the shipped authored
   // artifact with a decoder-variant condition. Checked before anything is
-  // read from `args.trained` or written anywhere.
+  // read from `args.trained` or written anywhere. Deliberately permissive
+  // about *unrecognized* decoder values here (any non-'authored' value
+  // requires --variant-out, recognized or not) -- resolveCondition (via
+  // buildArtifact, below) is what actually rejects an unrecognized value,
+  // so a bogus decoder with no --variant-out gets this actionable message
+  // first, and a bogus decoder with --variant-out still throws before any
+  // write.
   if (decoder !== 'authored' && !args.variantOut) {
     throw new Error(
       `null-report: ${args.authored} was scored with decoder "${decoder}", not "authored" -- pass ` +
@@ -808,10 +756,16 @@ export const runNullReport = (args: Readonly<NullReportArgs>): RunNullReportResu
         'to a shipped path (public/data/rewiring-null-v1.json, docs/rewiring-null-report.md, or the manifest).'
     );
   }
-  if (args.variantOut) guardVariantOutPath(args.variantOut, args.authored);
+  if (args.variantOut) {
+    guardVariantOutPath(args.variantOut, args.authored, {
+      out: DEFAULT_OUT,
+      reportMd: DEFAULT_REPORT_MD,
+      manifest: DEFAULT_MANIFEST
+    });
+  }
 
   const runMeta = resolveRunMeta(args);
-  const authoredArtifact = buildArtifact(raw, args, runMeta, condition);
+  const authoredArtifact = buildArtifact(raw, args, runMeta);
 
   // Variant mode: write only the built artifact to --variant-out, and never
   // merge in a --trained section -- that section describes the *trained*

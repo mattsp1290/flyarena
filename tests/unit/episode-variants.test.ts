@@ -104,28 +104,42 @@ describe('runEpisode: authored-flip-* decoder variants', () => {
   });
 
   it('the flip step never touches the brake entry: only OUTPUT_POPULATION.thrust/yaw are negated', () => {
-    // Direct check of the transform itself (independent of any particular
-    // graph/seed/tick's raw output values), against the same
-    // OUTPUT_POPULATION indices episode.ts's flip logic uses.
+    // Real check through runEpisode's own decoded output, not a hand-rolled
+    // local replica that can never fail regardless of what episode.ts
+    // actually does (a thermo-maintainability review finding on this test's
+    // prior form, which only asserted against a `Float32Array.from(rawOutputs)`
+    // copy it built itself). At tick 0 every decoder shares the same initial
+    // world/state/observation (createModelState starts at zero, and the
+    // decoder-family runners haven't diverged yet), so `runLesionedSubsteps`
+    // produces identical raw outputs across all four decoders before any
+    // flip is applied -- if the flip logic ever touched
+    // OUTPUT_POPULATION.brake, this would catch it via runEpisode's real
+    // onTick hook (`scripts/training/episode.ts`'s `EpisodeConfig.onTick`),
+    // not a re-implementation of the transform under test.
     const graph = createTraceGraph();
-    const world = createWorld(5);
-    const state = createModelState(graph);
-    const scratch = createStepScratch(graph);
-    const rawOutputs = createOutputBuffer(graph);
-    const observation = observeAgent(world, 'left');
-    runSubsteps(graph, state, scratch, observation, TRACE_SUBSTEPS, rawOutputs);
-    const brakeBefore = rawOutputs[OUTPUT_POPULATION.brake];
-    expect(brakeBefore).not.toBe(0); // meaningless if brake happens to already be zero here
+    const seed = 5;
 
-    for (const [flipThrust, flipYaw] of [
-      [true, false],
-      [false, true],
-      [true, true]
-    ] as const) {
-      const outputs = Float32Array.from(rawOutputs);
-      if (flipThrust) outputs[OUTPUT_POPULATION.thrust] *= -1;
-      if (flipYaw) outputs[OUTPUT_POPULATION.yaw] *= -1;
-      expect(outputs[OUTPUT_POPULATION.brake]).toBe(brakeBefore);
+    const decodedBrakeAtTickZero = (decoder: EpisodeDecoderKind): number => {
+      let brake: number | undefined;
+      runEpisode({
+        seed,
+        ticks: 1,
+        substeps: TRACE_SUBSTEPS,
+        left: { decoder, graph },
+        right: { decoder: 'parked' },
+        onTick: (tick, actions) => {
+          if (tick === 0) brake = actions.left.brake;
+        }
+      });
+      if (brake === undefined) throw new Error('onTick never fired');
+      return brake;
+    };
+
+    const authoredBrake = decodedBrakeAtTickZero('authored');
+    expect(authoredBrake).not.toBe(0); // meaningless if brake happens to already be zero here
+
+    for (const decoder of ['authored-flip-thrust', 'authored-flip-yaw', 'authored-flip-both'] as const) {
+      expect(decodedBrakeAtTickZero(decoder)).toBe(authoredBrake);
     }
   });
 
