@@ -1,6 +1,6 @@
 # FlyArena
 
-A client-only 3D Connectome Arena proof of concept: a reproducible 90-second arena experiment comparing a pinned, measured MaleCNS-derived connectome against seeded degree-preserving and disconnected controls, with a closed-loop simulation/render pipeline, an inspectable model ledger, and browser/CI/performance gates.
+A connectome experiment workbench with a default client-only 3D arena: a reproducible 90-second arena experiment comparing a pinned, measured MaleCNS-derived connectome against seeded degree-preserving and disconnected controls, with a closed-loop simulation/render pipeline, an inspectable model ledger, and browser/CI/performance gates.
 
 ## Requirements
 
@@ -14,7 +14,44 @@ npm ci
 npm run dev
 ```
 
-Vite prints the local development URL. No backend, credentials, database, or runtime service is required.
+Vite prints the local development URL. The arena and counterfactual workbench require no backend or credentials. The optional DGX sandbox uses a separate local Python service.
+
+## Counterfactual workbench
+
+Open **Counterfactual workbench** in the navigation, or choose **Probe this setup**
+from the arena. Fork identical world and neural state, persistently silence one
+model group, and compare baseline, sham and silenced futures across matched seeds.
+The authored decoder and zero-action opponent are explicit. Play or scrub the
+paired replay, inspect per-seed differences, and export reproducible evidence.
+
+```bash
+npm run experiment:counterfactual -- --seed 17 --output /tmp/counterfactual.json
+npm run experiment:counterfactual -- --verify /tmp/counterfactual.json
+# Explicit diagnostic for browser/Node floating-point differences:
+npm run experiment:counterfactual -- --compare-numerical /tmp/counterfactual.json
+```
+
+See [experiment contract](docs/counterfactual-workbench.md). Measured topology does
+not make the authored intervention a biological causal finding.
+
+## Optional DGX synthetic sandbox
+
+The **DGX sandbox** trains a separate authored 64-unit circuit on synthetic
+foraging worlds. Its physics, weights, and score units differ from the arena.
+On ARM64 GB10 with Docker and NVIDIA Container Toolkit:
+
+```bash
+./scripts/lab.sh --build
+export LAB_TOKEN=$(openssl rand -hex 24)
+./scripts/lab.sh --cuda
+```
+
+Enter the token and `http://127.0.0.1:8765` in the sandbox. `--cpu` starts the
+reference backend without GPU access. `LAB_PORT`, `LAB_CONTAINER_NAME` and
+`LAB_ORIGINS` configure a separate local instance. Navigation retains the job and
+result; reloading closes the page's tracking session. Tokens remain in memory.
+See [sandbox model contract](docs/counterfactual-lab.md) and the deployment guide
+for offline packaging. The large ARM64 runtime image is pinned by digest.
 
 ## Verification
 
@@ -22,6 +59,7 @@ Vite prints the local development URL. No backend, credentials, database, or run
 npm test -- --run
 npm run check
 npm run build
+npm run test:subpath
 ```
 
 The production build is written to `dist/`.
@@ -69,6 +107,19 @@ production build, the Playwright suite (against a fresh Chromium install),
 `uv run pytest tests_python` (fixture data only, no downloads), an `npm
 audit` report, and a dependency license report, on every push to `main` and
 every pull request.
+
+### Optional GPU integration tests
+
+With a separately started local backend, run:
+
+```bash
+LAB_TEST_TOKEN="$LAB_TOKEN" LAB_TEST_DEVICE=cuda npm run test:e2e -- tests/e2e/lab.spec.ts
+```
+
+Set `LAB_TEST_URL` for an alternate loopback port. The default web CI skips only
+the optional live-backend tests; counterfactual browser coverage uses real graph
+artifacts and runs without a server. `npm run test:subpath` serves the production
+build only under `/fly/` to catch root-relative asset regressions.
 
 ## Deployment
 

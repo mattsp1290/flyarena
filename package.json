@@ -17,7 +17,9 @@
     "training:traces": "tsx scripts/training/export-traces.ts",
     "training:export-arms": "tsx scripts/training/export-arms.ts",
     "training:evaluate": "tsx scripts/training/evaluate.ts",
-    "experiment:seed-sweep": "tsx scripts/experiments/seed-sweep.ts"
+    "experiment:seed-sweep": "tsx scripts/experiments/seed-sweep.ts",
+    "experiment:counterfactual": "tsx scripts/experiments/counterfactual.ts",
+    "test:subpath": "playwright test --config playwright.subpath.config.ts"
   },
   "dependencies": {
     "svelte": "^5.57.1",

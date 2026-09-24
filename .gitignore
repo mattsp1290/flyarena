@@ -33,3 +33,8 @@ training/runs/
 # data, regenerable on demand (npm run experiment:seed-sweep); only the
 # small hand-written summary at docs/seed-sweep.md is committed.
 scripts/experiments/out/
+
+# Optional DGX sandbox runtime and local evidence
+*.egg-info/
+backend/build/
+lab-results/

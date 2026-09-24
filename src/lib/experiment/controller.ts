@@ -125,7 +125,7 @@ export class ExperimentController {
     const load = this.options.loadArtifacts ?? loadArenaArtifacts;
     let artifacts: LoadedArenaArtifacts;
     try {
-      artifacts = await load();
+      artifacts = await load(`${import.meta.env.BASE_URL}data`);
     } catch (error) {
       if (this.destroyed) return;
       this.options.callbacks.onError(error instanceof Error ? error.message : String(error));

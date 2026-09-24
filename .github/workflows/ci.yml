@@ -58,6 +58,9 @@ jobs:
       - name: Browser smoke/controls/determinism/performance suite (Playwright)
         run: npm run test:e2e
 
+      - name: Strict subpath deployment journey
+        run: npm run test:subpath
+
       - name: Upload Playwright report and failure traces/screenshots
         if: always()
         uses: actions/upload-artifact@v7

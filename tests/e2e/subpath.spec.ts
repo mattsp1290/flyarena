@@ -1,0 +1,21 @@
+import { expect, test } from '@playwright/test';
+test('all views work beneath /fly/ with root asset routes deliberately unavailable',async({page,request})=>{
+  expect((await request.get('/data/malecns-arena-v1.manifest.json')).status()).toBe(404);
+  const failed:string[]=[];const errors:string[]=[];
+  page.on('response',r=>{if(r.status()>=400)failed.push(r.url());});page.on('pageerror',e=>errors.push(e.message));
+  await page.goto('/fly/');await expect(page.getByRole('status')).toHaveText('ready');
+  const manifest=page.getByRole('link',{name:'Compiled artifact manifest (JSON)'});
+  await expect(manifest).toHaveAttribute('href','/fly/data/malecns-arena-v1.manifest.json');
+  await page.getByRole('link',{name:'02 Counterfactual workbench',exact:true}).click();
+  await expect(page.getByRole('status')).toHaveText('ready');
+  await page.getByRole('button',{name:'Use quick probe settings'}).click();
+  await page.getByRole('button',{name:'Fork & compare →'}).click();
+  await expect(page.getByRole('status')).toHaveText('completed');
+  await page.getByRole('link',{name:/03 DGX sandbox/}).click();
+  await expect(page.getByLabel('Access token')).toBeVisible();
+  await page.setViewportSize({width:390,height:844});
+  expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+  await page.getByRole('link',{name:'01 Arena',exact:true}).click();
+  await expect(page.getByRole('status')).toHaveText('ready');
+  expect(errors).toEqual([]);expect(failed).toEqual([]);
+});

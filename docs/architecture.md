@@ -1,14 +1,15 @@
 # Architecture
 
-FlyArena is a client-only static Svelte application. Vite builds the application into `dist/`; there is no server, account system, multiplayer service, training service, database, or claim of full biomechanical fly simulation.
+FlyArena builds a static Svelte application into `dist/`. The default arena and counterfactual workbench run entirely in the browser. An optional DGX sandbox uses a separate bounded Python training service for a distinct synthetic model. There is no account system, multiplayer service, database, or claim of full biomechanical fly simulation.
 
 ## Component boundaries
 
-- **Application shell (`src/App.svelte`)** owns layout, the accessible regions for the arena, experiment controls, telemetry, and model ledger, asset loading/hash verification, Worker lifecycle (one dedicated Worker per arm), and the render loop. It contains no simulation or neural logic of its own — it wires `src/lib/experiment/runner.ts` to the renderer and the UI panels.
+- **Navigation shell (`src/Shell.svelte`)** selects hash-based arena/workbench/sandbox views and lazy-loads optional components. It disposes arena and counterfactual computation on navigation; after its first visit the sandbox stays mounted but hidden so it can track an active GPU job.
+- **Arena view (`src/App.svelte`)** owns layout, the accessible regions for the arena, experiment controls, telemetry, and model ledger, asset loading/hash verification, Worker lifecycle (one dedicated Worker per arm), and the render loop. It contains no simulation or neural logic of its own — it wires `src/lib/experiment/runner.ts` to the renderer and the UI panels.
 - **Arena model (`src/lib/arena/`)** owns deterministic plain-data world state, observations, decoded actions, and replay snapshots. It does not depend on Three.js or DOM APIs.
 - **Connectome model (`src/lib/connectome/`)** owns graph parsing, the synchronous CPU oracle, the disconnected-topology transform (`format.ts#createDisconnectedGraph`), and compact neural telemetry.
 - **Worker boundary (`src/lib/worker/`)** runs neural steps away from the main thread through a versioned message protocol (`protocol.ts`, `neural.worker.ts`) and a Promise-based RPC client (`client.ts`) that matches responses to callers by `requestId`.
-- **Experiment orchestration (`src/lib/experiment/`)** owns the closed-loop tick pipeline (`runner.ts`), the explicit state machine (`state.ts`), artifact fetch/gunzip/hash verification (`assets.ts`), and the CPU-oracle/Worker-client adapters that satisfy the runner's step-function interface (`bindings.ts`). This is the only layer that calls `stepWorld`; the renderer never does.
+- **Experiment orchestration (`src/lib/experiment/`)** owns the closed-loop tick pipeline (`runner.ts`), the explicit state machine (`state.ts`), artifact fetch/gunzip/hash verification (`assets.ts`), and the CPU-oracle/Worker-client adapters that satisfy the runner's step-function interface (`bindings.ts`). The causal engine and headless evaluators also call the same `stepWorld`; the renderer never does.
 - **Renderer (`src/lib/render/`)** treats interpolated arena snapshots (`ArenaSnapshot`) as read-only presentation data — `ArenaScene.update()` never mutates its input and holds no reference back into `arena/world.ts` state beyond the snapshot it was last handed. Camera/`OrbitControls` state and frame timing are local to the renderer and have no path back into observations or the physics step. Visual-only food-pickup/hazard-contact effects are derived by diffing consecutive snapshots (e.g. `FoodState.respawns`) purely for decoration; they are never scored and may not line up frame-for-frame with the simulation's own scoring. The two agents' fixed shape/label identity (`BIO` = left, icosahedron; `REWIRED` = right, octahedron+wireframe) is a renderer-level visual identifier, independent of which topology is actually selected for that arm — see `docs/model-ledger.md`.
 - **UI panels (`src/lib/ui/`)** — `ExperimentPanel.svelte` (Start/Pause/Reset, seed, per-agent topology selectors, replay download), `TelemetryPanel.svelte` (read-only live telemetry), and `LedgerPanel.svelte` (the model ledger vocabulary plus provenance links) — issue explicit experiment commands and present telemetry/provenance without bypassing the declared model contracts.
 
@@ -39,3 +40,20 @@ The authoritative golden-trace fixtures (`tests/fixtures/golden/`) and evaluator
 ## Current scope
 
 Work packages 1–7 of the 3D Connectome Arena POC plan are implemented: the static shell, the deterministic arena simulation core, the sparse neural oracle and Worker runtime, the pinned MaleCNS artifact and rewired control, the read-only Three.js renderer, the closed-loop experiment described above, and browser/CI/performance gates (`tests/e2e/arena.spec.ts`, `.github/workflows/ci.yml`, `scripts/experiments/seed-sweep.ts`, `docs/seed-sweep.md`). `App.svelte`'s previous scripted placeholder motion loop has been removed; the closed-loop `ExperimentRunner` now drives every run. Vercel deployment (work package 8) belongs to a later Beans work package.
+
+## Counterfactual workbench and DGX sandbox
+
+`src/lib/counterfactual/engine.ts` forks complete deterministic world/neural state
+and runs baseline, sham and persistent silencing using the canonical arena and
+connectome functions. Its dedicated Worker owns graph loading and simulation;
+the client owns deadlines and termination. No live neural Worker protocol or
+training artifact schema is changed. The evidence schema is distinct from arena
+replay and synthetic lab exports. See [contract](counterfactual-workbench.md).
+
+`src/lib/lab/` talks only to an explicitly configured sandbox backend.
+`backend/flyarena_lab/` owns its separate PyTorch model and bounded, authenticated
+single-job API. Its scoped styles cannot change arena presentation. The backend
+launcher binds to loopback by default; no backend request or credential is needed
+by the default arena or causal workbench. A hidden sandbox retains polling and
+result identity; full component destruction best-effort cancels a known active
+job before aborting polling. Browser termination cannot guarantee cancellation.

@@ -19,7 +19,7 @@ Carry forward the user's confirmed context from the original counterfactual-lab 
 ## Outcome and scope
 Add a browser counterfactual workbench to the real connectome arena: warm up a seeded episode, fork the complete world and neural state, then compare baseline, sham, and a persistently silenced circuit group. Show paired post-fork effects and synchronized separate-world replay. Put this and the existing DGX synthetic lab in one navigable app, with the existing arena as the default landing view.
 
-Change type: additive experiment capability and integration of an existing branch. Affected areas: new browser experiment engine/Worker/UI, entry-point navigation, a small arena handoff, imported DGX backend/UI, offline packaging and documentation. The plan ends with a branch tested against current main and a documented merge gate, not an automatic merge into another agent's occupied checkout.
+Change type: additive experiment capability and integration of an existing branch. Affected areas: new browser experiment engine/Worker/UI, entry-point navigation, a small arena handoff, imported DGX backend/UI, offline packaging and documentation. The plan ends with a branch tested against current main and a documented merge gate, a reviewed merge to main as explicitly requested after planning.
 
 ## Repository evidence and complementary work
 Grounding snapshot: main `69cb9ed`; original lab `26c422f`. Implementation worktree is on `feat/counterfactual-workbench`, created from main. Resolve worktree locations with `git worktree list`; do not hard-code developer filesystem paths in code.
@@ -36,7 +36,7 @@ Verified interfaces: `src/lib/arena/world.ts` exports deterministic `createWorld
 3. Study one chosen topology and one target group per run across matched seeds. Fork after warmup, with the right agent receiving zero action. Copy RNG, contacts, scores, neural rates and all other world state. Measure subsequent score increments. This is a replayable seeded setup, not a snapshot of the currently playing two-agent episode.
 4. Authored decoder only in this milestone. Label this next to controls and in every export. Main's upcoming trained toggle remains independent. Do not silently interpret trained state as authored state in a handoff.
 5. Retain the synthetic DGX backend's existing bounded service and verified CUDA runtime. No attempt to compare the 64-unit synthetic model's scores to MaleCNS arena scores, share weight schemas, or imply shared physics.
-6. Develop and track locally. Beans is read-only planning input; do not create/claim issues or publish this plan there. Never run deployment or change existing services. Only offline backend packaging through `scripts/deploy.sh` is in scope.
+6. Develop and track locally. Beans is read-only planning input; do not create/claim issues or publish this plan there. Do not deploy during development or disturb existing services. The user subsequently authorized `scripts/deploy.sh` after all work is merged to main.
 
 ## Success criteria
 - Main's arena still starts at the default URL and passes its full existing correctness, lifecycle, asset-integrity, and browser performance suites.
@@ -49,9 +49,9 @@ Verified interfaces: `src/lib/arena/world.ts` exports deterministic `createWorld
 ## Risks and non-goals
 A group may have no effect under the authored decoder. Report that honestly, with a sham and positive-control fixture; do not tune on the displayed seeds to manufacture an effect. Groups derive from authored input/output mappings, not anatomical regions. A parked agent still participates in world physics; label it as receiving zero action, not immovable. Matched RNG state is guaranteed at the fork; food placement can diverge after different contacts, so do not claim identical exogenous trajectories after intervention.
 
-No public endpoint, deployment, main-branch merge, graph regeneration, null study, anatomical view, new model training, trained-readout adapter, live-arena state capture, arbitrary neuron editor or cross-model statistical comparison. No external repository capability is needed; all owners/consumers are in FlyArena.
+No new public backend endpoint, graph regeneration, null study, anatomical view, new model training, trained-readout adapter, live-arena state capture, arbitrary neuron editor or cross-model statistical comparison. No external repository capability is needed; all owners/consumers are in FlyArena.
 
-Remaining decisions: optional user preference for emphasizing backend integration versus the proposed workbench is non-blocking; default to the workbench. Performance bounds may be reduced only if measured responsiveness requires it, while preserving matched controls and multiple seeds. Coordinate changes through fresh main inspection rather than editing another agent's files.
+The user selected the integrated workbench and later authorized scope expansion, required the live Cursor thermonuclear review and merge of all our work to main, and permitted deployment from main afterward. Performance bounds may be reduced only if measured responsiveness requires it, while preserving matched controls and multiple seeds. Coordinate changes through fresh main inspection rather than editing another agent's files.
 
 ## Document map
 - [01-integration.md](01-integration.md): preserve main, import sandbox, navigation and packaging.

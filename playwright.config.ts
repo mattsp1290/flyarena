@@ -2,6 +2,7 @@ import { defineConfig } from '@playwright/test';
 
 export default defineConfig({
   testDir: './tests/e2e',
+  testIgnore: '**/subpath.spec.ts',
   fullyParallel: true,
   forbidOnly: Boolean(process.env.CI),
   // A second dual-review pass (round 2) caught that scoping
