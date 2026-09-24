@@ -136,6 +136,21 @@ export const verifyAndDecompressArtifact = async (
   return binary;
 };
 
+/**
+ * The manifest's `positions` entry (WP1), describing the soma-position
+ * sidecar artifact (`malecns-arena-v1.positions.json`) built from the pinned
+ * MaleCNS annotations — never from the compiler, so the graph artifacts'
+ * bytes/hashes stay untouched. Optional on `ArenaManifest`: a manifest
+ * produced before WP1 (or a hand-built test fixture) simply has no
+ * anatomical activity view to offer — `loadPositions` below reports that as
+ * `status: 'missing'` rather than throwing.
+ */
+export interface PositionsManifestEntry {
+  artifact: string;
+  sha256: string;
+  coverage: { soma: number; tosoma: number; none: number };
+}
+
 export interface ArenaManifest {
   artifact: string;
   binaryBytes: number;
@@ -148,6 +163,8 @@ export interface ArenaManifest {
   license: string;
   neuronCount: number;
   outputPopulationCount: number;
+  /** WP1's soma-position sidecar entry; see `PositionsManifestEntry`. */
+  positions?: PositionsManifestEntry;
   sourceDataset: string;
   rewiredArms: Record<
     string,
@@ -188,7 +205,8 @@ const fetchJson = async <T>(url: string): Promise<T> => {
   return (await response.json()) as T;
 };
 
-const fetchArrayBuffer = async (url: string): Promise<ArrayBuffer> => {
+/** Exported for `loadPositions` below (it independently re-fetches the biological graph artifact for its own cross-check — see that function's doc comment) and for tests. */
+export const fetchArrayBuffer = async (url: string): Promise<ArrayBuffer> => {
   const response = await fetch(url);
   if (!response.ok) throw new Error(`Failed to fetch ${url}: ${response.status} ${response.statusText}`);
   return response.arrayBuffer();
@@ -286,4 +304,204 @@ export const loadArenaArtifacts = async (
   }
 
   return { manifest, biological, rewired };
+};
+
+/**
+ * Per-neuron soma-position sidecar (WP1's `scripts/data/positions.py`
+ * output, `malecns-arena-v1.positions.json`). `xyz[i]` is `null` exactly
+ * when `positionSource[i] === 'none'` (no annotated coordinate for that
+ * neuron — never fabricated); `bodyIds` is the MaleCNS body ID for neuron
+ * `i` as a decimal string, in the same order as the compiled graph's
+ * `biologicalIds` (verified by `loadPositions` below, not merely assumed).
+ */
+export interface PositionsArtifact {
+  version: number;
+  sourceFile: string;
+  sourceSha256: string;
+  /** sha256 of the compiled biological graph's *gzip* bytes this artifact was built against — matches `ArenaManifest.gzipSha256` when the two are in sync (see `loadPositions`'s cross-check). */
+  graphSha256: string;
+  /** Always the literal string "dataset voxel units (unverified)" as of WP1 — the view must never claim a verified physical unit. */
+  units: string;
+  bodyIds: readonly string[];
+  positionSource: readonly ('soma' | 'tosoma' | 'none')[];
+  role: readonly ('sensory' | 'bridge' | 'descending')[];
+  xyz: ReadonlyArray<readonly [number, number, number] | null>;
+  coverage: { soma: number; tosoma: number; none: number };
+  roleCounts: { sensory: number; bridge: number; descending: number };
+}
+
+export type PositionsLoadResult =
+  | { status: 'ok'; positions: PositionsArtifact; rateMin: number; rateMax: number }
+  | { status: 'missing'; reason: string }
+  | { status: 'invalid'; reason: string };
+
+const isFiniteTriple = (value: unknown): value is readonly [number, number, number] =>
+  Array.isArray(value) &&
+  value.length === 3 &&
+  value.every((component) => typeof component === 'number' && Number.isFinite(component));
+
+/**
+ * Fetch, hash-verify, and structurally validate the soma-position sidecar
+ * artifact the manifest declares (`manifest.positions`), then cross-check it
+ * against the real compiled biological graph. Never throws: every failure
+ * mode is a returned `status`, so a caller (`App.svelte`) can disable the
+ * activity view's toggle with an honest reason instead of failing the whole
+ * experiment (positions are optional presentation, unlike the graph
+ * artifacts `loadArenaArtifacts` gates Start on).
+ *
+ * `dataBaseUrl` must be the same value the caller passes to
+ * `loadArenaArtifacts` (`${import.meta.env.BASE_URL}data` in production) so
+ * both the positions artifact and the graph re-fetch below resolve under the
+ * app's real deployment base path (e.g. `/fly/`), not a hardcoded `/data`.
+ *
+ * Three layers of integrity, all required for `status: 'ok'`:
+ * 1. `manifest.positions.sha256` against the fetched bytes' own sha256 —
+ *    proves this is exactly the file the manifest names, byte for byte.
+ * 2. `positions.graphSha256` against `manifest.gzipSha256` — proves this
+ *    positions file was built against *this* compiled graph artifact, not a
+ *    stale one left over from an earlier compiler run.
+ * 3. `positions.bodyIds` (as decimal strings) against the graph's own
+ *    `biologicalIds`, element-by-element — the plan's own required check
+ *    that this artifact's per-index neuron identity actually lines up with
+ *    the graph's. This needs the *parsed* graph, which `assets.ts` does not
+ *    otherwise retain past `loadArenaArtifacts` returning — re-fetching and
+ *    re-parsing it here (reusing `verifyAndDecompressArtifact`/
+ *    `parseGraphBinary`, the same functions `loadArenaArtifacts` uses) is a
+ *    second network round trip for the same URL `loadArenaArtifacts` already
+ *    fetched, but it happens once, only when the activity view is offered
+ *    (not per frame), and the browser's own HTTP cache serves the repeat
+ *    request in practice. It also yields `graph.metadata.rateMin`/`rateMax`,
+ *    the declared dynamics bounds the activity view's colormap is scaled
+ *    against (never a per-frame auto-normalized range — see the plan's
+ *    "Color" decision) — returned alongside `positions` on success so no
+ *    third fetch/parse is needed just for those two numbers.
+ */
+export const loadPositions = async (manifest: ArenaManifest, dataBaseUrl: string): Promise<PositionsLoadResult> => {
+  const entry = manifest.positions;
+  if (!entry) {
+    return { status: 'missing', reason: 'The manifest has no positions artifact entry.' };
+  }
+
+  let rawBytes: ArrayBuffer;
+  try {
+    rawBytes = await fetchArrayBuffer(`${dataBaseUrl}/${entry.artifact}`);
+  } catch (error) {
+    return { status: 'missing', reason: error instanceof Error ? error.message : String(error) };
+  }
+
+  const rawHash = await sha256Hex(rawBytes);
+  if (rawHash !== entry.sha256) {
+    return {
+      status: 'invalid',
+      reason: `positions artifact sha256 ${rawHash} does not match the manifest (${entry.sha256})`
+    };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(new TextDecoder().decode(rawBytes));
+  } catch (error) {
+    return {
+      status: 'invalid',
+      reason: `positions artifact is not valid JSON: ${error instanceof Error ? error.message : String(error)}`
+    };
+  }
+
+  const positions = parsed as Partial<PositionsArtifact>;
+  if (
+    !Array.isArray(positions.bodyIds) ||
+    !Array.isArray(positions.xyz) ||
+    !Array.isArray(positions.positionSource) ||
+    !Array.isArray(positions.role) ||
+    typeof positions.graphSha256 !== 'string'
+  ) {
+    return { status: 'invalid', reason: 'positions artifact is missing one or more required fields' };
+  }
+
+  const { neuronCount } = manifest;
+  if (
+    positions.bodyIds.length !== neuronCount ||
+    positions.xyz.length !== neuronCount ||
+    positions.positionSource.length !== neuronCount ||
+    positions.role.length !== neuronCount
+  ) {
+    return {
+      status: 'invalid',
+      reason: `positions arrays do not all have length ${neuronCount} (the manifest's neuronCount)`
+    };
+  }
+
+  for (let index = 0; index < neuronCount; index += 1) {
+    const source = positions.positionSource[index];
+    const point = positions.xyz[index];
+    if (source !== 'soma' && source !== 'tosoma' && source !== 'none') {
+      return { status: 'invalid', reason: `positionSource[${index}] "${String(source)}" is not soma/tosoma/none` };
+    }
+    // Never invented: a "none" entry must carry no coordinate, and every
+    // other entry must carry a real, finite one — this is the one runtime
+    // check standing directly between a build-time bug and the view
+    // silently plotting a fabricated position.
+    if (source === 'none') {
+      if (point !== null) {
+        return { status: 'invalid', reason: `xyz[${index}] is non-null but positionSource is "none"` };
+      }
+    } else if (!isFiniteTriple(point)) {
+      return { status: 'invalid', reason: `xyz[${index}] is missing/malformed for positionSource "${source}"` };
+    }
+    const role = positions.role[index];
+    if (role !== 'sensory' && role !== 'bridge' && role !== 'descending') {
+      return { status: 'invalid', reason: `role[${index}] "${String(role)}" is not sensory/bridge/descending` };
+    }
+  }
+
+  if (positions.graphSha256 !== manifest.gzipSha256) {
+    return {
+      status: 'invalid',
+      reason: 'positions.graphSha256 does not match the manifest’s compiled graph gzip sha256 (stale positions artifact)'
+    };
+  }
+
+  let graphGzip: ArrayBuffer;
+  try {
+    graphGzip = await fetchArrayBuffer(`${dataBaseUrl}/${manifest.artifact}`);
+  } catch (error) {
+    return {
+      status: 'invalid',
+      reason: `could not re-fetch the biological graph for the positions cross-check: ${error instanceof Error ? error.message : String(error)}`
+    };
+  }
+
+  let graphBinary: ArrayBuffer;
+  let graph: ReturnType<typeof parseGraphBinary>;
+  try {
+    graphBinary = await verifyAndDecompressArtifact(graphGzip, manifest);
+    graph = parseGraphBinary(graphBinary.slice(0));
+  } catch (error) {
+    return {
+      status: 'invalid',
+      reason: `biological graph re-verification failed during the positions cross-check: ${error instanceof Error ? error.message : String(error)}`
+    };
+  }
+
+  if (graph.biologicalIds.length !== neuronCount) {
+    return {
+      status: 'invalid',
+      reason: `graph biologicalIds length ${graph.biologicalIds.length} does not match neuronCount ${neuronCount}`
+    };
+  }
+  for (let index = 0; index < neuronCount; index += 1) {
+    if (positions.bodyIds[index] !== graph.biologicalIds[index].toString()) {
+      return {
+        status: 'invalid',
+        reason: `bodyIds[${index}] "${positions.bodyIds[index]}" does not match the graph's biologicalIds[${index}] "${graph.biologicalIds[index].toString()}"`
+      };
+    }
+  }
+
+  return {
+    status: 'ok',
+    positions: positions as PositionsArtifact,
+    rateMin: graph.metadata.rateMin,
+    rateMax: graph.metadata.rateMax
+  };
 };

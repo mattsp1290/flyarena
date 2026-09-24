@@ -89,6 +89,42 @@ const waitForTick = (page: Page, minTick: number): Promise<unknown> =>
     { timeout: 20_000, polling: 'raf' }
   );
 
+/**
+ * WP3: the anatomical activity view's single collapse/expand toggle (one
+ * `<button>` inside `ActivityPanel`'s own `section.activity` root — its
+ * accessible name switches between "Expand"/"Collapse" with the panel's
+ * open state, so this locates it structurally rather than by name).
+ */
+const activityToggle = (page: Page) => page.locator('section.activity button');
+const activityCanvas = (page: Page) => page.getByLabel('Neural activity at soma positions');
+
+/** Expands the activity panel and waits for it to actually be open (real positions loaded and verified, not just clicked). */
+const expandActivityPanel = async (page: Page): Promise<void> => {
+  await expect(activityToggle(page)).toBeEnabled({ timeout: 20_000 });
+  await activityToggle(page).click();
+  await expect(activityToggle(page)).toHaveText(/collapse/i);
+  await expect(activityCanvas(page)).toBeVisible();
+};
+
+/**
+ * Proof the activity scene is actually receiving and drawing fresh rates —
+ * not just that the canvas element exists — mirroring `waitForRendererUp`'s
+ * own "don't just check for the absence of a failure" discipline. `left`'s
+ * `data-last-update-tick-left` debug attribute (set by `ActivityPanel`) only
+ * advances once `runner.getLatestRates('left')` has actually returned a
+ * fresh array and `ActivityScene#update` was called with it.
+ */
+const waitForActivityUpdateTick = (page: Page, agent: 'left' | 'right', minTick: number): Promise<unknown> =>
+  page.waitForFunction(
+    ({ attr, n }) => {
+      const canvas = document.querySelector(`canvas[aria-label="Neural activity at soma positions"]`);
+      const value = canvas?.getAttribute(attr);
+      return Boolean(value && Number(value) >= n);
+    },
+    { attr: `data-last-update-tick-${agent}`, n: minTick },
+    { timeout: 20_000, polling: 'raf' }
+  );
+
 interface DownloadedReplay {
   schemaVersion: 1;
   seed: number;
@@ -299,6 +335,280 @@ test.describe('model ledger and provenance', () => {
     // Never "uploaded a fly brain" / "brain emulation" framing anywhere on
     // the page — the model ledger's whole reason for existing.
     await expect(page.locator('body')).not.toContainText(/brain emulation/i);
+  });
+});
+
+test.describe('anatomical activity view', () => {
+  test('expanding the panel and starting a run shows the canvas, provenance labels, and coverage disclosure', async ({
+    page
+  }) => {
+    await page.goto('/');
+    await waitForReady(page);
+    await expandActivityPanel(page);
+
+    await expect(page.getByText('Measured', { exact: false }).first()).toBeVisible();
+    await expect(page.getByText('Computed', { exact: false }).first()).toBeVisible();
+    await expect(page.getByText('Annotated', { exact: false }).first()).toBeVisible();
+    await expect(page.getByText(/Both arms share neuron positions; only connections differ/)).toBeVisible();
+
+    const positionsManifest = JSON.parse(
+      readFileSync(resolve(publicDataDir, 'malecns-arena-v1.positions.json'), 'utf-8')
+    ) as { coverage: { soma: number; tosoma: number; none: number } };
+    await expect(page.getByText(/^Positioned:/)).toContainText(
+      `${positionsManifest.coverage.soma} soma, ${positionsManifest.coverage.tosoma} soma-tract, ${positionsManifest.coverage.none} unavailable`
+    );
+
+    await startOrResumeButton(page).click();
+    await waitForTick(page, 10);
+    await waitForActivityUpdateTick(page, 'left', 1);
+    await waitForActivityUpdateTick(page, 'right', 1);
+    await pauseButton(page).click();
+    await expect(statusRegion(page)).toHaveText('paused');
+  });
+
+  test('closing the panel stops rate streaming: the Worker sends no more `rates` messages after collapse', async ({
+    page
+  }) => {
+    // Instrument both dedicated neural Workers directly (not just the DOM):
+    // patch each one's own `postMessage` to count `step` responses that
+    // carry a `rates` key (`StepWorkerSuccess.rates` — present only while
+    // `set-activity` has most recently enabled streaming for that Worker;
+    // see `neural.worker.ts`/`protocol.ts`). `neural.worker.ts` stores
+    // `self` itself (not a destructured function reference) as its
+    // `workerScope`, so reassigning `self.postMessage` here is visible to
+    // every later call the Worker module makes — this is the direct,
+    // protocol-level proof the plan's "close -> no rates messages" gate
+    // asks for, not just a DOM proxy for it.
+    const workers: import('@playwright/test').Worker[] = [];
+    page.on('worker', (worker) => {
+      workers.push(worker);
+      void worker.evaluate(() => {
+        const scope = self as unknown as { postMessage: (...args: unknown[]) => void; __rateMessageCount: number };
+        scope.__rateMessageCount = 0;
+        const original = scope.postMessage.bind(scope);
+        scope.postMessage = (...args: unknown[]) => {
+          const data = args[0] as { type?: string; rates?: unknown } | undefined;
+          if (data && data.type === 'step' && 'rates' in data) scope.__rateMessageCount += 1;
+          return original(...args);
+        };
+      });
+    });
+
+    await page.goto('/');
+    await waitForReady(page);
+    await expandActivityPanel(page);
+    await startOrResumeButton(page).click();
+    await waitForActivityUpdateTick(page, 'left', 1);
+    await waitForActivityUpdateTick(page, 'right', 1);
+
+    const readCounts = (): Promise<number[]> =>
+      Promise.all(
+        workers.map((worker) =>
+          worker.evaluate(() => (self as unknown as { __rateMessageCount: number }).__rateMessageCount)
+        )
+      );
+
+    const countsWhileOpen = await readCounts();
+    expect(countsWhileOpen.some((count) => count > 0)).toBe(true);
+
+    await activityToggle(page).click();
+    await expect(activityToggle(page)).toHaveText(/expand/i);
+    // The canvas is removed from the DOM on collapse (this panel only
+    // renders it while expanded), which is itself proof the view stopped
+    // presenting — the real assertion below is protocol-level.
+    expect(await page.locator('canvas[aria-label="Neural activity at soma positions"]').count()).toBe(0);
+
+    const countsAtCollapse = await readCounts();
+    await waitForTick(page, 40);
+    const countsAfterMoreTicks = await readCounts();
+    expect(countsAfterMoreTicks).toEqual(countsAtCollapse);
+
+    // Reopen and confirm streaming actually resumes rather than staying
+    // wedged off — the gate is "off while closed," not "off forever."
+    await expandActivityPanel(page);
+    await waitForActivityUpdateTick(page, 'left', 1);
+    const countsAfterReopen = await readCounts();
+    expect(countsAfterReopen.some((count, index) => count > countsAfterMoreTicks[index])).toBe(true);
+
+    await pauseButton(page).click();
+    await expect(statusRegion(page)).toHaveText('paused');
+  });
+
+  test('switching the right arm’s topology while the panel stays open keeps both arms’ activity canvas updating on the new topology', async ({
+    page
+  }) => {
+    // `ExperimentRunner#setAgentBinding` only allows a topology switch from
+    // `ready`/`finished` (never mid-run) — `ExperimentPanel`'s topology
+    // selectors are disabled otherwise (see `topologyControlsLocked` in
+    // `App.svelte`), so the real reachable flow is: run a bit, Reset (back
+    // to `ready` — the activity panel stays open and streaming throughout;
+    // `ExperimentRunner#reset()` deliberately leaves the streaming setting
+    // alone, only the world/neural state), switch, then Start again. This
+    // exercises the real regression surface: `ExperimentController
+    // #changeTopology` must re-apply streaming to the *freshly rebuilt*
+    // right-arm Worker binding (a fresh `init` always resets streaming to
+    // off), or the activity view would silently go dark for that arm after
+    // any topology switch made while it was open.
+    await page.goto('/');
+    await waitForReady(page);
+    await expandActivityPanel(page);
+
+    await startOrResumeButton(page).click();
+    await waitForActivityUpdateTick(page, 'left', 5);
+    await waitForActivityUpdateTick(page, 'right', 5);
+    const rightTickBeforeReset = Number(await activityCanvas(page).getAttribute('data-last-update-tick-right'));
+    expect(rightTickBeforeReset).toBeGreaterThanOrEqual(5);
+
+    await resetButton(page).click();
+    await expect(statusRegion(page)).toHaveText('ready');
+
+    await page.getByLabel('Right arm topology').selectOption('disconnected');
+    await expect(rightTopologySelect(page)).toHaveValue('disconnected', { timeout: 10_000 });
+    await expect(statusRegion(page)).toHaveText('ready');
+
+    await startOrResumeButton(page).click();
+    // A fresh, low post-restart tick strictly less than the pre-reset value
+    // is proof this is genuinely new data on the switched topology, not a
+    // stale attribute left over from before the reset.
+    await page.waitForFunction(
+      ({ attr, ceiling }) => {
+        const canvas = document.querySelector('canvas[aria-label="Neural activity at soma positions"]');
+        const value = Number(canvas?.getAttribute(attr));
+        return Number.isFinite(value) && value > 0 && value < ceiling;
+      },
+      { attr: 'data-last-update-tick-right', ceiling: rightTickBeforeReset },
+      { timeout: 20_000, polling: 'raf' }
+    );
+    await waitForActivityUpdateTick(page, 'left', 1);
+    await expect(armMetric(armPanel(page, 'right'), 'Graph nodes / edges')).toHaveText(/\/\s*0$/);
+
+    await pauseButton(page).click();
+    await expect(statusRegion(page)).toHaveText('paused');
+  });
+
+  test('a WebGL-unavailable canvas shows a fallback message inside the activity panel, and the experiment still runs', async ({
+    page
+  }) => {
+    await page.addInitScript(() => {
+      const proto = HTMLCanvasElement.prototype;
+      const original = proto.getContext;
+      const stub = function (this: HTMLCanvasElement, type: string, ...args: unknown[]): unknown {
+        if (typeof type === 'string' && type.toLowerCase().includes('webgl')) return null;
+        return Reflect.apply(original, this, [type, ...args]);
+      };
+      proto.getContext = stub as typeof proto.getContext;
+    });
+
+    await page.goto('/');
+    await waitForReady(page);
+    // Not `expandActivityPanel` here: that helper asserts the canvas itself
+    // becomes visible, which is exactly what must *not* happen on this path
+    // (the canvas stays `visibility: hidden` while `sceneError` is set — see
+    // `ActivityPanel.svelte`). `ActivityScene`'s construction fails
+    // synchronously inside `expand()`, but the panel deliberately stays
+    // "open" (`expanded` is not reverted) so this fallback is actually shown
+    // instead of silently collapsing away — see that catch block's comment.
+    await expect(activityToggle(page)).toBeEnabled({ timeout: 20_000 });
+    await activityToggle(page).click();
+
+    // Both the arena canvas and the activity canvas fail the same stubbed
+    // `getContext`, so their fallback text is nearly identical
+    // ("... could not create a WebGL context") — scope to the activity
+    // panel specifically, both to disambiguate from the arena's own
+    // "3D rendering is unavailable" message and to prove *this* panel's
+    // fallback (not just the arena's, already covered by the
+    // 'WebGL-unavailable fallback' describe block) actually rendered.
+    const activitySection = page.locator('section.activity');
+    await expect(activitySection.getByRole('img', { name: 'Neural activity view unavailable' })).toBeVisible();
+    await expect(activitySection.getByText(/could not create a WebGL context/i)).toBeVisible();
+    await expect(activityCanvas(page)).toBeHidden();
+
+    await startOrResumeButton(page).click();
+    await expect(statusRegion(page)).toHaveText('running');
+    await waitForTick(page, 5);
+    await pauseButton(page).click();
+    await expect(statusRegion(page)).toHaveText('paused');
+  });
+});
+
+test.describe('performance gates with the activity panel open', () => {
+  test('median neural step latency stays under the 33ms control budget with the activity panel expanded and streaming', async ({
+    page
+  }) => {
+    await page.goto('/');
+    await waitForReady(page);
+    await expandActivityPanel(page);
+    await startOrResumeButton(page).click();
+    await waitForTick(page, 60);
+    await pauseButton(page).click();
+    await expect(statusRegion(page)).toHaveText('paused');
+
+    const readLatencyMs = async (agent: 'left' | 'right'): Promise<number> => {
+      const text = await armMetric(armPanel(page, agent), 'Neural step latency (median)').innerText();
+      const match = text.match(/^(\d+(?:\.\d+)?) ms$/);
+      if (!match) throw new Error(`Unexpected latency text for ${agent}: "${text}"`);
+      const value = Number(match[1]);
+      if (!Number.isFinite(value) || value < 0) throw new Error(`Non-finite/negative latency for ${agent}: "${text}"`);
+      return value;
+    };
+    const [leftMs, rightMs] = await Promise.all([readLatencyMs('left'), readLatencyMs('right')]);
+    // eslint-disable-next-line no-console -- perf-gate visibility.
+    console.log(`[perf] (activity panel open) median neural step latency: left=${leftMs}ms right=${rightMs}ms (budget < 33ms)`);
+    expect(leftMs).toBeLessThan(33);
+    expect(rightMs).toBeLessThan(33);
+  });
+
+  test('no main-thread stall >= 200ms while running with the activity panel expanded and streaming', async ({ page }) => {
+    await page.addInitScript(() => {
+      const w = window as unknown as {
+        __longTasks: unknown[];
+        __longTaskSupported: boolean;
+        __longTaskObserver?: PerformanceObserver;
+      };
+      w.__longTasks = [];
+      w.__longTaskSupported = PerformanceObserver.supportedEntryTypes?.includes('longtask') ?? false;
+      if (w.__longTaskSupported) {
+        const observer = new PerformanceObserver((list) => {
+          for (const entry of list.getEntries()) {
+            w.__longTasks.push({ name: entry.name, duration: entry.duration, startTime: entry.startTime });
+          }
+        });
+        observer.observe({ entryTypes: ['longtask'] });
+        w.__longTaskObserver = observer;
+      }
+    });
+
+    await page.goto('/');
+    await waitForReady(page);
+    await waitForRendererUp(page);
+    await expandActivityPanel(page);
+    expect(await page.evaluate(() => (window as unknown as { __longTaskSupported: boolean }).__longTaskSupported)).toBe(
+      true
+    );
+    await page.evaluate(() => {
+      (window as unknown as { __longTasks: unknown[] }).__longTasks = [];
+    });
+    await startOrResumeButton(page).click();
+    await waitForActivityUpdateTick(page, 'left', 1);
+    await waitForTick(page, 90);
+    await pauseButton(page).click();
+    await expect(statusRegion(page)).toHaveText('paused');
+
+    const longTasks = await page.evaluate(() => {
+      const w = window as unknown as {
+        __longTasks: Array<{ duration: number }>;
+        __longTaskObserver?: PerformanceObserver;
+      };
+      for (const entry of w.__longTaskObserver?.takeRecords() ?? []) {
+        w.__longTasks.push({ duration: entry.duration });
+      }
+      return w.__longTasks ?? [];
+    });
+    // eslint-disable-next-line no-console -- perf-gate visibility: report what was actually measured either way.
+    console.log(`[perf] (activity panel open) long tasks observed while running: ${JSON.stringify(longTasks)}`);
+    for (const task of longTasks) {
+      expect(task.duration).toBeLessThan(200);
+    }
   });
 });
 

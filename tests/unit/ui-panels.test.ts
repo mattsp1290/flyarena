@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/svelte';
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/svelte';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import ExperimentPanel from '../../src/lib/ui/ExperimentPanel.svelte';
 import TelemetryPanel from '../../src/lib/ui/TelemetryPanel.svelte';
@@ -250,12 +250,27 @@ describe('LedgerPanel', () => {
     rewiredArms: {}
   };
 
-  it('renders the ledger vocabulary, never says brain emulation, and links to the manifest/ledger/license', () => {
-    render(LedgerPanel, { manifest });
+  // Scoped by row (rather than a bare `getByText(label)`) because WP3 added
+  // a second "Measured" row (Neuron positions, alongside Graph topology) —
+  // an unscoped query would now match more than one element.
+  const ledgerRow = (container: HTMLElement, term: string): HTMLElement => {
+    const strong = within(container).getByText(term, { selector: 'strong' });
+    const row = strong.closest('li');
+    if (!row) throw new Error(`Ledger row for "${term}" is not inside an <li>`);
+    return row as HTMLElement;
+  };
 
-    for (const label of ['Measured', 'Annotated', 'Authored / literature-derived', 'Calibrated', 'Authored', 'Synthetic']) {
-      expect(screen.getByText(label)).toBeInTheDocument();
-    }
+  it('renders the ledger vocabulary, never says brain emulation, and links to the manifest/ledger/license', () => {
+    const { container } = render(LedgerPanel, { manifest });
+
+    expect(ledgerRow(container, 'Graph topology')).toHaveTextContent('Measured');
+    expect(ledgerRow(container, 'Biological annotations')).toHaveTextContent('Annotated');
+    expect(ledgerRow(container, 'Network dynamics')).toHaveTextContent('Authored / literature-derived');
+    expect(ledgerRow(container, 'Global parameters')).toHaveTextContent('Calibrated');
+    expect(ledgerRow(container, 'Sensory encoder and action decoder')).toHaveTextContent('Authored');
+    expect(ledgerRow(container, '3D presentation')).toHaveTextContent('Synthetic');
+    expect(ledgerRow(container, 'Neuron positions')).toHaveTextContent('Measured');
+    expect(ledgerRow(container, 'Displayed neural activity')).toHaveTextContent('Computed');
     expect(screen.queryByText(/brain emulation/i)).not.toBeInTheDocument();
     expect(screen.getByRole('link', { name: /manifest/i })).toHaveAttribute(
       'href',
@@ -272,7 +287,7 @@ describe('LedgerPanel', () => {
   });
 
   it('renders the static ledger vocabulary even without a loaded manifest', () => {
-    render(LedgerPanel, { manifest: undefined });
-    expect(screen.getByText('Measured')).toBeInTheDocument();
+    const { container } = render(LedgerPanel, { manifest: undefined });
+    expect(ledgerRow(container, 'Graph topology')).toHaveTextContent('Measured');
   });
 });

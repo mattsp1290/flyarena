@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from '@testing-library/svelte';
+import { cleanup, render, screen, waitFor, within } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from '../src/App.svelte';
 import { createPublicDataFetch, FakeNeuralWorker } from './helpers/fake-worker';
@@ -31,12 +31,18 @@ describe('App shell', () => {
 
     expect(screen.getByRole('heading', { level: 2, name: /arena/i })).toBeInTheDocument();
     expect(screen.getByRole('region', { name: /experiment controls/i })).toBeInTheDocument();
-    expect(screen.getByRole('region', { name: /model ledger/i })).toBeInTheDocument();
-    expect(screen.getByText('Measured')).toBeInTheDocument();
-    expect(screen.getByText('Annotated')).toBeInTheDocument();
-    expect(screen.getByText('Authored / literature-derived')).toBeInTheDocument();
-    expect(screen.getByText('Calibrated')).toBeInTheDocument();
-    expect(screen.getByText('Synthetic')).toBeInTheDocument();
+    const ledgerRegion = screen.getByRole('region', { name: /model ledger/i });
+    expect(ledgerRegion).toBeInTheDocument();
+    // Scoped to the ledger region: WP3 added a second "Measured" row
+    // (Neuron positions, alongside Graph topology), so an unscoped
+    // `screen.getByText('Measured')` now matches more than one element.
+    const withinLedger = within(ledgerRegion);
+    expect(withinLedger.getAllByText('Measured').length).toBeGreaterThanOrEqual(2);
+    expect(withinLedger.getByText('Annotated')).toBeInTheDocument();
+    expect(withinLedger.getByText('Authored / literature-derived')).toBeInTheDocument();
+    expect(withinLedger.getByText('Calibrated')).toBeInTheDocument();
+    expect(withinLedger.getByText('Synthetic')).toBeInTheDocument();
+    expect(withinLedger.getByText('Computed')).toBeInTheDocument();
 
     await screen.findByRole('region', { name: /telemetry/i }, { timeout: 5000 });
     await waitFor(() => expect(screen.getByLabelText(/experiment status: ready/i)).toBeInTheDocument(), {

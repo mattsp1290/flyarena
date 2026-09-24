@@ -19,7 +19,12 @@
     { term: 'Network dynamics', label: 'Authored / literature-derived' },
     { term: 'Global parameters', label: 'Calibrated' },
     { term: 'Sensory encoder and action decoder', label: 'Authored' },
-    { term: '3D presentation', label: 'Synthetic' }
+    { term: '3D presentation', label: 'Synthetic' },
+    // WP3 (anatomical activity view): neuron positions come from the MaleCNS
+    // soma annotation sidecar (`docs/data-provenance.md`); the colors drawn
+    // from them are the authored dynamics' live output, not a measurement.
+    { term: 'Neuron positions', label: 'Measured' },
+    { term: 'Displayed neural activity', label: 'Computed' }
   ];
 </script>
 

@@ -10,6 +10,8 @@ FlyArena separates source evidence from engineering choices. These labels must r
 | Global parameters | **Calibrated** | Global gains or thresholds may be adjusted under a documented, shared calibration procedure. |
 | Sensory encoder and action decoder | **Authored** | Input/output mappings are designed for this POC and must remain identical across experimental arms. |
 | 3D presentation | **Synthetic** | Arena geometry, agents, effects, and camera are visual presentation, not biological anatomy or biomechanics. |
+| Neuron positions | **Measured** | The anatomical activity view places each neuron at its MaleCNS soma annotation (or soma-tract fallback); a neuron with neither is shown in a labeled "position unavailable" strip, never at an invented coordinate. Units are the dataset's own voxel units and are explicitly disclosed as unverified (see `docs/data-provenance.md`). |
+| Displayed neural activity | **Computed** | The activity view's per-tick colors are this POC's authored dynamics running on the measured topology, not a measurement of biological activity. |
 
 The application must not describe the POC as a brain emulation or imply that authored behavior is biological. `src/lib/ui/LedgerPanel.svelte` renders this table in-product next to the experiment's live results, plus links to the compiled artifact's manifest and ledger JSON (`public/data/malecns-arena-v1.manifest.json`/`.ledger.json` — exact dataset version, source-file hashes, compiler-revision hash, node/edge/contact counts, inclusion rules, and retained/dropped counts) and the CC BY 4.0 attribution for the source dataset (Janelia FlyEM Project (HHMI), MRC Laboratory of Molecular Biology, Google Research). See `docs/data-provenance.md` for the full sourcing detail those links point at.
 

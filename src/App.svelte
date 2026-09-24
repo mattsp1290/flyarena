@@ -3,14 +3,15 @@
   import { ARENA_CONFIG } from './lib/arena/config';
   import { createSnapshot, createWorld } from './lib/arena/world';
   import type { AgentId } from './lib/arena/types';
-  import type { ArenaManifest } from './lib/experiment/assets';
+  import { loadPositions, type ArenaManifest, type PositionsLoadResult } from './lib/experiment/assets';
   import { ExperimentController } from './lib/experiment/controller';
-  import type { ExperimentTelemetry } from './lib/experiment/runner';
+  import type { ExperimentRunner, ExperimentTelemetry } from './lib/experiment/runner';
   import type { ExperimentStatus } from './lib/experiment/state';
   import type { GraphMode } from './lib/connectome/format';
   import ExperimentPanel from './lib/ui/ExperimentPanel.svelte';
   import TelemetryPanel from './lib/ui/TelemetryPanel.svelte';
   import LedgerPanel from './lib/ui/LedgerPanel.svelte';
+  import ActivityPanel from './lib/ui/ActivityPanel.svelte';
   // Type-only: `three`/OrbitControls are large enough to warrant their own
   // chunk (see docs/architecture.md's load-budget note), so the actual
   // `./lib/render/ArenaScene` module is loaded via a dynamic `import()`
@@ -39,6 +40,10 @@
   let status = $state<ExperimentStatus>('loading');
   let errorMessage = $state<string | undefined>(undefined);
   let manifest = $state<ArenaManifest | undefined>(undefined);
+  /** The anatomical activity view's soma-position sidecar, loaded independently of the graph artifacts (positions are optional presentation, not a Start gate — see `ActivityPanel.svelte`'s doc comment). `undefined` until `onManifest` fires and this load kicks off. */
+  let positionsStatus = $state<PositionsLoadResult | undefined>(undefined);
+  /** Mirrors `controller.getRunner()` into `$state` once `initialize()` resolves, so `ActivityPanel` (a reactive consumer) can be handed the runner without polling a plain, non-reactive handle. */
+  let runner = $state<ExperimentRunner | undefined>(undefined);
   let seed = $state(DEFAULT_SEED);
   let topology = $state<Record<AgentId, GraphMode>>({ left: 'biological', right: 'rewired' });
   let telemetry = $state<ExperimentTelemetry | undefined>(undefined);
@@ -165,7 +170,15 @@
           if (!destroyed) errorMessage = message;
         },
         onManifest: (nextManifest) => {
-          if (!destroyed) manifest = nextManifest;
+          if (destroyed) return;
+          manifest = nextManifest;
+          // Independent of graph-artifact loading/Worker construction below:
+          // the activity view's positions are optional presentation, not a
+          // Start gate, so this proceeds even if the rest of `initialize()`
+          // goes on to fail.
+          void loadPositions(nextManifest, `${import.meta.env.BASE_URL}data`).then((result) => {
+            if (!destroyed) positionsStatus = result;
+          });
         },
         onTopologyApplied: (agentId, mode) => {
           if (destroyed) return;
@@ -181,7 +194,14 @@
         }
       }
     });
-    void controller.initialize();
+    void controller.initialize().then(() => {
+      // `initialize()` never throws; a failure routes through `onError`/
+      // `onStatusChange` instead (see that method's doc comment) and leaves
+      // `getRunner()` undefined, which this simply mirrors as `undefined` —
+      // `ActivityPanel`'s own `!runner` guard already treats that as "not
+      // ready yet."
+      if (!destroyed) runner = controller?.getRunner();
+    });
 
     if (!canvasEl) return;
     reducedMotionQuery = window.matchMedia?.('(prefers-reduced-motion: reduce)');
@@ -300,6 +320,8 @@
       {/if}
     </div>
   </section>
+
+  <ActivityPanel {runner} {positionsStatus} {telemetry} {topologySwitchPending} />
 
   <aside class="sidebar" aria-label="Experiment information">
     <ExperimentPanel

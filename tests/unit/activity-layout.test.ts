@@ -1,0 +1,143 @@
+import { describe, expect, it } from 'vitest';
+import { layoutPositions, partitionByRole, writeColors, type NeuronRole, type PositionSource } from '../../src/lib/render/activity-layout';
+
+describe('layoutPositions', () => {
+  it('centers annotated (soma/tosoma) neurons on their centroid and uniformly scales to unit extent', () => {
+    const xyz: ReadonlyArray<readonly [number, number, number] | null> = [
+      [0, 0, 0],
+      [10, 0, 0],
+      [-10, 0, 0],
+      [0, 20, 0]
+    ];
+    const positionSource: readonly PositionSource[] = ['soma', 'soma', 'soma', 'soma'];
+
+    const { points, unavailableIdx } = layoutPositions(xyz, positionSource);
+
+    expect(unavailableIdx.length).toBe(0);
+    // Centroid is (0, 5, 0); the largest centered-axis magnitude is |20-5|=15,
+    // so the uniform scale factor is 1/15 (never per-axis — proportions are
+    // preserved, not stretched to fill a box).
+    expect(points[0]).toBeCloseTo(0);
+    expect(points[1]).toBeCloseTo(-5 / 15);
+    expect(points[2]).toBeCloseTo(0);
+    expect(points[3 * 1]).toBeCloseTo(10 / 15);
+    expect(points[3 * 3 + 1]).toBeCloseTo(15 / 15);
+    for (const value of points) {
+      expect(Math.abs(value)).toBeLessThanOrEqual(1 + 1e-9);
+    }
+  });
+
+  it('treats tosoma coordinates identically to soma ones for centering/scaling — both are real annotated positions', () => {
+    const xyz: ReadonlyArray<readonly [number, number, number] | null> = [
+      [1, 1, 1],
+      [3, 3, 3]
+    ];
+    const positionSource: readonly PositionSource[] = ['soma', 'tosoma'];
+    const { unavailableIdx } = layoutPositions(xyz, positionSource);
+    expect(unavailableIdx.length).toBe(0);
+  });
+
+  it('places "none" neurons on a separate unavailable strip, never inventing a real coordinate for them', () => {
+    const xyz: ReadonlyArray<readonly [number, number, number] | null> = [[0, 0, 0], null, [5, 0, 0], null];
+    const positionSource: readonly PositionSource[] = ['soma', 'none', 'soma', 'none'];
+
+    const { points, unavailableIdx } = layoutPositions(xyz, positionSource);
+
+    expect(Array.from(unavailableIdx)).toEqual([1, 3]);
+    // Strip neurons share a fixed Y distinct from (and below) the main
+    // cloud's [-1, 1] extent, and never both land on the exact same X unless
+    // there is only one of them.
+    const stripY1 = points[1 * 3 + 1];
+    const stripY3 = points[3 * 3 + 1];
+    expect(stripY1).toBeLessThan(-1);
+    expect(stripY1).toBe(stripY3);
+    expect(points[1 * 3]).not.toBe(points[3 * 3]);
+  });
+
+  it('an xyz of null is treated as unavailable even if positionSource disagrees (fails safe, never fabricates a position)', () => {
+    const xyz: ReadonlyArray<readonly [number, number, number] | null> = [[1, 1, 1], null];
+    // Deliberately inconsistent input: positionSource claims 'soma' but xyz is null.
+    const positionSource: readonly PositionSource[] = ['soma', 'soma'];
+    const { unavailableIdx } = layoutPositions(xyz, positionSource);
+    expect(Array.from(unavailableIdx)).toEqual([1]);
+  });
+
+  it('handles an all-unavailable input without producing NaN/Infinity', () => {
+    const xyz: ReadonlyArray<readonly [number, number, number] | null> = [null, null, null];
+    const positionSource: readonly PositionSource[] = ['none', 'none', 'none'];
+    const { points, unavailableIdx } = layoutPositions(xyz, positionSource);
+    expect(unavailableIdx.length).toBe(3);
+    for (const value of points) expect(Number.isFinite(value)).toBe(true);
+  });
+});
+
+describe('partitionByRole', () => {
+  it('groups every neuron index by role, and the three partitions sum to the full positioned neuron count', () => {
+    const role: readonly NeuronRole[] = ['sensory', 'bridge', 'bridge', 'descending', 'sensory'];
+    const { sensoryIdx, bridgeIdx, descendingIdx } = partitionByRole(role);
+
+    expect(Array.from(sensoryIdx)).toEqual([0, 4]);
+    expect(Array.from(bridgeIdx)).toEqual([1, 2]);
+    expect(Array.from(descendingIdx)).toEqual([3]);
+    expect(sensoryIdx.length + bridgeIdx.length + descendingIdx.length).toBe(role.length);
+  });
+
+  it('throws on an unrecognized role rather than silently dropping a neuron', () => {
+    const role = ['sensory', 'unknown'] as unknown as readonly NeuronRole[];
+    expect(() => partitionByRole(role)).toThrow(/unknown role/i);
+  });
+});
+
+describe('writeColors', () => {
+  // A synthetic, easily-asserted-against 256-entry LUT: index i -> (i/255, 0, 1 - i/255).
+  const lut = (() => {
+    const table = new Float32Array(256 * 3);
+    for (let index = 0; index < 256; index += 1) {
+      table[index * 3] = index / 255;
+      table[index * 3 + 1] = 0;
+      table[index * 3 + 2] = 1 - index / 255;
+    }
+    return table;
+  })();
+
+  it('maps rateMin -> LUT[0] and rateMax -> LUT[255] at the right output offsets for a given index array', () => {
+    const rates = new Float32Array([0, 10, 5]);
+    const indices = Int32Array.from([1, 2, 0]); // rates 10 (max), 5 (mid), 0 (min)
+    const out = new Float32Array(indices.length * 3);
+
+    writeColors(rates, indices, 0, 10, lut, out);
+
+    // k=0 -> neuron 1, rate 10 == max -> LUT[255]
+    expect(out[0]).toBeCloseTo(lut[255 * 3]);
+    expect(out[1]).toBeCloseTo(lut[255 * 3 + 1]);
+    expect(out[2]).toBeCloseTo(lut[255 * 3 + 2]);
+    // k=2 -> neuron 0, rate 0 == min -> LUT[0]
+    expect(out[6]).toBeCloseTo(lut[0]);
+    expect(out[7]).toBeCloseTo(lut[1]);
+    expect(out[8]).toBeCloseTo(lut[2]);
+  });
+
+  it('clamps rates outside [min, max]', () => {
+    const rates = new Float32Array([-1000, 1000]);
+    const indices = Int32Array.from([0, 1]);
+    const out = new Float32Array(6);
+
+    writeColors(rates, indices, 0, 10, lut, out);
+
+    expect(out[0]).toBeCloseTo(lut[0]);
+    expect(out[3]).toBeCloseTo(lut[255 * 3]);
+  });
+
+  it('writes only for indices present in the given array, in the array’s own order', () => {
+    const rates = new Float32Array([1, 2, 3, 4]);
+    const indices = Int32Array.from([3, 0]);
+    const out = new Float32Array(6);
+
+    writeColors(rates, indices, 1, 4, lut, out);
+
+    // k=0 -> neuron 3, rate 4 == max
+    expect(out[0]).toBeCloseTo(lut[255 * 3]);
+    // k=1 -> neuron 0, rate 1 == min
+    expect(out[3]).toBeCloseTo(lut[0]);
+  });
+});
