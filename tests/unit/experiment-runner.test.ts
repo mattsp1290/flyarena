@@ -872,4 +872,72 @@ describe('ExperimentRunner activity streaming', () => {
     expect(runner.getLatestRates('left')).toBeUndefined();
     expect(runner.getLatestRates('right')).toBeUndefined();
   });
+
+  /**
+   * Regression test for a bug dual review independently found and
+   * reproduced: `runOneTick` used to record `left.result.rates` /
+   * `right.result.rates` into `latestRates` whenever a result carried them,
+   * with no check of whether streaming was *still* on by the time the tick
+   * actually resolved. A tick whose `step` request the Worker had already
+   * computed (with activity on) before `setActivityStreaming(false)` was
+   * called could still resolve afterward and write its rates back in,
+   * resurrecting exactly the "stale pre-disable snapshot" this class's own
+   * doc comments say can never happen. The fix is `activityEpoch`: bumped by
+   * every `setActivityStreaming` call and checked against the value
+   * `runOneTick` captured at its own start.
+   */
+  it('a tick already in flight when streaming is disabled does not resurrect a stale rates snapshot', async () => {
+    const graph = createRandomGraph(0x9d, { neuronCount: 16, inputChannelCount: 8, outputPopulationCount: 3 });
+    const buffer = encodeGraphBinary(graph);
+    const built = await buildWorkerAgents(buffer);
+    // A small delay on both arms (see `withStepDelay`'s doc comment above):
+    // without it this worker-backed, `targetTickIntervalMs: 0` run finishes
+    // its whole microtask chain before any of this test's macrotask-based
+    // polling (`waitUntil`) or `holdNextStep`-arming ever gets a turn to run.
+    const delayed = { left: withStepDelay(built.left, 5), right: withStepDelay(built.right, 5) };
+
+    const releaseStep = createDeferred<void>();
+    let holdNextStep = false;
+    const left: AgentBinding = {
+      ...delayed.left,
+      step: async (input) => {
+        // The real Worker round trip completes first — with activity still
+        // on — so `result` genuinely carries `rates`, exactly like the
+        // reproduced bug. Only *this* JS-side resolution is held back.
+        const result = await delayed.left.step(input);
+        if (holdNextStep) {
+          holdNextStep = false;
+          await releaseStep.promise;
+        }
+        return result;
+      }
+    };
+    const agents: Record<'left' | 'right', AgentBinding> = { left, right: delayed.right };
+    const runner = new ExperimentRunner({ seed: 4, totalTicks: 300, agents, targetTickIntervalMs: 0 });
+
+    await runner.setActivityStreaming(true);
+    runner.start();
+    await waitUntil(() => runner.getLatestRates('left') !== undefined);
+
+    holdNextStep = true;
+    // Resolves once a tick's `left.step()` has finished its real round trip
+    // and is now parked on `releaseStep` — i.e. the in-flight-when-disabled
+    // window has genuinely opened, not a guessed number of ticks.
+    await waitUntil(() => !holdNextStep);
+
+    const disablePromise = runner.setActivityStreaming(false);
+    // Cleared synchronously, before the held tick's stale result can land.
+    expect(runner.getLatestRates('left')).toBeUndefined();
+
+    releaseStep.resolve();
+    await disablePromise;
+    // Let the now-unblocked `Promise.all`/`runOneTick` chain for the held
+    // tick actually finish processing its (stale-generation-of-activity)
+    // result.
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(runner.isActivityStreaming()).toBe(false);
+    expect(runner.getLatestRates('left')).toBeUndefined();
+    expect(runner.getLatestRates('right')).toBeUndefined();
+  });
 });

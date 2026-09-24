@@ -219,17 +219,20 @@ export const handleWorkerRequest = (
         // one allocation this path adds, and only while a caller has opted
         // in via `set-activity`; see `StepWorkerSuccess.rates`'s doc comment.
         const rates = activity ? state.rate.slice() : undefined;
-        return {
-          response: {
-            type: 'step',
-            requestId: request.requestId,
-            ok: true,
-            actionFeatures: Array.from(outputs),
-            telemetry: computeTelemetry(state),
-            ...(rates ? { rates } : {})
-          },
-          transfer: rates ? [rates.buffer] : undefined
+        const response: WorkerResponse = {
+          type: 'step',
+          requestId: request.requestId,
+          ok: true,
+          actionFeatures: Array.from(outputs),
+          telemetry: computeTelemetry(state),
+          ...(rates ? { rates } : {})
         };
+        // `respond()` (no `transfer` key at all) when not streaming, rather
+        // than `{ response, transfer: undefined }` — every other branch of
+        // this function goes through `respond()`, so a non-streaming `step`
+        // result has the exact same shape (`'transfer' in result === false`)
+        // as any other response, not merely an `undefined`-valued key.
+        return rates ? { response, transfer: [rates.buffer] } : respond(response);
       }
 
       case 'set-activity': {

@@ -32,6 +32,41 @@ describe('createWorkerClient', () => {
     expect(worker.terminated).toBe(true);
   });
 
+  it('setActivity round-trips a set-activity request, echoing enabled and toggling whether step responses carry rates', async () => {
+    const worker = new FakeNeuralWorker();
+    const client = createWorkerClient(worker);
+    await client.init(buffer.slice(0));
+
+    const disabledStep = await client.step([0.1, -0.2], 1);
+    expect('rates' in disabledStep).toBe(false);
+
+    const enableResult = await client.setActivity(true);
+    expect(enableResult.ok).toBe(true);
+    expect(enableResult.enabled).toBe(true);
+
+    const enabledStep = await client.step([0.1, -0.2], 1);
+    // `ArrayBuffer.isView` (not `toBeInstanceOf(Float32Array)`): the value
+    // crosses `structuredClone` inside `FakeNeuralWorker`, which under
+    // jsdom's Vitest environment can construct it in a different realm than
+    // this test file's own `Float32Array` global — a real cross-realm
+    // typed-array value that `instanceof` alone cannot see as one.
+    expect(ArrayBuffer.isView(enabledStep.rates)).toBe(true);
+    expect(enabledStep.rates).toHaveLength(graph.metadata.neuronCount);
+
+    const disableResult = await client.setActivity(false);
+    expect(disableResult.ok).toBe(true);
+    expect(disableResult.enabled).toBe(false);
+
+    const redisabledStep = await client.step([0.1, -0.2], 1);
+    expect('rates' in redisabledStep).toBe(false);
+  });
+
+  it('setActivity rejects before init with not-initialized', async () => {
+    const worker = new FakeNeuralWorker();
+    const client = createWorkerClient(worker);
+    await expect(client.setActivity(true)).rejects.toThrow(/not-initialized/);
+  });
+
   it('rejects the returned promise with the structured error message on a Worker failure response', async () => {
     const worker = new FakeNeuralWorker();
     const client = createWorkerClient(worker);

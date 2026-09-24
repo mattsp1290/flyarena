@@ -285,36 +285,73 @@ describe('ExperimentController#changeTopology', () => {
 });
 
 /**
- * A `FakeNeuralWorker`-shaped wrapper that can hold a single in-flight
- * `dispose` request's delivery until the test releases it, so a test can
- * deterministically land inside `changeTopology`'s dispose -> rebuild window
- * instead of guessing at raw microtask-hop counts against `FakeNeuralWorker`'s
- * own `queueMicrotask`-based delivery. Every other request type (including
- * the rebuilt binding's own `init`) is forwarded to the inner
- * `FakeNeuralWorker` immediately, undelayed.
+ * A `FakeNeuralWorker`-shaped wrapper that can hold the *next* `init`
+ * request's delivery to the inner worker until the test releases it.
+ *
+ * An earlier version of this helper (`GatedDisposeWorker`) gated `dispose`
+ * instead and was caught by dual review as not exercising the race it
+ * claimed to: `changeTopology` posts `dispose` one microtask *after*
+ * `changeTopology()` returns (it runs inside a `.then(async () => ...)`
+ * continuation — see `controller.ts`), so a racing `setActivityStreaming`
+ * call issued synchronously right after `changeTopology()` had its own
+ * `set-activity` message posted, and delivered, *before* `dispose` was even
+ * sent — never landing in the dispose/init window at all. Worse, that
+ * version forwarded every non-`dispose` message to the inner worker
+ * immediately even while `dispose` was held, so a message posted after the
+ * gated `dispose` could be *delivered* ahead of it — a real `Worker` never
+ * reorders messages like that, so the double had silently stopped modeling
+ * one.
+ *
+ * Gating `init` instead fixes both problems for the scenario this test
+ * actually wants: `changeTopology`'s `dispose` is allowed to complete
+ * normally (undelayed), so the Worker genuinely reaches `idle` before this
+ * helper intercepts anything; `initHeld` resolves exactly when the rebuilt
+ * binding's `init` has been *posted* (proving the Worker is idle and the
+ * dispose/rebuild window has genuinely opened), so a test can `await` it
+ * before racing another call in that window with no timing guesswork; and
+ * every message this helper does not hold (including one posted while an
+ * `init` is being held) still goes straight to the inner worker in call
+ * order, so it never itself introduces a reordering the real Worker
+ * couldn't produce.
  */
-class GatedDisposeWorker {
+class GatedInitWorker {
   private readonly inner = new FakeNeuralWorker();
-  private gate: Promise<void> | undefined;
-  private release: (() => void) | undefined;
+  private gating = false;
+  private markHeld: (() => void) | undefined;
+  private releaseFn: (() => void) | undefined;
+  /**
+   * Resolves once the gated `init` has actually been posted (and is being
+   * held) — reassigned to a fresh pending promise by `gateNextInit()`, and
+   * a test must call `gateNextInit()` (which a test always does before the
+   * racing call that posts `init`) and hold onto *that* promise reference
+   * before awaiting it, since `postMessage` settles this exact object
+   * in place rather than replacing it — an `await` on a stale reference
+   * from before `gateNextInit()` would never resolve.
+   */
+  initHeld: Promise<void> = Promise.resolve();
   terminated = false;
 
-  /** The next `dispose` request posted to this worker will not be forwarded to the inner worker until `releaseDispose()` is called. */
-  gateNextDispose(): void {
-    this.gate = new Promise((resolve) => {
-      this.release = resolve;
+  /** Arms the gate and resets `initHeld` to a fresh pending promise that the next `init` request's `postMessage` call will settle. */
+  gateNextInit(): void {
+    this.gating = true;
+    this.initHeld = new Promise((resolve) => {
+      this.markHeld = resolve;
     });
   }
 
-  releaseDispose(): void {
-    this.release?.();
+  releaseInit(): void {
+    this.releaseFn?.();
+    this.releaseFn = undefined;
   }
 
   postMessage(message: WorkerRequest, transfer?: Transferable[]): void {
-    if (message.type === 'dispose' && this.gate) {
-      const gate = this.gate;
-      this.gate = undefined;
-      void gate.then(() => this.inner.postMessage(message, transfer));
+    if (message.type === 'init' && this.gating) {
+      this.gating = false;
+      const release = new Promise<void>((resolve) => {
+        this.releaseFn = resolve;
+      });
+      void release.then(() => this.inner.postMessage(message, transfer));
+      this.markHeld?.();
       return;
     }
     this.inner.postMessage(message, transfer);
@@ -372,62 +409,142 @@ describe('ExperimentController activity streaming', () => {
 
   /**
    * bb45-style race test: `runner.setActivityStreaming(true)` issued while
-   * `changeTopology`'s own dispose -> rebuild chain is genuinely in flight
-   * for the same arm. `setActivityStreaming`'s `setActivity` call against
-   * the arm's *old*, disposing binding is expected to fail (caught and
-   * logged inside `ExperimentRunner`, per its doc comment — never rejects to
-   * this test); what this test actually verifies is that neither promise
-   * ever rejects unhandled, and that the streaming flag and the rebuilt
-   * binding's Worker both end up consistently "on" once the dust settles —
-   * exactly what `controller.ts#changeTopology`'s own re-apply step exists
-   * to guarantee, independent of how the two calls happened to interleave.
+   * `changeTopology`'s own dispose -> rebuild chain is genuinely in the
+   * `idle` window for the same arm — after `dispose` has resolved (the
+   * Worker is truly idle) but before the rebuilt binding's `init` has been
+   * delivered. `setActivityStreaming`'s `setActivity` call against that
+   * still-`idle` Worker is expected to fail with `not-initialized` (caught
+   * and logged inside `ExperimentRunner`, per its doc comment — never
+   * rejects to this test): this test asserts that rejection is actually
+   * exercised (via a `console.error` spy), not merely that the end state
+   * looks right despite it never having run — see `GatedInitWorker`'s doc
+   * comment for why an earlier version of this test (gating `dispose`, not
+   * `init`) never actually reached this window at all.
    */
-  it('setActivityStreaming(true) racing changeTopology resolves without an unhandled rejection, and streaming is active on both arms afterward', async () => {
-    let gatedWorker: GatedDisposeWorker | undefined;
+  it('setActivityStreaming(true) racing changeTopology through the idle window resolves without an unhandled rejection, logs the expected not-initialized failure, and streaming is active on both arms afterward', async () => {
+    let gatedWorker: GatedInitWorker | undefined;
     let createCount = 0;
     const createGatedWorker = (): Worker => {
       createCount += 1;
       if (createCount === 1) {
-        gatedWorker = new GatedDisposeWorker();
+        gatedWorker = new GatedInitWorker();
         return gatedWorker as unknown as Worker;
       }
       return new FakeNeuralWorker() as unknown as Worker;
     };
 
-    const callbacks = createCallbacks();
-    const controller = new ExperimentController({
-      seed: SEED,
-      totalTicks: TOTAL_TICKS,
-      initialTopology: { left: 'biological', right: 'rewired' },
-      createWorker: createGatedWorker,
-      callbacks
-    });
-    await controller.initialize();
-    const runner = controller.getRunner();
-    expect(runner).toBeDefined();
-    expect(gatedWorker).toBeDefined();
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const callbacks = createCallbacks();
+      const controller = new ExperimentController({
+        seed: SEED,
+        totalTicks: TOTAL_TICKS,
+        initialTopology: { left: 'biological', right: 'rewired' },
+        createWorker: createGatedWorker,
+        callbacks
+      });
+      await controller.initialize();
+      const runner = controller.getRunner();
+      expect(runner).toBeDefined();
+      expect(gatedWorker).toBeDefined();
 
-    // The left arm's Worker (the one `createGatedWorker` hands out first,
-    // matching `initialize()`'s `left`-then-`right` construction order) will
-    // hold its next `dispose` response, so `changeTopology('left', ...)`
-    // below is reliably still mid-flight (dispose sent, not yet resolved,
-    // `init` not yet reached) for the whole window between the two calls
-    // that follow.
-    gatedWorker!.gateNextDispose();
+      // The left arm's Worker (the one `createGatedWorker` hands out first,
+      // matching `initialize()`'s `left`-then-`right` construction order)
+      // will hold its rebuilt binding's `init` request. `changeTopology`'s
+      // own `dispose` is left ungated, so it completes normally — the
+      // Worker genuinely reaches `idle` before this test's racing call.
+      gatedWorker!.gateNextInit();
 
-    controller.changeTopology('left', 'disconnected');
-    const streamingPromise = runner!.setActivityStreaming(true);
-    gatedWorker!.releaseDispose();
+      controller.changeTopology('left', 'disconnected');
+      // Resolves only once `init` has actually been posted — proof the
+      // dispose/rebuild window has opened and the Worker is idle, not a
+      // guessed number of microtask hops.
+      await gatedWorker!.initHeld;
 
-    await expect(streamingPromise).resolves.toBeUndefined();
-    await vi.waitFor(() => expect(runner!.getTelemetry().agents.left.topology).toBe('disconnected'));
+      const streamingPromise = runner!.setActivityStreaming(true);
+      gatedWorker!.releaseInit();
 
-    expect(runner!.isActivityStreaming()).toBe(true);
-    expect(callbacks.errors).toHaveLength(0);
+      await expect(streamingPromise).resolves.toBeUndefined();
+      await vi.waitFor(() => expect(runner!.getTelemetry().agents.left.topology).toBe('disconnected'));
 
-    runner!.start();
-    await vi.waitFor(() => expect(runner!.getLatestRates('left')).toBeDefined());
-    await vi.waitFor(() => expect(runner!.getLatestRates('right')).toBeDefined());
+      // Proves the `not-initialized` rejection path in
+      // `ExperimentRunner#setActivityStreaming` actually ran for the left
+      // arm's old (now-idle) binding, not merely that the end state below
+      // happens to look right regardless.
+      expect(errorSpy).toHaveBeenCalled();
+
+      expect(runner!.isActivityStreaming()).toBe(true);
+      expect(callbacks.errors).toHaveLength(0);
+
+      runner!.start();
+      await vi.waitFor(() => expect(runner!.getLatestRates('left')).toBeDefined());
+      await vi.waitFor(() => expect(runner!.getLatestRates('right')).toBeDefined());
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  /**
+   * Mirror of the race test above: disabling (instead of enabling) while the
+   * arm's Worker is genuinely idle mid topology-switch must be equally
+   * unremarkable — `setActivityStreaming(false)`'s per-binding call against
+   * the idle old binding also fails and is swallowed the same way, and the
+   * rebuilt binding must end up *not* streaming (the controller only
+   * re-applies `setActivity(true)`, never `(true)` when the flag reads
+   * `false`), so the topology-switched arm produces no `rates`.
+   */
+  it('setActivityStreaming(false) racing changeTopology through the idle window leaves the rebuilt binding not streaming', async () => {
+    let gatedWorker: GatedInitWorker | undefined;
+    let createCount = 0;
+    const createGatedWorker = (): Worker => {
+      createCount += 1;
+      if (createCount === 1) {
+        gatedWorker = new GatedInitWorker();
+        return gatedWorker as unknown as Worker;
+      }
+      return new FakeNeuralWorker() as unknown as Worker;
+    };
+
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const callbacks = createCallbacks();
+      const controller = new ExperimentController({
+        seed: SEED,
+        totalTicks: TOTAL_TICKS,
+        initialTopology: { left: 'biological', right: 'rewired' },
+        createWorker: createGatedWorker,
+        callbacks
+      });
+      await controller.initialize();
+      const runner = controller.getRunner();
+      expect(runner).toBeDefined();
+      expect(gatedWorker).toBeDefined();
+
+      await runner!.setActivityStreaming(true);
+      expect(runner!.isActivityStreaming()).toBe(true);
+
+      gatedWorker!.gateNextInit();
+      controller.changeTopology('left', 'disconnected');
+      await gatedWorker!.initHeld;
+
+      const streamingPromise = runner!.setActivityStreaming(false);
+      gatedWorker!.releaseInit();
+
+      await expect(streamingPromise).resolves.toBeUndefined();
+      await vi.waitFor(() => expect(runner!.getTelemetry().agents.left.topology).toBe('disconnected'));
+
+      expect(runner!.isActivityStreaming()).toBe(false);
+      expect(callbacks.errors).toHaveLength(0);
+
+      runner!.start();
+      // The right arm never toggled off, but streaming is off runner-wide,
+      // so neither arm should ever populate `latestRates`.
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(runner!.getLatestRates('left')).toBeUndefined();
+      expect(runner!.getLatestRates('right')).toBeUndefined();
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 });
 

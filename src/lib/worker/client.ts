@@ -14,7 +14,7 @@ import type {
  * protocol (`./protocol.ts`), matching responses back to callers by
  * `requestId`. This is the only place that owns request-id generation and
  * the pending-request map; `src/lib/experiment/runner.ts` only ever sees
- * `init`/`reset`/`step`/`dispose` as plain async methods.
+ * `init`/`reset`/`step`/`dispose`/`setActivity` as plain async methods.
  *
  * Generic over `WorkerLike` (rather than the real DOM `Worker`) so the
  * request/response matching logic is unit-testable without a real Worker

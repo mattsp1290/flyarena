@@ -221,11 +221,28 @@ export class ExperimentController {
           // even though this arm may have been streaming right before the
           // switch. Re-issue it on the *new* binding directly — not via
           // `runner.setActivityStreaming`, which would redundantly re-toggle
-          // the other, untouched arm too — before the arm is used again, so
-          // the activity view's stream never silently drops for this arm
-          // across a topology switch.
+          // the other, untouched arm too — so the activity view's stream
+          // never silently drops for this arm across a topology switch.
+          //
+          // Deliberately not awaited (dual review flagged the earlier
+          // awaited version): `binding.setActivity` -> `client.setActivity`
+          // -> `send` posts the `set-activity` message synchronously, inside
+          // the Promise executor (`client.ts#send`), before this line even
+          // returns — so it is already FIFO-ordered ahead of any later
+          // `step` on this Worker regardless of whether its own round trip
+          // is awaited. Awaiting it here bought no ordering guarantee, only
+          // delayed `onTelemetry`/`onTopologyApplied` and, on a rejection,
+          // routed a per-arm streaming-toggle failure into `runner.fail()`
+          // — contradicting `ExperimentRunner#setActivityStreaming`'s own
+          // documented policy that such a failure is not a run failure, and
+          // leaving `onTopologyApplied` unfired even though `setAgentBinding`
+          // above had already committed the new topology (a presentation
+          // desync: the renderer would keep the old topology label).
           if (this.runner.isActivityStreaming()) {
-            await binding.setActivity?.(true);
+            binding.setActivity?.(true).catch((error: unknown) => {
+              if (this.destroyed) return;
+              console.error(`ExperimentController: re-applying activity streaming for ${agentId} failed`, error);
+            });
           }
           this.options.callbacks.onTelemetry(this.runner.getTelemetry());
           this.options.callbacks.onTopologyApplied(agentId, mode);
