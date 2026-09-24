@@ -1,0 +1,26 @@
+# Integration and repository ownership
+
+Prerequisite: review gate in overview. This work starts on a new branch from main, not a merge of the old lab's replacement `App.svelte` over the arena.
+
+## Change surfaces
+All proposed new paths are beneath existing `src/`, `scripts/`, `tests/`, `docs/`, or the repository root.
+
+- New `src/Shell.svelte`: three labeled navigation destinations; change existing `src/main.ts` to mount it. Existing `src/App.svelte` stays the arena. Add only a small optional callback/link that passes its configured seed and selected left topology to the workbench. Label the action “Probe this setup (authored decoder)” and explain that it restarts a matched parked-opponent episode. Do not claim to transfer paused state or a trained decoder.
+- New `src/lib/counterfactual/` component/engine family described in 02/03.
+- Import existing lab source from `feat/dgx-counterfactual-lab`: `src/lib/lab/`, `backend/`, `scripts/lab.sh`, corresponding lab tests and documents. These paths are new on integration main. Preserve source attribution in commit messages. Do not import its root App, root CSS, package lock, deployment secrets or generated exports. Inspect current branch contents before selecting files.
+- New `src/lib/lab/lab.css`: scope the original lab's styling to a sandbox wrapper, including element selectors and mobile rules. Root/body declarations must not override arena layout or typography. Keep the lab's replay styles and accessible controls. Put per-mode titles in the shell so hidden/inactive components cannot override metadata.
+- Existing `scripts/deploy.sh`: add only offline `--package-backend` dispatch before reading `.env`. Preserve main's concurrent deployment changes. Package an explicit file allowlist and exclude secrets/results. Do not overwrite with the old branch's script. Keep backend runtime metadata only if it is part of current main's deployment contract; manual backend connection must work without it.
+- Existing `README.md`, `.gitignore`, `docs/architecture.md`, `.agents/deployment.md`: distinguish default static arena/workbench from optional server sandbox. Add local launch/test/packaging commands and explain rollback as removal/revert of the additive entry points, without deleting artifacts from other plans. Historical private activation on the old branch is not evidence that this new integration is deployed.
+
+## Existing base-path integration
+Inspect latest main for the concurrent base-path fix before editing. At the grounding SHA, `src/lib/experiment/controller.ts` calls `loadArenaArtifacts` without a base argument and `src/lib/ui/LedgerPanel.svelte` uses root-absolute `/data` links. If still present, this package owns the minimal correction: pass BASE_URL-derived data URLs to the existing controller/loader and ledger links, preserving injectable test loaders. Include these existing files in the change surface only when needed. A strict subpath server must reject `/data/*` and expose artifacts only at `/fly/data/*`; all three views must work there. A root-hosted or permissive Vite preview alone does not prove this gate.
+
+## Navigation and lifecycle
+Use hash navigation (`#arena`, `#counterfactual`, `#dgx`) so subpath static hosting needs no routing rewrite. Unknown hashes fall back to arena. Default route incurs no sandbox imports/API calls. Handle browser back/forward and direct links; base paths come from Vite's BASE_URL for graph assets.
+
+Unmount arena and workbench when changing modes, releasing their renderers/Workers. Preserve the sandbox instance once visited while a job is active, including its token in component memory and serial polling, so switching views cannot orphan an untracked GPU job. A hidden sandbox must not change document title, expose duplicate status regions to accessibility queries, or intercept controls. On full app destruction cancel an active known sandbox job best-effort using a fresh bounded request, then abort polling; no claim of guaranteed cancellation on browser process exit. Completed evidence remains exportable on return. A real-browser test must start a sufficiently long sandbox job, navigate away and back while it is active, prove the same identifier remains tracked with exactly one submission, then let another job complete while hidden and export its result on return. Component tests must cover reconnect after polling failure across view switches, and full-shell destruction issuing cancellation with a fresh non-aborted signal while stopping polling. No token persistence or token-bearing navigation.
+
+Maintain original arena tests importing `App.svelte`; add shell/navigation tests. Prove repeated switching restores a ready arena and disposes old world loops. Validate both 390px and desktop modes, all three views, and root plus `/fly/` base paths.
+
+## Acceptance
+No change to graph bytes, world equations, neural equations, trained-readout schemas or default arena behavior. Existing full web suite remains green. Static build can be served with no backend and no lab metadata file. Offline packaging succeeds with no `.env` and contains precisely the declared source files. A rebuilt temporary backend passes its CPU/CUDA tests and browser journey; stop it afterward without touching the deployed lab or LLM containers.
