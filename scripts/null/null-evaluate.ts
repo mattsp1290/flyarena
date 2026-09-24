@@ -1,12 +1,12 @@
 import { fork } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gunzipSync } from 'node:zlib';
 
 import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import { requireNonNegativeInt, requirePositiveInt, requireValue } from '../training/cli';
+import { atomicWriteFileSync, sha256Hex } from '../training/fsio';
 import type { NullSeedResult, NullTaskMode, NullWorkerMessage, NullWorkerTask } from './null-worker';
 
 /**
@@ -41,8 +41,6 @@ const DEFAULT_TICKS = 1800;
 const DEFAULT_SHARDS = 18;
 const DEFAULT_OUT = resolve(repoRoot, 'training/runs/null/authored.json');
 
-const sha256Hex = (data: Uint8Array): string => createHash('sha256').update(data).digest('hex');
-
 // ---------------------------------------------------------------------------
 // rewire_batch.py index.json
 // ---------------------------------------------------------------------------
@@ -66,6 +64,18 @@ export interface RewireIndex {
   readonly rewireSourceSha256: string;
   readonly seeds: readonly RewireIndexSeedEntry[];
 }
+
+/**
+ * `index.seeds` sorted by numeric seed ascending — the single source of
+ * this module's "canonical task order" invariant (see the module doc
+ * comment above). `buildTasks` and `assembleRaw` both need this exact
+ * order for the same reason (byte-identical output independent of shard
+ * count/timing); previously each independently re-sorted, which let the
+ * two copies drift out of agreement by convention alone. Never a sort over
+ * `graphId` strings, which would put `rewired-10` before `rewired-2`.
+ */
+const sortedRewireSeeds = (index: Readonly<RewireIndex>): readonly RewireIndexSeedEntry[] =>
+  [...index.seeds].sort((a, b) => a.seed - b.seed);
 
 /**
  * Parse and lightly validate `rewire_batch.py`'s `index.json`. Deliberately
@@ -252,8 +262,7 @@ export const buildTasks = (
     tasks.push({ graphId: 'disconnected', mode: 'disconnected' as NullTaskMode, ...commonBio });
   }
 
-  const sortedSeeds = [...index.seeds].sort((a, b) => a.seed - b.seed);
-  for (const entry of sortedSeeds) {
+  for (const entry of sortedRewireSeeds(index)) {
     tasks.push({
       graphId: `rewired-${entry.seed}`,
       mode: 'rewired' as NullTaskMode,
@@ -475,15 +484,13 @@ export const assembleRaw = (
     return found;
   };
 
-  const rewired: NullRewiredGraphRaw[] = [...index.seeds]
-    .sort((a, b) => a.seed - b.seed)
-    .map((entry) => ({
-      seed: entry.seed,
-      gzipSha256: entry.gzipSha256,
-      acceptedSwaps: entry.stats.acceptedSwaps,
-      attempts: entry.stats.attempts,
-      ...toGraphRaw(require(`rewired-${entry.seed}`))
-    }));
+  const rewired: NullRewiredGraphRaw[] = sortedRewireSeeds(index).map((entry) => ({
+    seed: entry.seed,
+    gzipSha256: entry.gzipSha256,
+    acceptedSwaps: entry.stats.acceptedSwaps,
+    attempts: entry.stats.attempts,
+    ...toGraphRaw(require(`rewired-${entry.seed}`))
+  }));
 
   return {
     version: 1,
@@ -512,7 +519,7 @@ export const assembleRaw = (
  * no-ops on a mismatch: `"foo".replace(/\.json$/, '.run.json')` returns
  * `"foo"` unchanged when `outPath` doesn't end in `.json` (a dual-review
  * finding), which would make this function return `outPath` itself —
- * so the very next `writeFileSync` below would silently overwrite the
+ * so the very next `atomicWriteFileSync` below would silently overwrite the
  * multi-hour `authored.json` this function just wrote with the tiny
  * run-meta sidecar. `--out` is validated to end in `.json` at parse time
  * (`parseNullEvaluateArgs`), but this function stays self-checking for any
@@ -544,13 +551,23 @@ export const runNullEvaluate = async (
 
   const raw = assembleRaw(index, args, results);
   mkdirSync(dirname(args.out), { recursive: true });
-  writeFileSync(args.out, JSON.stringify(raw));
+  // `authored.json` costs real money and wall-clock time to reproduce (this
+  // study's own calibration gate anticipates runs up to 8 hours) — written
+  // atomically (temp file + rename) so a process killed mid-write (OOM,
+  // external `kill -9`, host preemption) never leaves a truncated,
+  // multi-hour result with no partial-recovery path. Matches
+  // `null-report.ts`'s `atomicWriteFileSync` convention for its own
+  // published outputs (a thermo-nuclear maintainability finding).
+  atomicWriteFileSync(args.out, JSON.stringify(raw));
 
   // Operational metadata `authored.json` deliberately excludes (see
   // `NullEvaluationRaw`'s doc comment) — `null-report.ts` reads this
-  // sidecar for its published `shards`/timing fields.
+  // sidecar for its published `shards`/timing fields. Same atomic-write
+  // treatment: a torn sidecar would otherwise look like "run never
+  // finished" even though the (correctly, atomically written) multi-hour
+  // `authored.json` right next to it is fine.
   const runMetaOut = runMetaPathFor(args.out);
-  writeFileSync(runMetaOut, `${JSON.stringify({ shards: args.shards, elapsedMs, perEpisodeMs }, null, 2)}\n`);
+  atomicWriteFileSync(runMetaOut, `${JSON.stringify({ shards: args.shards, elapsedMs, perEpisodeMs }, null, 2)}\n`);
 
   return { out: args.out, runMetaOut, taskCount: tasks.length, elapsedMs };
 };

@@ -1,10 +1,10 @@
-import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
 
 import { buildGraphBufferForMode } from '../../src/lib/experiment/bindings';
 import { parseGraphBinary, type GraphMode } from '../../src/lib/connectome/format';
 import { runEpisode } from '../training/episode';
+import { sha256Hex } from '../training/fsio';
 
 /**
  * `null-evaluate.ts`'s child process: `node:child_process.fork`s this file
@@ -54,8 +54,6 @@ export interface NullWorkerErrorMessage {
 }
 
 export type NullWorkerMessage = NullWorkerResultMessage | NullWorkerErrorMessage;
-
-const sha256Hex = (data: Uint8Array): string => createHash('sha256').update(data).digest('hex');
 
 /**
  * Read, decompress, and sha256-verify a graph binary against `expectedSha256`

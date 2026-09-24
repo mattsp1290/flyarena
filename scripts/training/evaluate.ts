@@ -1,5 +1,4 @@
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -24,6 +23,7 @@ import {
 import { runEpisode } from './episode';
 import { TRACE_SUBSTEPS } from './export-traces';
 import { requireNonNegativeInt, requirePositiveInt, requireValue } from './cli';
+import { sha256Hex } from './fsio';
 import { deriveTrainingBlock, readRunDir, type LoadedRun } from './run-dir';
 import { conditionRng, conditionStats, pairedStats } from './stats';
 import {
@@ -56,8 +56,6 @@ import {
 
 /** Replica 0 (`03-cem-training.md`: "Replica 0 is the one shipped to the browser"). */
 const SHIPPED_TRAINER_SEED = 101;
-
-const sha256Hex = (data: Uint8Array | string): string => createHash('sha256').update(data).digest('hex');
 
 /**
  * A topological (not statistical) guarantee that this arm's readout input —

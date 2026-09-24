@@ -13,6 +13,7 @@ import {
   resolveRunMeta,
   runNullReport,
   updateManifestWithRewiringNull,
+  verifyManifestRoundTrips,
   type NullReportArgs
 } from '../../scripts/null/null-report';
 
@@ -301,8 +302,17 @@ describe('runNullReport', () => {
   });
 });
 
-describe('updateManifestWithRewiringNull: round-trip safety', () => {
-  it('refuses to write if re-serializing the unmodified manifest is not byte-identical to the file on disk', () => {
+describe('verifyManifestRoundTrips: round-trip safety', () => {
+  // `updateManifestWithRewiringNull` no longer calls `verifyManifestRoundTrips`
+  // itself -- `runNullReport` already runs it as a preflight, before
+  // anything is written (see the "refuses to publish (before writing
+  // anything) when the manifest cannot round-trip byte-identically" test
+  // above), so calling it again inside `updateManifestWithRewiringNull` was
+  // pure duplicated work on every successful publish (a thermo-nuclear
+  // maintainability finding). This block now tests the exported
+  // `verifyManifestRoundTrips` function directly, which is the contract any
+  // other caller of `updateManifestWithRewiringNull` must uphold itself.
+  it('refuses (throws) if re-serializing the unmodified manifest is not byte-identical to the file on disk', () => {
     const root = mkdtempSync(join(tmpdir(), 'null-report-manifest-safety-'));
     const manifestPath = join(root, 'manifest.json');
     // A float value: JS's JSON.stringify writes `1` for `1.0`, which
@@ -310,19 +320,52 @@ describe('updateManifestWithRewiringNull: round-trip safety', () => {
     // this module's own sortKeysDeep+stringify convention, so the round
     // trip must fail closed rather than silently rewrite it.
     writeFileSync(manifestPath, '{\n  "binarySha256": "abc",\n  "value": 1.0\n}\n');
-    expect(() => updateManifestWithRewiringNull(manifestPath, { artifact: 'x.json', sha256: 'y' })).toThrow(
-      /re-serializing .* produced different bytes/
-    );
+    expect(() => verifyManifestRoundTrips(manifestPath)).toThrow(/re-serializing .* produced different bytes/);
     rmSync(root, { recursive: true, force: true });
   });
 
-  it('writes normally when the manifest already matches the sorted-keys/2-space-indent convention', () => {
+  it('does not throw when the manifest already matches the sorted-keys/2-space-indent convention', () => {
     const root = mkdtempSync(join(tmpdir(), 'null-report-manifest-ok-'));
+    const manifestPath = join(root, 'manifest.json');
+    writeFileSync(manifestPath, '{\n  "artifact": "x.bin.gz",\n  "binarySha256": "abc"\n}\n');
+    expect(() => verifyManifestRoundTrips(manifestPath)).not.toThrow();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('updateManifestWithRewiringNull itself writes normally given an already-conformant manifest (no preflight call of its own)', () => {
+    const root = mkdtempSync(join(tmpdir(), 'null-report-manifest-update-'));
     const manifestPath = join(root, 'manifest.json');
     writeFileSync(manifestPath, '{\n  "artifact": "x.bin.gz",\n  "binarySha256": "abc"\n}\n');
     updateManifestWithRewiringNull(manifestPath, { artifact: 'x.json', sha256: 'y' });
     const written = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>;
     expect(written.rewiringNull).toEqual({ artifact: 'x.json', sha256: 'y' });
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('updateManifestWithRewiringNull called directly (bypassing the caller-owned preflight) does NOT throw on a non-round-trippable manifest -- it trusts the caller per its doc comment', () => {
+    // Locks in the contract this function's doc comment now states: unlike
+    // before, this function no longer independently guards against
+    // rewriting unrelated bytes -- any caller that skips
+    // `verifyManifestRoundTrips` itself (as `runNullReport` no longer does,
+    // since it already ran the check as its own preflight) gets a silent
+    // reformat of the whole file, not a thrown error. This test exists so a
+    // future accidental re-introduction of the internal check (undoing this
+    // maintainability fix, or silently changing this function's contract
+    // back) shows up as a failing assertion rather than passing unnoticed.
+    const root = mkdtempSync(join(tmpdir(), 'null-report-manifest-unguarded-'));
+    const manifestPath = join(root, 'manifest.json');
+    const originalText = '{\n  "binarySha256": "abc",\n  "value": 1.0\n}\n';
+    writeFileSync(manifestPath, originalText);
+    expect(() => updateManifestWithRewiringNull(manifestPath, { artifact: 'x.json', sha256: 'y' })).not.toThrow();
+    const rewritten = readFileSync(manifestPath, 'utf8');
+    // The float `1.0` was silently reformatted to `1` (JS's JSON.stringify
+    // cannot preserve the distinction) -- exactly the "silently rewrite
+    // unrelated manifest bytes" risk `verifyManifestRoundTrips`'s doc
+    // comment warns about, now only prevented by callers that check first.
+    expect(rewritten).not.toBe(originalText);
+    const written = JSON.parse(rewritten) as Record<string, unknown>;
+    expect(written.rewiringNull).toEqual({ artifact: 'x.json', sha256: 'y' });
+    expect(written.value).toBe(1);
     rmSync(root, { recursive: true, force: true });
   });
 });

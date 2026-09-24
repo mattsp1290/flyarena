@@ -1,9 +1,9 @@
-import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { basename, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { requireNonNegativeInt, requirePositiveInt, requireValue } from '../training/cli';
+import { atomicWriteFileSync, sha256Hex } from '../training/fsio';
 import { conditionRng, pairedStats, type ConditionStats, type PairedStats } from '../training/stats';
 import {
   DEFAULT_HISTOGRAM_BINS,
@@ -47,31 +47,6 @@ const DEFAULT_BOOTSTRAP_RESAMPLES = 10000;
 
 /** This study's committed methodology (the plan's "500 rewired graphs"): the floor below which `--out`/`--report-md`/`--manifest` refuse to write to their default (shipped) paths, so a dev/fixture/partial run can never silently clobber the real published artifacts. */
 const MIN_REWIRED_FOR_SHIPPED_DEFAULT = 500;
-
-const sha256Hex = (data: string): string => createHash('sha256').update(data, 'utf8').digest('hex');
-
-/**
- * Write `contents` to `path` via a same-directory temp file + `renameSync`
- * (POSIX rename is atomic), so a process killed mid-write leaves either the
- * previous file or nothing — never a truncated one. Matches
- * `scripts/data/fsutil.py`'s `atomic_write_text` convention, which
- * `positions.py`/`rewire_batch.py` already use for the files this script's
- * output sits alongside.
- */
-const atomicWriteFileSync = (path: string, contents: string): void => {
-  const tmpPath = resolve(dirname(path), `.${basename(path)}.${randomBytes(6).toString('hex')}.tmp`);
-  try {
-    writeFileSync(tmpPath, contents);
-    renameSync(tmpPath, path);
-  } catch (error) {
-    try {
-      unlinkSync(tmpPath);
-    } catch {
-      // tmpPath was never created, or was already cleaned up — nothing more to do.
-    }
-    throw error;
-  }
-};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -314,11 +289,21 @@ export const verifyManifestRoundTrips = (manifestPath: string): void => {
   }
 };
 
+/**
+ * Does **not** call `verifyManifestRoundTrips` itself — `runNullReport`
+ * already runs it as a preflight (before anything is written, so a failure
+ * never leaves a half-published state; see that function's own call and
+ * `verifyManifestRoundTrips`'s doc comment above). Calling it again here
+ * was pure duplicated work on every successful publish (a thermo-nuclear
+ * maintainability finding). Any other caller of this function must run
+ * `verifyManifestRoundTrips(manifestPath)` itself first if it isn't already
+ * guaranteed to hold — this function trusts that contract rather than
+ * re-verifying it.
+ */
 export const updateManifestWithRewiringNull = (
   manifestPath: string,
   entry: { readonly artifact: string; readonly sha256: string }
 ): void => {
-  verifyManifestRoundTrips(manifestPath);
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>;
   manifest.rewiringNull = entry;
   atomicWriteFileSync(manifestPath, `${JSON.stringify(sortKeysDeep(manifest), null, 2)}\n`);
@@ -521,6 +506,17 @@ export const renderReportMarkdown = (artifact: Readonly<RewiringNullArtifact>): 
 
 Where the measured biological MaleCNS topology falls among ${artifact.rewired.length} degree-preserving
 rewirings of the same graph, scored under identical dynamics, encoder, decoder, and held-out seeds.
+
+**What "authored decoder" means.** The authored decoder is a fixed, hand-written mapping from
+output-neuron rates to motor actions (\`src/lib/arena/actions.ts\`'s \`decodeAction\`, invoked via
+\`scripts/training/episode.ts\`'s \`aggregateOutputs -> decodeAction\` pipeline) — it is not biological,
+not trained, and not derived from the connectome beyond reading rates off anatomically-labeled output
+neurons (see \`docs/model-ledger.md\`, which labels this **Authored** and separately states the product
+"must not... imply that authored behavior is biological"). This
+report describes how this specific hand-authored decoder, this rate-model dynamics, and this arena
+interact with the biological graph's topology versus ${artifact.rewired.length} rewirings of it — it is
+not a claim about the real fly's neural function or behavior, and it makes no claim that any rewiring's
+topology is causally "worse," or that any other rewiring is "better," than the biological one.
 ${degenerateSection}
 ## Method
 
@@ -577,10 +573,22 @@ ${renderHistogramTable(artifact.bins)}
 \`p_low\`/\`p_high\` are rank-based descriptive statistics \`(k_below + k_equal + 1)/(|N| + 1)\` and
 \`(|N| - k_below + 1)/(|N| + 1)\` — reported without significance language, per this study's non-goals.
 
+**Reconciling with [\`docs/seed-sweep.md\`](seed-sweep.md).** That study reports a 20-seed, two-agent, self-paired
+sweep (\`T=2700\`) where rewired-seed-0 outscored biological (mean 0.70 vs. −2.04). This report's paired
+biological − rewired-seed-0 comparison above, run under this study's different condition (single-agent,
+opponent parked, 100 seeds, \`T=${artifact.ticks}\`), agrees in direction — biological scores lower here too
+(mean diff ${fmt(artifact.pairedBiologicalVsRewiredSeed0.meanDifference)}, 95% CI ${fmt(artifact.pairedBiologicalVsRewiredSeed0.ci95[0])} to ${fmt(artifact.pairedBiologicalVsRewiredSeed0.ci95[1])}) —
+but the two studies differ in agent/opponent condition, tick count, and seed count (and seed set), so this
+is corroborating evidence under a related-but-distinct condition, not a replication of the same measurement.
+
 ## Limitations
 
-- Scores come from a **single-agent condition with the opponent parked** — the same headline condition the
-  trained-readout report uses. Two-agent competitive dynamics are not evaluated here.
+- Scores come from a **single-agent condition with the opponent parked**, on the same held-out seeds and
+  tick count as [the trained-readout report](trained-readout-report.md) — but that report evaluates a
+  different condition: it scores trained readouts (and a \`silenced\`-readout control) alongside the
+  authored decoder, restricted to the biological/rewired-seed-0/disconnected arms, not a null
+  distribution over ${artifact.rewired.length} degree-preserving rewirings. Two-agent competitive
+  dynamics are not evaluated in either report.
 - **One null model** is used: degree-preserving double-edge swaps (\`scripts/data/rewire.py\`). Other null
   models (weight shuffles within degree, Erdős–Rényi with matched density) are deferred follow-ups.
 - **No causal or superiority claim is made.** The percentile and rank statistics above are descriptive: they

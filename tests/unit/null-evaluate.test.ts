@@ -357,13 +357,29 @@ describe('runShardedEvaluation: failure/abort paths (stub worker)', () => {
   });
 
   it('a task-level error aborts the whole run quickly, not after the full queue drains', async () => {
-    const tasks = [task('err'), ...Array.from({ length: 8 }, (_, i) => task(`t${i}`, 300))];
+    // Self-calibrating regression floor rather than a tight fixed-ms bound
+    // (flagged as a small flakiness risk on slow/loaded CI runners by the
+    // thermo-nuclear maintainability review): with 2 shards and `err` as
+    // the very first dispatched task, a correct abort only ever lets at
+    // most one delayed task per shard start (each killed via SIGTERM
+    // mid-busy-wait, so `delayMs` never elapses for it) before `abortAll`
+    // fires -- wall time for the *passing* path is dominated by fork()/IPC
+    // overhead alone, independent of `remainingTaskCount`/`delayMs`. The
+    // pre-fix ("keep draining after an error") behavior instead splits the
+    // remaining tasks across both shards and finishes no faster than
+    // `regressionFloorMs`. Scaling both up (more remaining tasks, same
+    // per-task delay) widens the gap between "fast, correct" and "slow,
+    // regressed" far beyond any plausible fork/IPC jitter, so the assertion
+    // below can use a generous threshold without losing the ability to
+    // catch the regression.
+    const delayMs = 300;
+    const remainingTaskCount = 24;
+    const tasks = [task('err'), ...Array.from({ length: remainingTaskCount }, (_, i) => task(`t${i}`, delayMs))];
+    const regressionFloorMs = (remainingTaskCount / 2) * delayMs; // 3600ms
     const started = Date.now();
     await expect(runShardedEvaluation(tasks, 2, stubWorkerPath)).rejects.toThrow(/stub-induced failure/);
     const elapsedMs = Date.now() - started;
-    // If the other shard kept draining its half of the queue (4 tasks x 300ms
-    // each), this would take >= 1200ms. Aborting promptly keeps it well under.
-    expect(elapsedMs).toBeLessThan(900);
+    expect(elapsedMs).toBeLessThan(regressionFloorMs / 2); // generous 1800ms bound, still well below the 3600ms floor
   });
 
   it('a worker killed by a signal is reported as a failure, not treated as a clean exit', async () => {
