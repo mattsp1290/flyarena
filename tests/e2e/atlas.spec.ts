@@ -15,7 +15,8 @@ test('discover, replay, intervene and verify selected-controller evidence', asyn
   await page.getByRole('button', { name: 'Play behavior replay', exact: true }).click();
   await page.getByRole('button', { name: 'Pause behavior replay', exact: true }).click();
   await page.getByRole('slider', { name: 'Behavior replay timeline' }).fill('60');
-  await map.getByRole('button').first().click();
+  await map.getByRole('button').first().focus();
+  await page.keyboard.press('Enter');
   await expect(map.getByRole('button').first()).toHaveAttribute('aria-pressed', 'true');
   await page.getByRole('button', { name: 'Use quick probe settings' }).click();
   await page.getByRole('button', { name: 'Fork & compare' }).click();
@@ -44,6 +45,7 @@ test('discover, replay, intervene and verify selected-controller evidence', asyn
   await expect(page.getByRole('region', { name: 'Counterfactual results' })).toHaveCount(0);
   await page.getByLabel('Silence group', { exact: true }).selectOption('output');
   await page.getByRole('button', { name: 'Use quick probe settings' }).click();
+  await page.getByLabel('Fork tick', { exact: true }).fill('60');
   await page.getByRole('button', { name: 'Fork & compare' }).click();
   await page.getByRole('button', { name: 'Cancel probe', exact: true }).click();
   await expect(page.getByRole('status').filter({ hasText: 'cancelled' })).toBeVisible();

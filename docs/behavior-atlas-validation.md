@@ -1,7 +1,7 @@
 # Behavior atlas validation
 
-Status: implementation and maintainability review complete; integrated verification
-and deployment remain in progress.
+Status: implementation, maintainability review and integrated verification complete.
+Deployment verification remains in progress.
 
 ## Planning and hardware
 
@@ -24,7 +24,10 @@ The search produced 30 occupied cells. Canonical TypeScript evaluation retained
 2,747,730 bytes. The manifest records its exact SHA-256 and byte length.
 
 Two short fixture CUDA searches with identical settings produced identical results.
-CPU/CUDA and singleton/batched fixture rollouts passed. A real-graph smoke comparison
+CPU/CUDA and singleton/batched fixture rollouts passed. A repeated real-graph
+CUDA smoke search retained identical controller IDs and weights, with maximum
+quality difference 2.26e-10, turning difference 1.74e-9 and zero coverage difference.
+The real-graph GPU metrics are therefore not claimed to reproduce bitwise. A real-graph smoke comparison
 had zero coverage error, maximum absolute score error 8.57e-9 and turning error
 2.44e-8. The full 900-tick candidate comparison had maximum mean-score discrepancy
 0.464213, coverage discrepancy 0.0025 and turning discrepancy 0.001359. This is
@@ -83,5 +86,18 @@ shared trained rollout stepping, bounded artifact loaders, and no new file near
 is offline; concurrent development fetches fail closed during a partial update.
 Production activation switches the complete release atomically.
 
-Still pending: final integrated browser/subpath gates, merge, deployment and the
-public browser smoke.
+## Integrated verification
+
+Integrated main revision `03992de` (the other agents' trained-decoder toggle) into
+this branch without conflicts. The combined tree passed Svelte/TypeScript checks,
+631 tests in 56 Vitest files, production build, 31 browser tests, and two strict
+subpath tests. Two unchanged optional live-sandbox tests were skipped. The final
+replay-seed default adjustment then passed type checking, all five atlas browser
+tests (including keyboard selection, pending-worker cancellation, missing/tampered
+assets and deployment-race rejection), and both subpath tests again.
+
+Desktop and 390-pixel mobile renders were inspected. Buttons, controller summaries,
+controls, playback and labels remained readable without horizontal overflow.
+The atlas probe now starts on the same seed as the displayed replay.
+
+Still pending: merge to main, deployment and public browser smoke.

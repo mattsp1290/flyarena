@@ -55,6 +55,7 @@ The initial replay always uses seed 62001, selected before evaluation; it is not
 the best-performing seed. Food/hazard positions belong to that actual trajectory.
 Playback samples at most 61 frames over the full episode.
 
+The initial probe seed matches the displayed replay seed (62001); it can be changed.
 After selection, the existing counterfactual engine runs a new experiment with
 the selected readout during warmup and in every future. Full world state, neural
 rates and RNG state are cloned at the fork. Baseline and sham are identical;

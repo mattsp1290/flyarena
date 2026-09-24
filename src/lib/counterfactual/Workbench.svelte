@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, untrack } from 'svelte';
-  import type { AtlasSelection } from '../atlas/types';
+  import { HELDOUT_SEEDS, type AtlasSelection } from '../atlas/types';
   import type { GraphMode } from '../connectome/format';
   import { CounterfactualClient, ExperimentCancelled } from './client';
   import { DEFAULT_REQUEST, BRANCHES, type ExportDocument, type Preparation, type Request } from './types';
@@ -8,7 +8,7 @@
   import PairedReplay from './PairedReplay.svelte';
 
   let { setup, selection }: { setup?: { seed: number; topology: GraphMode }; selection?: AtlasSelection } = $props();
-  let options = $state<Request>(untrack(() => ({ ...DEFAULT_REQUEST, ...setup })));
+  let options = $state<Request>(untrack(() => ({ ...DEFAULT_REQUEST, ...(selection ? { seed: HELDOUT_SEEDS[0] } : {}), ...setup })));
   let preparation = $state<Preparation | null>(null);
   let document = $state<ExportDocument | null>(null);
   let status = $state<'preparing' | 'ready' | 'running' | 'completed' | 'cancelled' | 'error'>('preparing');
