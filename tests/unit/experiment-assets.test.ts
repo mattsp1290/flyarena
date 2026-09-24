@@ -48,6 +48,13 @@ afterEach(() => {
 });
 
 describe('sha256Hex / decompressGzip (real artifact bytes)', () => {
+  it('hashes known vectors and real artifacts without secure-context Web Crypto', async () => {
+    vi.stubGlobal('crypto', {});
+    expect(await sha256Hex(new ArrayBuffer(0))).toBe('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855');
+    expect(await sha256Hex(new TextEncoder().encode('abc').buffer)).toBe('ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
+    const gzip = toArrayBuffer(readFileSync(resolve(publicDataDir, 'malecns-arena-v1.bin.gz')));
+    expect(await sha256Hex(gzip)).toBe(manifest.gzipSha256);
+  });
   it('sha256Hex matches the manifest for both the gzip and decompressed bytes', async () => {
     const gzipBytes = toArrayBuffer(readFileSync(resolve(publicDataDir, 'malecns-arena-v1.bin.gz')));
     expect(await sha256Hex(gzipBytes)).toBe(manifest.gzipSha256);

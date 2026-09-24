@@ -22,6 +22,7 @@
     "test:subpath": "playwright test --config playwright.subpath.config.ts"
   },
   "dependencies": {
+    "@noble/hashes": "2.4.0",
     "svelte": "^5.57.1",
     "three": "^0.186.0"
   },

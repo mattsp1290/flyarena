@@ -90,3 +90,41 @@ The local exact Node rerun passed. Mean post-fork baseline score was
 These are small authored-model movements, not a claim about animal behavior.
 Seven real CLI tests cover exact regeneration and rejection of edited graph,
 body ID, seed list, model version, replay and outcome evidence.
+
+## Main merge and deployment
+
+The reviewed integration was merged to main as
+`bba244ada8c185b5c24d86c3f13294bd300c2304` and pushed to origin.
+The first authorized deployment stopped before upload because GNU tar detected
+its source directory changing when the package was created inside `dist`.
+The narrow fix creates the archive in a temporary file outside that directory,
+then moves the completed package into place. Both independent reviewers approved
+this follow-up, including the live thermonuclear rubric. Build-only execution and
+byte comparison of the extracted archive against `dist` passed.
+
+The packaging fix reached main as `0d86c3992660a8ab679cb2767ab4da11053a89fb`.
+`./scripts/deploy.sh` then succeeded from main and verified public HTML plus every
+emitted asset byte for byte. Activated static release:
+`20260924T141000Z-dfd5e1609939`. Existing backend/LLM containers were not restarted.
+The synthetic sandbox remains an optional separately authenticated service.
+
+A maximum bounded 16-seed/300-warmup/300-horizon real-graph probe also passed exact
+Node regeneration; its 9,375,345-byte JSON fits the 16 MiB verifier limit.
+
+The public browser smoke then exposed a host-specific issue: the configured HTTP
+origin has no `crypto.subtle`, so main's existing graph loader could not digest
+artifacts. The canonical digest helper now uses pinned `@noble/hashes` 2.4.0 in
+both browser and Node; no hash check is skipped or weakened. Both independent
+reviewers approved this correction under their respective rubrics. Independent
+review compared all four real-artifact digests with Node SHA-256; every one
+matched (roughly 0.45–3.96 ms per call locally).
+
+After this fix: check/build and **405 frontend tests** passed; both strict
+subpath tests passed, including a genuine insecure HTTP origin (not localhost)
+with absent SubtleCrypto. Its arena and real experiment Worker run successfully,
+and same-length byte corruption still fails SHA-256 verification. All 15 static
+browser/performance journeys passed again: neural median 0.6/0.5 ms, largest
+arena long task 88 ms, no counterfactual long tasks, throttled load 2099 ms.
+Remote CI passed for the prior packaging revision `0d86c39`; this does not imply
+remote success for later revisions. The following release record supersedes the
+initial byte-only deployment verification above.

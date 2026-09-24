@@ -11,6 +11,8 @@
  */
 
 import { parseGraphBinary } from '../connectome/format';
+import { sha256 } from '@noble/hashes/sha2.js';
+import { bytesToHex } from '@noble/hashes/utils.js';
 
 export class ArtifactIntegrityError extends Error {
   constructor(message: string) {
@@ -35,11 +37,10 @@ export class DecompressionUnsupportedError extends Error {
   }
 }
 
-const bytesToHex = (bytes: ArrayBuffer): string =>
-  Array.from(new Uint8Array(bytes), (byte) => byte.toString(16).padStart(2, '0')).join('');
-
+// Static HTTP deployments do not expose crypto.subtle. Use the same SHA-256
+// implementation in browser Workers and Node without weakening verification.
 export const sha256Hex = async (data: ArrayBuffer): Promise<string> =>
-  bytesToHex(await crypto.subtle.digest('SHA-256', data));
+  bytesToHex(sha256(new Uint8Array(data)));
 
 /** Decompress one gzip member via the streaming Web Compression API. Throws `DecompressionUnsupportedError` if unavailable. */
 export const decompressGzip = async (data: ArrayBuffer): Promise<ArrayBuffer> => {

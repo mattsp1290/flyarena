@@ -60,3 +60,23 @@ Base: merged main `bba244ada8c1`. Reviewed the uncommitted `scripts/deploy.sh` p
 Applied the same full live thermonuclear rubric to this narrow fix: (0/3) it deletes the underlying incidental conflict rather than retrying or suppressing a failure; (1) no file-size threshold issue; (2) no new mode-specific branches or shared-flow tangling; (4) direct shell primitives, no magic wrapper; (5) quoted paths and explicit failure boundary; (6) packaging remains in the existing canonical deployment script; (7) packaging completes before upload and temporary cleanup owns its full lifetime. None of the approval-bar blockers applies. There are no new findings or requested refactors.
 
 Independently ran `bash -n scripts/deploy.sh`: passed. Root owns real build-only/archive inspection, merging this correction to main before retrying deployment, and public release verification; this addendum does not claim those remaining operations succeeded.
+
+## Portable artifact hashing re-review — 2026-09-24 14:14 UTC
+
+Base: main `0d86c3992660`. Reviewed the complete uncommitted patch, canonical artifact loader, all asset-integrity tests, strict subpath browser test, package metadata/lock entry and deployment evidence update. **APPROVE.**
+
+The correction replaces the secure-context-only Web Crypto digest with one pinned, portable SHA-256 implementation in the existing canonical `sha256Hex` function. It removes the custom hex encoder and does not introduce a runtime fallback, bypass, separate browser/Worker implementation, or weakened integrity check. Retaining the existing Promise return contract avoids changing all consumers; this is a justified boundary adapter, not an unnecessary wrapper. The exact package pin and lock integrity match `@noble/hashes` 2.4.0; its installed export paths and Node >=20.19.0 requirement are compatible with this repository's Node 22 runtime. No runtime transitive dependency is added.
+
+Applied every live thermonuclear rule: (0/3) one canonical implementation deletes environment-dependent branching and duplicated encoding; (1) no file-size threshold crossing; (2) no scattered feature checks; (4) no bespoke cryptography or silent fallback; (5) existing ArrayBuffer/string/Promise boundary stays explicit; (6) the fix lives at the canonical artifact-integrity layer shared by Arena, Worker and CLI; (7) artifact network requests remain parallel and integrity verification still completes before graph use. SHA computation becomes synchronous inside the async adapter, but for these bounded artifacts this is not a reason to introduce another Worker or dual implementation. Root's normal browser performance gates remain relevant. No approval-bar blocker or new finding.
+
+Independently ran `vitest run tests/unit/experiment-assets.test.ts`: **15 tests passed**. The new test removes Web Crypto and checks standard empty/`abc` vectors plus a real committed manifest digest; the existing tests retain compressed/decompressed identity, metadata and corruption checks. The additional browser test correctly uses a mapped non-loopback HTTP hostname, explicitly asserts `isSecureContext === false` and absent `crypto.subtle`, exercises both Arena and the experiment Worker, and alters an interior byte without changing length to require hash rejection. This is stronger than treating HTTP loopback as an insecure-context test. Root owns executing that browser test and the full performance/regression suite.
+
+Reviewed content SHA-256:
+
+- `src/lib/experiment/assets.ts`: `a4addb91cf59fa048e88b750fd2437f2d032ba71a340b2f6f0e4bd8ef219fe98`
+- `package-lock.json`: `12eff1e15f162272152c9fbb8d3b699c1f18b1e4926ba5a6e90a37b7a687afe5`
+- `tests/e2e/subpath.spec.ts`: `b9b99378d11a6115a4d825c122d40eab966ad9e10b49db2a5c36813ba61689e0`
+
+Approval covers this source correction. It does not claim the corrected source has already been merged or deployed, or that public browser behavior has already passed post-deployment verification.
+
+Inspected the final test-fixture correction: corruption now reads the committed gzip bytes locally before flipping byte 24, avoiding Node-side DNS resolution of Chrome’s mapped hostname. This preserves the browser integrity assertion and approval; the listed test hash reflects this final version.
