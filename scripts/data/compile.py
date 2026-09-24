@@ -201,6 +201,16 @@ COMPILER_SOURCE_DIR = Path(__file__).resolve().parent
 #: section.
 COMPILER_SOURCE_FILENAMES: tuple[str, ...] = ("binfmt.py", "compile.py", "download.py", "rewire.py")
 
+#: Every `scripts/data/*.py` file that is *not* part of "the compiler" --
+#: i.e. every file `compiler_source_sha256()` deliberately excludes.
+#: `test_every_scripts_data_module_is_classified` in `tests_python/
+#: test_compile.py` asserts that `COMPILER_SOURCE_FILENAMES` and this tuple
+#: partition the directory's actual `*.py` files exactly, so a new module
+#: dropped into `scripts/data/` (compiler or sidecar) can never be silently
+#: left out of both -- unlike the old `*.py` glob, an allowlist fails open
+#: by default; this test is what makes it fail closed instead.
+NON_COMPILER_SIDECAR_FILENAMES: tuple[str, ...] = ("positions.py",)
+
 
 def compiler_source_sha256(source_dir: Path = COMPILER_SOURCE_DIR) -> str:
     """sha256 over this compiler's own Python source
@@ -683,7 +693,7 @@ def build_manifest_and_ledger(
         "gzipBytes": binary_gzip_size,
         "license": "CC-BY-4.0",
         "sourceDataset": "male-cns:v1.0 (Janelia FlyEM Male CNS connectome)",
-        # sha256 over scripts/data/*.py at compile time -- see
+        # sha256 over COMPILER_SOURCE_FILENAMES at compile time -- see
         # compiler_source_sha256()'s docstring. Echoed into the ledger too
         # (below) so either file alone proves which compiler code produced
         # this artifact.
@@ -692,11 +702,12 @@ def build_manifest_and_ledger(
 
     ledger = {
         "artifact": f"{ARTIFACT_NAME}.bin.gz",
-        # sha256 over scripts/data/*.py (binfmt.py, compile.py, download.py,
-        # rewire.py) at compile time -- see compiler_source_sha256()'s
-        # docstring in scripts/data/compile.py. Unlike compiledFromGitRevision
-        # below, this is derived directly from the code that ran, so it
-        # cannot go stale the way a self-referential git SHA can.
+        # sha256 over COMPILER_SOURCE_FILENAMES (binfmt.py, compile.py,
+        # download.py, rewire.py) at compile time -- see
+        # compiler_source_sha256()'s docstring in scripts/data/compile.py.
+        # Unlike compiledFromGitRevision below, this is derived directly
+        # from the code that ran, so it cannot go stale the way a
+        # self-referential git SHA can.
         "compilerSourceSha256": compiler_source_sha256_value,
         # Informational only: `git rev-parse HEAD` *at compile time*. This is
         # inherently self-referential -- the commit that ships this

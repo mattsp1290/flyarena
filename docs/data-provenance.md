@@ -350,7 +350,28 @@ hides. `roleCounts` from this same run -- `{sensory: 160, bridge: 800,
 descending: 48}` -- match `malecns-arena-v1.ledger.json`'s
 `selectionCounts.{sensorySelectedCount,bridgeSelectedCount,descendingSelectedCount}`
 exactly, confirming every compiled neuron got exactly one role and the
-positions artifact's neuron set is the graph's neuron set.
+positions artifact's neuron set is the graph's neuron set. `positions.py`
+checks this itself (raising if it ever disagrees) whenever a ledger is
+present at `--ledger-path`/`--out-dir`.
+
+**By role, the 165 unplaced neurons are overwhelmingly the sensory
+population, not a scattering across all three roles**: all 160 sensory
+neurons (`vnc_sensory`: 85 `mechanosensory_tactile`, 75
+`mechanosensory_proprioceptive`; real VNC sensory neurons have peripheral
+cell bodies, typically outside the imaged central-nervous-system volume)
+have `positionSource: "none"` -- the annotations table records neither a
+`somaLocation` nor a `tosomaLocation` for any of them. The remaining 5
+`"none"` neurons are bridge neurons. Every descending neuron has a position
+(48/48 soma). Bridge: 786 soma, 9 tosoma, 5 none. **In practice this means
+the anatomical activity view has no measured position for the entire
+sensory (input) layer**: all 160 sensory neurons appear only in the
+"position unavailable" strip, never in the spatially-placed scene. This is
+a fact about the source data (real VNC sensory somata sit outside this
+imaged volume), not a bug in the join -- but it is exactly the kind of
+thing a reader of this artifact needs to know before building a view on
+top of it, so it is recorded here rather than only visible by inspecting
+`coverage`/`roleCounts` against the per-neuron `role`/`positionSource`
+arrays by hand.
 
 **Provenance fields.** `positions.json` carries its own `sourceFile` /
 `sourceSha256` (the verified annotations table) and `graphSha256` (sha256
@@ -366,7 +387,23 @@ byte-identical output (verified directly, and by
 `positions: {artifact, sha256, coverage}` entry and
 `malecns-arena-v1.ledger.json` with a `positionsCoverage: {soma, tosoma,
 none}` entry, following the same in-place-update convention
-`scripts/data/rewire.py` already uses for `rewiredArms`.
+`scripts/data/rewire.py` already uses for `rewiredArms`. Before writing
+either, it refuses to proceed (raising, writing nothing) if `--graph`'s
+sha256 doesn't match the manifest's own `gzipSha256` -- otherwise a stale
+or mismatched `--graph` could attach a `positions` entry that describes a
+different compiled artifact than the one the rest of the manifest
+describes.
+
+**Pipeline order matters.** `compile.py`'s `main()` writes
+`manifest.json`/`ledger.json` from scratch on every run -- it has no
+knowledge of `rewiredArms`, `positions`, or `positionsCoverage`, and a
+recompile silently drops all three if `rewire.py`/`positions.py` are not
+re-run afterward. `tests/unit/malecns-artifact.test.ts`'s positions-sidecar
+test (and `positions.py`'s own `--graph`/manifest sha256 guard above) turn
+a resulting drift into a loud CI failure rather than a silent stale file,
+but the correct order to avoid it in the first place is always: `compile.py`,
+then `rewire.py`, then `positions.py` (see "Reproducing this artifact"
+below).
 
 `positions.py` is deliberately **not** part of "the compiler" -- see
 "Compiler provenance" below: it is excluded from `compilerSourceSha256` and

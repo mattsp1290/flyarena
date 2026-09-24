@@ -30,12 +30,14 @@ import argparse
 import gzip
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pyarrow.feather as feather
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -84,6 +86,14 @@ def _pinned_annotations_sha256() -> str:
     )
 
 
+#: Columns `build_positions` requires. A table missing any of these would
+#: otherwise silently produce an all-`"none"` positions artifact (every
+#: neuron "not found") rather than failing -- exactly the "never guess
+#: silently" case this module's docstring commits to avoiding. Checked
+#: eagerly in `build_positions`, not lazily per-row.
+REQUIRED_ANNOTATION_COLUMNS = ("bodyId", "somaLocation", "tosomaLocation")
+
+
 def load_annotations_verified(
     raw_dir: Path = RAW_DATA_DIR, expected_sha256: Optional[str] = None
 ) -> "tuple[pd.DataFrame, str]":
@@ -91,7 +101,15 @@ def load_annotations_verified(
     sha256 doesn't match the pinned value (`expected_sha256`, defaulting to
     download.py's pin for the real filename -- overridable so tests can
     point this at a small fixture file with its own expected hash).
-    Returns `(dataframe, verified_sha256)`."""
+    Returns `(dataframe, verified_sha256)`.
+
+    Also asserts, for whichever of `somaLocation`/`tosomaLocation` are
+    present, that the column's Arrow type is `list<integer>` before
+    converting to pandas: a schema that ever changed to a float or
+    variable-precision type could otherwise silently truncate or lose
+    precision on the `int(...)` coercion in `_location_or_none` below,
+    breaking this module's "coordinates are copied exactly" guarantee
+    without ever raising."""
     path = raw_dir / ANNOTATIONS_FILENAME
     if not path.exists():
         raise RuntimeError(f"{path} does not exist; run scripts/data/download.py first")
@@ -103,20 +121,48 @@ def load_annotations_verified(
             "refusing to join positions from a stale/tampered/unexpected file"
         )
     table = feather.read_table(path)
+    for column in ("somaLocation", "tosomaLocation"):
+        if column not in table.column_names:
+            continue  # build_positions raises its own clearer error for a fully-missing column
+        field_type = table.schema.field(column).type
+        if not (pa.types.is_list(field_type) and pa.types.is_integer(field_type.value_type)):
+            raise RuntimeError(
+                f"{path}'s {column} column has Arrow type {field_type}, expected a "
+                "list<integer> column; refusing to coerce coordinates that might not be exact integers"
+            )
     return table.to_pandas(), actual_sha256
 
 
-def _is_valid_location(value: object) -> bool:
-    """True when `value` is a real 3-element coordinate, not a missing
-    (`None`/NaN) list cell. Feather round-trips a missing `list[int64]`
-    cell as Python `None` (object dtype), not `NaN` -- this also tolerates
-    a stray float NaN defensively."""
+def _location_or_none(value: object, *, body: int, column: str) -> "Optional[list[int]]":
+    """Returns the `[x, y, z]` integer coordinate from `value`, or `None` if
+    the cell is genuinely absent. Feather round-trips a missing
+    `list[int64]` cell as Python `None` (object dtype), not `NaN` -- a
+    stray float NaN is tolerated defensively.
+
+    Raises on anything else that is not a clean 3-element integer
+    coordinate (wrong length, or a null/NaN component inside an otherwise-
+    present list) rather than silently treating a malformed cell the same
+    as a legitimately-absent one -- a malformed cell is a data-integrity
+    problem this module should surface, not paper over with a fallback."""
     if value is None:
-        return False
+        return None
     if isinstance(value, float) and pd.isna(value):
-        return False
-    arr = np.asarray(value)
-    return arr.shape == (3,)
+        return None
+    arr = np.asarray(value, dtype=object)
+    if arr.shape != (3,):
+        raise RuntimeError(
+            f"bodyId {body}: {column} has shape {arr.shape} (expected a 3-element "
+            f"coordinate or a fully-missing cell): {value!r}"
+        )
+    coordinate: "list[int]" = []
+    for component in arr.tolist():
+        if component is None or (isinstance(component, float) and pd.isna(component)):
+            raise RuntimeError(
+                f"bodyId {body}: {column} has a missing component inside an otherwise-present "
+                f"3-element coordinate: {value!r}"
+            )
+        coordinate.append(int(component))
+    return coordinate
 
 
 def build_positions(graph: binfmt.GraphArrays, annotations: pd.DataFrame) -> dict:
@@ -127,18 +173,37 @@ def build_positions(graph: binfmt.GraphArrays, annotations: pd.DataFrame) -> dic
     somaLocation -> tosomaLocation -> none (never fabricated/imputed).
     Returns the fields `malecns-arena-v1.positions.json` needs, minus the
     top-level provenance fields (`version`/`sourceFile`/`sourceSha256`/
-    `graphSha256`/`units`) the caller adds."""
-    if "bodyId" not in annotations.columns:
-        raise RuntimeError("annotations table has no bodyId column")
+    `graphSha256`/`units`) the caller adds.
+
+    Raises rather than silently degrading to an all-`"none"` artifact when
+    the annotations table is missing a required column, or when a compiled
+    neuron's bodyId has no row in the table at all -- every graph node
+    comes from this same table's `traced` subset (`compile.py`'s
+    `select_subgraph`), so a missing row means the graph and the
+    annotations table have diverged (or, e.g., `bodyId` was read back with
+    an unexpected dtype), not that the neuron legitimately has no data."""
+    missing_columns = [c for c in REQUIRED_ANNOTATION_COLUMNS if c not in annotations.columns]
+    if missing_columns:
+        raise RuntimeError(
+            f"annotations table is missing required column(s) {missing_columns}; refusing to "
+            "silently emit an all-'none' positions artifact"
+        )
     if annotations["bodyId"].duplicated().any():
         dup = sorted(annotations.loc[annotations["bodyId"].duplicated(), "bodyId"].unique().tolist())
         raise RuntimeError(f"annotations table has duplicate bodyId(s): {dup[:10]}")
 
     by_body = annotations.set_index("bodyId")
-    has_soma_column = "somaLocation" in annotations.columns
-    has_tosoma_column = "tosomaLocation" in annotations.columns
 
     neuron_count = int(graph.metadata["neuronCount"])
+    graph_body_ids = [int(b) for b in graph.biological_ids]
+    missing_rows = [b for b in graph_body_ids if b not in by_body.index]
+    if missing_rows:
+        raise RuntimeError(
+            f"{len(missing_rows)} compiled neuron bodyId(s) have no row in the annotations table "
+            "at all (graph/annotations divergence, or a bodyId dtype mismatch such as strings vs "
+            f"integers): {missing_rows[:10]}"
+        )
+
     body_ids: list[str] = []
     roles: list[str] = []
     position_sources: list[str] = []
@@ -148,7 +213,7 @@ def build_positions(graph: binfmt.GraphArrays, annotations: pd.DataFrame) -> dic
     none_count = 0
 
     for i in range(neuron_count):
-        body = int(graph.biological_ids[i])
+        body = graph_body_ids[i]
         body_ids.append(str(body))
 
         is_sensory = int(graph.input_channel_index[i]) >= 0
@@ -160,16 +225,16 @@ def build_positions(graph: binfmt.GraphArrays, annotations: pd.DataFrame) -> dic
             )
         roles.append("sensory" if is_sensory else ("descending" if is_descending else "bridge"))
 
-        row = by_body.loc[body] if body in by_body.index else None
-        soma = row["somaLocation"] if row is not None and has_soma_column else None
-        tosoma = row["tosomaLocation"] if row is not None and has_tosoma_column else None
+        row = by_body.loc[body]
+        soma = _location_or_none(row["somaLocation"], body=body, column="somaLocation")
+        tosoma = _location_or_none(row["tosomaLocation"], body=body, column="tosomaLocation")
 
-        if _is_valid_location(soma):
-            xyz.append([int(v) for v in soma])
+        if soma is not None:
+            xyz.append(soma)
             position_sources.append(POSITION_SOURCE_SOMA)
             soma_count += 1
-        elif _is_valid_location(tosoma):
-            xyz.append([int(v) for v in tosoma])
+        elif tosoma is not None:
+            xyz.append(tosoma)
             position_sources.append(POSITION_SOURCE_TOSOMA)
             tosoma_count += 1
         else:
@@ -218,6 +283,16 @@ def render_positions_document(
     return json.dumps(document, indent=2, sort_keys=True, separators=(",", ": ")) + "\n"
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write `text` to `path` via a same-directory temp file plus
+    `os.replace`, so a crash mid-write (or a `KeyboardInterrupt`) can never
+    leave `path` truncated or half-written -- `path` either has its old
+    contents or its new ones, never something in between."""
+    tmp_path = path.with_name(path.name + ".tmp")
+    tmp_path.write_text(text, encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--raw-dir", type=Path, default=RAW_DATA_DIR)
@@ -234,6 +309,22 @@ def main(argv: list[str] | None = None) -> int:
     graph = rewire.decode_graph_binary(binary)
     print(f"  neuronCount={graph.metadata['neuronCount']}, graph sha256(gzip)={graph_sha256}")
 
+    # Load (but don't yet write) the manifest/ledger up front, so every
+    # validation below runs -- and can fail loudly -- before anything on
+    # disk is touched, and so the --graph/manifest cross-check and the
+    # roleCounts/selectionCounts cross-check both have what they need.
+    manifest_path = args.manifest_path or (args.out_dir / f"{ARTIFACT_NAME}.manifest.json")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else None
+    if manifest is not None and manifest.get("gzipSha256") != graph_sha256:
+        raise RuntimeError(
+            f"--graph {args.graph} has sha256 {graph_sha256}, which does not match "
+            f"{manifest_path}'s gzipSha256 ({manifest.get('gzipSha256')!r}); refusing to attach "
+            "a positions entry to a manifest that describes a different compiled graph"
+        )
+
+    ledger_path = args.ledger_path or (args.out_dir / f"{ARTIFACT_NAME}.ledger.json")
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8")) if ledger_path.exists() else None
+
     print("Loading + verifying pinned body-annotations...")
     annotations, source_sha256 = load_annotations_verified(args.raw_dir)
     print(f"  {len(annotations)} rows, sha256 verified: {source_sha256}")
@@ -243,35 +334,52 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  coverage: {json.dumps(fields['coverage'], sort_keys=True)}")
     print(f"  roleCounts: {json.dumps(fields['roleCounts'], sort_keys=True)}")
 
+    # Defense in depth: `fields["roleCounts"]` is derived purely from the
+    # graph's own channel/population arrays (see build_positions), so this
+    # can only disagree with the ledger if the two describe different
+    # compiled graphs, or if a future edit to the bridge/sensory/descending
+    # classification above silently drifted from compile.py's
+    # `select_subgraph` policy. Either way, that is exactly the class of
+    # silent-drift bug this whole artifact exists to prevent.
+    selection_counts = (ledger or {}).get("selectionCounts")
+    if selection_counts is not None:
+        expected_role_counts = {
+            "sensory": selection_counts.get("sensorySelectedCount"),
+            "bridge": selection_counts.get("bridgeSelectedCount"),
+            "descending": selection_counts.get("descendingSelectedCount"),
+        }
+        if expected_role_counts != fields["roleCounts"]:
+            raise RuntimeError(
+                f"roleCounts {fields['roleCounts']} does not match {ledger_path}'s "
+                f"selectionCounts {expected_role_counts}"
+            )
+
     payload = render_positions_document(
         source_sha256=source_sha256, graph_sha256=graph_sha256, fields=fields
     )
-    positions_sha256 = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    payload_bytes = payload.encode("utf-8")
+    positions_sha256 = hashlib.sha256(payload_bytes).hexdigest()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     out_path = args.out_dir / f"{ARTIFACT_NAME}.positions.json"
-    out_path.write_text(payload)
-    print(f"Wrote {out_path} ({len(payload.encode('utf-8'))} bytes)")
+    _atomic_write_text(out_path, payload)
+    print(f"Wrote {out_path} ({len(payload_bytes)} bytes)")
     print(f"positions sha256: {positions_sha256}")
 
-    manifest_path = args.manifest_path or (args.out_dir / f"{ARTIFACT_NAME}.manifest.json")
-    if manifest_path.exists():
-        manifest = json.loads(manifest_path.read_text())
+    if manifest is not None:
         manifest["positions"] = {
             "artifact": out_path.name,
             "sha256": positions_sha256,
             "coverage": fields["coverage"],
         }
-        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        _atomic_write_text(manifest_path, json.dumps(manifest, indent=2, sort_keys=True) + "\n")
         print(f"Updated {manifest_path} with the positions entry")
     else:
         print(f"[warn] {manifest_path} does not exist; skipped manifest update")
 
-    ledger_path = args.ledger_path or (args.out_dir / f"{ARTIFACT_NAME}.ledger.json")
-    if ledger_path.exists():
-        ledger = json.loads(ledger_path.read_text())
+    if ledger is not None:
         ledger["positionsCoverage"] = fields["coverage"]
-        ledger_path.write_text(json.dumps(ledger, indent=2, sort_keys=True) + "\n")
+        _atomic_write_text(ledger_path, json.dumps(ledger, indent=2, sort_keys=True) + "\n")
         print(f"Updated {ledger_path} with positionsCoverage")
     else:
         print(f"[warn] {ledger_path} does not exist; skipped ledger update")

@@ -69,6 +69,35 @@ interface Manifest {
     string,
     { artifact: string; binarySha256: string; binaryBytes: number; gzipSha256: string; gzipBytes: number }
   >;
+  positions?: {
+    artifact: string;
+    sha256: string;
+    coverage: { soma: number; tosoma: number; none: number };
+  };
+}
+
+interface Ledger {
+  compilerSourceSha256: string;
+  selectionCounts: {
+    sensorySelectedCount: number;
+    bridgeSelectedCount: number;
+    descendingSelectedCount: number;
+  };
+  positionsCoverage?: { soma: number; tosoma: number; none: number };
+}
+
+interface PositionsDocument {
+  version: number;
+  sourceFile: string;
+  sourceSha256: string;
+  graphSha256: string;
+  units: string;
+  bodyIds: string[];
+  role: Array<'sensory' | 'bridge' | 'descending'>;
+  positionSource: Array<'soma' | 'tosoma' | 'none'>;
+  xyz: Array<[number, number, number] | null>;
+  coverage: { soma: number; tosoma: number; none: number };
+  roleCounts: { sensory: number; bridge: number; descending: number };
 }
 
 const loadArtifact = (basename: string) => {
@@ -160,18 +189,52 @@ describe('malecns-arena-v1 artifact (real, pinned MaleCNS-derived graph)', () =>
     expect(graph.metadata.edgeCount).toBe(biologicalGraph.metadata.edgeCount);
   });
 
-  it('compilerSourceSha256, recomputed from the working-tree scripts/data/*.py files, matches the committed manifest and ledger', () => {
+  it('compilerSourceSha256, recomputed from the working-tree COMPILER_SOURCE_FILENAMES files, matches the committed manifest and ledger', () => {
     // Guards against the class of bug a prior review flagged in the
     // now-removed self-referential compilerRevision git SHA: a code change
     // to the compiler with no accompanying recompile/recommit of the
     // artifact. See docs/data-provenance.md's "Compiler provenance" section.
     const ledger = JSON.parse(
       readFileSync(resolve(publicDataDir, 'malecns-arena-v1.ledger.json'), 'utf-8')
-    ) as { compilerSourceSha256: string };
+    ) as Ledger;
 
     const recomputed = computeCompilerSourceSha256();
 
     expect(recomputed).toBe(manifest.compilerSourceSha256);
     expect(recomputed).toBe(ledger.compilerSourceSha256);
+  });
+
+  it('the soma positions sidecar (if present) is hash-consistent with the manifest, ledger, and compiled graph', () => {
+    // scripts/data/positions.py is a separate offline sidecar (see
+    // docs/data-provenance.md's "Soma positions sidecar" section) that is
+    // not re-run by compile.py, so nothing else guarantees this stays
+    // consistent after a recompile -- this is that guard.
+    const positionsEntry = manifest.positions;
+    expect(positionsEntry).toBeDefined();
+    if (!positionsEntry) return;
+
+    const positionsBytes = readFileSync(resolve(publicDataDir, positionsEntry.artifact));
+    expect(sha256Hex(positionsBytes)).toBe(positionsEntry.sha256);
+
+    const doc = JSON.parse(positionsBytes.toString('utf-8')) as PositionsDocument;
+    expect(doc.graphSha256).toBe(manifest.gzipSha256);
+    expect(doc.coverage).toEqual(positionsEntry.coverage);
+    expect(doc.bodyIds.length).toBe(manifest.neuronCount);
+    expect(doc.coverage.soma + doc.coverage.tosoma + doc.coverage.none).toBe(manifest.neuronCount);
+
+    const { binary } = loadArtifact('malecns-arena-v1');
+    const arrayBuffer = binary.buffer.slice(binary.byteOffset, binary.byteOffset + binary.byteLength);
+    const graph = parseGraphBinary(arrayBuffer);
+    expect(doc.bodyIds).toEqual(Array.from(graph.biologicalIds, (id) => id.toString()));
+
+    const ledger = JSON.parse(
+      readFileSync(resolve(publicDataDir, 'malecns-arena-v1.ledger.json'), 'utf-8')
+    ) as Ledger;
+    expect(ledger.positionsCoverage).toEqual(doc.coverage);
+    expect(doc.roleCounts).toEqual({
+      sensory: ledger.selectionCounts.sensorySelectedCount,
+      bridge: ledger.selectionCounts.bridgeSelectedCount,
+      descending: ledger.selectionCounts.descendingSelectedCount
+    });
   });
 });

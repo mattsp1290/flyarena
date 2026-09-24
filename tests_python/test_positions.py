@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import csv
 import gzip
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -137,7 +138,11 @@ def _default_annotation_rows() -> "list[dict]":
 
 def test_body_ids_order_matches_graph_biological_ids():
     graph = _build_fixture_graph()
-    annotations = pd.DataFrame(_default_annotation_rows())
+    # Reversed row order: the annotations table's own row order must have no
+    # effect on the emitted order. If build_positions ever iterated the
+    # annotations table instead of the graph's biological_ids, this would
+    # catch it (an ascending-both-fixtures test would not).
+    annotations = pd.DataFrame(list(reversed(_default_annotation_rows())))
 
     fields = positions.build_positions(graph, annotations)
 
@@ -205,6 +210,81 @@ def test_both_channel_and_population_assigned_raises():
         positions.build_positions(graph, annotations)
 
 
+def test_missing_position_column_raises_instead_of_all_none():
+    """A table missing somaLocation/tosomaLocation entirely must not
+    silently produce an all-"none" artifact (exit 0) -- see
+    docs/data-provenance.md's "never guess silently" policy."""
+    graph = _build_fixture_graph()
+    rows = [{k: v for k, v in row.items() if k != "tosomaLocation"} for row in _default_annotation_rows()]
+    annotations = pd.DataFrame(rows)
+
+    with pytest.raises(RuntimeError, match="missing required column"):
+        positions.build_positions(graph, annotations)
+
+
+def test_graph_body_with_no_annotation_row_raises():
+    """Every compiled neuron's bodyId comes from this same annotations
+    table's traced subset (compile.py's select_subgraph), so a compiled
+    body missing from the table entirely is a graph/annotations divergence,
+    not a legitimate "no data" case -- it must raise, not silently become
+    positionSource "none"."""
+    graph = _build_fixture_graph()
+    rows = [row for row in _default_annotation_rows() if row["bodyId"] != SENSORY_A]
+    annotations = pd.DataFrame(rows)
+
+    with pytest.raises(RuntimeError, match="no row in the annotations table"):
+        positions.build_positions(graph, annotations)
+
+
+def test_body_id_dtype_mismatch_raises():
+    """A bodyId column read back as strings (a schema-drift scenario) joins
+    against nothing, and must raise rather than silently emitting an
+    all-"none" artifact."""
+    graph = _build_fixture_graph()
+    rows = [{**row, "bodyId": str(row["bodyId"])} for row in _default_annotation_rows()]
+    annotations = pd.DataFrame(rows)
+
+    with pytest.raises(RuntimeError, match="no row in the annotations table"):
+        positions.build_positions(graph, annotations)
+
+
+def test_malformed_location_cell_raises():
+    """A 3-element list containing a null component, or a list of the wrong
+    length, is a malformed cell -- not the same as a legitimately-absent
+    (None) cell -- and must raise with the offending bodyId, not silently
+    fall back to the next source."""
+    graph = _build_fixture_graph()
+    rows = _default_annotation_rows()
+    rows[0] = {**rows[0], "somaLocation": [1, None, 3]}  # SENSORY_A
+    annotations = pd.DataFrame(rows)
+
+    with pytest.raises(RuntimeError, match=r"bodyId 2001: somaLocation has a missing component"):
+        positions.build_positions(graph, annotations)
+
+
+def test_wrong_length_location_cell_raises():
+    graph = _build_fixture_graph()
+    rows = _default_annotation_rows()
+    rows[0] = {**rows[0], "somaLocation": [1, 2]}  # SENSORY_A
+    annotations = pd.DataFrame(rows)
+
+    with pytest.raises(RuntimeError, match=r"bodyId 2001: somaLocation has shape"):
+        positions.build_positions(graph, annotations)
+
+
+def test_annotations_sha_mismatch_raises_with_specific_message(tmp_path):
+    """In-process counterpart to test_annotations_sha_mismatch_exits_non_zero
+    below: pins the exact failure branch (not just "some error happened")
+    via load_annotations_verified directly."""
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    annotations_path = raw_dir / positions.ANNOTATIONS_FILENAME
+    _write_annotations_feather(annotations_path, _default_annotation_rows())
+
+    with pytest.raises(RuntimeError, match="does not match the pinned"):
+        positions.load_annotations_verified(raw_dir, expected_sha256="0" * 64)
+
+
 def test_two_runs_produce_byte_identical_positions_json(tmp_path):
     graph = _build_fixture_graph()
     graph_path = tmp_path / "malecns-arena-v1.bin.gz"
@@ -236,12 +316,37 @@ def test_two_runs_produce_byte_identical_positions_json(tmp_path):
     bytes_a = (out_dir_a / "malecns-arena-v1.positions.json").read_bytes()
     bytes_b = (out_dir_b / "malecns-arena-v1.positions.json").read_bytes()
     assert bytes_a == bytes_b
-    # Deterministic formatting: sorted keys, trailing newline.
+    # Deterministic formatting: sorted keys, fixed separators, trailing
+    # newline -- checked as a full round-trip so this doesn't hard-code
+    # which key happens to sort first (a later WP could add one that sorts
+    # before "bodyIds").
     assert bytes_a.endswith(b"\n")
-    assert bytes_a.decode("utf-8").splitlines()[1].strip().startswith('"bodyIds"')
+    text_a = bytes_a.decode("utf-8")
+    canonical = json.dumps(json.loads(text_a), indent=2, sort_keys=True, separators=(",", ": ")) + "\n"
+    assert text_a == canonical
 
 
-def test_main_writes_manifest_and_ledger_entries(tmp_path):
+def _write_manifest_and_ledger_fixtures(
+    out_dir: Path, graph_path: Path, *, selection_counts: "dict | None" = None
+) -> "tuple[Path, Path]":
+    """A manifest/ledger pair minimal enough for main()'s cross-checks: the
+    manifest's gzipSha256 must match `graph_path`'s actual sha256 (I3's
+    --graph/manifest guard), and an optional ledger `selectionCounts` block
+    exercises the roleCounts cross-check."""
+    manifest_path = out_dir / "malecns-arena-v1.manifest.json"
+    ledger_path = out_dir / "malecns-arena-v1.ledger.json"
+    graph_gzip_sha256 = binfmt.sha256_hex(graph_path.read_bytes())
+    manifest_path.write_text(
+        json.dumps({"artifact": "malecns-arena-v1.bin.gz", "gzipSha256": graph_gzip_sha256}) + "\n"
+    )
+    ledger = {"artifact": "malecns-arena-v1.bin.gz"}
+    if selection_counts is not None:
+        ledger["selectionCounts"] = selection_counts
+    ledger_path.write_text(json.dumps(ledger) + "\n")
+    return manifest_path, ledger_path
+
+
+def test_main_writes_manifest_and_ledger_entries(tmp_path, monkeypatch):
     graph = _build_fixture_graph()
     graph_path = tmp_path / "malecns-arena-v1.bin.gz"
     _write_graph_gzip(graph, graph_path)
@@ -254,37 +359,37 @@ def test_main_writes_manifest_and_ledger_entries(tmp_path):
 
     out_dir = tmp_path / "out"
     out_dir.mkdir()
-    manifest_path = out_dir / "malecns-arena-v1.manifest.json"
-    ledger_path = out_dir / "malecns-arena-v1.ledger.json"
-    manifest_path.write_text('{"artifact": "malecns-arena-v1.bin.gz"}\n')
-    ledger_path.write_text('{"artifact": "malecns-arena-v1.bin.gz"}\n')
+    manifest_path, ledger_path = _write_manifest_and_ledger_fixtures(
+        out_dir,
+        graph_path,
+        selection_counts={
+            "sensorySelectedCount": 2,
+            "bridgeSelectedCount": 1,
+            "descendingSelectedCount": 2,
+        },
+    )
 
     # main() always verifies against download.py's real pinned sha256 for
     # the real filename; monkeypatch it to this fixture's hash for this
     # end-to-end test only.
-    original_pin = positions._pinned_annotations_sha256
-    positions._pinned_annotations_sha256 = lambda: expected_sha256
-    try:
-        exit_code = positions.main(
-            [
-                "--raw-dir",
-                str(raw_dir),
-                "--graph",
-                str(graph_path),
-                "--out-dir",
-                str(out_dir),
-                "--manifest-path",
-                str(manifest_path),
-                "--ledger-path",
-                str(ledger_path),
-            ]
-        )
-    finally:
-        positions._pinned_annotations_sha256 = original_pin
+    monkeypatch.setattr(positions, "_pinned_annotations_sha256", lambda: expected_sha256)
+
+    exit_code = positions.main(
+        [
+            "--raw-dir",
+            str(raw_dir),
+            "--graph",
+            str(graph_path),
+            "--out-dir",
+            str(out_dir),
+            "--manifest-path",
+            str(manifest_path),
+            "--ledger-path",
+            str(ledger_path),
+        ]
+    )
 
     assert exit_code == 0
-
-    import json
 
     positions_json_path = out_dir / "malecns-arena-v1.positions.json"
     assert positions_json_path.exists()
@@ -301,6 +406,92 @@ def test_main_writes_manifest_and_ledger_entries(tmp_path):
 
     ledger = json.loads(ledger_path.read_text())
     assert ledger["positionsCoverage"] == {"soma": 2, "tosoma": 2, "none": 1}
+
+
+def test_main_raises_when_graph_does_not_match_manifest(tmp_path, monkeypatch):
+    """--graph must describe the same compiled artifact the manifest does;
+    otherwise a positions entry could be attached to the wrong graph."""
+    graph = _build_fixture_graph()
+    graph_path = tmp_path / "malecns-arena-v1.bin.gz"
+    _write_graph_gzip(graph, graph_path)
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    annotations_path = raw_dir / positions.ANNOTATIONS_FILENAME
+    _write_annotations_feather(annotations_path, _default_annotation_rows())
+    expected_sha256 = positions._sha256_of_file(annotations_path)
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    manifest_path = out_dir / "malecns-arena-v1.manifest.json"
+    ledger_path = out_dir / "malecns-arena-v1.ledger.json"
+    # Deliberately wrong gzipSha256: does not match graph_path's real hash.
+    manifest_path.write_text(json.dumps({"artifact": "malecns-arena-v1.bin.gz", "gzipSha256": "0" * 64}) + "\n")
+    ledger_path.write_text(json.dumps({"artifact": "malecns-arena-v1.bin.gz"}) + "\n")
+
+    monkeypatch.setattr(positions, "_pinned_annotations_sha256", lambda: expected_sha256)
+
+    with pytest.raises(RuntimeError, match="does not match .*gzipSha256"):
+        positions.main(
+            [
+                "--raw-dir",
+                str(raw_dir),
+                "--graph",
+                str(graph_path),
+                "--out-dir",
+                str(out_dir),
+                "--manifest-path",
+                str(manifest_path),
+                "--ledger-path",
+                str(ledger_path),
+            ]
+        )
+    # Nothing should have been written: the check runs before any write.
+    assert not (out_dir / "malecns-arena-v1.positions.json").exists()
+
+
+def test_main_raises_when_role_counts_disagree_with_ledger_selection_counts(tmp_path, monkeypatch):
+    graph = _build_fixture_graph()
+    graph_path = tmp_path / "malecns-arena-v1.bin.gz"
+    _write_graph_gzip(graph, graph_path)
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    annotations_path = raw_dir / positions.ANNOTATIONS_FILENAME
+    _write_annotations_feather(annotations_path, _default_annotation_rows())
+    expected_sha256 = positions._sha256_of_file(annotations_path)
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    manifest_path, ledger_path = _write_manifest_and_ledger_fixtures(
+        out_dir,
+        graph_path,
+        # Deliberately wrong: the fixture graph actually has 2 sensory.
+        selection_counts={
+            "sensorySelectedCount": 999,
+            "bridgeSelectedCount": 1,
+            "descendingSelectedCount": 2,
+        },
+    )
+
+    monkeypatch.setattr(positions, "_pinned_annotations_sha256", lambda: expected_sha256)
+
+    with pytest.raises(RuntimeError, match="does not match .* selectionCounts"):
+        positions.main(
+            [
+                "--raw-dir",
+                str(raw_dir),
+                "--graph",
+                str(graph_path),
+                "--out-dir",
+                str(out_dir),
+                "--manifest-path",
+                str(manifest_path),
+                "--ledger-path",
+                str(ledger_path),
+            ]
+        )
+    assert not (out_dir / "malecns-arena-v1.positions.json").exists()
 
 
 def test_annotations_sha_mismatch_exits_non_zero(tmp_path):
@@ -334,6 +525,14 @@ def test_annotations_sha_mismatch_exits_non_zero(tmp_path):
         text=True,
     )
 
+    combined = result.stdout + result.stderr
     assert result.returncode != 0
-    assert "sha256" in (result.stdout + result.stderr)
+    # main() prints a "graph sha256(gzip)=..." progress line to stdout
+    # before it ever checks the annotations, so a bare "sha256" in output"
+    # assertion would pass for any failure after the graph loads -- assert
+    # on the mismatch-specific message instead, so this test actually
+    # proves the mismatch branch (not some unrelated crash) is what stopped
+    # the run.
+    assert "does not match the pinned" in combined
+    assert "refusing to join positions" in combined
     assert not (out_dir / "malecns-arena-v1.positions.json").exists()
