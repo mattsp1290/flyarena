@@ -25,15 +25,16 @@ Unrelated to this port's correctness; disable Datadog's Python
 instrumentation for every `uv run` invocation, one of two ways:
 
 ```bash
-DD_TRACE_ENABLED=false DD_IAST_ENABLED=false DD_APPSEC_ENABLED=false uv run pytest -v
+env -u PYTHONPATH DD_TRACE_ENABLED=false DD_IAST_ENABLED=false DD_APPSEC_ENABLED=false uv run pytest -v
 # or, equivalently, for any command (pytest, a future flyarena-train CLI, ...):
 training/scripts/run.sh pytest -v
 ```
 
-`training/scripts/run.sh` wraps the three env vars and `exec`s `uv run
-"$@"`, so WP3's automation (a script, a cron job, a CI runner) doesn't have
-to rely on the vars being copy-pasted correctly by hand every time — it's a
-one-line substitution for `uv run` everywhere in this project. (The env vars
+`training/scripts/run.sh` wraps the three `DD_*` env vars, unsets
+`PYTHONPATH`, and `exec`s `uv run "$@"`, so WP3's automation (a script, a
+cron job, a CI runner) doesn't have to rely on the vars being copy-pasted
+correctly by hand every time — it's a one-line substitution for `uv run`
+everywhere in this project. (The env vars
 can't be set from inside `training/tests/conftest.py` and have this effect:
 ddtrace's auto-injection runs via `sitecustomize`/`PYTHONPATH` before any
 user code executes, so by the time `conftest.py` runs it's too late — the

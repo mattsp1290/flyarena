@@ -1,7 +1,14 @@
 import { decodeAction } from '../../src/lib/arena/actions';
 import { observeAgent } from '../../src/lib/arena/sensors';
 import { createWorld, stepWorld } from '../../src/lib/arena/world';
-import type { ActionsByAgent, AgentId, AgentScore, DecodedAction, WorldState } from '../../src/lib/arena/types';
+import type {
+  ActionsByAgent,
+  AgentId,
+  AgentScore,
+  DecodedAction,
+  ReadonlyWorldState,
+  WorldState
+} from '../../src/lib/arena/types';
 import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import type { ConnectomeGraph } from '../../src/lib/connectome/format';
 import {
@@ -90,7 +97,7 @@ export interface EpisodeConfig {
    * review pass found could drift from this file's own tick loop without
    * the parity gate noticing (see that test's module doc).
    */
-  readonly onTick?: (tick: number, actions: Readonly<Record<AgentId, DecodedAction>>, world: Readonly<WorldState>) => void;
+  readonly onTick?: (tick: number, actions: Readonly<Record<AgentId, DecodedAction>>, world: ReadonlyWorldState) => void;
 }
 
 export interface AgentScoreResult {

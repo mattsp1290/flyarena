@@ -408,6 +408,14 @@ below).
 `positions.py` is deliberately **not** part of "the compiler" -- see
 "Compiler provenance" below: it is excluded from `compilerSourceSha256` and
 never writes to or otherwise influences the `.bin.gz` artifact's bytes.
+`scripts/data/rewire_batch.py` (the batch entry point that generates many
+seeded rewirings at once, `.agents/plans/rewiring-null/01-rewired-graph-generation.md`)
+is the same kind of non-compiler sidecar, for the same reason: it only calls
+`rewire.rewire_graph` per seed and writes to a gitignored training-run
+directory, never to this compiler's own `.bin.gz`/manifest/ledger output.
+`scripts/data/fsutil.py` (the shared atomic-text-write helper both
+`positions.py` and `rewire_batch.py` use) is a third sidecar, for the same
+reason: it has no graph-compilation logic of its own.
 
 ```console
 $ uv run python scripts/data/positions.py --help
@@ -442,10 +450,16 @@ file contributing its filename (UTF-8) + a single NUL byte + its raw bytes
 into one hasher (see `compiler_source_sha256()` for the exact scheme).
 This is deliberately an explicit allowlist rather than a `scripts/data/*.py`
 directory glob (which an earlier version of this function used): the "Soma
-positions sidecar" section above adds `scripts/data/positions.py` to this
-same directory, and it must not change this hash -- it never influences the
-compiled `.bin.gz` bytes, so folding it into "the compiler" would force an
-unrelated recompile/rehash every time it changed. Because this is derived
+positions sidecar" section above adds `scripts/data/positions.py`,
+`scripts/data/rewire_batch.py`, and `scripts/data/fsutil.py`
+(`NON_COMPILER_SIDECAR_FILENAMES` in `compile.py`) to this
+same directory, and none of them may change this hash -- none influences the
+compiled `.bin.gz` bytes, so folding any of them into "the compiler" would
+force an unrelated recompile/rehash every time one changed. A fail-closed
+test (`test_every_scripts_data_module_is_classified` in
+`tests_python/test_compile.py`) asserts every `scripts/data/*.py` file is
+classified as either compiler or sidecar, so a new file dropped into the
+directory can't silently fall into neither. Because this is derived
 directly from the code that ran rather than from a commit reference, it is
 self-consistent: re-running the pipeline after *any* change to those files
 -- even one that doesn't happen to change the compiled bytes, as with the

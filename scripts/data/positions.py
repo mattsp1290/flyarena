@@ -30,7 +30,6 @@ import argparse
 import gzip
 import hashlib
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -42,6 +41,7 @@ import pyarrow.feather as feather
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import binfmt  # noqa: E402
+import fsutil  # noqa: E402
 import rewire  # noqa: E402
 from download import SOURCE_FILES, _sha256_of_file  # noqa: E402
 
@@ -275,16 +275,6 @@ def render_positions_document(
     return json.dumps(document, indent=2, sort_keys=True, separators=(",", ": ")) + "\n"
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
-    """Write `text` to `path` via a same-directory temp file plus
-    `os.replace`, so a crash mid-write (or a `KeyboardInterrupt`) can never
-    leave `path` truncated or half-written -- `path` either has its old
-    contents or its new ones, never something in between."""
-    tmp_path = path.with_name(path.name + ".tmp")
-    tmp_path.write_text(text, encoding="utf-8")
-    os.replace(tmp_path, path)
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--raw-dir", type=Path, default=RAW_DATA_DIR)
@@ -354,7 +344,7 @@ def main(argv: list[str] | None = None) -> int:
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     out_path = args.out_dir / f"{ARTIFACT_NAME}.positions.json"
-    _atomic_write_text(out_path, payload)
+    fsutil.atomic_write_text(out_path, payload)
     print(f"Wrote {out_path} ({len(payload_bytes)} bytes)")
     print(f"positions sha256: {positions_sha256}")
 
@@ -364,14 +354,14 @@ def main(argv: list[str] | None = None) -> int:
             "sha256": positions_sha256,
             "coverage": fields["coverage"],
         }
-        _atomic_write_text(manifest_path, json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        fsutil.atomic_write_text(manifest_path, json.dumps(manifest, indent=2, sort_keys=True) + "\n")
         print(f"Updated {manifest_path} with the positions entry")
     else:
         print(f"[warn] {manifest_path} does not exist; skipped manifest update")
 
     if ledger is not None:
         ledger["positionsCoverage"] = fields["coverage"]
-        _atomic_write_text(ledger_path, json.dumps(ledger, indent=2, sort_keys=True) + "\n")
+        fsutil.atomic_write_text(ledger_path, json.dumps(ledger, indent=2, sort_keys=True) + "\n")
         print(f"Updated {ledger_path} with positionsCoverage")
     else:
         print(f"[warn] {ledger_path} does not exist; skipped ledger update")

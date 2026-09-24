@@ -6,7 +6,7 @@ import { gunzipSync } from 'node:zlib';
 import { describe, expect, it } from 'vitest';
 
 import { decodeAction } from '../../src/lib/arena/actions';
-import type { AgentId, DecodedAction, WorldState } from '../../src/lib/arena/types';
+import type { AgentId, DecodedAction, ReadonlyWorldState } from '../../src/lib/arena/types';
 import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import { parseGraphBinary, type ConnectomeGraph } from '../../src/lib/connectome/format';
 import type { NeuralTelemetry } from '../../src/lib/connectome/telemetry';
@@ -136,7 +136,7 @@ interface Position {
   z: number;
 }
 
-const capturePosition = (world: Readonly<WorldState>, agentId: AgentId): Position => {
+const capturePosition = (world: ReadonlyWorldState, agentId: AgentId): Position => {
   const agent = world.agents.find((candidate) => candidate.id === agentId);
   if (!agent) throw new Error(`parity gate: world is missing agent "${agentId}"`);
   return { x: agent.position.x, z: agent.position.z };

@@ -36,21 +36,30 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import inspect
 import json
-import os
 import sys
-import tempfile
 from pathlib import Path
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import binfmt  # noqa: E402
+import fsutil  # noqa: E402
 import rewire  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PUBLIC_DATA_DIR = REPO_ROOT / "public" / "data"
 ARTIFACT_NAME = "malecns-arena-v1"
+
+#: `rewire_graph`'s own `allow_self_loops` default, read off its signature
+#: rather than duplicated as a literal here -- so if that default ever
+#: changes, this batch script's recorded `params.allowSelfLoops` (below)
+#: changes with it instead of silently going stale. `rewire.py` has no
+#: separate `DEFAULT_ALLOW_SELF_LOOPS` constant (unlike
+#: `DEFAULT_SWAP_ATTEMPTS_MULTIPLIER`), so the function's own default
+#: parameter value is the single source of truth.
+ALLOW_SELF_LOOPS = inspect.signature(rewire.rewire_graph).parameters["allow_self_loops"].default
 
 
 def parse_seed_range(spec: str) -> range:
@@ -84,32 +93,38 @@ def file_sha256(path: Path) -> str:
     return binfmt.sha256_hex(path.read_bytes())
 
 
-def _write_text_atomic(path: Path, text: str) -> None:
-    """Write `text` to `path` via a same-directory temp file + `os.replace`,
-    so a process killed mid-write leaves the previous file (or nothing)
-    rather than a truncated, unparseable one. `path.parent` must already
-    exist."""
-    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as fh:
-            fh.write(text)
-        os.replace(tmp_name, path)
-    except BaseException:
-        Path(tmp_name).unlink(missing_ok=True)
-        raise
+def _load_source_graph(in_path: Path) -> "tuple[bytes, binfmt.GraphArrays]":
+    """Read and decode `in_path`'s compiled graph, raising `OSError` (e.g.
+    missing file), `gzip.BadGzipFile`, or `binfmt.InvalidGraphError` if it
+    doesn't exist or doesn't parse as a valid graph. Shared by `main()` --
+    to validate `--in-path` before any destructive write, see its call site
+    -- and by `run_batch` itself."""
+    with gzip.open(in_path, "rb") as fh:
+        source_binary = fh.read()
+    graph = rewire.decode_graph_binary(source_binary)
+    return source_binary, graph
 
 
 def run_batch(
     in_path: Path,
     seeds: range,
     out_dir: Path,
+    *,
+    preloaded_source: "tuple[bytes, binfmt.GraphArrays] | None" = None,
 ) -> dict:
     """Rewire `in_path`'s graph once per seed in `seeds`, writing each
     output to `out_dir` and returning the `index.json`-shaped dict (not yet
-    written to disk) describing every seed written, in seed order."""
-    with gzip.open(in_path, "rb") as fh:
-        source_binary = fh.read()
-    graph = rewire.decode_graph_binary(source_binary)
+    written to disk) describing every seed written, in seed order.
+
+    `preloaded_source`, if given, must be `_load_source_graph(in_path)`'s
+    own return value -- passing it lets a caller that already loaded and
+    validated `in_path` (e.g. `main()`, which must validate it before
+    deleting any existing `index.json`) avoid reading and gzip-decoding the
+    same file a second time. Left `None` (the default), `run_batch` loads
+    it itself, unchanged from before -- this keeps `run_batch(in_path=...,
+    seeds=..., out_dir=...)` a complete, self-sufficient call for every
+    existing caller (tests, a future direct import)."""
+    source_binary, graph = preloaded_source if preloaded_source is not None else _load_source_graph(in_path)
     source_sha256 = binfmt.sha256_hex(source_binary)
     rewire_source_sha256 = file_sha256(Path(rewire.__file__).resolve())
     # rewire_source_sha256 alone ties a batch back to the swap algorithm's
@@ -125,7 +140,7 @@ def run_batch(
 
     seed_entries = []
     for seed in seeds:
-        rewired, stats = rewire.rewire_graph(graph, seed=seed)
+        rewired, stats = rewire.rewire_graph(graph, seed=seed, allow_self_loops=ALLOW_SELF_LOOPS)
         rewired_binary = binfmt.encode_graph_binary(rewired)
         rewired_sha256 = binfmt.sha256_hex(rewired_binary)
 
@@ -154,7 +169,7 @@ def run_batch(
         "binfmtSourceSha256": binfmt_source_sha256,
         "numpyVersion": np.__version__,
         "params": {
-            "allowSelfLoops": False,
+            "allowSelfLoops": ALLOW_SELF_LOOPS,
             "swapAttemptsMultiplier": rewire.DEFAULT_SWAP_ATTEMPTS_MULTIPLIER,
         },
         "seeds": seed_entries,
@@ -184,6 +199,17 @@ def main(argv: list[str] | None = None) -> int:
 
     seed_range = parse_seed_range(args.seeds)
 
+    # Validated *before* index_out is touched: a bad --in-path (missing,
+    # not gzip, not a valid graph) must fail here, not after a previous
+    # run's valid index.json has already been deleted below. The loaded
+    # (source_binary, graph) pair is kept and handed to run_batch below
+    # (preloaded_source) rather than discarded, so a valid --in-path is
+    # only ever read and gzip-decoded once per invocation.
+    try:
+        preloaded_source = _load_source_graph(args.in_path)
+    except (OSError, binfmt.InvalidGraphError) as exc:
+        parser.error(f"--in-path {args.in_path} is not a readable, valid compiled graph: {exc}")
+
     # Removed up front, before any rewiring starts: if this run is
     # interrupted partway through, the directory is left with no index
     # (which a reader can detect) rather than the previous run's index --
@@ -193,14 +219,16 @@ def main(argv: list[str] | None = None) -> int:
     index_out.parent.mkdir(parents=True, exist_ok=True)
     index_out.unlink(missing_ok=True)
 
-    index = run_batch(in_path=args.in_path, seeds=seed_range, out_dir=args.out_dir)
+    index = run_batch(
+        in_path=args.in_path, seeds=seed_range, out_dir=args.out_dir, preloaded_source=preloaded_source
+    )
 
     # sort_keys + a fixed separator (via indent) matches rewire.py's own
     # manifest-writing convention, so two runs over the same seed range
     # produce byte-identical index.json (tests_python/test_rewire_batch.py).
-    # Written atomically (_write_text_atomic) so a process killed mid-write
-    # never leaves a truncated, unparseable index.json.
-    _write_text_atomic(index_out, json.dumps(index, indent=2, sort_keys=True) + "\n")
+    # Written atomically (fsutil.atomic_write_text) so a process killed
+    # mid-write never leaves a truncated, unparseable index.json.
+    fsutil.atomic_write_text(index_out, json.dumps(index, indent=2, sort_keys=True) + "\n")
 
     print(f"Wrote {index_out} ({len(index['seeds'])} seeds)")
     return 0
