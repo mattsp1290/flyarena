@@ -2,7 +2,7 @@ import { afterEach, beforeEach, vi } from 'vitest';
 import { ExperimentController, type ExperimentControllerCallbacks } from '../../src/lib/experiment/controller';
 import type { AgentId } from '../../src/lib/arena/types';
 import type { GraphMode } from '../../src/lib/connectome/format';
-import type { ArenaManifest, TrainedReadoutLoadResult } from '../../src/lib/experiment/assets';
+import type { ArenaManifest, RewiringNullLoadResult, TrainedReadoutLoadResult } from '../../src/lib/experiment/assets';
 import type { ExperimentStatus } from '../../src/lib/experiment/state';
 import type { DecoderKind } from '../../src/lib/worker/protocol';
 import { createPublicDataFetch, FakeNeuralWorker } from '../helpers/fake-worker';
@@ -26,6 +26,7 @@ export type TestControllerCallbacks = ExperimentControllerCallbacks & {
   topologyApplied: Array<[AgentId, GraphMode]>;
   switchCounts: Array<Readonly<Record<AgentId, number>>>;
   trainedReadoutStatuses: TrainedReadoutLoadResult[];
+  rewiringNullResults: RewiringNullLoadResult[];
   decodersApplied: DecoderKind[];
 };
 
@@ -35,6 +36,7 @@ export const createCallbacks = (): TestControllerCallbacks => {
   const topologyApplied: Array<[AgentId, GraphMode]> = [];
   const switchCounts: Array<Readonly<Record<AgentId, number>>> = [];
   const trainedReadoutStatuses: TrainedReadoutLoadResult[] = [];
+  const rewiringNullResults: RewiringNullLoadResult[] = [];
   const decodersApplied: DecoderKind[] = [];
   return {
     statuses,
@@ -42,6 +44,7 @@ export const createCallbacks = (): TestControllerCallbacks => {
     topologyApplied,
     switchCounts,
     trainedReadoutStatuses,
+    rewiringNullResults,
     decodersApplied,
     onStatusChange: (status) => statuses.push(status),
     onTelemetry: vi.fn(),
@@ -50,6 +53,7 @@ export const createCallbacks = (): TestControllerCallbacks => {
     onTopologyApplied: (agentId, mode) => topologyApplied.push([agentId, mode]),
     onTopologySwitchCountChange: (counts) => switchCounts.push({ ...counts }),
     onTrainedReadoutStatus: (status) => trainedReadoutStatuses.push(status),
+    onRewiringNull: (result) => rewiringNullResults.push(result),
     onDecoderApplied: (decoder) => decodersApplied.push(decoder)
   };
 };

@@ -5,9 +5,11 @@ import { createWorkerClient, type WorkerClient } from '../worker/client';
 import type { DecoderKind } from '../worker/protocol';
 import {
   loadArenaArtifacts,
+  loadRewiringNull,
   loadTrainedReadoutArtifact,
   type ArenaManifest,
   type LoadedArenaArtifacts,
+  type RewiringNullLoadResult,
   type TrainedReadoutLoadResult
 } from './assets';
 import { buildGraphBufferForMode, createWorkerAgentBinding } from './bindings';
@@ -74,6 +76,16 @@ export interface ExperimentControllerCallbacks {
    * decoder toggle's Trained option (WP6).
    */
   onTrainedReadoutStatus: (status: TrainedReadoutLoadResult) => void;
+  /**
+   * Fired once `loadRewiringNull` resolves for this manifest — independent
+   * of, and never awaited before, Worker/binding construction (WP4's
+   * "loading must not block Start"). Started right after `onManifest` fires,
+   * in parallel with the trained-readout load and the Worker construction
+   * below it; like `onTrainedReadoutStatus`, this never blocks reaching
+   * `ready`. The host's hook for the ledger panel's "Topology null
+   * distribution" section (`LedgerPanel.svelte`/`NullHistogram.svelte`).
+   */
+  onRewiringNull: (result: RewiringNullLoadResult) => void;
   /**
    * Fired once per agent right after `setDecoder()` has successfully applied
    * a decoder switch to both arms' Workers and reset the run to tick 0 —
@@ -311,6 +323,17 @@ export class ExperimentController {
     this.biologicalGraphBuffer = artifacts.biological;
     this.rewiredGraphBuffer = artifacts.rewired;
     this.options.callbacks.onManifest(artifacts.manifest, artifacts.parsedBiological);
+
+    // WP4: fire-and-forget, deliberately not awaited here (unlike the
+    // trained-readout load just below) — "loading must not block Start"
+    // means this must not sit in this method's own `await` chain ahead of
+    // Worker construction. `loadRewiringNull` never throws (see its own doc
+    // comment), so no `.catch` is needed to keep this from becoming an
+    // unhandled rejection.
+    void loadRewiringNull(artifacts.manifest, dataBaseUrl).then((result) => {
+      if (this.destroyed) return;
+      this.options.callbacks.onRewiringNull(result);
+    });
 
     // Trained-readout artifact: optional relative to the required arena
     // graph artifacts above — `loadTrainedReadoutArtifact` never throws, and

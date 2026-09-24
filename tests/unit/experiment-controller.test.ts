@@ -115,6 +115,80 @@ describe('ExperimentController#initialize', () => {
   });
 });
 
+describe('ExperimentController rewiring-null loading (WP4)', () => {
+  /**
+   * `createPublicDataFetch` serves whichever committed `public/data/*` file
+   * matches the requested basename, and `rewiring-null-v1.json` plus its
+   * manifest entry are committed there (WP2) — so this runs against the
+   * real shipped artifact by default, matching how the trained-readout
+   * controller tests exercise the real WP5 artifact
+   * (`experiment-controller-decoder.test.ts`).
+   */
+  it('fires onRewiringNull with the real artifact as "ok", without blocking reaching "ready"', async () => {
+    const callbacks = createCallbacks();
+    const controller = new ExperimentController({
+      seed: SEED,
+      totalTicks: TOTAL_TICKS,
+      initialTopology: { left: 'biological', right: 'rewired' },
+      createWorker,
+      callbacks
+    });
+    trackController(controller);
+
+    await controller.initialize();
+
+    expect(controller.getRunner()).toBeDefined();
+    expect(callbacks.statuses).toContain('ready');
+    expect(callbacks.rewiringNullResults).toHaveLength(1);
+    const result = callbacks.rewiringNullResults[0];
+    expect(result.status).toBe('ok');
+    if (result.status === 'ok') {
+      expect(result.data.rewired.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('a tampered rewiring-null-v1.json reports "invalid" with an honest sha256 reason; the experiment still reaches "ready" (loading never blocks Start)', async () => {
+    vi.stubGlobal('fetch', createPublicDataFetch({ corrupt: 'rewiring-null-v1.json' }));
+    const callbacks = createCallbacks();
+    const controller = new ExperimentController({
+      seed: SEED,
+      totalTicks: TOTAL_TICKS,
+      initialTopology: { left: 'biological', right: 'rewired' },
+      createWorker,
+      callbacks
+    });
+    trackController(controller);
+
+    await controller.initialize();
+
+    expect(controller.getRunner()).toBeDefined();
+    expect(callbacks.statuses).toContain('ready');
+    expect(callbacks.errors).toHaveLength(0);
+    expect(callbacks.rewiringNullResults).toHaveLength(1);
+    const result = callbacks.rewiringNullResults[0];
+    expect(result.status).toBe('invalid');
+    if (result.status === 'invalid') expect(result.reason).toMatch(/sha256/i);
+  });
+
+  it('does not fire onRewiringNull once disposed before initialize() resolves', async () => {
+    const callbacks = createCallbacks();
+    const controller = new ExperimentController({
+      seed: SEED,
+      totalTicks: TOTAL_TICKS,
+      initialTopology: { left: 'biological', right: 'rewired' },
+      createWorker,
+      callbacks
+    });
+    trackController(controller);
+
+    const initializing = controller.initialize();
+    controller.dispose();
+    await initializing;
+
+    expect(callbacks.rewiringNullResults).toHaveLength(0);
+  });
+});
+
 describe('ExperimentController#changeTopology', () => {
   const setUp = async () => {
     const callbacks = createCallbacks();

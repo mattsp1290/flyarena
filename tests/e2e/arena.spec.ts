@@ -280,6 +280,71 @@ test.describe('model ledger and provenance', () => {
     // the page — the model ledger's whole reason for existing.
     await expect(page.locator('body')).not.toContainText(/brain emulation/i);
   });
+
+  test('shows the "Topology null distribution" histogram with a percentile sentence and a link to the full report (WP4)', async ({
+    page
+  }) => {
+    await page.goto('/');
+    await waitForReady(page);
+
+    const ledgerRow = (term: string) => page.locator('.ledger li', { hasText: term });
+    await expect(ledgerRow('Topology null distribution')).toContainText('Computed (offline)');
+
+    await expect(page.getByRole('heading', { name: 'Topology null distribution' })).toBeVisible();
+    const histogram = page.locator('.null-histogram');
+    await expect(histogram).toBeVisible();
+    await expect(histogram.locator('svg[role="img"]')).toHaveAttribute(
+      'aria-label',
+      /Biological scored above \d+(\.\d+)?% of 500 degree-preserving rewirings \(authored decoder, opponent parked, 100 held-out seeds\)\./
+    );
+    // The markers are labeled in a visible legend, never color alone —
+    // scoped to the legend list specifically, since the same words also
+    // appear inside the SVG's `<desc>`/`<figcaption>` sentence.
+    const legend = histogram.locator('.marker-legend');
+    await expect(legend.getByText('Biological')).toBeVisible();
+    await expect(legend.getByText('Rewired (seed 0, shipped)')).toBeVisible();
+    await expect(legend.getByText('Disconnected')).toBeVisible();
+
+    const reportLink = histogram.getByRole('link', { name: /full rewiring-null report/i });
+    await expect(reportLink).toHaveAttribute(
+      'href',
+      'https://github.com/mattsp1290/flyarena/blob/main/docs/rewiring-null-report.md'
+    );
+    await expect(page.locator('.ledger').getByRole('link', { name: /rewiring-null result \(json\)/i })).toHaveAttribute(
+      'href',
+      '/data/rewiring-null-v1.json'
+    );
+  });
+});
+
+test.describe('rewiring-null hash-mismatch integrity check', () => {
+  test('a tampered rewiring-null-v1.json shows an honest verification-failure message in the ledger, while the rest of the experiment (Start included) keeps working', async ({
+    page
+  }) => {
+    const original = readFileSync(resolve(publicDataDir, 'rewiring-null-v1.json'));
+    const tampered = Buffer.from(original);
+    tampered[10] ^= 0xff;
+
+    await page.route('**/data/rewiring-null-v1.json', (route) =>
+      route.fulfill({ status: 200, contentType: 'application/json', body: tampered })
+    );
+
+    await page.goto('/');
+    await waitForReady(page);
+
+    await expect(page.locator('.ledger')).toContainText(/null-distribution result failed verification/i);
+    await expect(page.locator('.ledger')).toContainText(/sha256/i);
+    // The histogram itself must never render over unverified bytes.
+    await expect(page.locator('.null-histogram')).toHaveCount(0);
+
+    // The required arena graph artifacts are untouched — the experiment
+    // keeps working exactly as if the rewiring-null artifact were never
+    // routed (WP4's "loading must not block Start" non-negotiable).
+    await expect(startOrResumeButton(page)).toBeEnabled();
+    await startOrResumeButton(page).click();
+    await waitForTick(page, 10);
+    await expect(statusRegion(page)).toHaveText('running');
+  });
 });
 
 test.describe('anatomical activity view', () => {

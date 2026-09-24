@@ -171,6 +171,15 @@ export interface ArenaManifest {
   outputPopulationCount: number;
   /** WP1's soma-position sidecar entry; see `PositionsManifestEntry`. */
   positions?: PositionsManifestEntry;
+  /**
+   * WP4's rewiring-null-distribution ledger entry: `null-report.ts`
+   * (`.agents/plans/rewiring-null/02-authored-null-evaluation.md`) writes
+   * this once `rewiring-null-v1.json` exists. Optional: a manifest produced
+   * before that WP (or a hand-built test fixture) simply has no null
+   * distribution to show — `loadRewiringNull` below reports that as
+   * `status: 'missing'` rather than throwing.
+   */
+  rewiringNull?: { artifact: string; sha256: string };
   sourceDataset: string;
   rewiredArms: Record<
     string,
@@ -700,4 +709,234 @@ export const loadTrainedReadoutArtifact = async (dataBaseUrl = '/data'): Promise
     // decoder is simply not offered, and Authored keeps working.
     return { status: 'unavailable', reason: error instanceof Error ? error.message : String(error) };
   }
+};
+
+/**
+ * `public/data/rewiring-null-v1.json` (WP4,
+ * `.agents/plans/rewiring-null/02-authored-null-evaluation.md`'s "Artifact
+ * shape (conceptual)"): every graph's per-seed-averaged authored-decoder
+ * score, plus the 500-graph null set's summary statistics and a pre-binned
+ * histogram (`src/lib/ui/NullHistogram.svelte` draws bars straight from
+ * `bins`, never rebinning `rewired` itself). `trained` is WP3's follow-on
+ * addition (the CEM-retrained-readout sample on 20 rewirings) and may not
+ * exist yet — deliberately typed `unknown` rather than a guessed shape:
+ * `null-report.ts`'s `trained` section had not landed as of this WP, so any
+ * hand-authored field list here would be unverified against a real
+ * producer. `NullHistogram.svelte` narrows it defensively at render time and
+ * renders nothing extra when it is absent or does not look like the shape
+ * it expects — this artifact's own validation below never depends on it.
+ */
+export interface RewiringNullScoreStats {
+  score: number;
+  median: number;
+  std: number;
+  ci: readonly [number, number];
+}
+
+export interface RewiringNullRewiredEntry extends RewiringNullScoreStats {
+  seed: number;
+  gzipSha256: string;
+  acceptedSwaps: number;
+  attempts: number;
+}
+
+export interface RewiringNullSummary {
+  n: number;
+  mean: number;
+  median: number;
+  std: number;
+  p2_5: number;
+  p97_5: number;
+  iqr: number;
+  degenerate: boolean;
+}
+
+export interface RewiringNullBins {
+  /** `counts.length + 1` sorted (non-decreasing) bin boundaries. */
+  edges: readonly number[];
+  /** One non-negative integer count per bin; `counts.length === edges.length - 1`. */
+  counts: readonly number[];
+}
+
+export interface RewiringNullArtifact {
+  version: number;
+  condition: string;
+  seeds: { start: number; count: number };
+  ticks: number;
+  substeps: number;
+  sourceGraphSha256: string;
+  rewireSourceSha256: string;
+  shards: number;
+  biological: RewiringNullScoreStats;
+  disconnected: RewiringNullScoreStats;
+  /** Sorted by seed (0…499); the 500-graph null set `NullHistogram.svelte` bins bars from. */
+  rewired: readonly RewiringNullRewiredEntry[];
+  null: RewiringNullSummary;
+  /** Biological's empirical percentile in the null set, in `[0, 1]` (e.g. `0` means biological scored below every rewired graph). */
+  bioPercentile: number;
+  pLow: number;
+  pHigh: number;
+  bins: RewiringNullBins;
+  /** WP3's trained-sample section; see this interface's own doc comment. */
+  trained?: unknown;
+}
+
+export type RewiringNullLoadResult =
+  | { status: 'ok'; data: RewiringNullArtifact }
+  | { status: 'missing'; reason: string }
+  | { status: 'invalid'; reason: string };
+
+const isFiniteNumber = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
+
+const isFiniteCiPair = (value: unknown): value is readonly [number, number] =>
+  Array.isArray(value) && value.length === 2 && isFiniteNumber(value[0]) && isFiniteNumber(value[1]);
+
+const isScoreStats = (value: unknown): value is RewiringNullScoreStats => {
+  if (typeof value !== 'object' || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return isFiniteNumber(v.score) && isFiniteNumber(v.median) && isFiniteNumber(v.std) && isFiniteCiPair(v.ci);
+};
+
+const isRewiredEntry = (value: unknown): value is RewiringNullRewiredEntry => {
+  if (!isScoreStats(value)) return false;
+  const v = value as unknown as Record<string, unknown>;
+  return (
+    isFiniteNumber(v.seed) &&
+    typeof v.gzipSha256 === 'string' &&
+    isFiniteNumber(v.acceptedSwaps) &&
+    isFiniteNumber(v.attempts)
+  );
+};
+
+const isSummary = (value: unknown): value is RewiringNullSummary => {
+  if (typeof value !== 'object' || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return (
+    isFiniteNumber(v.n) &&
+    isFiniteNumber(v.mean) &&
+    isFiniteNumber(v.median) &&
+    isFiniteNumber(v.std) &&
+    isFiniteNumber(v.p2_5) &&
+    isFiniteNumber(v.p97_5) &&
+    isFiniteNumber(v.iqr) &&
+    typeof v.degenerate === 'boolean'
+  );
+};
+
+/**
+ * `edges` must be sorted (non-decreasing — `null-report.ts` writes strictly
+ * increasing equal-width edges, but non-decreasing is the weakest check that
+ * still catches a shuffled/corrupted array without rejecting a legitimate
+ * degenerate bin) and `counts` must have exactly one fewer entry than
+ * `edges`, every one a finite, non-negative count.
+ */
+const isBins = (value: unknown): value is RewiringNullBins => {
+  if (typeof value !== 'object' || value === null) return false;
+  const v = value as Record<string, unknown>;
+  if (!Array.isArray(v.edges) || !Array.isArray(v.counts)) return false;
+  if (v.edges.length < 2 || v.counts.length !== v.edges.length - 1) return false;
+  for (let i = 0; i < v.edges.length; i += 1) {
+    if (!isFiniteNumber(v.edges[i])) return false;
+    if (i > 0 && (v.edges[i] as number) < (v.edges[i - 1] as number)) return false;
+  }
+  for (const count of v.counts) {
+    if (!isFiniteNumber(count) || count < 0) return false;
+  }
+  return true;
+};
+
+/**
+ * Structural validation only (version 1, sorted bins, finite numbers) —
+ * mirrors `loadPositions`'s "never throws, always return a reasoned status"
+ * contract. Every top-level field the UI actually reads
+ * (`NullHistogram.svelte`/`LedgerPanel.svelte`) is checked; `trained` is
+ * deliberately left unchecked (see `RewiringNullArtifact.trained`'s doc
+ * comment) — a malformed `trained` section never fails the whole artifact.
+ */
+const validateRewiringNullShape = (value: unknown): { ok: true; data: RewiringNullArtifact } | { ok: false; reason: string } => {
+  if (typeof value !== 'object' || value === null) {
+    return { ok: false, reason: 'rewiring-null artifact is not a JSON object' };
+  }
+  const v = value as Record<string, unknown>;
+  if (v.version !== 1) return { ok: false, reason: `rewiring-null artifact has unsupported version ${String(v.version)}` };
+  if (typeof v.condition !== 'string') return { ok: false, reason: 'rewiring-null artifact is missing "condition"' };
+  if (
+    typeof v.seeds !== 'object' ||
+    v.seeds === null ||
+    !isFiniteNumber((v.seeds as Record<string, unknown>).start) ||
+    !isFiniteNumber((v.seeds as Record<string, unknown>).count)
+  ) {
+    return { ok: false, reason: 'rewiring-null artifact has a malformed "seeds" field' };
+  }
+  if (!isFiniteNumber(v.ticks) || !isFiniteNumber(v.substeps) || !isFiniteNumber(v.shards)) {
+    return { ok: false, reason: 'rewiring-null artifact is missing ticks/substeps/shards' };
+  }
+  if (typeof v.sourceGraphSha256 !== 'string' || typeof v.rewireSourceSha256 !== 'string') {
+    return { ok: false, reason: 'rewiring-null artifact is missing sourceGraphSha256/rewireSourceSha256' };
+  }
+  if (!isScoreStats(v.biological)) return { ok: false, reason: 'rewiring-null artifact has a malformed "biological" field' };
+  if (!isScoreStats(v.disconnected)) return { ok: false, reason: 'rewiring-null artifact has a malformed "disconnected" field' };
+  if (!Array.isArray(v.rewired) || v.rewired.length === 0 || !v.rewired.every(isRewiredEntry)) {
+    return { ok: false, reason: 'rewiring-null artifact has a malformed "rewired" array' };
+  }
+  if (!isSummary(v.null)) return { ok: false, reason: 'rewiring-null artifact has a malformed "null" summary field' };
+  if (!isFiniteNumber(v.bioPercentile) || !isFiniteNumber(v.pLow) || !isFiniteNumber(v.pHigh)) {
+    return { ok: false, reason: 'rewiring-null artifact is missing bioPercentile/pLow/pHigh' };
+  }
+  if (!isBins(v.bins)) return { ok: false, reason: 'rewiring-null artifact has a malformed or unsorted "bins" field' };
+
+  return { ok: true, data: value as RewiringNullArtifact };
+};
+
+/**
+ * Fetch, sha256-verify, and structurally validate `rewiring-null-v1.json`
+ * (WP4's counterpart to `loadTrainedReadoutArtifact` above). Never throws —
+ * every failure mode is a returned `status`, matching `TrainedReadoutLoadResult`'s
+ * and `PositionsLoadResult`'s "optional presentation, not a Start gate"
+ * contract: a missing/tampered/malformed null-distribution artifact only
+ * ever hides or degrades the ledger panel's "Topology null distribution"
+ * section (`LedgerPanel.svelte`), never the experiment itself.
+ *
+ * `dataBaseUrl` must be the same value the caller passes to
+ * `loadArenaArtifacts`/`loadTrainedReadoutArtifact` (`ExperimentController#initialize`
+ * passes `${import.meta.env.BASE_URL}data`) so this artifact resolves under
+ * the app's real deployment base path too.
+ */
+export const loadRewiringNull = async (
+  manifest: ArenaManifest,
+  dataBaseUrl: string
+): Promise<RewiringNullLoadResult> => {
+  const entry = manifest.rewiringNull;
+  if (!entry) {
+    return { status: 'missing', reason: 'The manifest has no rewiringNull artifact entry.' };
+  }
+
+  let rawBytes: ArrayBuffer;
+  try {
+    rawBytes = await fetchArrayBuffer(`${dataBaseUrl}/${entry.artifact}`);
+  } catch (error) {
+    return { status: 'missing', reason: error instanceof Error ? error.message : String(error) };
+  }
+
+  const rawHash = await sha256Hex(rawBytes);
+  if (rawHash !== entry.sha256) {
+    return {
+      status: 'invalid',
+      reason: `rewiring-null artifact sha256 ${rawHash} does not match the manifest (${entry.sha256})`
+    };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(new TextDecoder().decode(rawBytes));
+  } catch (error) {
+    return {
+      status: 'invalid',
+      reason: `rewiring-null artifact is not valid JSON: ${error instanceof Error ? error.message : String(error)}`
+    };
+  }
+
+  const validated = validateRewiringNullShape(parsed);
+  if (!validated.ok) return { status: 'invalid', reason: validated.reason };
+  return { status: 'ok', data: validated.data };
 };

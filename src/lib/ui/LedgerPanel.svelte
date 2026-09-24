@@ -1,6 +1,7 @@
 <script lang="ts">
-  import type { ArenaManifest, TrainedReadoutLoadResult } from '../experiment/assets';
+  import type { ArenaManifest, RewiringNullLoadResult, TrainedReadoutLoadResult } from '../experiment/assets';
   import type { DecoderKind } from '../worker/protocol';
+  import NullHistogram from './NullHistogram.svelte';
 
   /**
    * The model ledger vocabulary (`docs/model-ledger.md`) plus provenance
@@ -20,9 +21,11 @@
     decoder: DecoderKind;
     /** `undefined` while `ExperimentController#initialize()`'s trained-readout step has not yet resolved. */
     trainedReadout: TrainedReadoutLoadResult | undefined;
+    /** `undefined` while `ExperimentController#initialize()`'s rewiring-null load (WP4) has not yet resolved. */
+    rewiringNull: RewiringNullLoadResult | undefined;
   }
 
-  let { manifest, decoder, trainedReadout }: Props = $props();
+  let { manifest, decoder, trainedReadout, rewiringNull }: Props = $props();
 
   const LEDGER_ROWS = $derived<readonly { term: string; label: string }[]>([
     { term: 'Graph topology', label: 'Measured' },
@@ -52,6 +55,20 @@
           : trainedReadout.status === 'ok'
             ? 'Trained (offline)'
             : 'Trained (offline) — unavailable'
+    },
+    // WP4 (`docs/model-ledger.md`'s new row): descriptive scores of
+    // degree-preserving rewirings under the authored decoder, computed
+    // offline — never a biological measurement.
+    {
+      term: 'Topology null distribution',
+      label:
+        rewiringNull === undefined
+          ? 'Loading…'
+          : rewiringNull.status === 'ok'
+            ? 'Computed (offline)'
+            : rewiringNull.status === 'missing'
+              ? 'Computed (offline) — not shipped'
+              : 'Computed (offline) — unavailable'
     }
   ]);
 
@@ -65,6 +82,9 @@
    * links; this is offered alongside them for the prose version.
    */
   const GITHUB_REPORT_URL = 'https://github.com/mattsp1290/flyarena/blob/main/docs/trained-readout-report.md';
+
+  /** WP4's counterpart to `reportUrl` above, for the rewiring-null artifact's own JSON — `NullHistogram.svelte`'s figcaption links the human-readable report. */
+  const rewiringNullJsonUrl = $derived(`${import.meta.env.BASE_URL}data/rewiring-null-v1.json`);
 </script>
 
 <section class="panel ledger" aria-labelledby="ledger-heading">
@@ -131,6 +151,25 @@
       <div><dt>License</dt><dd>{manifest.license}</dd></div>
       <div><dt>Neurons / edges (biological)</dt><dd>{manifest.neuronCount} / {manifest.edgeCount}</dd></div>
     </dl>
+  {/if}
+
+  {#if rewiringNull?.status === 'ok' || rewiringNull?.status === 'invalid'}
+    <h3>Topology null distribution</h3>
+  {/if}
+  {#if rewiringNull?.status === 'ok'}
+    <!-- `NullHistogram`'s own `<figcaption>` already links "Full
+         rewiring-null report" (the bean's non-negotiable) — this list adds
+         only the machine-readable JSON, matching the "JSON is linked too"
+         instruction without duplicating the same link text/target twice on
+         one page. -->
+    <NullHistogram data={rewiringNull.data} />
+    <ul class="links">
+      <li><a href={rewiringNullJsonUrl} target="_blank" rel="noreferrer">Rewiring-null result (JSON)</a></li>
+    </ul>
+  {:else if rewiringNull?.status === 'invalid'}
+    <p class="error-message">
+      Null-distribution result failed verification: {rewiringNull.reason}
+    </p>
   {/if}
 
   <h3>Provenance and licensing</h3>

@@ -4,7 +4,7 @@ import ExperimentPanel from '../../src/lib/ui/ExperimentPanel.svelte';
 import TelemetryPanel from '../../src/lib/ui/TelemetryPanel.svelte';
 import LedgerPanel from '../../src/lib/ui/LedgerPanel.svelte';
 import type { ExperimentTelemetry } from '../../src/lib/experiment/runner';
-import type { ArenaManifest, TrainedReadoutLoadResult } from '../../src/lib/experiment/assets';
+import type { ArenaManifest, RewiringNullLoadResult, TrainedReadoutLoadResult } from '../../src/lib/experiment/assets';
 
 afterEach(() => cleanup());
 
@@ -347,7 +347,7 @@ describe('LedgerPanel', () => {
   };
 
   it('renders the ledger vocabulary, never says brain emulation, and links to the manifest/ledger/license', () => {
-    const { container } = render(LedgerPanel, { manifest, decoder: 'authored', trainedReadout: undefined });
+    const { container } = render(LedgerPanel, { manifest, decoder: 'authored', trainedReadout: undefined, rewiringNull: undefined });
 
     expect(ledgerRow(container, 'Graph topology')).toHaveTextContent('Measured');
     expect(ledgerRow(container, 'Biological annotations')).toHaveTextContent('Annotated');
@@ -373,7 +373,7 @@ describe('LedgerPanel', () => {
   });
 
   it('renders the static ledger vocabulary even without a loaded manifest', () => {
-    const { container } = render(LedgerPanel, { manifest: undefined, decoder: 'authored', trainedReadout: undefined });
+    const { container } = render(LedgerPanel, { manifest: undefined, decoder: 'authored', trainedReadout: undefined, rewiringNull: undefined });
     expect(ledgerRow(container, 'Graph topology')).toHaveTextContent('Measured');
   });
 
@@ -387,7 +387,7 @@ describe('LedgerPanel', () => {
   } as unknown as TrainedReadoutLoadResult;
 
   it('shows the "Readout (trained mode)" row and provenance detail (hash prefix, param count, D -> H -> 3, report links) when the artifact is ok, visible even in Authored mode', () => {
-    const { container } = render(LedgerPanel, { manifest, decoder: 'authored', trainedReadout: trainedReadoutOk });
+    const { container } = render(LedgerPanel, { manifest, decoder: 'authored', trainedReadout: trainedReadoutOk, rewiringNull: undefined });
 
     expect(ledgerRow(container, 'Readout (trained mode)')).toHaveTextContent('Trained (offline)');
     expect(screen.getByText('835')).toBeInTheDocument();
@@ -405,7 +405,7 @@ describe('LedgerPanel', () => {
   });
 
   it('scopes the "Sensory encoder and action decoder" row label to Trained mode', () => {
-    const { container } = render(LedgerPanel, { manifest, decoder: 'trained', trainedReadout: trainedReadoutOk });
+    const { container } = render(LedgerPanel, { manifest, decoder: 'trained', trainedReadout: trainedReadoutOk, rewiringNull: undefined });
     const row = ledgerRow(container, 'Sensory encoder and action decoder');
     expect(row).toHaveTextContent(/authored/i);
     expect(row).toHaveTextContent(/trained/i);
@@ -415,9 +415,83 @@ describe('LedgerPanel', () => {
     render(LedgerPanel, {
       manifest,
       decoder: 'authored',
-      trainedReadout: { status: 'unavailable', reason: 'trained-readout-v1.json sha256 mismatch' }
+      trainedReadout: { status: 'unavailable', reason: 'trained-readout-v1.json sha256 mismatch' },
+      rewiringNull: undefined
     });
     const message = screen.getByText(/artifact failed verification/i);
+    expect(message).toHaveTextContent(/sha256 mismatch/i);
+  });
+
+  const rewiringNullOk = {
+    status: 'ok',
+    data: {
+      version: 1,
+      condition: 'authored, opponent parked',
+      seeds: { start: 30001, count: 100 },
+      ticks: 1800,
+      substeps: 4,
+      sourceGraphSha256: 'a'.repeat(64),
+      rewireSourceSha256: 'b'.repeat(64),
+      shards: 18,
+      biological: { score: -0.22, median: -1.4, std: 3.28, ci: [-0.85, 0.45] },
+      disconnected: { score: -1.86, median: -2, std: 1.79, ci: [-2.22, -1.52] },
+      rewired: [
+        { seed: 0, gzipSha256: 'c'.repeat(64), score: 1.02, median: 0.62, std: 3.73, ci: [0.3, 1.77], acceptedSwaps: 764340, attempts: 926220 },
+        { seed: 1, gzipSha256: 'd'.repeat(64), score: 2.5, median: 2.5, std: 1.0, ci: [2.0, 3.0], acceptedSwaps: 764340, attempts: 926220 }
+      ],
+      null: { n: 2, mean: 1.76, median: 1.76, std: 1.05, p2_5: 1.05, p97_5: 2.47, iqr: 1.48, degenerate: false },
+      bioPercentile: 0,
+      pLow: 0.33,
+      pHigh: 1,
+      bins: { edges: [-2, 0, 2, 4], counts: [0, 1, 1] }
+    }
+  } as unknown as RewiringNullLoadResult;
+
+  it('shows the "Topology null distribution" section with the histogram and percentile sentence when the artifact is ok', () => {
+    const { container } = render(LedgerPanel, {
+      manifest,
+      decoder: 'authored',
+      trainedReadout: undefined,
+      rewiringNull: rewiringNullOk
+    });
+
+    expect(ledgerRow(container, 'Topology null distribution')).toHaveTextContent('Computed (offline)');
+    expect(screen.getByRole('heading', { name: /topology null distribution/i })).toBeInTheDocument();
+    // The percentile sentence is duplicated onto the SVG's own accessible
+    // name/`<desc>` (for screen-reader users who never reach the visible
+    // `<figcaption>`) — scope this assertion to the visible figcaption
+    // specifically, rather than an unscoped `getByText` that would match
+    // both and fail with "multiple elements found".
+    const figcaption = container.querySelector('figcaption');
+    expect(figcaption).toHaveTextContent(/scored above 0\.0% of 500 degree-preserving rewirings/i);
+    expect(figcaption).toHaveTextContent(/opponent parked/i);
+    expect(screen.getByRole('link', { name: /rewiring-null result \(json\)/i })).toHaveAttribute(
+      'href',
+      '/data/rewiring-null-v1.json'
+    );
+    expect(screen.getByRole('link', { name: /full rewiring-null report/i })).toBeInTheDocument();
+  });
+
+  it('hides the "Topology null distribution" section entirely when the artifact is missing (the ledger row itself, like "Readout (trained mode)", still shows)', () => {
+    const { container } = render(LedgerPanel, {
+      manifest,
+      decoder: 'authored',
+      trainedReadout: undefined,
+      rewiringNull: { status: 'missing', reason: 'no entry' }
+    });
+    expect(ledgerRow(container, 'Topology null distribution')).toHaveTextContent('Computed (offline) — not shipped');
+    expect(screen.queryByRole('heading', { name: /topology null distribution/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /rewiring-null result \(json\)/i })).not.toBeInTheDocument();
+  });
+
+  it('shows the honest verification-failure message when the rewiring-null artifact is invalid', () => {
+    render(LedgerPanel, {
+      manifest,
+      decoder: 'authored',
+      trainedReadout: undefined,
+      rewiringNull: { status: 'invalid', reason: 'rewiring-null artifact sha256 mismatch' }
+    });
+    const message = screen.getByText(/null-distribution result failed verification/i);
     expect(message).toHaveTextContent(/sha256 mismatch/i);
   });
 });

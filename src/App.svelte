@@ -7,6 +7,7 @@
     loadPositions,
     type ArenaManifest,
     type PositionsLoadResult,
+    type RewiringNullLoadResult,
     type TrainedReadoutLoadResult
   } from './lib/experiment/assets';
   import { ExperimentController } from './lib/experiment/controller';
@@ -68,6 +69,8 @@
   let decoder = $state<DecoderKind>('authored');
   /** `undefined` until `initialize()`'s trained-readout load/validate step resolves; feeds the ledger's "Readout (trained mode)" row and gates the Trained radio option. */
   let trainedReadoutStatus = $state<TrainedReadoutLoadResult | undefined>(undefined);
+  /** `undefined` until `initialize()`'s rewiring-null load resolves (WP4); feeds the ledger's "Topology null distribution" section. Loading it never blocks Start — see `ExperimentController#initialize`'s doc comment. */
+  let rewiringNullStatus = $state<RewiringNullLoadResult | undefined>(undefined);
   /** True for the duration of an in-flight `controller.setDecoder()` call — set/cleared locally around that call (there is only ever one decoder shared by both arms, unlike per-arm topology switches, so a single flag suffices). */
   let decoderSwitchPending = $state(false);
 
@@ -305,6 +308,9 @@
         onTrainedReadoutStatus: (status) => {
           if (!destroyed) trainedReadoutStatus = status;
         },
+        onRewiringNull: (result) => {
+          if (!destroyed) rewiringNullStatus = result;
+        },
         onDecoderApplied: (next) => {
           if (!destroyed) decoder = next;
         }
@@ -465,7 +471,7 @@
       <TelemetryPanel {telemetry} />
     {/if}
 
-    <LedgerPanel {manifest} {decoder} trainedReadout={trainedReadoutStatus} />
+    <LedgerPanel {manifest} {decoder} trainedReadout={trainedReadoutStatus} rewiringNull={rewiringNullStatus} />
   </aside>
 </main>
 
