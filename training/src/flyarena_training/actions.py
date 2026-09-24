@@ -11,6 +11,8 @@ from __future__ import annotations
 import math
 from typing import Sequence
 
+import torch
+
 # Canonical output-population order (`OUTPUT_POPULATION`, actions.ts):
 # thrust, yaw, brake.
 OUTPUT_POPULATION = {"thrust": 0, "yaw": 1, "brake": 2}
@@ -42,3 +44,29 @@ def decode_action(input_: Sequence[float] | None) -> tuple[float, float, float]:
         _clamp(_finite_or_zero(yaw_raw), -1.0, 1.0),
         _clamp(_finite_or_zero(brake_raw), 0.0, 1.0),
     )
+
+
+def decode_action_batch(
+    raw: torch.Tensor | None,
+    batch_size: int,
+    device: str | torch.device,
+    dtype: torch.dtype = torch.float64,
+) -> torch.Tensor:
+    """Batched port of `decode_action`/`decodeAction`. `raw`: `[B, >=3]`
+    tensor (columns in `OUTPUT_POPULATION` order) or `None`/missing for the
+    zero action for every item, matching `decodeAction(undefined)`. Returns
+    `[B, 3]`, clamped to `[-1, 1]`, `[-1, 1]`, `[0, 1]` for thrust/yaw/brake;
+    non-finite input values become zero before clamping, like
+    `_finite_or_zero` above."""
+    device = torch.device(device)
+
+    def column(index: int) -> torch.Tensor:
+        if raw is None or raw.shape[1] <= index:
+            return torch.zeros(batch_size, dtype=dtype, device=device)
+        values = raw[:, index].to(dtype=dtype, device=device)
+        return torch.where(torch.isfinite(values), values, torch.zeros_like(values))
+
+    thrust = column(OUTPUT_POPULATION["thrust"]).clamp(-1.0, 1.0)
+    yaw = column(OUTPUT_POPULATION["yaw"]).clamp(-1.0, 1.0)
+    brake = column(OUTPUT_POPULATION["brake"]).clamp(0.0, 1.0)
+    return torch.stack([thrust, yaw, brake], dim=1)

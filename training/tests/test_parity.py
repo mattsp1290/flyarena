@@ -25,8 +25,8 @@ from flyarena_training.readout import (
     load_readout_weights_json,
     readout_forward,
 )
-from flyarena_training.sensors import observe_agent
-from flyarena_training.world import step_world_item, world_item_from_dict
+from flyarena_training.sensors import observe_batch
+from flyarena_training.world import step_world_batched, world_batch_from_dicts, world_batch_from_items, world_item_from_dict
 
 # Mirrors scripts/training/export-traces.ts's constants (DEFAULT_GRAPH_ID,
 # TRACE_SEEDS, TRACE_SUBSTEPS, TRACE_TICKS). Not imported from TS: this is a
@@ -198,88 +198,123 @@ def test_readout_parity_teacher_forced(device, trace_dir):
 
 @pytest.mark.parametrize("seed", TRACE_SEEDS)
 def test_world_state_and_observation_parity_teacher_forced(seed, include_world_trace_dir):
-    """Requires the `--include-world` trace (see conftest.py). Each tick:
-    observe from the *recorded* prior world state, step with the *recorded*
-    decoded action, then compare the result (and food-respawn/hazard-contact
-    event counters, checked exactly) against the recorded post-step state
-    before resetting to it for the next tick."""
+    """Requires the `--include-world` trace (see conftest.py). Teacher-forced
+    and fully batched: every tick's recorded prior world state becomes one
+    row of a `B = ticks` `WorldBatch` (`world_batch_from_dicts`), observed
+    (`observe_batch`) and stepped (`step_world_batched`) all at once — each
+    row is independent under teacher forcing, so this is a real exercise of
+    the batched port across many rows in a single call, not `B = 1` in a
+    Python loop. Compares the result (and food-respawn/food-pickup/hazard-
+    contact event counters, checked exactly) against the recorded post-step
+    state for every tick."""
     trace = _load_json(include_world_trace_dir / f"{GRAPH_ID}-seed-{seed}.json")
     ticks = trace["ticks"]
 
-    prior = world_item_from_dict(trace["initialWorld"])
-    max_world_abs = 0.0
-    max_obs_abs = 0.0
-    for tick in range(ticks):
-        observation = observe_agent(prior, "left", ARENA_CONFIG)
-        expected_observation = trace["observations"][tick]
-        for actual, expected in zip(observation, expected_observation):
-            diff = abs(actual - expected)
-            max_obs_abs = max(max_obs_abs, diff)
-            assert diff <= OBSERVATION_ABS_TOL, f"seed={seed} tick={tick}: observation mismatch"
+    prior_dicts = [trace["initialWorld"]] + trace["worldAfter"][:-1]
+    state = world_batch_from_dicts(prior_dicts, device="cpu")
 
-        action = trace["actions"][tick]
-        stepped = step_world_item(prior, {"left": action, "right": [0.0, 0.0, 0.0]})
-        expected_after = trace["worldAfter"][tick]
+    observation = observe_batch(state, "left", ARENA_CONFIG)
+    expected_observation = torch.tensor(trace["observations"], dtype=torch.float64)
+    obs_diff = (observation - expected_observation).abs()
+    assert bool((obs_diff <= OBSERVATION_ABS_TOL).all()), (
+        f"seed={seed}: observation parity failed, max abs diff {obs_diff.max().item():.3e}"
+    )
 
-        # Exact event checks.
-        for i, food in enumerate(stepped.foods):
-            assert food.respawns == expected_after["foodRespawns"][i], (
-                f"seed={seed} tick={tick} food {i}: respawn count {food.respawns} != "
-                f"{expected_after['foodRespawns'][i]}"
-            )
-        for i, agent in enumerate(stepped.agents):
-            assert agent.score.food_pickups == expected_after["agentScores"][i][0]
-            assert agent.score.hazard_contacts == expected_after["agentScores"][i][1]
+    actions = torch.tensor(trace["actions"], dtype=torch.float64)
+    zero_actions = torch.zeros_like(actions)
+    stepped = step_world_batched(state, {"left": actions, "right": zero_actions}, ARENA_CONFIG)
 
-        # World-state numeric parity.
-        for i, agent in enumerate(stepped.agents):
-            expected_position = expected_after["agentPositions"][i]
-            for actual, expected in zip(agent.position, expected_position):
-                diff = abs(actual - expected)
-                max_world_abs = max(max_world_abs, diff)
-                assert diff <= WORLD_ABS_TOL, f"seed={seed} tick={tick} agent {i}: position mismatch"
-            for actual, expected in zip(agent.velocity, expected_after["agentVelocities"][i]):
-                assert abs(actual - expected) <= WORLD_ABS_TOL
-            assert abs(agent.heading - expected_after["agentHeadings"][i]) <= WORLD_ABS_TOL
-        for i, food in enumerate(stepped.foods):
-            for actual, expected in zip(food.position, expected_after["foodPositions"][i]):
-                diff = abs(actual - expected)
-                max_world_abs = max(max_world_abs, diff)
-                assert diff <= WORLD_ABS_TOL, f"seed={seed} tick={tick} food {i}: position mismatch"
-        for i, hazard in enumerate(stepped.hazards):
-            for actual, expected in zip(hazard.position, expected_after["hazardPositions"][i]):
-                assert abs(actual - expected) <= WORLD_ABS_TOL
+    expected_food_respawns = torch.tensor([w["foodRespawns"] for w in trace["worldAfter"]], dtype=torch.int64)
+    assert torch.equal(stepped.food_respawns, expected_food_respawns), f"seed={seed}: food respawn count mismatch"
+    expected_scores = torch.tensor([w["agentScores"] for w in trace["worldAfter"]], dtype=torch.int64)
+    assert torch.equal(stepped.agent_food_pickups, expected_scores[:, :, 0]), f"seed={seed}: food pickup count mismatch"
+    assert torch.equal(
+        stepped.agent_hazard_contacts, expected_scores[:, :, 1]
+    ), f"seed={seed}: hazard contact count mismatch"
 
-        prior = world_item_from_dict(expected_after)  # teacher-force for the next tick
+    expected_position = torch.tensor([w["agentPositions"] for w in trace["worldAfter"]], dtype=torch.float64)
+    expected_velocity = torch.tensor([w["agentVelocities"] for w in trace["worldAfter"]], dtype=torch.float64)
+    expected_heading = torch.tensor([w["agentHeadings"] for w in trace["worldAfter"]], dtype=torch.float64)
+    expected_food_position = torch.tensor([w["foodPositions"] for w in trace["worldAfter"]], dtype=torch.float64)
+    expected_hazard_position = torch.tensor([w["hazardPositions"] for w in trace["worldAfter"]], dtype=torch.float64)
+
+    position_diff = (stepped.agent_position - expected_position).abs()
+    velocity_diff = (stepped.agent_velocity - expected_velocity).abs()
+    heading_diff = (stepped.agent_heading - expected_heading).abs()
+    food_position_diff = (stepped.food_position - expected_food_position).abs()
+    hazard_position_diff = (stepped.hazard_position - expected_hazard_position).abs()
+
+    max_world_abs = max(
+        position_diff.max().item(),
+        velocity_diff.max().item(),
+        heading_diff.max().item(),
+        food_position_diff.max().item(),
+        hazard_position_diff.max().item(),
+    )
+    assert bool((position_diff <= WORLD_ABS_TOL).all()), f"seed={seed}: agent position parity failed"
+    assert bool((velocity_diff <= WORLD_ABS_TOL).all()), f"seed={seed}: agent velocity parity failed"
+    assert bool((heading_diff <= WORLD_ABS_TOL).all()), f"seed={seed}: agent heading parity failed"
+    assert bool((food_position_diff <= WORLD_ABS_TOL).all()), f"seed={seed}: food position parity failed"
+    assert bool((hazard_position_diff <= WORLD_ABS_TOL).all()), f"seed={seed}: hazard position parity failed"
 
     print(
-        f"[parity] world/observation seed={seed}: max world abs diff {max_world_abs:.3e}, "
-        f"max observation abs diff {max_obs_abs:.3e}"
+        f"[parity] world/observation (batched, B={ticks}) seed={seed}: max world abs diff "
+        f"{max_world_abs:.3e}, max observation abs diff {obs_diff.max().item():.3e}"
     )
 
 
 @pytest.mark.parametrize("seed", TRACE_SEEDS)
 def test_free_running_world_positions(seed, include_world_trace_dir):
-    """No teacher forcing: replays `initialWorld` forward through our own
-    `step_world_item` for all committed ticks using the recorded decoded
-    actions, without resetting to the recorded world state each tick —
-    catches systematic port errors (e.g. an operation-order slip) that
-    per-tick teacher forcing could mask."""
+    """No teacher forcing: replays `initialWorld` forward through
+    `step_world_batched` (`B = 1`) for all committed ticks using the
+    recorded decoded actions, without resetting to the recorded world state
+    each tick — catches systematic port errors (e.g. an operation-order
+    slip) that per-tick teacher forcing could mask. See
+    `test_free_running_world_positions_batched_across_seeds` below for the
+    same check batched across all seeds at once (`B = len(TRACE_SEEDS)`)."""
     trace = _load_json(include_world_trace_dir / f"{GRAPH_ID}-seed-{seed}.json")
     ticks = trace["ticks"]
 
-    world = world_item_from_dict(trace["initialWorld"])
+    state = world_batch_from_items([world_item_from_dict(trace["initialWorld"])], device="cpu")
     max_abs = 0.0
     for tick in range(ticks):
-        action = trace["actions"][tick]
-        world = step_world_item(world, {"left": action, "right": [0.0, 0.0, 0.0]})
+        action = torch.tensor([trace["actions"][tick]], dtype=torch.float64)
+        zero_action = torch.zeros_like(action)
+        state = step_world_batched(state, {"left": action, "right": zero_action}, ARENA_CONFIG)
         expected_after = trace["worldAfter"][tick]
-        for i, agent in enumerate(world.agents):
-            for actual, expected in zip(agent.position, expected_after["agentPositions"][i]):
-                diff = abs(actual - expected)
-                max_abs = max(max_abs, diff)
-                assert diff <= FREE_RUNNING_ABS_TOL, (
-                    f"seed={seed} tick={tick} agent {i}: free-running position drift {diff:.3e}"
-                )
+        expected_position = torch.tensor([expected_after["agentPositions"]], dtype=torch.float64)
+        diff = (state.agent_position - expected_position).abs()
+        max_abs = max(max_abs, diff.max().item())
+        assert bool((diff <= FREE_RUNNING_ABS_TOL).all()), (
+            f"seed={seed} tick={tick}: free-running position drift {diff.max().item():.3e}"
+        )
 
     print(f"[parity] free-running seed={seed}: max position abs diff over {ticks} ticks {max_abs:.3e}")
+
+
+def test_free_running_world_positions_batched_across_seeds(include_world_trace_dir):
+    """Same check as `test_free_running_world_positions`, but batched across
+    every `TRACE_SEEDS` row at once (`B = len(TRACE_SEEDS)`, sequential over
+    ticks) instead of one `step_world_batched(B=1)` call per seed — a direct
+    exercise of `step_world_batched` doing independent, unrelated work for
+    different batch rows simultaneously."""
+    traces = [_load_json(include_world_trace_dir / f"{GRAPH_ID}-seed-{seed}.json") for seed in TRACE_SEEDS]
+    ticks = traces[0]["ticks"]
+    assert all(trace["ticks"] == ticks for trace in traces)
+
+    state = world_batch_from_items([world_item_from_dict(trace["initialWorld"]) for trace in traces], device="cpu")
+    max_abs = 0.0
+    for tick in range(ticks):
+        action = torch.tensor([trace["actions"][tick] for trace in traces], dtype=torch.float64)
+        zero_action = torch.zeros_like(action)
+        state = step_world_batched(state, {"left": action, "right": zero_action}, ARENA_CONFIG)
+        expected_position = torch.tensor(
+            [trace["worldAfter"][tick]["agentPositions"] for trace in traces], dtype=torch.float64
+        )
+        diff = (state.agent_position - expected_position).abs()
+        max_abs = max(max_abs, diff.max().item())
+        assert bool((diff <= FREE_RUNNING_ABS_TOL).all()), (
+            f"tick={tick}: free-running position drift {diff.max().item():.3e} (batched across seeds)"
+        )
+
+    print(f"[parity] free-running (batched across {len(TRACE_SEEDS)} seeds): max position abs diff {max_abs:.3e}")

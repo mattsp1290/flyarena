@@ -4,19 +4,24 @@ version = "0.1.0"
 description = "Batched PyTorch port of the FlyArena arena/rate model, for GPU-accelerated CEM training and TS parity checking."
 requires-python = ">=3.12"
 dependencies = [
-    "torch>=2.4",
+    # Pinned to the exact cu128 build verified working on this host's GB10
+    # (README.md's "Setup on the Spark" GPU check); a bare lower bound would
+    # let `uv lock --upgrade` silently jump to an untested build on a
+    # Blackwell-class (sm_121) device with a narrow compatibility window.
+    "torch==2.11.0",
     # WP2's change surface (`.agents/plans/trained-readout/02-gpu-port-and-parity.md`)
-    # lists numpy as a required dependency; this port ended up using plain
-    # Python floats + torch tensors only (see world.py's module doc for
-    # why world-state stepping stays per-item rather than array-batched),
-    # so it's currently unused directly but kept per the plan's explicit
-    # dependency list for WP3's forward compatibility.
-    "numpy>=1.26",
+    # lists numpy as a required dependency; this port's batched world/sensor
+    # step (world.py, sensors.py) uses plain torch tensors directly, so
+    # numpy is currently unused directly but kept per the plan's explicit
+    # dependency list — reserved for WP3's CEM statistics (e.g.
+    # `numpy.random.default_rng` for the seed-sampling policy the plan
+    # specifies, `.agents/plans/trained-readout/03-cem-training.md`).
+    "numpy>=1.26,<3",
 ]
 
 [dependency-groups]
 dev = [
-    "pytest>=8.0",
+    "pytest>=8.0,<9",
 ]
 
 [tool.uv.sources]

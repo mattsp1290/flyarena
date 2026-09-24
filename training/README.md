@@ -12,6 +12,38 @@ This is a separate `uv` project so `torch` never enters the root
 `pyproject.toml`/`uv.lock`, which are reserved for the offline graph
 compiler (bean `flyarena-qyxw`).
 
+## Environment note (this host) — read this first
+
+This host's global Datadog APM auto-injection (`DD_INJECTION_ENABLED=tracer`,
+forced onto every Python process's `sys.path` via
+`/opt/datadog-packages/datadog-apm-library-python/.../ddtrace/bootstrap`)
+ships an IAST instrumentation aspect for `Tensor.expand` that raises
+`RuntimeError: Boolean value of Tensor with more than one value is
+ambiguous` on any `expand()` call producing more than one element — this
+port's `PreparedGraph`/`broadcast_readout_weights` both call `expand()`.
+Unrelated to this port's correctness; disable Datadog's Python
+instrumentation for every `uv run` invocation, one of two ways:
+
+```bash
+DD_TRACE_ENABLED=false DD_IAST_ENABLED=false DD_APPSEC_ENABLED=false uv run pytest -v
+# or, equivalently, for any command (pytest, a future flyarena-train CLI, ...):
+training/scripts/run.sh pytest -v
+```
+
+`training/scripts/run.sh` wraps the three env vars and `exec`s `uv run
+"$@"`, so WP3's automation (a script, a cron job, a CI runner) doesn't have
+to rely on the vars being copy-pasted correctly by hand every time — it's a
+one-line substitution for `uv run` everywhere in this project. (The env vars
+can't be set from inside `training/tests/conftest.py` and have this effect:
+ddtrace's auto-injection runs via `sitecustomize`/`PYTHONPATH` before any
+user code executes, so by the time `conftest.py` runs it's too late — the
+shell invocation is the only correct fix point. `conftest.py` sets them
+anyway, defensively, in case some other code path reads `os.environ` at
+runtime; see its module doc.)
+
+If this project is ever run on a host without this injection, the env vars
+(and `run.sh`) are harmless no-ops.
+
 ## Setup on the Spark
 
 ```bash
@@ -116,6 +148,46 @@ On this host, Node was found and the trace generated successfully every run
 during development of this port — the skip path was verified by temporarily
 hiding `node`/nvm from `PATH`.
 
+### Longer traces for event coverage
+
+The committed golden fixtures (60 ticks × 4 seeds) never trigger a food
+pickup, wall clamp, or hazard contact — a review pass caught that this left
+`place_without_overlap`'s respawn path (and `step_world_batched`'s wall-clamp
+and hazard-contact branches) untested even indirectly. `training/scripts/generate_long_traces.ts`
+reuses `buildSeedTrace` from `scripts/training/export-traces.ts` (the actual
+TS `createWorld`/`stepWorld`/rate-model rollout, unchanged) with a
+configurable seed list and tick count — the committed exporter's CLI only
+accepts its own fixed `TRACE_SEEDS`/`TRACE_TICKS`, so this is a separate
+script rather than an edit to that exporter (see its own module doc for the
+full reasoning). No action scripting was needed to reach useful coverage: a
+hand-picked list of 13 seeds (found via a throwaway sweep over seeds 1..800,
+picking for wall-clamp frequency plus a few for extra food/hazard variety;
+see the script's `DEFAULT_SEEDS` comment) at 2000 ticks each, under the
+existing closed-loop authored policy, produces:
+
+```
+food respawns=15, hazard contacts=42, wall-clamp ticks=63
+```
+
+`tests/conftest.py`'s `long_trace_dir` fixture generates this the same way
+`include_world_trace_dir` does (skips with the manual command if Node isn't
+found):
+
+```bash
+npx tsx training/scripts/generate_long_traces.ts --out training/runs/traces/event-coverage
+```
+
+`tests/test_world_event_coverage.py` uses it for two things: (1) a minimum-
+event-count assertion directly against the generated trace (so this
+coverage can't silently regress back to zero), and (2) the same
+teacher-forced, fully-batched parity check `test_parity.py` runs against the
+committed fixtures, but against a trace where the respawn fallback and
+wall-clamp/hazard-contact branches actually execute — batching every
+(seed, tick) row across all 13 seeds into one `WorldBatch` (`B = 26,000`)
+and stepping it in a single `step_world_batched` call. Measured result: max
+position/observation abs diff ~9e-16 (float64 round-off), exact event-count
+match (respawns/pickups/hazard-contacts) against the recorded trace.
+
 ### Config-drift gate — a deliberate deviation from the plan's literal wording
 
 The plan's tolerance table says: *"A config-drift test fails if
@@ -158,13 +230,22 @@ All figures from `uv run pytest -v -s` against the committed
 | Food respawn / hazard contact events | exact | **exact** (all seeds, all ticks) | n/a |
 | Free-running positions, 60 ticks | abs ≤ 1e-4 | **0.000e+00** (all 4 seeds) | n/a |
 
-World-state/observation/event/free-running checks are pure-Python
-(`world.py`, `sensors.py`; see those modules' doc comments for why — the
-placement rejection sampling is inherently sequential/data-dependent, not a
-dense GPU op), so they have no separate CUDA variant; they ran once, on
-CPU, and their result applies regardless of the GPU gate. The rate/output
-model and readout MLP are the actual GPU-batched pieces and are checked on
-both devices where CUDA is available.
+World-state/observation/event/free-running checks run through the batched
+`step_world_batched`/`observe_batch` (`world.py`, `sensors.py`), on CPU in
+these test runs; they work identically on CUDA (`device=` is threaded
+through `world_batch_from_items`/`create_world_batch`), but aren't
+parametrized onto it in `test_parity.py` since the committed golden traces
+are small enough that CPU is already instant — see "World step batching"
+below for the CUDA throughput numbers that actually matter for these ops
+(B = 4096). The rate/output model and readout MLP are checked on both
+devices where CUDA is available (`test_parity.py`'s `DEVICES`).
+
+Also see `tests/test_world_batch.py` (reset-vs-`initialWorld` parity, a
+property-based cross-check of `step_world_batched` against the per-item
+reference oracle across random actions, and `validate_world_batch` tests)
+and `tests/test_world_event_coverage.py` (parity + minimum-event-count
+assertions against a longer, event-rich trace — see "Longer traces for
+event coverage" below), both added by the batching fix.
 
 All tolerances passed with wide margin — the rate/output/readout residuals
 (~1e-7, tolerance 1e-5/1e-6) are consistent with the plan's documented
@@ -196,24 +277,82 @@ at this tiny graph size the run-to-run variance from kernel-launch overhead
 is comparable in magnitude, so treat both figures as order-of-magnitude,
 not precise.)
 
-## Environment note (this host)
+### World step batching — before/after (thermo-architecture review finding #1)
 
-This host's global Datadog APM auto-injection (`DD_INJECTION_ENABLED=tracer`,
-forced onto every Python process's `sys.path` via
-`/opt/datadog-packages/datadog-apm-library-python/.../ddtrace/bootstrap`)
-ships an IAST instrumentation aspect for `Tensor.expand` that raises
-`RuntimeError: Boolean value of Tensor with more than one value is
-ambiguous` on any `expand()` call producing more than one element — this
-port's `PreparedGraph`/`broadcast_readout_weights` both call `expand()`.
-Unrelated to this port's correctness; disable Datadog's Python
-instrumentation for `uv run pytest` invocations:
+A first review pass found that `step_world`/`observe_agent` were ported as a
+Python `for` loop over per-item dataclasses for *all* physics (movement
+integration, wall clamp, hazard motion/bounce, contact detection, score
+updates) — not just the rejection-sampling placement the plan scopes to
+per-item — which the reviewer measured at ~41,000 item-ticks/s combined
+(world + sensors), ~200x slower than the already-batched GPU model step,
+projecting to **~67 hours of pure Python object-churn for WP3's full 9-run
+CEM sweep** at the plan's declared defaults. That's fixed: `world.py`'s
+`step_world_batched`/`sensors.py`'s `observe_batch` are now dense `[B, ...]`
+`torch` tensor ops (see `world.py`'s module doc); only `place_without_overlap`
+(food-respawn placement, genuinely sequential rejection sampling) stays
+per-item, and it now runs as a **masked** CPU fallback only for the batch
+items that actually had a pickup that tick, not unconditionally for every
+item every tick.
 
-```bash
-DD_TRACE_ENABLED=false DD_IAST_ENABLED=false DD_APPSEC_ENABLED=false uv run pytest -v
+Before/after benchmark (`training/scripts/bench_combined_step.py`), CUDA,
+`B = 4096`, `trace-graph` fixture, combined world-step + observe + rate-model
+(4 substeps) + readout MLP per tick — "before" reproduces the pre-fix
+architecture exactly (the per-item Python `step_world`/`observe_agent`,
+preserved as the test oracle at `training/tests/reference_world.py`, driving
+the *same* batched model+readout step "after" uses):
+
+```
+BEFORE (per-item world/observe + batched model/readout), B=4096:
+  8.8 ticks/s, ~36,100 item-ticks/s
+AFTER (fully batched world/observe/model/readout), B=4096:
+  ~320 ticks/s, ~1,310,000 item-ticks/s
+Speedup: ~35x
 ```
 
-If this project is ever run on a host without this injection, the env vars
-are harmless no-ops.
+(Two runs measured 34.0x and 36.3x; the "before" number is in the same
+order of magnitude as the review's own ~41,000 item-ticks/s world+sensors-only
+measurement — this run's number is combined world+observe+model+readout, so
+a slightly lower per-item rate is expected.)
+
+**Re-estimated WP3 wall time** at the plan's declared defaults (`P = 256`,
+`E = 16` ⇒ `B = 4096`; `T = 1800`; `G = 150`; 9 runs = 3 arms × 3 replicas):
+
+| | Before (per-item) | After (batched) |
+| --- | --- | --- |
+| Per generation | ~185–204 s | ~5.5–5.6 s |
+| Per run (`G = 150`) | ~7.7–8.5 h | ~0.23 h |
+| All 9 runs | **~70–77 h (≈3 days)** | **~2.0–2.1 h** |
+
+This does not include per-tick GPU↔CPU synchronization from
+`validate_world_batch` (on by default in `step_world_batched`, matching
+`stepWorld` always calling `validateStepState`; pass `validate=False` in a
+rollout loop that already trusts its state) or WP3's own CEM bookkeeping
+(elite selection, seed sampling) — both still TODO for WP3 — but the
+Python-object-churn bottleneck the first review pass identified is gone,
+and the batched pipeline is fast enough for WP3's calibration loop (many
+short, iterable runs), which the plan's "Unresolved decisions" table
+requires and the pre-fix architecture could not deliver.
+
+## Hardening (this fix)
+
+Two other review findings, both fixed alongside the batching work above:
+
+- **`validate_world_batch`** (`world.py`) ports TS `stepWorld`'s
+  `validateStepState` guard (finite-value + clock-consistency checks) as a
+  batched, cheap `torch.isfinite(...).all()`-based check, run by default at
+  the start of every `step_world_batched` call (matching `stepWorld` always
+  calling `validateStepState`); pass `validate=False` to skip it in a
+  perf-critical rollout loop. See `tests/test_world_batch.py`'s
+  `test_validate_world_batch_*`/`test_step_world_batched_*` tests.
+- **`graph.load_graph_json`** now validates the loaded JSON (required keys,
+  array lengths against `neuronCount`/`edgeCount`, index bounds, finite
+  values, `presynapticOffsets`' CSR invariants) and raises
+  `InvalidGraphJsonError` (a `ValueError`, mirroring `scripts/data/binfmt.py`'s
+  `InvalidGraphError` convention) naming the malformed field, instead of a
+  bare `KeyError` at the load site or an opaque shape mismatch several
+  frames away inside `model.PreparedGraph.__init__`. This matters once
+  WP4/WP5 feed real (less-trusted) MaleCNS exports through this loader — see
+  `tests/test_graph_validation.py`.
 
 ## Deviations from the plan (summary)
 
@@ -223,17 +362,26 @@ are harmless no-ops.
   for the full reasoning — no such file exists, and creating one would
   require editing `tests/unit/golden-traces.test.ts`, out of this work
   package's change surface).
-- **World state, RNG placement/respawn, sensors, and action decoding are
-  plain Python (not dense `torch` tensors).** The plan's module list
-  describes `world.py` as "batched world state tensors `[B, ...]`"; this
-  port batches at the *list-of-instances* level (`WorldItem` per seed)
-  rather than as dense arrays, because `placeWithoutOverlap` (used both at
-  reset and for food respawn during `stepWorld`) is sequential, data-dependent
-  rejection sampling — not vectorizable across a batch without either a
-  different algorithm or reduced fidelity. The plan itself directs reset
-  placement to run "on CPU per seed"; this port applies the identical
-  reasoning to respawn placement, since it is the same function for the
-  same underlying reason. The dense, GPU-batched piece is exactly the piece
-  the plan's throughput requirement targets: the rate model (`model.py`,
-  CSR sparse matmul) and the readout MLP (`readout.py`).
+- **Reset placement (`create_world_item`) and food-respawn placement
+  (`place_without_overlap`, called from `step_world_batched`'s masked
+  fallback) stay per-item, on CPU.** Both are `placeWithoutOverlap`:
+  sequential, data-dependent rejection sampling, not vectorizable across a
+  batch without either a different algorithm or reduced fidelity. The plan
+  itself directs reset placement to run "on CPU per seed"; this port applies
+  the identical reasoning to respawn placement, since it is the same
+  function for the same underlying reason — but the respawn fallback now
+  runs only for the batch items that actually need it each tick (see "World
+  step batching" above), not unconditionally for every item. Everything
+  else — movement integration, wall clamping, hazard motion/bounce, contact
+  detection, score bookkeeping, sensors, and action decoding — is dense
+  `[B, ...]` `torch` tensor ops (`step_world_batched`, `observe_batch`,
+  `decode_action_batch`), matching the plan's "batched world state tensors
+  `[B, ...]`" module description.
+- **`validate_world_batch`'s clock check uses a small float64 tolerance
+  (`1e-9`) instead of TS's `Object.is` bit-exact comparison** — see
+  `validate_world_batch`'s docstring in `world.py` for why (a `WorldBatch`
+  built from externally-serialized JSON has already round-tripped through
+  two independent language runtimes, unlike TS's in-process check).
+  `schemaVersion` is not tracked (nothing in this port ever sees a
+  different one).
 - No GPU fallback was needed: the cu128 wheel worked on the first attempt.
