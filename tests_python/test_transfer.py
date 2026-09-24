@@ -26,8 +26,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "data")
 import binfmt  # noqa: E402
 
 from env_guard import REQUIRED_SINGLE_THREADED_ENV_VARS, assert_single_threaded_blas  # noqa: E402
-from graph_io import build_dense_matrices  # noqa: E402
-from transfer import ILL_CONDITIONED_THRESHOLD, transfer_matrix  # noqa: E402
+from graph_io import DenseGraphMatrices, build_dense_matrices, canonical_json_text  # noqa: E402
+from transfer import (  # noqa: E402
+    ILL_CONDITIONED_THRESHOLD,
+    OBSERVATION_CHANNEL_INDEX,
+    OUTPUT_POPULATION_INDEX,
+    _compute_transfer,
+    transfer_matrix,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_PATH = REPO_ROOT / "tests_python" / "fixtures" / "trace-graph-transfer.json"
@@ -304,10 +310,19 @@ def _write_cli_fixture(root: Path) -> tuple[Path, Path, Path]:
     `_make_three_neuron_graph`: the CLI's per-graph dispatch now runs with
     `strict_shape=True` (a dual-review finding -- `turnGain`/`approachGain`
     must raise, not silently go `None`, for a production-shaped graph), and
-    the 3-neuron hand graph's 1x1 `T` would trip that guard. The "rewired"
-    graph reuses the exact same structure under a different artifact name --
-    this test only needs CLI-level plumbing (shard determinism, sha
-    verification), not two structurally distinct graphs."""
+    the 3-neuron hand graph's 1x1 `T` would trip that guard.
+
+    The "rewired" graph is the trace graph with its first edge's magnitude
+    scaled by 1.5 -- structurally identical (same shape, same CSR topology)
+    but numerically distinct, so its `T` differs from `biological`'s. This
+    matters for what these tests can actually detect (a round-2 dual-review
+    finding): an earlier version of this fixture reused the *exact same*
+    bytes for both graphs, which meant a worker mixing up which result or
+    steady-state sidecar belongs to which graph ID would have gone
+    completely undetected by the determinism test below, and a
+    `graphBinarySha256`/`sidecarSha256` swap in the manifest would have been
+    invisible too -- both graphs looked identical, so nothing could tell a
+    correct assignment apart from a scrambled one."""
     if not FIXTURE_PATH.exists():
         pytest.skip(f"{FIXTURE_PATH} not generated (run scripts/analysis/export-trace-graph-fixture.ts)")
     with FIXTURE_PATH.open("r") as fh:
@@ -322,8 +337,23 @@ def _write_cli_fixture(root: Path) -> tuple[Path, Path, Path]:
     bio_path = root / "biological.bin.gz"
     bio_path.write_bytes(gzip.compress(bio_binary))
 
-    rewired_binary = bio_binary  # same structure, different artifact name -- see this function's doc comment
-    rewired_sha256 = bio_sha256
+    perturbed_magnitudes = graph.contact_magnitudes.copy()
+    perturbed_magnitudes[0] = perturbed_magnitudes[0] * np.float32(1.5)
+    rewired_graph = binfmt.GraphArrays(
+        metadata=graph.metadata,
+        biological_ids=graph.biological_ids,
+        presynaptic_offsets=graph.presynaptic_offsets,
+        postsynaptic_indices=graph.postsynaptic_indices,
+        contact_magnitudes=perturbed_magnitudes,
+        presynaptic_signs=graph.presynaptic_signs,
+        input_channel_index=graph.input_channel_index,
+        input_weight=graph.input_weight,
+        output_population_index=graph.output_population_index,
+        output_weight=graph.output_weight,
+    )
+    rewired_binary = binfmt.encode_graph_binary(rewired_graph)
+    assert rewired_binary != bio_binary  # a perturbation that silently no-ops would defeat this fixture's own point
+    rewired_sha256 = binfmt.sha256_hex(rewired_binary)
     rewired_gzip = gzip.compress(rewired_binary)
     rewired_path = graphs_dir / "rewired-seed0.bin.gz"
     rewired_path.write_bytes(rewired_gzip)
@@ -397,6 +427,87 @@ def test_transfer_cli_is_byte_identical_across_worker_counts():
 
         payload = json.loads(out1.read_text())
         assert set(payload["graphs"].keys()) == {"biological", "disconnected", "rewired-0"}
+        # biological and rewired-0 are numerically distinct (see
+        # _write_cli_fixture's doc comment) -- if this ever failed, every
+        # assertion below it would pass vacuously regardless of whether
+        # graph/sidecar attribution is actually correct.
+        assert payload["graphs"]["biological"]["T"] != payload["graphs"]["rewired-0"]["T"]
+
+        # The steady-state manifest is the round-1/round-2 dual-review fix
+        # (I1/I2): every entry must tie the graph it was computed from
+        # (`graphBinarySha256`) to the sidecar bytes actually on disk
+        # (`sidecarSha256`), and the manifest itself must be exactly as
+        # deterministic as `transfer.json` -- a worker-count-dependent
+        # manifest would defeat the whole point of verifying it up front in
+        # `regime-check.ts`.
+        manifest1_path = root / "steady-state-1" / "manifest.json"
+        manifest3_path = root / "steady-state-3" / "manifest.json"
+        assert manifest1_path.read_bytes() == manifest3_path.read_bytes()
+        manifest = json.loads(manifest1_path.read_text())
+        assert manifest["version"] == 1
+        assert manifest["rewireSourceSha256"] == "0" * 64
+        assert set(manifest["graphs"].keys()) == {"biological", "disconnected", "rewired-0"}
+        bio_sha256 = binfmt.sha256_hex(gzip.decompress(bio_path.read_bytes()))
+        for graph_id, entry in manifest["graphs"].items():
+            sidecar_path = root / "steady-state-1" / f"{graph_id}.steadystate.f64"
+            assert entry["sidecarSha256"] == binfmt.sha256_hex(sidecar_path.read_bytes())
+        assert manifest["graphs"]["biological"]["graphBinarySha256"] == bio_sha256
+        assert manifest["graphs"]["disconnected"]["graphBinarySha256"] == bio_sha256
+        index_payload = json.loads(index_path.read_text())
+        rewired_sha256 = index_payload["seeds"][0]["binarySha256"]
+        assert manifest["graphs"]["rewired-0"]["graphBinarySha256"] == rewired_sha256
+        # And a sha mismatch really is caught: corrupt one entry and confirm
+        # regime-check.ts's verifySteadyStateManifest would reject it (the
+        # TS-side unit tests exercise verifySteadyStateManifest directly;
+        # this only re-confirms the Python side actually wrote a sha that
+        # differs from a tampered one, i.e. the check has something to catch).
+        assert manifest["graphs"]["biological"]["graphBinarySha256"] != manifest["graphs"]["rewired-0"]["graphBinarySha256"]
+
+
+def test_singular_system_is_flagged_and_serializable():
+    # `A = diag(0.5, 0.0)` at `leakRate=0.5`, `globalGain=1.0`: neuron 0's
+    # block (`0.5 - 1.0*0.5 = 0`) is exactly singular, and neuron 1 is
+    # completely isolated (no edges at all) -- together the whole 2x2
+    # `system_matrix` is exactly singular (`np.linalg.cond` returns `inf`,
+    # `np.linalg.solve` raises `LinAlgError`), reproducing the round-2
+    # dual-review finding: `condition_number` must become `None`, not the
+    # raw `inf` `np.linalg.cond` returns, or `canonical_json_text`'s
+    # `allow_nan=False` raises when the *whole batch's* result is written
+    # (see `_compute_transfer`'s `singular` branch doc comment).
+    matrices = DenseGraphMatrices(
+        adjacency=np.diag([0.5, 0.0]),
+        input_matrix=np.zeros((2, len(OBSERVATION_CHANNEL_INDEX))),
+        output_matrix=np.zeros((len(OUTPUT_POPULATION_INDEX), 2)),
+    )
+    computation = _compute_transfer(matrices, leak_rate=0.5, global_gain=1.0, timestep_seconds=1.0 / 30.0, strict_shape=True)
+    result = computation.result
+
+    assert result["singular"] is True
+    assert result["illConditioned"] is True
+    assert result["T"] is None
+    assert result["conditionNumber"] is None
+    assert result["stable"] is False
+    assert result["timeConstantSeconds"] is None
+    assert result["turnGain"] is None
+    assert result["approachGain"] is None
+    assert np.isfinite(result["spectralAbscissa"])
+    assert np.isfinite(result["discretizedSpectralRadius"])
+
+    # The actual failure mode this test reproduces: canonical_json_text must
+    # not raise on a singular graph's result.
+    canonical_json_text(result)
+
+
+def test_compute_transfer_strict_shape_raises_on_a_non_production_shape():
+    # `_compute_transfer`'s `strict_shape=True` path (the CLI's own
+    # `_one_graph`/`_one_disconnected`) is otherwise never exercised by any
+    # test: the CLI fixture uses a production-shaped (3x8) graph precisely
+    # so it does NOT hit this raise -- so nothing previously proved the
+    # guard actually fires (a round-2 dual-review finding).
+    graph = _make_three_neuron_graph(leak_rate=0.35, global_gain=0.5, a=1.5, b=0.75, c=2.0, w_in=1.0, w_out=1.0)
+    matrices = build_dense_matrices(graph)
+    with pytest.raises(ValueError, match=r"expected \(3, 8\)"):
+        _compute_transfer(matrices, leak_rate=0.35, global_gain=0.5, timestep_seconds=1.0 / 30.0, strict_shape=True)
 
 
 def test_transfer_cli_rejects_a_tampered_rewired_file():

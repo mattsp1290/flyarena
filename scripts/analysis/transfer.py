@@ -37,7 +37,7 @@ A)^-1 B`. Also reports (per the plan's "Linear transfer" section):
 
 Also writes, per graph, the steady-state input map `M = (lambda I - g A)^-1
 B` (shape `neuronCount x inputChannelCount`, float64, row-major) as a raw
-binary sidecar under `--steady-state-dir`: `scripts/null/regime-worker.ts`
+binary sidecar under `--steady-state-dir`: `scripts/null/regime-task.ts`
 reuses it (`r*(u_t) = M @ clamp(u_t)`) to compute the linear-regime distance
 metric per tick without repeating this module's `O(n^3)` dense solve in
 TypeScript.
@@ -137,10 +137,11 @@ def _compute_transfer(
         steady_state_map = np.zeros((0, B.shape[1]), dtype=np.float64)
         eig_A = np.zeros((0,), dtype=np.complex128)
     else:
-        condition_number = float(np.linalg.cond(system_matrix))
+        raw_condition_number = float(np.linalg.cond(system_matrix))
         try:
             steady_state_map = np.linalg.solve(system_matrix, B)
             singular = False
+            condition_number = raw_condition_number
         except np.linalg.LinAlgError:
             # The plan's policy for a bad graph is to flag and exclude it,
             # not to abort the whole batch (`illConditioned` already does
@@ -152,6 +153,19 @@ def _compute_transfer(
             # multi-hour work in the same batch (a dual-review finding).
             steady_state_map = np.full((neuron_count, B.shape[1]), np.nan, dtype=np.float64)
             singular = True
+            # `np.linalg.cond` does not itself raise on an exactly singular
+            # matrix -- it returns `inf` (a valid float, no exception) --
+            # so `raw_condition_number` here is `inf`, not `nan`. Reporting
+            # it as `None` (not `inf`) matters: `graph_io.canonical_json_text`
+            # writes with `allow_nan=False` (a *different* dual-review
+            # finding, from the same review round as this `singular`
+            # handling), and `json.dumps` treats `Infinity` the same as
+            # `NaN` -- it would raise at write time, *after* the whole
+            # batch's `ProcessPoolExecutor` pool has already finished,
+            # losing every other graph's result in the same run. A
+            # round-2 dual-review finding: this exact interaction was
+            # missed when the two fixes were made independently.
+            condition_number = None
         eig_A = np.linalg.eigvals(A)
 
     T = O @ steady_state_map  # (outputPopulationCount, inputChannelCount)
@@ -176,16 +190,29 @@ def _compute_transfer(
     # graph) may not. `strict_shape=True` (the CLI path) raises on a
     # mismatch instead of silently reporting `None`; `strict_shape=False`
     # (the public `transfer_matrix()` used by tests/tooling on
-    # non-production-shaped graphs) reports `None`.
-    if T.shape == PRODUCTION_T_SHAPE and not singular:
+    # non-production-shaped graphs) reports `None`. `singular` is checked
+    # first and unconditionally reports `None` regardless of `strict_shape`
+    # or `T`'s shape: `T` itself is already `None` for a singular graph (see
+    # `result["T"]` below), so there is nothing to index into -- and it must
+    # never raise here, since `_verify_jobs`'s pre-flight check cannot catch
+    # an exactly singular graph (a round-2 dual-review finding: a flattened
+    # `if singular / elif shape-matches / elif strict_shape / else` reads
+    # this precedence directly, rather than requiring `and not singular` on
+    # two of three branches to work it out).
+    if singular:
+        turn_gain = None
+        approach_gain = None
+        output_population_order: list[str] | None = None
+        input_channel_order: list[str] | None = None
+    elif T.shape == PRODUCTION_T_SHAPE:
         turn_gain = float(
             T[OUTPUT_POPULATION_INDEX["yaw"], OBSERVATION_CHANNEL_INDEX["foodBearing"]]
             - T[OUTPUT_POPULATION_INDEX["yaw"], OBSERVATION_CHANNEL_INDEX["hazardBearing"]]
         )
         approach_gain = float(T[OUTPUT_POPULATION_INDEX["thrust"], OBSERVATION_CHANNEL_INDEX["foodDistance"]])
-        output_population_order: list[str] | None = list(OUTPUT_POPULATION_INDEX.keys())
-        input_channel_order: list[str] | None = list(OBSERVATION_CHANNEL_INDEX.keys())
-    elif strict_shape and not singular:
+        output_population_order = list(OUTPUT_POPULATION_INDEX.keys())
+        input_channel_order = list(OBSERVATION_CHANNEL_INDEX.keys())
+    elif strict_shape:
         raise ValueError(
             f"transfer: T has shape {T.shape}, expected {PRODUCTION_T_SHAPE} "
             "(OUTPUT_POPULATION/OBSERVATION_CHANNELS changed? update transfer.py's constants)"
@@ -248,7 +275,7 @@ def disconnected_matrices(matrices: DenseGraphMatrices) -> DenseGraphMatrices:
 
 
 def write_steady_state_sidecar(path: Path, steady_state_map: np.ndarray) -> None:
-    """Raw float64, row-major (`C` order): `regime-worker.ts` reads this as a
+    """Raw float64, row-major (`C` order): `regime-task.ts` reads this as a
     flat `Float64Array` of length `neuronCount * inputChannelCount` and
     indexes `M[i * inputChannelCount + c]`."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -382,6 +409,18 @@ def main(argv: list[str] | None = None) -> None:
 
     _verify_jobs(jobs)
 
+    # Delete any manifest left over from a previous run into this same
+    # `--steady-state-dir` *before* writing anything new: without this, a
+    # run that crashes partway (after overwriting some sidecars but before
+    # reaching the manifest write below) leaves the *previous* run's
+    # manifest.json sitting next to a directory it no longer accurately
+    # describes -- `regime-check.ts`'s `readSteadyStateManifest` doc comment
+    # says "its mere presence already rules out a run that crashed partway
+    # through", which is only true if this happens (a round-2 dual-review
+    # finding).
+    manifest_path = steady_state_dir / "manifest.json"
+    manifest_path.unlink(missing_ok=True)
+
     results: dict[str, dict] = {}
     manifest_graphs: dict[str, dict] = {}
     with ProcessPoolExecutor(max_workers=max(1, args.workers)) as pool:
@@ -441,7 +480,7 @@ def main(argv: list[str] | None = None) -> None:
         "rewireSourceSha256": index["rewireSourceSha256"],
         "graphs": manifest_graphs,
     }
-    write_canonical_json(steady_state_dir / "manifest.json", manifest_payload)
+    write_canonical_json(manifest_path, manifest_payload)
 
     # eslint-equivalent user-facing summary line for a CLI tool.
     print(f"transfer: wrote {args.out} ({len(results)} graphs) and steady-state sidecars under {steady_state_dir}")

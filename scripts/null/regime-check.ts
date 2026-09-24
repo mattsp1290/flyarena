@@ -21,11 +21,11 @@ import type { RegimeSeedResult, RegimeWorkerMessage, RegimeWorkerTask } from './
  * "Regime check" driver: runs authored episodes (opponent parked) on
  * held-out seeds `30001..30010` for biological, disconnected, and all 500
  * rewirings, and records each seed's clamp-active fraction and linear
- * steady-state distance (`scripts/null/regime-worker.ts`'s doc comment has
+ * steady-state distance (`scripts/null/regime-task.ts`'s doc comment has
  * the exact metrics and the algebra behind them).
  *
  * Deliberately its own driver, not an edit to `null-evaluate.ts` (owned by
- * a concurrent bean -- see `regime-worker.ts`'s module doc comment). Reuses
+ * a concurrent bean -- see `regime-task.ts`'s module doc comment). Reuses
  * `null-evaluate.ts`'s already-generic, already-exported
  * `runShardedEvaluation<Task, Result, Message>` (per the plan's "Make
  * `runShardedEvaluation` generic" instruction -- it was already generic on
@@ -167,9 +167,18 @@ interface SteadyStateManifest {
  * `neuronCount * inputChannelCount` sidecar length, so a stale one from an
  * older `index.json`/`--graphs-dir` would otherwise pass silently and
  * corrupt `steadyStateDistance` for that graph (a dual-review finding, both
- * reviewers independently). `transfer.py` writes this manifest only after
- * every graph in its own run has succeeded, so its mere presence already
- * rules out a run that crashed partway through.
+ * reviewers independently). `transfer.py` deletes any manifest already
+ * present at the start of its own `main()` (before writing anything) and
+ * writes a fresh one only after every graph in its own run has succeeded --
+ * so its mere presence rules out a run that crashed partway through *and*
+ * an earlier run's stale manifest surviving a crashed rerun into the same
+ * `--steady-state-dir` (a round-2 dual-review finding: without the
+ * delete-at-start step, a crashed rerun could leave the *previous* run's
+ * manifest sitting next to sidecars it no longer describes). The per-task
+ * `steadyStateSha256` check inside `regime-task.ts`'s `loadSteadyStateMap`
+ * is a second, independent layer on top of this one, not a redundant one:
+ * it catches on-disk corruption of a sidecar *after* a valid manifest was
+ * written, which this manifest check alone cannot.
  */
 const readSteadyStateManifest = (steadyStateDir: string): SteadyStateManifest => {
   const path = resolve(steadyStateDir, 'manifest.json');
@@ -198,7 +207,7 @@ const readSteadyStateManifest = (steadyStateDir: string): SteadyStateManifest =>
  * second, independent verification (mirroring the graph-binary sha256
  * check's own two-layer convention elsewhere in this pipeline).
  */
-const verifySteadyStateManifest = (
+export const verifySteadyStateManifest = (
   steadyStateDir: string,
   rewireSourceSha256: string,
   tasks: ReadonlyArray<{ readonly graphId: string; readonly expectedSha256: string }>

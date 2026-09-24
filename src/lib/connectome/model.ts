@@ -141,7 +141,7 @@ export const aggregateOutputs = (
  * is one `undefined` check per substep (`onSubstep?.(...)`), not a branch
  * that changes what gets computed -- so every existing caller and every
  * parity/golden-trace test is numerically unaffected. Added for
- * `scripts/null/regime-worker.ts` (`.agents/plans/null-explanation/
+ * `scripts/null/regime-task.ts`'s `runTask` (`.agents/plans/null-explanation/
  * 02-transfer-and-features.md`'s WP2 regime check), which needs both the
  * per-substep rate (for the `±rateMax` clamp-fraction metric) and that
  * tick's input (to compare against the graph's precomputed steady-state

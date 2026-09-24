@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { encodeGraphBinary, SUPPORTED_FORMAT_VERSION, type ConnectomeGraph, type GraphMetadata } from '../../src/lib/connectome/format';
 import { runTask, type RegimeWorkerTask } from '../../scripts/null/regime-task';
-import { parseRegimeCheckArgs } from '../../scripts/null/regime-check';
+import { parseRegimeCheckArgs, verifySteadyStateManifest } from '../../scripts/null/regime-check';
 import { sha256Hex } from '../../scripts/training/fsio';
 
 /**
@@ -273,7 +273,7 @@ describe('regime-worker runTask: clamp fraction and steady-state distance', () =
     correctM[0 * CHANNEL_COUNT + 1] = 0.4 / 0.35;
     correctM[1 * CHANNEL_COUNT + 3] = 0.6 / 0.35;
 
-    // A deliberately *transposed* sidecar: `regime-worker.ts` always reads
+    // A deliberately *transposed* sidecar: `regime-task.ts` always reads
     // a sidecar as row-major `neuronCount x inputChannelCount`
     // (`M[i * inputChannelCount + c]`), so writing the same values in
     // column-major order (`wrong[c * neuronCount + i] = correctM[i *
@@ -506,6 +506,76 @@ describe('regime-check.ts CLI: end to end via a real forked worker', () => {
     );
     expect(result.status).not.toBe(0);
     expect(result.stderr).toMatch(/different rewire batch/);
+  });
+});
+
+describe('verifySteadyStateManifest', () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'verify-steady-state-manifest-'));
+  });
+
+  afterEach(() => {
+    if (root) rmSync(root, { recursive: true, force: true });
+  });
+
+  const writeManifest = (manifest: unknown): void => {
+    writeFileSync(join(root, 'manifest.json'), JSON.stringify(manifest));
+  };
+
+  it('rejects a manifest missing a required graph entry', () => {
+    writeManifest({
+      version: 1,
+      rewireSourceSha256: 'a'.repeat(64),
+      graphs: { biological: { graphBinarySha256: 'b'.repeat(64), sidecarSha256: 'c'.repeat(64) } }
+    });
+
+    expect(() =>
+      verifySteadyStateManifest(root, 'a'.repeat(64), [
+        { graphId: 'biological', expectedSha256: 'b'.repeat(64) },
+        { graphId: 'rewired-0', expectedSha256: 'd'.repeat(64) } // no manifest entry
+      ])
+    ).toThrow(/no steady-state manifest entry/);
+  });
+
+  it('rejects a per-graph graphBinarySha256 mismatch (the stale-sidecar scenario the manifest exists for)', () => {
+    writeManifest({
+      version: 1,
+      rewireSourceSha256: 'a'.repeat(64),
+      graphs: {
+        'rewired-0': { graphBinarySha256: 'stale-sha-from-an-earlier-batch'.padEnd(64, '0'), sidecarSha256: 'c'.repeat(64) }
+      }
+    });
+
+    expect(() =>
+      verifySteadyStateManifest(root, 'a'.repeat(64), [{ graphId: 'rewired-0', expectedSha256: 'd'.repeat(64) }])
+    ).toThrow(/computed from a different graph/);
+  });
+
+  it('returns each graphId -> sidecarSha256 when every task matches the manifest', () => {
+    writeManifest({
+      version: 1,
+      rewireSourceSha256: 'a'.repeat(64),
+      graphs: {
+        biological: { graphBinarySha256: 'b'.repeat(64), sidecarSha256: 'sidecar-bio'.padEnd(64, '0') },
+        'rewired-0': { graphBinarySha256: 'd'.repeat(64), sidecarSha256: 'sidecar-rewired'.padEnd(64, '0') }
+      }
+    });
+
+    const result = verifySteadyStateManifest(root, 'a'.repeat(64), [
+      { graphId: 'biological', expectedSha256: 'b'.repeat(64) },
+      { graphId: 'rewired-0', expectedSha256: 'd'.repeat(64) }
+    ]);
+
+    expect(result.get('biological')).toBe('sidecar-bio'.padEnd(64, '0'));
+    expect(result.get('rewired-0')).toBe('sidecar-rewired'.padEnd(64, '0'));
+  });
+
+  it('rejects a manifest from a different rewire batch before checking any per-graph entry', () => {
+    writeManifest({ version: 1, rewireSourceSha256: 'different-batch'.padEnd(64, '0'), graphs: {} });
+
+    expect(() => verifySteadyStateManifest(root, 'this-batch'.padEnd(64, '0'), [])).toThrow(/different rewire batch/);
   });
 });
 

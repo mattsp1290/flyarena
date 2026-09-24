@@ -179,6 +179,22 @@ export const runTask = (task: RegimeWorkerTask): readonly RegimeSeedResult[] => 
         `${expectedSteadyStateLength} (neuronCount ${neuronCount} x inputChannelCount ${inputChannelCount})`
     );
   }
+  // The `onSubstep` clamp-fraction check below (`value === rateMin || value
+  // === rateMax`) assumes `rateMin < 0 < rateMax`: every real graph today
+  // has `rateMin = -2, rateMax = 2` (symmetric around the model's zero-rate
+  // rest state, per `docs/graph-format.md`), so a lesioned or never-driven
+  // neuron sits at `0`, strictly between the bounds, and is never miscounted
+  // as clamped. A hypothetical `rateMin = 0` (a rectified model) would
+  // break that assumption -- every silent neuron would then read as
+  // "clamped at rateMin" -- so this asserts it rather than silently
+  // changing the metric's meaning if that ever changes (a round-2
+  // dual-review finding).
+  if (!(rateMin < 0 && 0 < rateMax)) {
+    throw new Error(
+      `regime-worker: ${task.graphId} has rateMin=${rateMin}, rateMax=${rateMax} -- the clamp-fraction metric ` +
+        'assumes rateMin < 0 < rateMax (so a silent/lesioned neuron at rate 0 is never miscounted as clamped)'
+    );
+  }
 
   const substeps = NEURAL_SUBSTEPS_PER_TICK;
   const uClamped = new Float64Array(inputChannelCount);
@@ -229,9 +245,19 @@ export const runTask = (task: RegimeWorkerTask): readonly RegimeSeedResult[] => 
     // not this metric's concern -- only the per-substep observations
     // `onSubstep` recorded above are. `null-worker.ts`'s equivalent path
     // reads `result.left`; this one deliberately does not.
+    //
+    // `substeps` passed explicitly (not left to `runEpisode`'s own default,
+    // which happens to be the same `NEURAL_SUBSTEPS_PER_TICK` this file
+    // already uses for tick-boundary detection above): ties the two to one
+    // variable, so a future caller that overrides `runEpisode`'s `substeps`
+    // could never silently desync `onSubstep`'s tick-boundary counting from
+    // the episode's real substep count (a round-2 dual-review finding; no
+    // live bug today, since nothing in this file's own call path overrides
+    // it, but the coupling was implicit before this line existed).
     runEpisode({
       seed,
       ticks: task.ticks,
+      substeps,
       left: { decoder: 'authored', graph, onSubstep },
       right: { decoder: 'parked' }
     });
