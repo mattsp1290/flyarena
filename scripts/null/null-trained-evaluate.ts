@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import { requireNonNegativeInt, requirePositiveInt, requireValue } from '../training/cli';
 import { atomicWriteFileSync } from '../training/fsio';
-import { CEM_CONFIG_FIELDS, readRunDir } from '../training/run-dir';
+import { CEM_CONFIG_FIELDS, isEmptyCemConfig, readRunDir } from '../training/run-dir';
 import { runShardedEvaluation } from './null-evaluate';
 import type { NullSeedResult, NullWorkerMessage } from './null-worker';
 import type { NullTrainedWorkerTask } from './null-trained-worker';
@@ -361,7 +361,15 @@ export interface NullTrainedEvaluationRaw {
    * CEM config (never expected for a real `flyarena-train` run directory).
    */
   readonly cemConfig: Record<string, unknown> | null;
-  /** Any task whose CEM config/training-seed policy disagreed with the baseline (expected empty for a correctly-run study). */
+  /**
+   * Always `[]` when this script's output was actually written:
+   * `reconcileCemConfig` now throws (rather than warning) on any CEM-config
+   * disagreement, per the plan's "the CEM config must match bigq's, so it
+   * cannot be silently shrunk" -- see that function's own doc comment. Kept
+   * in the schema (not removed) for forward compatibility with a possible
+   * future explicit override flag, and because `null-report.ts`'s
+   * `TrainedSection`/report-markdown already surface it.
+   */
   readonly cemConfigWarnings: readonly string[];
 }
 
@@ -381,50 +389,88 @@ const gitRev = (): string | null => {
   }
 };
 
-const isEmptyCemConfig = (candidate: Readonly<Record<string, unknown>>): boolean =>
-  Object.values(candidate).every((value) => value === undefined);
+/**
+ * `run-dir.ts`'s `CEM_CONFIG_FIELDS` plus `ticks` (T -- written by
+ * `flyarena-train` but, unlike the other CEM hyperparameters, not part of
+ * `RunConfig`'s declared TS shape; read via an explicit untyped cast here,
+ * the same way `CEM_CONFIG_FIELDS` fields are already read off the parsed
+ * config). A run trained at a different tick count is just as invalid a
+ * comparison as one trained at a different population/generations/etc., so
+ * it is checked alongside them (a round-2 dual-review finding: an earlier
+ * version compared only `CEM_CONFIG_FIELDS`, silently missing `ticks`).
+ */
+const TICKS_FIELD = 'ticks' as const;
+const CONFIG_RECONCILE_FIELDS: readonly string[] = [...CEM_CONFIG_FIELDS, TICKS_FIELD];
 
 /**
- * Every task's `config.json`, reduced to `CEM_CONFIG_FIELDS` (population,
- * elites, generations, alpha, stdFloor, initStd, trainingSeedsPerGeneration,
- * trainingSeedRange, trainingSeedRng, validationSeedRange, heldOutSeedRange)
- * -- `run-dir.ts`'s own field list, reused directly rather than
- * re-enumerated here, so this can never drift from what
- * `evaluate.ts`'s/`deriveTrainingBlock`'s manifest reconciliation considers
- * "the CEM config". The first task in `tasks` order (rewired seed 0, or the
- * first configured rewired seed) is the baseline; every other task that
- * disagrees produces a warning string rather than silently overwriting or
- * being dropped -- mirrors `run-dir.ts`'s `deriveTrainingBlock` algorithm,
- * simplified for this script's flat task list (every task here is either
- * arm "rewired" or arm "biological", never a >3-arm reconciliation).
+ * Every task's `config.json`, reduced to `CONFIG_RECONCILE_FIELDS`.
+ * `.agents/plans/rewiring-null/03-trained-sample.md`'s own words: "The CEM
+ * config must match bigq's, so it cannot be silently shrunk" -- so, unlike
+ * `run-dir.ts`'s `deriveTrainingBlock` (which only *warns* on a mismatch,
+ * because it is building a purely informational manifest block for
+ * `evaluate.ts`), ANY disagreement here throws. This study's every
+ * published number depends on every run sharing one config except
+ * arm/trainer-seed, so a silently-published mismatch would invalidate the
+ * whole comparison, not just one field of a report (a round-2 dual-review
+ * finding: an earlier version of this function only warned, matching
+ * `deriveTrainingBlock`'s precedent, which does not actually apply here).
+ *
+ * The baseline is the FIRST biological task (sorted by trainerSeed
+ * ascending -- `buildTasks` always builds biological tasks in that order),
+ * never "the first task in `tasks` order" (which would usually be
+ * `rewired-<rewiredSeedStart>`): a biological run directory is copied
+ * directly from the already bigq-manifest-verified production runs, never
+ * produced by this study's own `train-sample.sh`, so it is the more
+ * trustworthy reference. A rewired run, by contrast, could in principle be
+ * a stale/small calibration run that `train-sample.sh`'s resumability check
+ * (keyed only on `config.json` existing) would treat as "done" and never
+ * regenerate -- using it as the baseline would silently make every OTHER
+ * (correctly-configured) run look like the outlier instead.
+ *
+ * A task whose `config.json` has no recorded CEM hyperparameters at all
+ * (every `CONFIG_RECONCILE_FIELDS` value `undefined` -- only ever expected
+ * from a tiny/older test fixture, never a real `flyarena-train` run) is
+ * tolerated only when EVERY task is like that (`cemConfig: null`,
+ * `warnings: []`); any other combination -- some tasks recorded, some not,
+ * or recorded-but-different -- throws.
  */
 const reconcileCemConfig = (
   tasks: readonly NullTrainedWorkerTask[]
 ): { readonly cemConfig: Record<string, unknown> | null; readonly warnings: readonly string[] } => {
-  const warnings: string[] = [];
   const candidates: Array<{ graphId: string; candidate: Record<string, unknown> }> = tasks.map((task) => {
     const { config } = readRunDir(task.runDir);
     const candidate: Record<string, unknown> = {};
-    for (const field of CEM_CONFIG_FIELDS) candidate[field] = (config as unknown as Record<string, unknown>)[field];
+    for (const field of CONFIG_RECONCILE_FIELDS) candidate[field] = (config as unknown as Record<string, unknown>)[field];
     return { graphId: task.graphId, candidate };
   });
 
-  const baselineEntry = candidates.find(({ candidate }) => !isEmptyCemConfig(candidate));
-  const cemConfig = baselineEntry?.candidate ?? null;
-  if (!cemConfig) return { cemConfig: null, warnings };
+  if (candidates.every(({ candidate }) => isEmptyCemConfig(candidate))) {
+    return { cemConfig: null, warnings: [] };
+  }
+
+  const biologicalTask = tasks.find((task) => task.expectedArm === 'biological');
+  const baselineGraphId = biologicalTask?.graphId ?? tasks[0].graphId;
+  const baselineEntry = candidates.find(({ graphId }) => graphId === baselineGraphId)!;
+  if (isEmptyCemConfig(baselineEntry.candidate)) {
+    throw new Error(
+      `null-trained-evaluate: "${baselineGraphId}" (the CEM-config baseline) has no recorded CEM hyperparameters, ` +
+        'but at least one other scored run does -- refusing to publish an inconsistent trained.json'
+    );
+  }
 
   for (const { graphId, candidate } of candidates) {
-    if (graphId === baselineEntry?.graphId) continue;
-    if (isEmptyCemConfig(candidate)) {
-      warnings.push(`"${graphId}"'s config.json has no recorded CEM hyperparameters, while "${baselineEntry?.graphId}" does`);
-      continue;
-    }
-    if (JSON.stringify(candidate) !== JSON.stringify(cemConfig)) {
-      warnings.push(`"${graphId}"'s CEM config/training-seed policy differs from "${baselineEntry?.graphId}"'s`);
+    if (graphId === baselineGraphId) continue;
+    if (JSON.stringify(candidate) !== JSON.stringify(baselineEntry.candidate)) {
+      throw new Error(
+        `null-trained-evaluate: "${graphId}"'s CEM config/training-seed policy (including ticks) differs from ` +
+          `"${baselineGraphId}"'s -- ${JSON.stringify(candidate)} vs ${JSON.stringify(baselineEntry.candidate)} -- ` +
+          "this study's config must match bigq's exactly (03-trained-sample.md's \"Time budget\" section), so it " +
+          'cannot be silently published as a warning'
+      );
     }
   }
 
-  return { cemConfig, warnings };
+  return { cemConfig: baselineEntry.candidate, warnings: [] };
 };
 
 export const assembleRaw = (

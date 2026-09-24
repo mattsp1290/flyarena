@@ -90,6 +90,22 @@ graphs_dir="training/runs/null/graphs"
 arms_out="training/runs/null/arms"
 trained_out="training/runs/null/trained"
 
+# A RELATIVE --graph/--graphs-dir/--arms-out/--trained-out resolves against
+# repo_root (this script `cd`s there below), NOT against the directory this
+# script happens to be invoked from -- unlike null-trained-evaluate.ts's own
+# CLI flags, which resolve relative paths against `process.cwd()` (the
+# normal Node-CLI convention). This is a deliberate difference, not an
+# oversight (a round-2 dual-review finding asked that it be documented
+# rather than "fixed" either way, since both conventions are individually
+# correct and reconciling them risks a regression under time pressure): this
+# script's defaults are themselves repo-root-relative paths, and it is most
+# often run via cron/automation from an arbitrary cwd while always meaning
+# "this repo's training/runs/ tree" -- so repo-root-relative is the more
+# useful default here. Pass an ABSOLUTE path (`to_abs_path` below leaves it
+# unchanged) for a custom location, when invoking this script and
+# null-trained-evaluate.ts together and comparing --trained-out to
+# --rewired-trained-dir, etc.
+
 usage() {
   echo "Usage: $0 [--dry-run-fixture] [--seed-start N] [--seed-count N] [--replica-seed N]" >&2
   echo "          [--population N] [--elites N] [--generations N] [--train-seeds-per-generation N]" >&2
@@ -121,6 +137,19 @@ while [[ $# -gt 0 ]]; do
     *) echo "train-sample.sh: unknown argument: $1" >&2; usage ;;
   esac
 done
+
+# --seed-start/--seed-count feed the `(( seed = seed_start; ...))` C-style
+# `for` loop below -- a non-integer value there fails with bash's own
+# unhelpful "syntax error in expression" rather than this script's own
+# argument-specific error message, so it is validated explicitly here.
+if [[ ! "$seed_start" =~ ^[0-9]+$ ]]; then
+  echo "train-sample.sh: --seed-start must be a non-negative integer, got \"$seed_start\"" >&2
+  exit 1
+fi
+if [[ ! "$seed_count" =~ ^[0-9]+$ ]] || [[ "$seed_count" -eq 0 ]]; then
+  echo "train-sample.sh: --seed-count must be a positive integer, got \"$seed_count\"" >&2
+  exit 1
+fi
 
 if [[ "$dry_run_fixture" -eq 1 ]]; then
   # Never share a directory with the real study's output -- see this

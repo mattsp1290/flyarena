@@ -169,6 +169,31 @@ describe('buildTasks / assembleRaw (fixture run directories)', () => {
     const biological101 = tasks.find((t) => t.graphId === 'biological-101')!;
     expect(biological101.expectedArm).toBe('biological');
     expect(biological101.expectedTrainerSeed).toBe(101);
+    expect(biological101.expectedSubsteps).toBe(NEURAL_SUBSTEPS_PER_TICK);
+    expect(biological101.expectedHiddenSize).toBe(4);
+  });
+
+  it('a biological task\'s expectedTrainerSeed is ITS OWN trainer seed, not args.replicaSeed (regression: an earlier bug could have wired args.replicaSeed into every task)', () => {
+    // replicaSeed (101, the rewired-run trainer seed) is deliberately
+    // DIFFERENT from the biological trainer seed under test (202) here, so
+    // a bug that reused args.replicaSeed for every task's expectedTrainerSeed
+    // (rewired AND biological alike) would be caught -- the happy-path test
+    // above uses biologicalTrainerSeeds: [101], which happens to equal the
+    // default replicaSeed and so could not, by itself, catch that bug.
+    writeTinyRunDir({
+      dir: join(biologicalRunsDir, 'biological-202'),
+      arm: 'biological',
+      trainerSeed: 202,
+      D: d,
+      H: 4,
+      substeps: NEURAL_SUBSTEPS_PER_TICK,
+      weightSeed: 99,
+      armBundleSha256: biologicalBundleSha256
+    });
+    const tasks = buildTasks(baseArgs({ replicaSeed: 101, biologicalTrainerSeeds: [202] }));
+    const biological202 = tasks.find((t) => t.graphId === 'biological-202')!;
+    expect(biological202.expectedTrainerSeed).toBe(202);
+    expect(biological202.expectedTrainerSeed).not.toBe(101);
   });
 
   it('throws when a rewired seed has no config.json', () => {
@@ -216,9 +241,10 @@ describe('buildTasks / assembleRaw (fixture run directories)', () => {
     // inside null-trained-worker.ts, at actual-scoring time), so this is a
     // valid way to exercise the check without needing a bundle whose sha256
     // still matches a hand-edited D. The hash subdirectory name is looked
-    // up directly (not via the shared `rewiredBundleSha256` fixture
-    // variable, which `beforeEach`'s per-seed loop overwrites on each
-    // iteration and so only ever holds the LAST seed's hash).
+    // up directly (not via `rewiredBundleSha256ForSeed`, which holds each
+    // seed's OWN hash -- looking it up by seed would work here too, but
+    // reading the directory listing directly is a more literal exercise of
+    // "one hash subdirectory per seed").
     const seed0ArmsDir = join(rewiredArmsDir, 'seed0');
     const seed0HashDir = readdirSync(seed0ArmsDir, { withFileTypes: true }).find((e) => e.isDirectory())!.name;
     const bundlePath = join(seed0ArmsDir, seed0HashDir, 'rewired.json');
@@ -246,9 +272,78 @@ describe('buildTasks / assembleRaw (fixture run directories)', () => {
     expect(raw.cemConfigWarnings).toEqual([]);
   });
 
-  it('assembleRaw: reconcileCemConfig warns when one run disagrees with the baseline CEM config', () => {
-    // Rebuild seed0/seed1's run dirs with an explicit (agreeing) CEM config,
-    // and give biological-101 a disagreeing one.
+  /** Rebuilds all three fixture run dirs with an explicit CEM config, so `reconcileCemConfig`'s "all empty" tolerance case never triggers for these tests. */
+  const rebuildRunsWithCemConfig = (
+    rewiredCemConfig: { population: number; elites: number; generations: number },
+    biologicalCemConfig: { population: number; elites: number; generations: number }
+  ): void => {
+    for (const seed of [0, 1] as const) {
+      rmSync(join(rewiredTrainedDir, `seed${seed}`), { recursive: true, force: true });
+      writeTinyRunDir({
+        dir: join(rewiredTrainedDir, `seed${seed}`),
+        arm: 'rewired',
+        trainerSeed: 101,
+        D: d,
+        H: 4,
+        substeps: NEURAL_SUBSTEPS_PER_TICK,
+        weightSeed: seed + 1,
+        armBundleSha256: rewiredBundleSha256ForSeed[seed],
+        cemConfig: rewiredCemConfig
+      });
+    }
+    rmSync(join(biologicalRunsDir, 'biological-101'), { recursive: true, force: true });
+    writeTinyRunDir({
+      dir: join(biologicalRunsDir, 'biological-101'),
+      arm: 'biological',
+      trainerSeed: 101,
+      D: d,
+      H: 4,
+      substeps: NEURAL_SUBSTEPS_PER_TICK,
+      weightSeed: 3,
+      armBundleSha256: biologicalBundleSha256,
+      cemConfig: biologicalCemConfig
+    });
+  };
+
+  it('assembleRaw: reconcileCemConfig publishes the biological config when every run agrees', () => {
+    rebuildRunsWithCemConfig(
+      { population: 128, elites: 32, generations: 150 },
+      { population: 128, elites: 32, generations: 150 }
+    );
+    const args = baseArgs();
+    const tasks = buildTasks(args);
+    const seeds = [30001, 30002, 30003];
+    const results = new Map<string, readonly NullSeedResult[]>(
+      tasks.map((t) => [t.graphId, seeds.map((seed) => ({ seed, movementScore: 1, foodPickups: 0, hazardContacts: 0 }))])
+    );
+
+    const raw = assembleRaw(args, tasks, results);
+    expect(raw.cemConfig).toMatchObject({ population: 128, elites: 32, generations: 150 });
+    expect(raw.cemConfigWarnings).toEqual([]);
+  });
+
+  it('assembleRaw: reconcileCemConfig THROWS (does not warn) when a rewired run disagrees with the biological baseline', () => {
+    // 03-trained-sample.md: "The CEM config must match bigq's, so it cannot
+    // be silently shrunk" -- a round-2 dual-review finding escalated this
+    // from a published warning to a hard failure, and changed the baseline
+    // from "the first task" to "the biological task" specifically (a
+    // rewired run could in principle be a stale/small calibration run that
+    // train-sample.sh's resumability check treated as already-done).
+    rebuildRunsWithCemConfig(
+      { population: 8, elites: 4, generations: 2 }, // e.g. an unfinished calibration run
+      { population: 128, elites: 32, generations: 150 } // the real bigq-verified biological config
+    );
+    const args = baseArgs();
+    const tasks = buildTasks(args);
+    const seeds = [30001, 30002, 30003];
+    const results = new Map<string, readonly NullSeedResult[]>(
+      tasks.map((t) => [t.graphId, seeds.map((seed) => ({ seed, movementScore: 1, foodPickups: 0, hazardContacts: 0 }))])
+    );
+
+    expect(() => assembleRaw(args, tasks, results)).toThrow(/CEM config\/training-seed policy \(including ticks\) differs/);
+  });
+
+  it('assembleRaw: reconcileCemConfig THROWS when the biological baseline itself has no recorded CEM config but a rewired run does', () => {
     rmSync(join(rewiredTrainedDir, 'seed0'), { recursive: true, force: true });
     writeTinyRunDir({
       dir: join(rewiredTrainedDir, 'seed0'),
@@ -261,30 +356,7 @@ describe('buildTasks / assembleRaw (fixture run directories)', () => {
       armBundleSha256: rewiredBundleSha256ForSeed[0],
       cemConfig: { population: 128, elites: 32, generations: 150 }
     });
-    rmSync(join(rewiredTrainedDir, 'seed1'), { recursive: true, force: true });
-    writeTinyRunDir({
-      dir: join(rewiredTrainedDir, 'seed1'),
-      arm: 'rewired',
-      trainerSeed: 101,
-      D: d,
-      H: 4,
-      substeps: NEURAL_SUBSTEPS_PER_TICK,
-      weightSeed: 2,
-      armBundleSha256: rewiredBundleSha256ForSeed[1],
-      cemConfig: { population: 128, elites: 32, generations: 150 }
-    });
-    rmSync(join(biologicalRunsDir, 'biological-101'), { recursive: true, force: true });
-    writeTinyRunDir({
-      dir: join(biologicalRunsDir, 'biological-101'),
-      arm: 'biological',
-      trainerSeed: 101,
-      D: d,
-      H: 4,
-      substeps: NEURAL_SUBSTEPS_PER_TICK,
-      weightSeed: 3,
-      armBundleSha256: biologicalBundleSha256,
-      cemConfig: { population: 64, elites: 32, generations: 150 } // disagreeing population
-    });
+    // biological-101 (the baseline) keeps its default fixture config: no cemConfig at all.
 
     const args = baseArgs();
     const tasks = buildTasks(args);
@@ -293,10 +365,7 @@ describe('buildTasks / assembleRaw (fixture run directories)', () => {
       tasks.map((t) => [t.graphId, seeds.map((seed) => ({ seed, movementScore: 1, foodPickups: 0, hazardContacts: 0 }))])
     );
 
-    const raw = assembleRaw(args, tasks, results);
-    expect(raw.cemConfig).toMatchObject({ population: 128, elites: 32, generations: 150 });
-    expect(raw.cemConfigWarnings).toHaveLength(1);
-    expect(raw.cemConfigWarnings[0]).toMatch(/biological-101/);
+    expect(() => assembleRaw(args, tasks, results)).toThrow(/the CEM-config baseline.*has no recorded CEM hyperparameters/);
   });
 
   it('assembleRaw throws when a result is missing for a task', () => {

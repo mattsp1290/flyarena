@@ -369,6 +369,40 @@ describe('runNullReport', () => {
       expect(result.artifact.trained).toBeUndefined();
       expect(readFileSync(reportMdPath, 'utf8')).not.toContain('## Trained-readout sample');
     });
+
+    it("throws when trained.json's held-out seeds do not match authored.json's", () => {
+      writeFileSync(args.trained, JSON.stringify(buildTrainedRaw({ seeds: { start: 30001, count: 5 } })));
+      expect(() => runNullReport(trainedArgs)).toThrow(/held-out seeds/);
+    });
+
+    it("throws when trained.json's ticks do not match authored.json's", () => {
+      writeFileSync(args.trained, JSON.stringify(buildTrainedRaw({ ticks: 999 })));
+      expect(() => runNullReport(trainedArgs)).toThrow(/ticks \(999\) do not match/);
+    });
+
+    it("throws when trained.json's substeps do not match authored.json's", () => {
+      writeFileSync(args.trained, JSON.stringify(buildTrainedRaw({ substeps: 999 })));
+      expect(() => runNullReport(trainedArgs)).toThrow(/substeps \(999\) do not match/);
+    });
+
+    it('throws when trained.json has no biological entry at raw.replicaSeed (the shipped replica)', () => {
+      writeFileSync(
+        args.trained,
+        JSON.stringify(
+          buildTrainedRaw({
+            replicaSeed: 555,
+            biological: [101, 202, 303].map((trainerSeed) => ({
+              trainerSeed,
+              heldOutSeeds: [30001, 30002, 30003],
+              movementScore: [1, 2, 3],
+              foodPickups: [1, 2, 3],
+              hazardContacts: [0, 0, 1]
+            }))
+          })
+        )
+      );
+      expect(() => runNullReport(trainedArgs)).toThrow(/no biological trainer-seed-555 entry/);
+    });
   });
 
   it('does not write authored.run.json as part of publishing (that sidecar is null-evaluate.ts\'s output)', () => {
