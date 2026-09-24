@@ -19,6 +19,9 @@ dependencies = [
     "numpy>=1.26,<3",
 ]
 
+[project.scripts]
+flyarena-train = "flyarena_training.cli:main"
+
 [dependency-groups]
 dev = [
     "pytest>=8.0,<9",

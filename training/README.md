@@ -419,6 +419,207 @@ Two other review findings, both fixed alongside the batching work above:
   WP4/WP5 feed real (less-trusted) MaleCNS exports through this loader — see
   `tests/test_graph_validation.py`.
 
+## WP3 — CEM readout trainer (`flyarena-train`)
+
+Seeded, GPU-batched cross-entropy method (CEM) trainer for the readout MLP
+(`.agents/plans/trained-readout/03-cem-training.md`). New modules:
+`flyarena_training/cem.py` (the CEM optimizer and seed-sampling policy),
+`flyarena_training/rollout.py` (batched episode rollout: world + observe +
+model + readout + decode, `evaluate(theta_batch, seeds) -> fitness`), and
+`flyarena_training/cli.py` (the `flyarena-train` entry point, registered in
+`pyproject.toml`'s `[project.scripts]`). Tests: `tests/test_cem.py`.
+
+### Usage
+
+```bash
+# Trace-graph development (substeps default to TRACE_SUBSTEPS=4):
+npm run training:export-arms   # writes training/runs/arms/<sha>/{biological,disconnected}.json
+training/scripts/run.sh python -m flyarena_training.cli \
+  --arm biological --graph training/runs/arms/<sha>/biological.json \
+  --replica-seed 101 --out training/runs/dev-run --generations 5
+
+# Real graph (substeps K is required explicitly; no default):
+npm run training:export-arms -- --graph public/data/malecns-arena-v1.bin.gz \
+  --rewired public/data/malecns-arena-v1-rewired-seed0.bin.gz
+training/scripts/run.sh python -m flyarena_training.cli \
+  --arm biological --graph training/runs/arms/<sha>/biological.json \
+  --replica-seed 101 --out training/runs/<run-id> --substeps 4
+```
+
+`--graph` always takes an `export-arms.ts` bundle (`training/runs/arms/<graph
+sha>/<arm>.json`), never a re-derived graph: `graph.load_graph_json` already
+reads a bundle correctly with no format-specific branch, because a bundle is
+a strict superset of the fields `ConnectomeGraph` needs (it adds `arm`,
+`graphId`, `graphSource`, `graphArtifactSha256`, `provenance`, `D`,
+`outputNeuronIndices`, and its own self-certifying `sha256` on top of the
+graph arrays), and `load_graph_json`'s validator only ever reads its own
+known field list, so it silently ignores the extra bundle fields. `cli.py`
+reads those extra fields itself (from the raw JSON, once) for `--substeps`
+defaulting and for `config.json`/`env.json` provenance.
+
+`--substeps` defaults to `TRACE_SUBSTEPS` (4) only when the loaded bundle's
+`graphSource` is `"trace-graph-fixture"`; a bundle with `graphSource:
+"artifact"` (a real compiled graph — biological, rewired, or disconnected)
+must pass `--substeps` explicitly or the CLI exits non-zero, per the plan's
+"the CLI refuses a production graph without an explicit --substeps".
+
+Output (`training/runs/<run-id>/`, gitignored): `config.json` (every
+hyperparameter, the seed sets, `D`, `H`, `parameterCount`, `arm`,
+`trainerSeed`, `substeps`, `armBundleSha256` — satisfies
+`scripts/training/run-dir.ts`'s `RunConfig` contract exactly, plus extra
+informational fields `run-dir.ts` ignores), `theta_final.npy`/`theta_best.npy`
+(1-D float32, the flat `[w1 (H×D), b1 (H), w2 (3×H), b2 (3)]` layout
+`run-dir.ts` documents), `generations.csv` (`generation,meanFitness,
+maxFitness,validationFitness` per row), `env.json` (torch/CUDA versions,
+device name, git rev, graph bundle sha256, precision flags, wall time).
+
+### CEM defaults and seed policy
+
+Population 256, elites 32, generations 150, smoothing α=0.7 on mean and std,
+std floor 0.02, init std 0.5, `E=16` training seeds per generation (`B = P ×
+E = 4096`), hidden size `H=16` — all CLI-overridable, defaults matching
+03-cem-training.md's table exactly. Training seeds: `E` sampled without
+replacement per generation from `numpy.random.default_rng(trainer_seed +
+generation)` over `[1, 10000]`. Validation seeds: the fixed range
+`[20001, 20064]`, evaluated on the CEM mean (not the population) every
+generation, used only to track the best-ever candidate by validation
+fitness — never to select elites. Held-out seeds `[30001, 30100]` are never
+sampled by either policy; `rollout.assert_no_held_out_seeds` is called
+before every training and validation batch regardless (defense in depth —
+see `test_cem_held_out_injection_fires_the_assertion` and
+`test_evaluate_fitness_held_out_seed_raises`). The published candidate is
+`theta_final` (the final smoothed CEM mean); `theta_best` (the best-ever
+candidate by validation mean) is also written but not consumed by the
+evaluator.
+
+**α convention (resolved ambiguity):** the plan states only "smoothing α =
+0.7 on mean and std" with no formula. This trainer follows the standard
+smoothed cross-entropy method convention (De Boer, Kroese, Mannor &
+Rubinstein 2005, "A Tutorial on the Cross-Entropy Method"): `α` weights the
+*new* elite estimate, `mean = α·new_mean + (1-α)·mean`, so `α=0.7` moves the
+search distribution 70% of the way toward each generation's elites. Pinned
+by `test_cem_alpha_weights_the_new_elite_estimate`.
+
+**Replica training-seed overlap (a property of the plan's own formula, not a
+bug):** because `sample_training_seeds` keys `numpy.random.default_rng` on
+`trainer_seed + generation`, two replicas whose `trainer_seed`s differ by
+`< generations` share part of their training-seed curriculum — e.g. at the
+default replica seeds 101/202/303 and `G=150`, replica 101's generation
+`g >= 101` draws exactly the seed set replica 202 draws at generation
+`g - 101` (about a third of each pair's 150 generations). The candidate
+noise stream is still independent per replica (`torch.Generator` seeded from
+`trainer_seed` alone), so replicas are not identical, but WP4/WP5 should not
+treat the three replicas' training curricula as fully independent samples
+when interpreting cross-replica variance. This implements 03-cem-training.md's
+seed-policy formula exactly as written; changing the RNG keying (e.g. to
+`np.random.default_rng([trainer_seed, generation])`, a `SeedSequence`
+entropy tuple with no aliasing) is a plan-level decision, not something this
+work package changes unilaterally.
+
+### Reproducibility (measured)
+
+- **CPU bit-identity (blocking gate, measured):** two CPU runs with the same
+  `trainer_seed`, graph bundle, and config produce byte-identical
+  `theta_final.npy` — `test_cpu_theta_final_bit_identical_across_two_runs`.
+  Verified true on this host.
+- **GPU rerun (informational, measured, not gated):** two CUDA runs with the
+  same config; `test_gpu_theta_final_rerun_diff_is_informational` measures
+  and prints `theta_final`'s max-abs diff (`gpuRerunMaxAbsDiff`) without
+  asserting a bound. On this host, at the test's tiny scale (P=16, G=3,
+  T=20 ticks, trace graph), the measured diff was `0.0` — CUDA's sparse
+  kernels happened to be deterministic at this scale on this run; this is
+  not a guarantee at production scale (P=256, G=150, T=1800), where
+  `torch.use_deterministic_algorithms(True, warn_only=True)` still allows a
+  nondeterministic kernel to fall back with only a warning (see
+  `flyarena_training/__init__.py`). WP5 records the real production-scale
+  `gpuRerunMaxAbsDiff` in the manifest.
+
+### Calibration (informational; no gate; no full production run performed)
+
+Measured on this host (GB10), CUDA, at the plan's defaults (`P=256, E=16,
+T=1800` -> `B=4096`), `H=16`, 2 generations:
+
+| Graph | D (output neurons) | s/generation |
+| --- | --- | --- |
+| Trace graph (`tests/fixtures/golden/trace-graph.json`) | 6 | ~8.45 |
+| Real MaleCNS (`public/data/malecns-arena-v1.bin.gz`, `--substeps 4`) | 48 | ~8.42 |
+
+The two are within measurement noise of each other: at this batch size the
+per-tick Python/CUDA-launch overhead of the 1800-tick rollout loop dominates
+wall time, not the sparse operator's size (6 vs. 48 output neurons, and the
+underlying neuron/edge counts, are both tiny relative to `B=4096`). Projected
+full WP5 cost at `G=150`: `9 runs (3 arms × 3 replicas) × 150 generations ×
+~8.4 s/generation ≈ 3.2 hours` — comfortably under the plan's 12-hour budget
+(`05-production-run.md`), so no `P` reduction is anticipated to be necessary,
+though WP5 should still re-calibrate on the merged, real closed-loop `K`.
+These are single-arm, few-generation measurements only; no full production
+run (`G=150`, all 9 arm×replica combinations) was performed in this work
+package, per its exclusions.
+
+### End-to-end contract test
+
+`test_end_to_end_contract_with_ts_evaluator` (`tests/test_cem.py`) trains a
+tiny trace-graph run with the Python CLI, then runs the real
+`scripts/training/evaluate.ts` (via `npm run training:evaluate`) on it into a
+scratch `--out` directory (never `public/data`/`docs/`) and asserts it loads,
+validates (including the arm bundle's self-certifying sha256 check inside
+`evaluate.ts`'s `loadArmGraphs`), and scores the run — confirming
+`training/`'s output run directory is byte-for-byte consumable by the
+TypeScript evaluator with zero TS changes. Skips (naming the manual command)
+when Node isn't reachable, matching `conftest.py`'s existing convention.
+Verified passing on this host.
+
+### Deviations from the WP3 plan
+
+- **Calibration test ticks:** `test_cli_trace_graph_run_writes_all_files` and
+  the CPU-bit-identity test use `--ticks 20`, not the plan's `T=1800`
+  episode length. The plan's acceptance bullet for this test pins `G=3,
+  P=16, E=2` but not `T`; a full 1800-tick episode at these tiny `P`/`E`
+  would cost more wall time in CI with no additional coverage of "does the
+  CLI write every file correctly". `T=1800` is exercised by the calibration
+  runs above (this file) and is the CLI's own default.
+- **CLI-only tests use a hand-built synthetic bundle**, not a real
+  `export-arms.ts` bundle: `cli.py` never verifies a bundle's own
+  self-certifying `sha256` (only `evaluate.ts` does), so a placeholder
+  `sha256`/`graphArtifactSha256` is sufficient for exercising the CLI's file
+  writing in isolation. The end-to-end contract test uses a real
+  `export-arms.ts`-produced bundle instead, since `evaluate.ts` does verify
+  it.
+- **`elite_candidates.std(dim=0, unbiased=False)`** (population, not sample,
+  standard deviation) for the CEM std update: the plan does not specify
+  biased vs. unbiased; population std was chosen since `N_e=32` is the
+  entire elite population being summarized, not a sample of a larger one.
+- **Training seeds are sampled without replacement**
+  (`numpy.random.default_rng(...).choice(..., replace=False)`): the plan
+  specifies the RNG but not replacement; sampling without replacement avoids
+  wasting part of the `E`-seed batch on a duplicate episode.
+- **`--out` write ordering, not full atomic publish:** `cli.py` creates
+  `--out` before training (fails fast on a bad path), immediately removes
+  any `config.json` already there (so a *reused* `--out` can't leave an old
+  run's `config.json` paired with this run's new weights if training
+  crashes), and writes this run's own `config.json` last, after
+  `theta_final.npy`/`theta_best.npy`/`generations.csv`/`env.json` all
+  succeed — `run-dir.ts` reads `config.json` first, so an interrupted write
+  is a clean "file not found" rather than a *complete-looking* but
+  mismatched run directory. This is not a full atomic-rename publish (a
+  `.partial` staging directory that only replaces `--out` on total success):
+  WP3's manual training procedure runs one `flyarena-train` invocation at a
+  time, so the remaining residual risk (a genuinely concurrent writer to the
+  same `--out` from two processes at once) is out of scope for this pass.
+- **Bundle validation requires every `export-arms.ts` `SerializedArmBundle`
+  field this CLI reads** (`formatVersion`, `arm`, `graphId`, `graphSource`,
+  `graphArtifactSha256`, `sha256`, `D`, `outputNeuronIndices`), and
+  cross-checks the bundle's declared `D`/`outputNeuronIndices` against what
+  `output_neuron_indices` computes from the loaded graph arrays. A bundle
+  missing any of these, or one whose `D`/`outputNeuronIndices` disagree with
+  its own graph arrays, is refused before training starts, rather than
+  trained against silently and only rejected later by `evaluate.ts`.
+  `config.json`'s `armBundleSha256` is always the bundle's real `sha256`
+  (never silently dropped for being absent): `evaluate.ts`'s `loadArmGraphs`
+  cross-checks that field against the bundle it loads as its "trained
+  against the right bundle" integrity check, so a missing or wrong value
+  there would silently disable that check.
+
 ## Deviations from the plan (summary)
 
 - **Config-drift check** reads the `configFingerprint` already embedded in
