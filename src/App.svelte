@@ -3,11 +3,17 @@
   import { ARENA_CONFIG } from './lib/arena/config';
   import { createSnapshot, createWorld } from './lib/arena/world';
   import type { AgentId } from './lib/arena/types';
-  import { loadPositions, type ArenaManifest, type PositionsLoadResult } from './lib/experiment/assets';
+  import {
+    loadPositions,
+    type ArenaManifest,
+    type PositionsLoadResult,
+    type TrainedReadoutLoadResult
+  } from './lib/experiment/assets';
   import { ExperimentController } from './lib/experiment/controller';
   import type { ExperimentRunner, ExperimentTelemetry } from './lib/experiment/runner';
   import type { ExperimentStatus } from './lib/experiment/state';
   import type { GraphMode } from './lib/connectome/format';
+  import type { DecoderKind } from './lib/worker/protocol';
   import ExperimentPanel from './lib/ui/ExperimentPanel.svelte';
   import TelemetryPanel from './lib/ui/TelemetryPanel.svelte';
   import LedgerPanel from './lib/ui/LedgerPanel.svelte';
@@ -58,10 +64,33 @@
   let topologySwitchCount = $state<Record<AgentId, number>>({ left: 0, right: 0 });
   const topologySwitchPending = $derived(topologySwitchCount.left > 0 || topologySwitchCount.right > 0);
 
+  /** Mirrors `controller.getDecoder()`; authored by default, updated only via `onDecoderApplied` once a switch has actually landed on both arms. */
+  let decoder = $state<DecoderKind>('authored');
+  /** `undefined` until `initialize()`'s trained-readout load/validate step resolves; feeds the ledger's "Readout (trained mode)" row and gates the Trained radio option. */
+  let trainedReadoutStatus = $state<TrainedReadoutLoadResult | undefined>(undefined);
+  /** True for the duration of an in-flight `controller.setDecoder()` call — set/cleared locally around that call (there is only ever one decoder shared by both arms, unlike per-arm topology switches, so a single flag suffices). */
+  let decoderSwitchPending = $state(false);
+
   /** True while running/loading — locks Start and Seed. Pause/Reset are governed by `topologySwitchPending` directly instead (see `ExperimentPanel`): they must stay clickable for the entire duration of a run, which is most of what this flag being true actually means. */
   const controlsLocked = $derived(status === 'running' || status === 'loading' || topologySwitchPending);
   /** Topology selectors additionally require `ready`/`finished` — a switch is never allowed mid-run (see `ExperimentRunner#setAgentBinding`), including while merely `paused`. */
   const topologyControlsLocked = $derived(controlsLocked || (status !== 'ready' && status !== 'finished'));
+  /**
+   * The decoder radio group's own lock, distinct from `controlsLocked`:
+   * `ExperimentController#setDecoder` allows switching from `paused` (only
+   * `running` itself is disallowed — see that method's doc comment), so this
+   * does not include `status === 'loading'`/`paused` the way `controlsLocked`
+   * does; it locks on `running`, on a topology switch in flight (avoids
+   * racing `setDecoder`'s own Worker messages against a topology switch's
+   * dispose/init window), on a decoder switch already in flight, and while
+   * `loading` (no runner exists yet for `setDecoder` to act on).
+   */
+  const decoderControlsLocked = $derived(
+    status === 'running' || status === 'loading' || topologySwitchPending || decoderSwitchPending
+  );
+  const trainedDecoderUnavailableReason = $derived(
+    trainedReadoutStatus?.status === 'unavailable' ? trainedReadoutStatus.reason : undefined
+  );
 
   // Plain (non-reactive) orchestration handle: `ExperimentController`
   // (`./lib/experiment/controller.ts`) owns asset loading, Worker/binding
@@ -109,6 +138,24 @@
 
   const handleTopologyChange = (agentId: AgentId, mode: GraphMode): void => {
     controller?.changeTopology(agentId, mode);
+  };
+
+  /**
+   * `ExperimentController#setDecoder` is async (it round-trips `set-decoder`
+   * to both arms' Workers before resetting) but returns no busy-signal of
+   * its own the way `onTopologySwitchCountChange` does for topology — this
+   * local flag is what actually disables the radio group for the duration
+   * (see `decoderControlsLocked`), cleared unconditionally in `finally` so a
+   * rejected/no-op call never leaves the group stuck locked.
+   */
+  const handleDecoderChange = (next: DecoderKind): void => {
+    if (!controller) return;
+    decoderSwitchPending = true;
+    void controller
+      .setDecoder(next)
+      .finally(() => {
+        if (!destroyed) decoderSwitchPending = false;
+      });
   };
 
   const handleDownloadReplay = (): void => {
@@ -212,6 +259,12 @@
         },
         onTopologySwitchCountChange: (counts) => {
           if (!destroyed) topologySwitchCount = { ...counts };
+        },
+        onTrainedReadoutStatus: (status) => {
+          if (!destroyed) trainedReadoutStatus = status;
+        },
+        onDecoderApplied: (next) => {
+          if (!destroyed) decoder = next;
         }
       }
     });
@@ -353,11 +406,15 @@
       {controlsLocked}
       {topologySwitchPending}
       {topologyControlsLocked}
+      {decoder}
+      {decoderControlsLocked}
+      {trainedDecoderUnavailableReason}
       onStart={handleStart}
       onPause={handlePause}
       onReset={handleReset}
       onSeedInput={handleSeedInput}
       onTopologyChange={handleTopologyChange}
+      onDecoderChange={handleDecoderChange}
       onDownloadReplay={handleDownloadReplay}
     />
 
@@ -365,7 +422,7 @@
       <TelemetryPanel {telemetry} />
     {/if}
 
-    <LedgerPanel {manifest} />
+    <LedgerPanel {manifest} {decoder} trainedReadout={trainedReadoutStatus} />
   </aside>
 </main>
 

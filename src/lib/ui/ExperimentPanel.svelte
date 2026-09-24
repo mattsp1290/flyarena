@@ -2,6 +2,7 @@
   import type { AgentId } from '../arena/types';
   import type { GraphMode } from '../connectome/format';
   import type { ExperimentStatus } from '../experiment/state';
+  import type { DecoderKind } from '../worker/protocol';
 
   /**
    * Start/Pause/Reset, seed input, per-agent topology selectors, and the
@@ -32,11 +33,25 @@
     topologySwitchPending: boolean;
     /** `controlsLocked`, plus true whenever the run isn't idle at `ready`/`finished` — a topology switch is never allowed mid-run, including merely `paused`. */
     topologyControlsLocked: boolean;
+    /** Which decoder both agents currently share (`ExperimentController#getDecoder()`); authored by default. */
+    decoder: DecoderKind;
+    /**
+     * True while the decoder radio group must be disabled entirely: while
+     * `running` (WP6's "disabled while running" contract — unlike
+     * `controlsLocked`, `paused` does *not* lock this group, matching
+     * `ExperimentController#setDecoder`'s own "not running" gate), a
+     * topology switch is in flight, or a decoder switch is itself in
+     * flight.
+     */
+    decoderControlsLocked: boolean;
+    /** Non-empty exactly when the Trained option must be shown disabled with this reason (a missing/hash-mismatched/graph-mismatched trained-readout artifact); `undefined` when Trained is selectable. */
+    trainedDecoderUnavailableReason?: string;
     onStart: () => void;
     onPause: () => void;
     onReset: () => void;
     onSeedInput: (seed: number) => void;
     onTopologyChange: (agentId: AgentId, mode: GraphMode) => void;
+    onDecoderChange: (decoder: DecoderKind) => void;
     onDownloadReplay: () => void;
   }
 
@@ -48,11 +63,15 @@
     controlsLocked,
     topologySwitchPending,
     topologyControlsLocked,
+    decoder,
+    decoderControlsLocked,
+    trainedDecoderUnavailableReason,
     onStart,
     onPause,
     onReset,
     onSeedInput,
     onTopologyChange,
+    onDecoderChange,
     onDownloadReplay
   }: Props = $props();
 
@@ -97,6 +116,8 @@
   const handleTopologyChange = (agentId: AgentId) => (event: Event): void => {
     onTopologyChange(agentId, (event.currentTarget as HTMLSelectElement).value as GraphMode);
   };
+
+  const handleDecoderChange = (value: DecoderKind) => (): void => onDecoderChange(value);
 </script>
 
 <section class="panel" aria-labelledby="controls-heading">
@@ -160,6 +181,43 @@
     </select>
   </div>
 
+  <fieldset class="field decoder-field" disabled={decoderControlsLocked}>
+    <legend>Decoder</legend>
+    <label class="radio-option">
+      <input
+        type="radio"
+        name="decoder"
+        value="authored"
+        checked={decoder === 'authored'}
+        onchange={handleDecoderChange('authored')}
+      />
+      Authored
+    </label>
+    <label class="radio-option">
+      <input
+        type="radio"
+        name="decoder"
+        value="trained"
+        checked={decoder === 'trained'}
+        disabled={trainedDecoderUnavailableReason !== undefined}
+        onchange={handleDecoderChange('trained')}
+      />
+      Trained (offline)
+    </label>
+    {#if trainedDecoderUnavailableReason}
+      <!--
+        No `role="status"`: `App.svelte`'s header status span already owns
+        that role page-wide (`tests/e2e/arena.spec.ts`'s `statusRegion`
+        helper assumes exactly one `[role="status"]` element), and this
+        hint's visibility is already reactively tied to
+        `trainedDecoderUnavailableReason` — a live-region role would only
+        duplicate that, not add anything a locator/visibility assertion
+        can't already see.
+      -->
+      <p class="hint">Trained unavailable: {trainedDecoderUnavailableReason}</p>
+    {/if}
+  </fieldset>
+
   <button type="button" class="replay-download" onclick={onDownloadReplay} disabled={!canDownload}>
     Download replay (config + score traces, no connectome)
   </button>
@@ -185,6 +243,35 @@
     border-radius: 0.4rem;
     color: #edf4ff;
     background: #0e1826;
+  }
+
+  .decoder-field {
+    border: 1px solid #304355;
+    border-radius: 0.4rem;
+    padding: 0.5rem 0.6rem 0.65rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+
+  .decoder-field legend {
+    padding: 0 0.3rem;
+    color: #cbd8e7;
+    font-size: 0.82rem;
+  }
+
+  .radio-option {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    color: #edf4ff;
+    font-size: 0.85rem;
+  }
+
+  .hint {
+    margin: 0.2rem 0 0;
+    color: #ffd7de;
+    font-size: 0.75rem;
   }
 
   .replay-download {

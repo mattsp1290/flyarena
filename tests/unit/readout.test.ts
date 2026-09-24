@@ -1,15 +1,22 @@
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { validateGraph } from '../../src/lib/connectome/format';
 import {
   createReadoutOutput,
   createReadoutScratch,
+  decodeReadoutArtifact,
   outputNeuronIndices,
   readoutForward,
   readoutParameterCount,
   validateReadoutWeights,
-  type ReadoutWeights
+  type ReadoutWeights,
+  type TrainedReadoutArtifactJson
 } from '../../src/lib/connectome/readout';
 import { createTraceGraph, TRACE_GRAPH_OUTPUT_NEURON_INDICES } from '../fixtures/trace-graph';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
 
 describe('outputNeuronIndices', () => {
   it('returns ascending output-neuron indices matching the trace graph\'s hand-computed layout', () => {
@@ -296,5 +303,48 @@ describe('createTraceGraph', () => {
     // test in this file assumes createTraceGraph() already returns a valid
     // graph without re-checking it.
     expect(() => validateGraph(createTraceGraph())).not.toThrow();
+  });
+});
+
+describe('decodeReadoutArtifact', () => {
+  const tinyArtifact = JSON.parse(
+    readFileSync(resolve(HERE, '../fixtures/trained-readout-tiny.json'), 'utf8')
+  ) as TrainedReadoutArtifactJson;
+
+  it('decodes each arm of the tiny fixture into a ReadoutWeights that validates against the trace graph', () => {
+    const graph = createTraceGraph(); // D = 6, matching the tiny fixture's inputSize.
+    for (const arm of ['biological', 'rewired', 'disconnected'] as const) {
+      const weights = decodeReadoutArtifact(tinyArtifact, arm);
+      expect(weights.inputSize).toBe(6);
+      expect(weights.hiddenSize).toBe(3);
+      expect(weights.w1).toHaveLength(3 * 6);
+      expect(weights.b1).toHaveLength(3);
+      expect(weights.w2).toHaveLength(3 * 3);
+      expect(weights.b2).toHaveLength(3);
+      expect(() => validateReadoutWeights(weights, graph)).not.toThrow();
+    }
+  });
+
+  it('the three arms decode to different weights (per-arm, not one shared readout)', () => {
+    const biological = decodeReadoutArtifact(tinyArtifact, 'biological');
+    const rewired = decodeReadoutArtifact(tinyArtifact, 'rewired');
+    expect(Array.from(biological.w1)).not.toEqual(Array.from(rewired.w1));
+  });
+
+  it('throws for an arm the artifact does not have', () => {
+    expect(() => decodeReadoutArtifact(tinyArtifact, 'no-such-arm')).toThrow(/no-such-arm/);
+  });
+
+  it('round-trips a base64-encoded float32 array exactly', () => {
+    const values = Float32Array.from([1.5, -2.25, 0, 3.75, -0.125]);
+    const base64 = Buffer.from(values.buffer, values.byteOffset, values.byteLength).toString('base64');
+    const artifact: TrainedReadoutArtifactJson = {
+      version: 1,
+      hiddenSize: 1,
+      inputSize: values.length,
+      arms: { biological: { w1: base64, b1: base64, w2: base64, b2: base64 } }
+    };
+    const decoded = decodeReadoutArtifact(artifact, 'biological');
+    expect(Array.from(decoded.w1)).toEqual(Array.from(values));
   });
 });

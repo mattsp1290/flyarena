@@ -1,10 +1,13 @@
 import type { GraphMode } from '../connectome/format';
+import type { ReadoutWeights } from '../connectome/readout';
 import { WORKER_PROTOCOL_VERSION } from './protocol';
 import type {
+  DecoderKind,
   DisposeWorkerSuccess,
   InitWorkerSuccess,
   ResetWorkerSuccess,
   SetActivityWorkerSuccess,
+  SetDecoderWorkerSuccess,
   StepWorkerSuccess,
   WorkerErrorCode,
   WorkerRequest,
@@ -66,14 +69,23 @@ export class WorkerClientError extends Error {
 }
 
 export interface WorkerClient {
-  /** Rejects with a `WorkerClientError` (`code: 'protocol-version-mismatch'`) if the Worker's echoed `InitWorkerSuccess.protocolVersion` does not match this bundle's own `WORKER_PROTOCOL_VERSION`. */
-  init: (graphBuffer: ArrayBuffer, mode?: GraphMode) => Promise<InitWorkerSuccess>;
+  /**
+   * Rejects with a `WorkerClientError` (`code: 'protocol-version-mismatch'`)
+   * if the Worker's echoed `InitWorkerSuccess.protocolVersion` does not
+   * match this bundle's own `WORKER_PROTOCOL_VERSION`. `readout`, when
+   * given, is this arm's trained-readout weights (see
+   * `InitWorkerRequest.readout`'s doc comment) — rejects with
+   * `invalid-request` if they do not match the graph being initialized.
+   */
+  init: (graphBuffer: ArrayBuffer, mode?: GraphMode, readout?: Readonly<ReadoutWeights>) => Promise<InitWorkerSuccess>;
   reset: () => Promise<ResetWorkerSuccess>;
   /** Resolves with the full `StepWorkerSuccess`, including `rates` when activity streaming is currently enabled. */
   step: (channelValues: ArrayLike<number>, substeps: number) => Promise<StepWorkerSuccess>;
   dispose: () => Promise<DisposeWorkerSuccess>;
   /** Toggles whether subsequent `step` responses include the full per-neuron `rates` vector; rejects with `not-initialized` before `init`. */
   setActivity: (enabled: boolean) => Promise<SetActivityWorkerSuccess>;
+  /** Switches this arm's decoding path; rejects with `not-initialized` before `init`, or `invalid-request` for `'trained'` when this Worker was initialized with no `readout`. */
+  setDecoder: (decoder: DecoderKind) => Promise<SetDecoderWorkerSuccess>;
   /** Detach listeners and, if the underlying worker supports it, terminate it. Rejects every in-flight request. */
   terminate: () => void;
 }
@@ -157,9 +169,9 @@ export const createWorkerClient = (worker: WorkerLike): WorkerClient => {
   };
 
   return {
-    init: async (graphBuffer, mode) => {
+    init: async (graphBuffer, mode, readout) => {
       const result = await send<InitWorkerSuccess>(
-        { type: 'init', requestId: nextRequestId(), graphBuffer, mode },
+        { type: 'init', requestId: nextRequestId(), graphBuffer, mode, readout },
         [graphBuffer]
       );
       // The Worker has already transitioned to `ready` by the time this
@@ -184,6 +196,8 @@ export const createWorkerClient = (worker: WorkerLike): WorkerClient => {
     dispose: () => send<DisposeWorkerSuccess>({ type: 'dispose', requestId: nextRequestId() }),
     setActivity: (enabled) =>
       send<SetActivityWorkerSuccess>({ type: 'set-activity', requestId: nextRequestId(), enabled }),
+    setDecoder: (decoder) =>
+      send<SetDecoderWorkerSuccess>({ type: 'set-decoder', requestId: nextRequestId(), decoder }),
     terminate: () => {
       if (terminated) return;
       terminated = true;

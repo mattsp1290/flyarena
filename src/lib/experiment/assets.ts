@@ -10,7 +10,8 @@
  * `public/data/` files (read via `node:fs`) without a server.
  */
 
-import { parseGraphBinary, type ConnectomeGraph } from '../connectome/format';
+import { parseGraphBinary, type ConnectomeGraph, type GraphMode } from '../connectome/format';
+import { decodeReadoutArtifact, type ReadoutWeights, type TrainedReadoutArtifactJson } from '../connectome/readout';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
 
@@ -557,4 +558,92 @@ export const loadPositions = async (
     rateMin: biologicalGraph.metadata.rateMin,
     rateMax: biologicalGraph.metadata.rateMax
   };
+};
+
+/**
+ * The subset of `public/data/trained-readout-v1.manifest.json` the app
+ * actually reads: enough to verify the artifact JSON's own bytes and to
+ * label its provenance in the ledger panel (WP6). The manifest also carries
+ * training/evaluator/env provenance the ledger does not surface — those
+ * fields simply pass through untyped here rather than being restated field
+ * by field.
+ */
+export interface TrainedReadoutManifest {
+  version: number;
+  /** sha256 of `trained-readout-v1.json`'s exact bytes — checked against the fetched artifact below before it is trusted. */
+  artifactSha256: string;
+  /** Output-neuron count (readout input size), identical across arms by construction (`export-arms.ts`'s node-set gate). */
+  D: number;
+  /** Hidden layer width, identical across arms (one shared training config). */
+  H: number;
+  /** Total trainable scalars per arm (`readoutParameterCount(D, H)`), identical across arms. */
+  parameterCount: number;
+}
+
+/**
+ * WP6's trained-readout counterpart to `PositionsLoadResult`: never throws,
+ * and every failure is a returned `status` so `ExperimentController` can
+ * keep the Authored path working and disable just the Trained decoder with
+ * an honest reason (the "artifact failed verification" ledger message) —
+ * never fail the whole experiment over a missing/corrupt trained-readout
+ * artifact, which is optional relative to the required arena graph
+ * artifacts `loadArenaArtifacts` gates Start on.
+ */
+export type TrainedReadoutLoadResult =
+  | { status: 'ok'; manifest: TrainedReadoutManifest; weightsByMode: Readonly<Record<GraphMode, ReadoutWeights>> }
+  | { status: 'unavailable'; reason: string };
+
+/** Every `GraphMode` the trained-readout artifact carries a per-arm entry for (`TrainedReadoutArtifactJson.arms`'s required keys). */
+const READOUT_ARMS: readonly GraphMode[] = ['biological', 'rewired', 'disconnected'];
+
+/**
+ * Fetch, sha256-verify, and base64-decode `trained-readout-v1.{json,manifest.json}`
+ * (WP6 item 2's trained-readout counterpart to `loadArenaArtifacts`). Unlike
+ * that function, this one never throws — see `TrainedReadoutLoadResult`'s doc
+ * comment — and does not itself call `validateReadoutWeights` against a
+ * graph: the caller (`ExperimentController`, which has the per-arm parsed
+ * graphs) does that once it has something to validate each arm's weights
+ * against.
+ */
+export const loadTrainedReadoutArtifact = async (dataBaseUrl = '/data'): Promise<TrainedReadoutLoadResult> => {
+  try {
+    const manifest = await fetchJson<TrainedReadoutManifest>(`${dataBaseUrl}/trained-readout-v1.manifest.json`);
+    const artifactBytes = await fetchArrayBuffer(`${dataBaseUrl}/trained-readout-v1.json`);
+
+    const artifactHash = await sha256Hex(artifactBytes);
+    if (artifactHash !== manifest.artifactSha256) {
+      return {
+        status: 'unavailable',
+        reason: `trained-readout-v1.json sha256 ${artifactHash} does not match its manifest (${manifest.artifactSha256})`
+      };
+    }
+
+    let json: TrainedReadoutArtifactJson;
+    try {
+      json = JSON.parse(new TextDecoder().decode(artifactBytes)) as TrainedReadoutArtifactJson;
+    } catch (error) {
+      return {
+        status: 'unavailable',
+        reason: `trained-readout-v1.json is not valid JSON: ${error instanceof Error ? error.message : String(error)}`
+      };
+    }
+
+    const weightsByMode: Partial<Record<GraphMode, ReadoutWeights>> = {};
+    for (const arm of READOUT_ARMS) {
+      weightsByMode[arm] = decodeReadoutArtifact(json, arm);
+    }
+
+    return {
+      status: 'ok',
+      manifest,
+      weightsByMode: weightsByMode as Record<GraphMode, ReadoutWeights>
+    };
+  } catch (error) {
+    // Fetch failure (e.g. a 404 because WP5's production artifact has not
+    // shipped yet), a malformed manifest, or a `decodeReadoutArtifact`
+    // failure (a missing arm key or a non-multiple-of-4 base64 payload) all
+    // land here as the same honest "unavailable" outcome — the Trained
+    // decoder is simply not offered, and Authored keeps working.
+    return { status: 'unavailable', reason: error instanceof Error ? error.message : String(error) };
+  }
 };

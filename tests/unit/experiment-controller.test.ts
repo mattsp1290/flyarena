@@ -2,9 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ExperimentController, type ExperimentControllerCallbacks } from '../../src/lib/experiment/controller';
 import type { AgentId } from '../../src/lib/arena/types';
 import type { ConnectomeGraph, GraphMode } from '../../src/lib/connectome/format';
-import type { ArenaManifest } from '../../src/lib/experiment/assets';
+import type { ArenaManifest, TrainedReadoutLoadResult } from '../../src/lib/experiment/assets';
 import type { ExperimentStatus } from '../../src/lib/experiment/state';
-import type { WorkerRequest, WorkerResponse } from '../../src/lib/worker/protocol';
+import type { DecoderKind, WorkerRequest, WorkerResponse } from '../../src/lib/worker/protocol';
 import { createPublicDataFetch, FakeNeuralWorker } from '../helpers/fake-worker';
 
 /**
@@ -27,22 +27,30 @@ const createCallbacks = (): ExperimentControllerCallbacks & {
   errors: string[];
   topologyApplied: Array<[AgentId, GraphMode]>;
   switchCounts: Array<Readonly<Record<AgentId, number>>>;
+  trainedReadoutStatuses: TrainedReadoutLoadResult[];
+  decodersApplied: DecoderKind[];
 } => {
   const statuses: ExperimentStatus[] = [];
   const errors: string[] = [];
   const topologyApplied: Array<[AgentId, GraphMode]> = [];
   const switchCounts: Array<Readonly<Record<AgentId, number>>> = [];
+  const trainedReadoutStatuses: TrainedReadoutLoadResult[] = [];
+  const decodersApplied: DecoderKind[] = [];
   return {
     statuses,
     errors,
     topologyApplied,
     switchCounts,
+    trainedReadoutStatuses,
+    decodersApplied,
     onStatusChange: (status) => statuses.push(status),
     onTelemetry: vi.fn(),
     onError: (message) => errors.push(message),
     onManifest: vi.fn(),
     onTopologyApplied: (agentId, mode) => topologyApplied.push([agentId, mode]),
-    onTopologySwitchCountChange: (counts) => switchCounts.push({ ...counts })
+    onTopologySwitchCountChange: (counts) => switchCounts.push({ ...counts }),
+    onTrainedReadoutStatus: (status) => trainedReadoutStatuses.push(status),
+    onDecoderApplied: (decoder) => decodersApplied.push(decoder)
   };
 };
 
@@ -757,6 +765,133 @@ describe('ExperimentController activity streaming', () => {
       errorSpy.mockRestore();
     }
   });
+});
+
+/**
+ * `createPublicDataFetch` (`../helpers/fake-worker.ts`) serves whichever
+ * committed `public/data/*` file matches the requested basename, and WP5's
+ * production artifacts (`trained-readout-v1.{json,manifest.json}`, D = 48,
+ * H = 16, parameterCount = 835) are committed there — so these tests run
+ * against the real shipped artifact by default, not a fixture, the same way
+ * `ExperimentController#initialize`'s existing tests do for the arena graph.
+ */
+describe('ExperimentController trained-readout / setDecoder', () => {
+  const setUp = async (overrides?: { totalTicks?: number; targetTickIntervalMs?: number }) => {
+    const callbacks = createCallbacks();
+    const controller = new ExperimentController({
+      seed: SEED,
+      totalTicks: overrides?.totalTicks ?? TOTAL_TICKS,
+      targetTickIntervalMs: overrides?.targetTickIntervalMs,
+      initialTopology: { left: 'biological', right: 'rewired' },
+      createWorker,
+      callbacks
+    });
+    trackController(controller);
+    await controller.initialize();
+    return { controller, callbacks };
+  };
+
+  it('defaults to the authored decoder and reports the real trained-readout artifact as ok with its manifest D/H/parameterCount', async () => {
+    const { controller, callbacks } = await setUp();
+
+    expect(controller.getDecoder()).toBe('authored');
+    expect(callbacks.trainedReadoutStatuses).toHaveLength(1);
+    const status = callbacks.trainedReadoutStatuses[0];
+    expect(status.status).toBe('ok');
+    if (status.status === 'ok') {
+      expect(status.manifest.D).toBe(48);
+      expect(status.manifest.H).toBe(16);
+      expect(status.manifest.parameterCount).toBe(835);
+    }
+    expect(controller.getTrainedReadoutStatus()).toBe(status);
+  });
+
+  it('a corrupted trained-readout-v1.json disables Trained with an honest reason; Authored still works and setDecoder("trained") stays a no-op', async () => {
+    vi.stubGlobal('fetch', createPublicDataFetch({ corrupt: 'trained-readout-v1.json' }));
+    const { controller, callbacks } = await setUp();
+
+    // The required arena graph artifacts are untouched by this corruption,
+    // so the experiment itself must still come up fine (WP6's "the app
+    // keeps working in Authored mode" invariant).
+    expect(controller.getRunner()).toBeDefined();
+    expect(callbacks.errors).toHaveLength(0);
+
+    const status = callbacks.trainedReadoutStatuses[0];
+    expect(status.status).toBe('unavailable');
+    if (status.status === 'unavailable') expect(status.reason).toMatch(/sha256/i);
+
+    await controller.setDecoder('trained');
+    expect(controller.getDecoder()).toBe('authored');
+    expect(callbacks.decodersApplied).toHaveLength(0);
+  });
+
+  it('setDecoder is a no-op while the run is running', async () => {
+    const { controller, callbacks } = await setUp({ targetTickIntervalMs: 0 });
+    const runner = controller.getRunner();
+    runner!.start();
+    expect(runner!.getStatus()).toBe('running');
+
+    await controller.setDecoder('trained');
+
+    expect(controller.getDecoder()).toBe('authored');
+    expect(callbacks.decodersApplied).toHaveLength(0);
+    runner!.pause();
+  });
+
+  it('setDecoder applies to both arms and resets the run to tick 0, even from paused', async () => {
+    // Real-time pacing left at its default (unlike the "no-op while running"
+    // and determinism tests above/below): with it disabled, a 30-tick run
+    // can race straight to `finished` between the `waitFor` below and
+    // `pause()`, since nothing then bounds how fast ticks resolve.
+    const { controller, callbacks } = await setUp();
+    const runner = controller.getRunner();
+    runner!.start();
+    await vi.waitFor(() => expect(runner!.getTelemetry().tick).toBeGreaterThan(0));
+    runner!.pause();
+    expect(runner!.getStatus()).toBe('paused');
+
+    await controller.setDecoder('trained');
+
+    expect(controller.getDecoder()).toBe('trained');
+    expect(callbacks.decodersApplied).toEqual(['trained']);
+    expect(runner!.getStatus()).toBe('ready');
+    expect(runner!.getTelemetry().tick).toBe(0);
+    expect(callbacks.errors).toHaveLength(0);
+  });
+
+  it('is a no-op when the requested decoder is already selected', async () => {
+    const { controller, callbacks } = await setUp();
+    await controller.setDecoder('authored');
+    expect(callbacks.decodersApplied).toHaveLength(0);
+  });
+
+  /**
+   * The WP6 acceptance bar this test targets directly: "two runs with the
+   * same seed and Trained give identical score traces over 300 ticks; the
+   * Authored and Trained traces differ." `targetTickIntervalMs: 0` disables
+   * `ExperimentRunner`'s real-time pacing (see that option's doc comment) so
+   * 300 ticks complete in milliseconds instead of ~10 real seconds.
+   */
+  it('determinism: two Trained runs with the same seed produce identical 300-tick score traces; Authored and Trained differ', async () => {
+    const runToCompletion = async (decoder: DecoderKind) => {
+      const { controller } = await setUp({ totalTicks: 300, targetTickIntervalMs: 0 });
+      if (decoder === 'trained') {
+        await controller.setDecoder('trained');
+        expect(controller.getDecoder()).toBe('trained');
+      }
+      const runner = controller.getRunner()!;
+      runner.start();
+      await vi.waitFor(() => expect(runner.getStatus()).toBe('finished'), { timeout: 10000 });
+      return runner.getReplayExport().trace;
+    };
+
+    const trainedTraceA = await runToCompletion('trained');
+    const trainedTraceB = await runToCompletion('trained');
+    const authoredTrace = await runToCompletion('authored');
+
+    expect(trainedTraceA).toEqual(trainedTraceB);
+    expect(trainedTraceA).not.toEqual(authoredTrace);
+  }, 20000);
 });
 
 describe('ExperimentController#dispose', () => {

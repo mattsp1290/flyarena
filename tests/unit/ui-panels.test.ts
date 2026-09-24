@@ -4,7 +4,7 @@ import ExperimentPanel from '../../src/lib/ui/ExperimentPanel.svelte';
 import TelemetryPanel from '../../src/lib/ui/TelemetryPanel.svelte';
 import LedgerPanel from '../../src/lib/ui/LedgerPanel.svelte';
 import type { ExperimentTelemetry } from '../../src/lib/experiment/runner';
-import type { ArenaManifest } from '../../src/lib/experiment/assets';
+import type { ArenaManifest, TrainedReadoutLoadResult } from '../../src/lib/experiment/assets';
 
 afterEach(() => cleanup());
 
@@ -17,11 +17,15 @@ describe('ExperimentPanel accessibility and wiring', () => {
     controlsLocked: false,
     topologySwitchPending: false,
     topologyControlsLocked: false,
+    decoder: 'authored' as const,
+    decoderControlsLocked: false,
+    trainedDecoderUnavailableReason: undefined,
     onStart: vi.fn(),
     onPause: vi.fn(),
     onReset: vi.fn(),
     onSeedInput: vi.fn(),
     onTopologyChange: vi.fn(),
+    onDecoderChange: vi.fn(),
     onDownloadReplay: vi.fn()
   });
 
@@ -35,18 +39,50 @@ describe('ExperimentPanel accessibility and wiring', () => {
     expect(screen.getByLabelText(/left arm topology/i)).toBeInTheDocument();
     expect(screen.getByLabelText(/right arm topology/i)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /download replay/i })).toBeInTheDocument();
+    expect(screen.getByRole('radio', { name: /^authored$/i })).toBeInTheDocument();
+    expect(screen.getByRole('radio', { name: /trained \(offline\)/i })).toBeInTheDocument();
 
     // Every interactive control here is a native <button>/<input>/<select>,
     // which are keyboard-operable (Tab/Enter/Space/arrow keys) by the
     // platform itself — no custom `div`-as-button widget to audit.
     for (const element of [
       ...screen.getAllByRole('button'),
+      ...screen.getAllByRole('radio'),
       screen.getByLabelText(/^seed$/i),
       screen.getByLabelText(/left arm topology/i),
       screen.getByLabelText(/right arm topology/i)
     ]) {
       expect(['BUTTON', 'INPUT', 'SELECT']).toContain(element.tagName);
     }
+  });
+
+  it('the decoder radio group defaults to Authored checked, and calls onDecoderChange on selection', async () => {
+    const props = baseProps();
+    render(ExperimentPanel, props);
+
+    const authored = screen.getByRole('radio', { name: /^authored$/i });
+    const trained = screen.getByRole('radio', { name: /trained \(offline\)/i });
+    expect(authored).toBeChecked();
+    expect(trained).not.toBeChecked();
+
+    await fireEvent.click(trained);
+    expect(props.onDecoderChange).toHaveBeenCalledWith('trained');
+  });
+
+  it('decoderControlsLocked disables both decoder radios', () => {
+    render(ExperimentPanel, { ...baseProps(), decoderControlsLocked: true });
+    expect(screen.getByRole('radio', { name: /^authored$/i })).toBeDisabled();
+    expect(screen.getByRole('radio', { name: /trained \(offline\)/i })).toBeDisabled();
+  });
+
+  it('shows the Trained option disabled with its reason when the trained-readout artifact is unavailable, without disabling Authored', () => {
+    render(ExperimentPanel, {
+      ...baseProps(),
+      trainedDecoderUnavailableReason: 'trained-readout-v1.json sha256 mismatch'
+    });
+    expect(screen.getByRole('radio', { name: /^authored$/i })).toBeEnabled();
+    expect(screen.getByRole('radio', { name: /trained \(offline\)/i })).toBeDisabled();
+    expect(screen.getByText(/trained-readout-v1\.json sha256 mismatch/i)).toBeInTheDocument();
   });
 
   it('disables Start when not ready, and enables Pause only while running', () => {
@@ -261,7 +297,7 @@ describe('LedgerPanel', () => {
   };
 
   it('renders the ledger vocabulary, never says brain emulation, and links to the manifest/ledger/license', () => {
-    const { container } = render(LedgerPanel, { manifest });
+    const { container } = render(LedgerPanel, { manifest, decoder: 'authored', trainedReadout: undefined });
 
     expect(ledgerRow(container, 'Graph topology')).toHaveTextContent('Measured');
     expect(ledgerRow(container, 'Biological annotations')).toHaveTextContent('Annotated');
@@ -287,7 +323,51 @@ describe('LedgerPanel', () => {
   });
 
   it('renders the static ledger vocabulary even without a loaded manifest', () => {
-    const { container } = render(LedgerPanel, { manifest: undefined });
+    const { container } = render(LedgerPanel, { manifest: undefined, decoder: 'authored', trainedReadout: undefined });
     expect(ledgerRow(container, 'Graph topology')).toHaveTextContent('Measured');
+  });
+
+  // LedgerPanel only reads `manifest` off an `'ok'` result, never
+  // `weightsByMode` — so this test double omits it (it exists purely to
+  // satisfy the real type's structural shape for the decoded readout
+  // weights, which the component has no reason to render).
+  const trainedReadoutOk = {
+    status: 'ok',
+    manifest: { version: 1, artifactSha256: 'abcdef0123456789abcdef0123456789', D: 48, H: 16, parameterCount: 835 }
+  } as unknown as TrainedReadoutLoadResult;
+
+  it('shows the "Readout (trained mode)" row and provenance detail (hash prefix, param count, D -> H -> 3, report links) when the artifact is ok, visible even in Authored mode', () => {
+    const { container } = render(LedgerPanel, { manifest, decoder: 'authored', trainedReadout: trainedReadoutOk });
+
+    expect(ledgerRow(container, 'Readout (trained mode)')).toHaveTextContent('Trained (offline)');
+    expect(screen.getByText('835')).toBeInTheDocument();
+    expect(screen.getByText(/48 → 16 → 3/)).toBeInTheDocument();
+    expect(screen.getByText(/abcdef012345/)).toBeInTheDocument();
+    expect(screen.getByText(/opponent parked/i)).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /report \(json\)/i })).toHaveAttribute(
+      'href',
+      '/data/trained-readout-v1.report.json'
+    );
+    expect(screen.getByRole('link', { name: /github/i })).toHaveAttribute(
+      'href',
+      'https://github.com/mattsp1290/flyarena/blob/main/docs/trained-readout-report.md'
+    );
+  });
+
+  it('scopes the "Sensory encoder and action decoder" row label to Trained mode', () => {
+    const { container } = render(LedgerPanel, { manifest, decoder: 'trained', trainedReadout: trainedReadoutOk });
+    const row = ledgerRow(container, 'Sensory encoder and action decoder');
+    expect(row).toHaveTextContent(/authored/i);
+    expect(row).toHaveTextContent(/trained/i);
+  });
+
+  it('shows the artifact-failed-verification message when the trained-readout artifact is unavailable', () => {
+    render(LedgerPanel, {
+      manifest,
+      decoder: 'authored',
+      trainedReadout: { status: 'unavailable', reason: 'trained-readout-v1.json sha256 mismatch' }
+    });
+    const message = screen.getByText(/artifact failed verification/i);
+    expect(message).toHaveTextContent(/sha256 mismatch/i);
   });
 });

@@ -1,5 +1,5 @@
 import { OUTPUT_POPULATION } from '../arena/actions';
-import type { ConnectomeGraph } from './format';
+import type { ConnectomeGraph, GraphMode } from './format';
 
 /**
  * Shared readout contract: one small MLP (`D -> H -> 3`) reading the
@@ -112,6 +112,78 @@ export const validateReadoutWeights = (
   requireFiniteArray(weights.b2, 'b2');
 
   return weights;
+};
+
+/**
+ * On-disk shape of `public/data/trained-readout-v1.json` (and its tiny test
+ * fixture, `tests/fixtures/trained-readout-tiny.json`): one shared `D -> H`
+ * shape plus one `{ w1, b1, w2, b2 }` entry per arm, each array base64-encoded
+ * little-endian float32 (see `.agents/plans/trained-readout/04-authoritative-evaluation-and-artifacts.md`).
+ * `arms` is keyed by `GraphMode` in production, but typed as
+ * `Record<string, ...>` here so a malformed/missing arm key is a normal,
+ * handled `decodeReadoutArtifact` failure rather than a type-level
+ * impossibility that can't actually be checked at a JSON boundary.
+ */
+export interface TrainedReadoutArtifactArm {
+  readonly w1: string;
+  readonly b1: string;
+  readonly w2: string;
+  readonly b2: string;
+}
+
+export interface TrainedReadoutArtifactJson {
+  readonly version: number;
+  readonly hiddenSize: number;
+  readonly inputSize: number;
+  readonly arms: Readonly<Record<string, TrainedReadoutArtifactArm>>;
+}
+
+/**
+ * Base64 -> little-endian `Float32Array`, matching the tiny-fixture test's
+ * own decode (`tests/unit/trained-readout-artifact.test.ts`). `atob` (not
+ * Node's `Buffer`) so this runs unmodified in the browser Worker/main
+ * thread, the app's real production callers, as well as under Vitest's
+ * jsdom environment and any Node `tsx` script — all of which provide it.
+ * Almost every real deployment target is little-endian (browsers, Node,
+ * this project's CI), so a `Float32Array` view over the decoded bytes
+ * already reads them correctly with no explicit byte-swap, matching the
+ * artifact's documented little-endian encoding.
+ */
+const decodeBase64Float32 = (base64: string): Float32Array => {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  if (bytes.byteLength % 4 !== 0) {
+    throw new Error(`Invalid readout artifact: base64-decoded array length ${bytes.byteLength} is not a multiple of 4`);
+  }
+  return new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4);
+};
+
+/**
+ * Decode one arm's `ReadoutWeights` out of a parsed `trained-readout-v1.json`
+ * document. Throws (never returns a partial/invalid result) if `arm` is
+ * absent from `json.arms` or any of its four arrays fails to base64-decode
+ * to a whole number of float32 elements; does **not** call
+ * `validateReadoutWeights` itself — callers that have a graph to validate
+ * against (the Worker's `init` handler, `ExperimentController`) do that
+ * separately, since this function has no graph to check shapes against.
+ */
+export const decodeReadoutArtifact = (
+  json: Readonly<TrainedReadoutArtifactJson>,
+  arm: GraphMode | string
+): ReadoutWeights => {
+  const entry = json.arms[arm];
+  if (!entry) {
+    throw new Error(`Trained readout artifact has no arm "${arm}" (available: ${Object.keys(json.arms).join(', ')})`);
+  }
+  return {
+    inputSize: json.inputSize,
+    hiddenSize: json.hiddenSize,
+    w1: decodeBase64Float32(entry.w1),
+    b1: decodeBase64Float32(entry.b1),
+    w2: decodeBase64Float32(entry.w2),
+    b2: decodeBase64Float32(entry.b2)
+  };
 };
 
 const sigmoid = (value: number): number => 1 / (1 + Math.exp(-value));
