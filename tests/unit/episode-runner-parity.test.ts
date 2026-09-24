@@ -182,6 +182,7 @@ describe('episode.ts runEpisode vs ExperimentRunner: per-tick closed-loop parity
         // `onTick` (see this file's module doc for why this replaced an
         // earlier hand-replay approach). ---
         const episodeLeftActions: DecodedAction[] = [];
+        const episodeRightActions: DecodedAction[] = [];
         const episodeRightPositions: Position[] = [];
         const episodeResult = runEpisode({
           seed,
@@ -191,6 +192,7 @@ describe('episode.ts runEpisode vs ExperimentRunner: per-tick closed-loop parity
           right: { decoder: 'parked' },
           onTick: (_tick, actions, world) => {
             episodeLeftActions.push(actions.left);
+            episodeRightActions.push(actions.right);
             episodeRightPositions.push(capturePosition(world, 'right'));
           }
         });
@@ -200,6 +202,15 @@ describe('episode.ts runEpisode vs ExperimentRunner: per-tick closed-loop parity
         // just mean both paths independently produced an all-zero run.
         expect(episodeResult.left.distanceTravelled).toBeGreaterThan(0);
         expect(episodeResult.right.distanceTravelled).toBe(0);
+        // The right arm's *action* must be exactly zero every tick, not just
+        // its resulting position: a yaw-only action ([0, 1, 0]) would leave
+        // distanceTravelled at 0 (the agent turns in place) while still
+        // being a real regression in "parked". `episodeRightPositions`
+        // above corroborates this at the world-state level.
+        const zeroAction = decodeAction([0, 0, 0]);
+        for (const action of episodeRightActions) {
+          expect(action).toEqual(zeroAction);
+        }
 
         // --- Path B: the product closed-loop orchestrator, ExperimentRunner
         // + createOracleAgentBinding, with a test-only zero binding for
