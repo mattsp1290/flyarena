@@ -13,7 +13,13 @@ import { fileURLToPath } from 'node:url';
 import { encodeGraphBinary } from '../../src/lib/connectome/format';
 import { createTraceGraph } from '../fixtures/trace-graph';
 import { createFixtureRewiredTraceGraph } from '../fixtures/trace-graph-rewire';
-import { buildTasks, parseNullEvaluateArgs, readRewireIndex, runShardedEvaluation } from '../../scripts/null/null-evaluate';
+import {
+  buildTasks,
+  parseNullEvaluateArgs,
+  readRewireIndex,
+  runNullEvaluate,
+  runShardedEvaluation
+} from '../../scripts/null/null-evaluate';
 import type { NullSeedResult, NullWorkerMessage, NullWorkerTask } from '../../scripts/null/null-worker';
 
 /**
@@ -53,9 +59,14 @@ describe('parseNullEvaluateArgs', () => {
   });
 
   it('rejects an unknown --decoder value', () => {
-    expect(() =>
-      parseNullEvaluateArgs(['--rewired-index', 'i.json', '--graphs-dir', 'g', '--decoder', 'trained'])
-    ).toThrow(/--decoder must be one of/);
+    // 'trained'/'silenced'/'parked' are real EpisodeDecoderKind values --
+    // just never valid for null-evaluate.ts, which always drives the left
+    // agent through the authored family against a parked opponent.
+    for (const bogus of ['trained', 'silenced', 'parked', 'authored-flip-brake', '']) {
+      expect(() =>
+        parseNullEvaluateArgs(['--rewired-index', 'i.json', '--graphs-dir', 'g', '--decoder', bogus])
+      ).toThrow(/--decoder must be one of/);
+    }
   });
 
   it('parses --rewired-seeds START:END', () => {
@@ -468,6 +479,64 @@ describe('buildTasks: --decoder propagation and --rewired-seeds filtering', () =
     const tasks = buildTasks(index, args, 'bio.bin.gz');
     expect(tasks.length).toBeGreaterThan(0);
     for (const task of tasks) expect(task.decoder).toBe('authored-flip-both');
+  });
+
+  it('throws when --rewired-seeds matches no seeds in the index (regression: used to silently produce an empty rewired list)', () => {
+    const index = indexFor([0, 1, 2]);
+    const args = { ...baseArgs(), rewiredSeeds: { start: 10, end: 12 } };
+    expect(() => buildTasks(index, args, 'bio.bin.gz')).toThrow(/missing 2: 10, 11/);
+  });
+
+  it('throws when --rewired-seeds only partially matches the index (regression: used to silently score fewer seeds than requested)', () => {
+    const index = indexFor([0, 1, 2]); // seed 3 is absent
+    const args = { ...baseArgs(), rewiredSeeds: { start: 1, end: 4 } };
+    expect(() => buildTasks(index, args, 'bio.bin.gz')).toThrow(/requested 3 seed\(s\).*missing 1: 3/s);
+  });
+});
+
+describe('runNullEvaluate: refuses to overwrite the canonical default --out with a non-canonical run', () => {
+  // Regression test for a dual-review finding: the plan's own reproduction-
+  // gate example command (`--rewired-seeds 0:5 --decoder authored`, no
+  // --out) would otherwise silently overwrite the canonical, hours-long
+  // full-index run at the default --out path. The guard must fire before
+  // any file is read (readRewireIndex would throw on the bogus paths below
+  // first if it ran), so a non-matching error message here would mean the
+  // guard isn't actually first.
+  const nonCanonicalArgsWithDefaultOut = (overrides: Partial<Parameters<typeof runNullEvaluate>[0]>) => ({
+    biological: true,
+    graph: undefined,
+    rewiredIndex: '/nonexistent/index.json',
+    graphsDir: '/nonexistent/graphs',
+    heldOutStart: 30001,
+    heldOutCount: 100,
+    ticks: 1800,
+    shards: 1,
+    out: resolve(process.cwd(), 'training/runs/null/authored.json'),
+    decoder: 'authored' as const,
+    rewiredSeeds: undefined as { start: number; end: number } | undefined,
+    ...overrides
+  });
+
+  it('throws for a non-authored decoder writing to the default --out', async () => {
+    await expect(
+      runNullEvaluate(nonCanonicalArgsWithDefaultOut({ decoder: 'authored-flip-both' }))
+    ).rejects.toThrow(/refusing to write a non-canonical run/);
+  });
+
+  it("throws for the reproduction gate's own --rewired-seeds-restricted authored run writing to the default --out", async () => {
+    await expect(
+      runNullEvaluate(nonCanonicalArgsWithDefaultOut({ rewiredSeeds: { start: 0, end: 5 } }))
+    ).rejects.toThrow(/refusing to write a non-canonical run/);
+  });
+
+  it('does not throw this guard for a canonical (authored, unfiltered) run at the default --out (fails later, on the nonexistent index instead)', async () => {
+    // Proves the guard is scoped correctly: a plain authored run targeting
+    // the default --out is legitimate and must not be blocked by this
+    // check. It still fails -- just for an unrelated, expected reason (the
+    // fixture's rewiredIndex path does not exist).
+    await expect(runNullEvaluate(nonCanonicalArgsWithDefaultOut({}))).rejects.not.toThrow(
+      /refusing to write a non-canonical run/
+    );
   });
 });
 

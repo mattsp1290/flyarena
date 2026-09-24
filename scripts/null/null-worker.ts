@@ -27,14 +27,27 @@ import { assertFiniteScores, runWorkerMain } from './null-worker-shared';
 export type NullTaskMode = GraphMode;
 
 /**
- * The authored decoder family kinds this study's evaluator ever drives the
- * left agent with (`scripts/training/episode.ts`'s `EpisodeDecoderKind`,
- * restricted to the `isAuthoredFamily` subset) —
+ * Single source of truth for every authored decoder family kind this
+ * study's evaluator ever drives the left agent with
+ * (`scripts/training/episode.ts`'s `EpisodeDecoderKind`, restricted to the
+ * `isAuthoredFamily` subset) —
  * `.agents/plans/null-explanation/01-decoder-variants.md` WP1's
- * decoder-convention-check variants. `null-evaluate.ts`'s `--decoder` flag
- * accepts exactly these four and rejects anything else.
+ * decoder-convention-check variants. `NullDecoderKind` is derived from this
+ * array (`as const` + `(typeof ...)[number]`), not declared independently,
+ * so adding or renaming a kind here is a compile error everywhere it isn't
+ * also updated (`null-evaluate.ts`'s `--decoder` validator, `null-report.ts`'s
+ * `CONDITION_LABELS`) instead of a silent runtime gap — a reviewer finding:
+ * an earlier version declared the type and this array separately, so a kind
+ * added to one without the other would compile.
  */
-export type NullDecoderKind = 'authored' | 'authored-flip-thrust' | 'authored-flip-yaw' | 'authored-flip-both';
+export const NULL_DECODER_KINDS = [
+  'authored',
+  'authored-flip-thrust',
+  'authored-flip-yaw',
+  'authored-flip-both'
+] as const;
+
+export type NullDecoderKind = (typeof NULL_DECODER_KINDS)[number];
 
 export interface NullWorkerTask {
   readonly graphId: string;

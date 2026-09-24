@@ -1,6 +1,6 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { NullEvaluationRaw, NullGraphRaw } from '../../scripts/null/null-evaluate';
@@ -499,9 +499,107 @@ describe('runNullReport', () => {
       writeFileSync(authoredPath, JSON.stringify(buildRaw({ decoder: 'authored-flip-yaw' })));
       const variantOut = join(root, 'variant-authored-flip-yaw-summary.json');
       const first = runNullReport({ ...args, variantOut });
+      const bytesAfterFirst = readFileSync(variantOut);
       const second = runNullReport({ ...args, variantOut });
       expect(second.artifactSha256).toBe(first.artifactSha256);
-      expect(readFileSync(variantOut, 'utf8')).toEqual(readFileSync(variantOut, 'utf8'));
+      expect(readFileSync(variantOut).equals(bytesAfterFirst)).toBe(true);
+    });
+
+    it('rejects --variant-out that resolves to any shipped default path -- and the real shipped files stay untouched', () => {
+      // Uses the REAL DEFAULT_OUT/DEFAULT_REPORT_MD/DEFAULT_MANIFEST paths
+      // (not scratch fixtures): guardVariantOutPath must throw before any
+      // write, so reading these committed files before/after and asserting
+      // byte-equality is a genuine end-to-end proof, not just "the scratch
+      // path was never created". DEFAULT_REPORT_MD is rejected by the
+      // ".json"-extension check first (it's a .md path) -- still a throw
+      // before any write, just a different message than the other two.
+      for (const shipped of [DEFAULT_OUT, DEFAULT_MANIFEST]) {
+        const before = readFileSync(shipped);
+        expect(() => runNullReport({ ...args, variantOut: shipped })).toThrow(/must not resolve to/);
+        expect(readFileSync(shipped).equals(before)).toBe(true);
+      }
+      const reportMdBefore = readFileSync(DEFAULT_REPORT_MD);
+      expect(() => runNullReport({ ...args, variantOut: DEFAULT_REPORT_MD })).toThrow(/must end with "\.json"/);
+      expect(readFileSync(DEFAULT_REPORT_MD).equals(reportMdBefore)).toBe(true);
+    });
+
+    it('rejects --variant-out that resolves to its own --authored input', () => {
+      expect(() => runNullReport({ ...args, variantOut: authoredPath })).toThrow(/its own --authored input/);
+    });
+
+    it('rejects a --variant-out anywhere under public/ or docs/, not just the three named shipped defaults', () => {
+      // Regression test for a reviewer finding: a named-file list would
+      // never keep up with other shipped tracked JSON (trained-readout-v1.json,
+      // the ledger, positions.json, lab-benchmark.json, ...) that a
+      // copy-pasted or typo'd --variant-out could still land on. Uses real
+      // shipped files (not fixtures) so an actual overwrite would be caught.
+      const publicJson = join(dirname(DEFAULT_OUT), 'trained-readout-v1.json');
+      const docsJson = join(dirname(DEFAULT_REPORT_MD), 'lab-benchmark.json');
+      for (const shipped of [publicJson, docsJson]) {
+        const before = readFileSync(shipped);
+        expect(() => runNullReport({ ...args, variantOut: shipped })).toThrow(/must not be under/);
+        expect(readFileSync(shipped).equals(before)).toBe(true);
+      }
+    });
+
+    it('rejects a --variant-out path without a .json extension', () => {
+      expect(() => runNullReport({ ...args, variantOut: join(root, 'variant-summary') })).toThrow(
+        /--variant-out must end with "\.json"/
+      );
+    });
+
+    it('never merges a --trained section into a variant summary, even when trained.json exists', () => {
+      // Regression test for a dual-review finding: the trained section
+      // describes the unrelated 'trained' decoder condition (WP3), not the
+      // authored-flip-* condition a variant summary is labelled with --
+      // merging it in would silently contaminate the variant JSON whenever
+      // a local trained.json happened to exist.
+      writeFileSync(authoredPath, JSON.stringify(buildRaw({ decoder: 'authored-flip-both' })));
+      writeFileSync(args.trained, JSON.stringify(buildTrainedRaw()));
+      writeTrainedReadoutManifest(args.trainedReadoutManifest);
+      const variantOut = join(root, 'variant-authored-flip-both-summary.json');
+      const result = runNullReport({ ...args, variantOut });
+      expect(result.artifact.trained).toBeUndefined();
+      const written = JSON.parse(readFileSync(variantOut, 'utf8')) as { trained?: unknown };
+      expect(written.trained).toBeUndefined();
+    });
+  });
+
+  describe('raw.decoder validation', () => {
+    it('treats a missing decoder field as authored (backward compatibility with pre-WP1 authored.json)', () => {
+      const { decoder: _decoder, ...raw } = buildRaw();
+      writeFileSync(authoredPath, JSON.stringify(raw));
+      const result = runNullReport(args);
+      expect(result.artifact.condition).toBe('authored, opponent parked');
+    });
+
+    it('treats an explicit null decoder as authored', () => {
+      const raw = { ...buildRaw(), decoder: null };
+      writeFileSync(authoredPath, JSON.stringify(raw));
+      const result = runNullReport(args);
+      expect(result.artifact.condition).toBe('authored, opponent parked');
+    });
+
+    it('throws on an unrecognized decoder value rather than producing a variant with no condition', () => {
+      const raw = { ...buildRaw(), decoder: 'authored-flip-brake' };
+      writeFileSync(authoredPath, JSON.stringify(raw));
+      const variantOut = join(root, 'variant-bogus-summary.json');
+      expect(() => runNullReport({ ...args, variantOut })).toThrow(/unrecognized decoder/);
+    });
+
+    it('throws on an inherited-property decoder value (constructor/toString/__proto__) instead of silently resolving a condition off Object.prototype', () => {
+      // Regression test for a reviewer finding: `decoder in CONDITION_LABELS`
+      // walks the prototype chain, so a hand-edited "constructor" would have
+      // passed and CONDITION_LABELS['constructor'] would have been the
+      // Object constructor function -- JSON.stringify then silently drops it,
+      // producing exactly the "variant with no condition" outcome this check
+      // exists to prevent. Object.hasOwn fixes this.
+      for (const bogus of ['constructor', 'toString', '__proto__', 'hasOwnProperty']) {
+        const raw = { ...buildRaw(), decoder: bogus };
+        writeFileSync(authoredPath, JSON.stringify(raw));
+        const variantOut = join(root, `variant-${bogus.replace(/[^a-z]/gi, '')}-summary.json`);
+        expect(() => runNullReport({ ...args, variantOut })).toThrow(/unrecognized decoder/);
+      }
     });
   });
 });

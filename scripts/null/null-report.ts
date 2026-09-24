@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
-import { basename, dirname, resolve } from 'node:path';
+import { basename, dirname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { requireNonNegativeInt, requirePositiveInt, requireValue } from '../training/cli';
@@ -736,12 +736,63 @@ const verifySourceGraphMatchesManifest = (
   }
 };
 
+/**
+ * `--variant-out` is otherwise unconstrained (see `runNullReport`'s variant
+ * branch, which deliberately skips `guardShippedDefault`) -- without this
+ * check, `--variant-out public/data/rewiring-null-v1.json` (or the report
+ * markdown, the manifest, or even `--authored`'s own input file) would
+ * silently overwrite a shipped/input path with a decoder-variant artifact, a
+ * dual-review finding on this WP. `.json` is required for the same reason
+ * `--out`/`--authored` require it elsewhere in this module: a caller that
+ * strips a trailing `.json` for a sidecar path must never collide.
+ */
+const guardVariantOutPath = (variantOut: string, authoredPath: string): void => {
+  if (!variantOut.endsWith('.json')) {
+    throw new Error(`null-report: --variant-out must end with ".json" (got "${variantOut}")`);
+  }
+  const resolved = resolve(variantOut);
+  const forbidden: readonly [string, string][] = [
+    [DEFAULT_OUT, 'the shipped published artifact'],
+    [DEFAULT_REPORT_MD, 'the shipped report markdown'],
+    [DEFAULT_MANIFEST, 'the shipped manifest'],
+    [authoredPath, 'its own --authored input']
+  ];
+  for (const [path, label] of forbidden) {
+    if (resolved === resolve(path)) {
+      throw new Error(`null-report: --variant-out must not resolve to ${label} (${path})`);
+    }
+  }
+  // Named-path checks above only ever catch the specific shipped files this
+  // module itself knows about; `public/` and `docs/` both hold other
+  // tracked, shipped JSON this study doesn't touch (trained-readout-v1.json,
+  // the ledger, positions, lab-benchmark.json, ...) that a copy-pasted or
+  // typo'd path could still land on, and a named list would never keep up
+  // with future shipped files anyway (a reviewer finding). Block the whole
+  // tree instead.
+  for (const shippedDir of [resolve(repoRoot, 'public'), resolve(repoRoot, 'docs')]) {
+    if (resolved === shippedDir || resolved.startsWith(shippedDir + sep)) {
+      throw new Error(`null-report: --variant-out must not be under ${shippedDir} (a shipped tree)`);
+    }
+  }
+};
+
 export const runNullReport = (args: Readonly<NullReportArgs>): RunNullReportResult => {
   const raw = JSON.parse(readFileSync(args.authored, 'utf8')) as NullEvaluationRaw;
-  // Missing on any authored.json produced before this field existed (see
+  // Missing (or explicitly null, from a hand-edited/corrupted file) on any
+  // authored.json produced before this field existed (see
   // NullEvaluationRaw.decoder's doc comment) -- treated as 'authored', the
-  // only value every such file could ever have meant.
-  const decoder: NullDecoderKind = raw.decoder ?? 'authored';
+  // only value every such file could ever have meant. Anything else that
+  // isn't a recognized NullDecoderKind throws rather than silently producing
+  // a variant artifact with no `condition` (a dual-review finding).
+  const rawDecoder = raw.decoder as NullDecoderKind | null | undefined;
+  const decoder: NullDecoderKind = rawDecoder ?? 'authored';
+  // Object.hasOwn (not `in`, which walks the prototype chain) -- a
+  // hand-edited/corrupted authored.json with `"decoder": "toString"` or
+  // `"constructor"` must be rejected as unrecognized, not silently resolve
+  // to a function inherited from Object.prototype (a reviewer finding).
+  if (!Object.hasOwn(CONDITION_LABELS, decoder)) {
+    throw new Error(`null-report: ${args.authored} has an unrecognized decoder "${String(decoder)}"`);
+  }
   const condition = CONDITION_LABELS[decoder];
 
   // A new check alongside guardShippedDefault below (a dual-review-style
@@ -757,9 +808,29 @@ export const runNullReport = (args: Readonly<NullReportArgs>): RunNullReportResu
         'to a shipped path (public/data/rewiring-null-v1.json, docs/rewiring-null-report.md, or the manifest).'
     );
   }
+  if (args.variantOut) guardVariantOutPath(args.variantOut, args.authored);
 
   const runMeta = resolveRunMeta(args);
   const authoredArtifact = buildArtifact(raw, args, runMeta, condition);
+
+  // Variant mode: write only the built artifact to --variant-out, and never
+  // merge in a --trained section -- that section describes the *trained*
+  // decoder condition (a completely different, unrelated evaluation from
+  // WP3), never the authored-flip-* condition this summary is labelled
+  // with; merging it here would silently contaminate a decoder-convention
+  // variant summary with unrelated trained-readout data whenever a local
+  // trained.json happens to exist (a dual-review finding). Never touches
+  // --out/--report-md/--manifest -- no guardShippedDefault check, no
+  // manifest preflight/update, no report markdown, regardless of `decoder`
+  // (including 'authored', if a caller passes --variant-out anyway; see
+  // NullReportArgs.variantOut's doc comment).
+  if (args.variantOut) {
+    const artifactContents = JSON.stringify(authoredArtifact);
+    const artifactSha256 = sha256Hex(artifactContents);
+    mkdirSync(dirname(args.variantOut), { recursive: true });
+    atomicWriteFileSync(args.variantOut, artifactContents);
+    return { out: args.variantOut, artifactSha256, artifact: authoredArtifact };
+  }
 
   // `--trained` is optional: "Reads authored.json (and trained.json from
   // WP3 if present)" (02-authored-null-evaluation.md). When present, its
@@ -779,19 +850,6 @@ export const runNullReport = (args: Readonly<NullReportArgs>): RunNullReportResu
       raw.substeps
     );
     artifact = { ...authoredArtifact, trained: trainedSection };
-  }
-
-  // Variant mode: write only the built artifact to --variant-out. Never
-  // touches --out/--report-md/--manifest -- no guardShippedDefault check,
-  // no manifest preflight/update, no report markdown, regardless of
-  // `decoder` (including 'authored', if a caller passes --variant-out
-  // anyway; see NullReportArgs.variantOut's doc comment).
-  if (args.variantOut) {
-    const artifactContents = JSON.stringify(artifact);
-    const artifactSha256 = sha256Hex(artifactContents);
-    mkdirSync(dirname(args.variantOut), { recursive: true });
-    atomicWriteFileSync(args.variantOut, artifactContents);
-    return { out: args.variantOut, artifactSha256, artifact };
   }
 
   guardShippedDefault(args.out, DEFAULT_OUT, 'published artifact', artifact.rewired.length);

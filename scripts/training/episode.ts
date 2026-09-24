@@ -57,7 +57,8 @@ import {
  * training and by the headline evaluation conditions,
  * `.agents/plans/trained-readout/00-overview.md`'s "Opponent slot" row).
  * `authored`: the current shipped path, `aggregateOutputs` (inside
- * `runSubsteps`) -> `decodeAction`.
+ * `runLesionedSubsteps`, numerically identical to `runSubsteps` when no
+ * lesion is set) -> `decodeAction`.
  * `authored-flip-thrust`/`authored-flip-yaw`/`authored-flip-both`: the
  * authored family's decoder-convention-check variants
  * (`.agents/plans/null-explanation/01-decoder-variants.md` WP1) — identical

@@ -7,7 +7,14 @@ import { gunzipSync } from 'node:zlib';
 import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import { requireNonNegativeInt, requirePositiveInt, requireValue } from '../training/cli';
 import { atomicWriteFileSync, sha256Hex } from '../training/fsio';
-import type { NullDecoderKind, NullSeedResult, NullTaskMode, NullWorkerMessage, NullWorkerTask } from './null-worker';
+import {
+  NULL_DECODER_KINDS,
+  type NullDecoderKind,
+  type NullSeedResult,
+  type NullTaskMode,
+  type NullWorkerMessage,
+  type NullWorkerTask
+} from './null-worker';
 
 /**
  * `.agents/plans/rewiring-null/02-authored-null-evaluation.md`'s WP2 driver:
@@ -47,17 +54,11 @@ const DEFAULT_DECODER: NullDecoderKind = 'authored';
  * (`.agents/plans/null-explanation/01-decoder-variants.md` WP1). `trained`/
  * `silenced`/`parked` are never valid here: this evaluator always drives the
  * left agent through the authored path (with an optional sign flip) against
- * a parked opponent, matching `null-worker.ts`'s own `NullDecoderKind`.
+ * a parked opponent. Derived from `null-worker.ts`'s `NULL_DECODER_KINDS`,
+ * the single source of truth for the four kinds.
  */
-const NULL_EVALUATE_DECODERS: readonly NullDecoderKind[] = [
-  'authored',
-  'authored-flip-thrust',
-  'authored-flip-yaw',
-  'authored-flip-both'
-];
-
 const isNullDecoderKind = (value: string): value is NullDecoderKind =>
-  (NULL_EVALUATE_DECODERS as readonly string[]).includes(value);
+  (NULL_DECODER_KINDS as readonly string[]).includes(value);
 
 // ---------------------------------------------------------------------------
 // rewire_batch.py index.json
@@ -259,7 +260,7 @@ export const parseNullEvaluateArgs = (argv: readonly string[]): NullEvaluateArgs
     } else if (flag === '--decoder') {
       const value = requireValue(flag, argv[index + 1]);
       if (!isNullDecoderKind(value)) {
-        throw new Error(`--decoder must be one of ${NULL_EVALUATE_DECODERS.join(', ')} (got "${value}")`);
+        throw new Error(`--decoder must be one of ${NULL_DECODER_KINDS.join(', ')} (got "${value}")`);
       }
       decoder = value;
       index += 2;
@@ -316,7 +317,12 @@ export const parseNullEvaluateArgs = (argv: readonly string[]): NullEvaluateArgs
  * `sortedRewireSeeds(index)` narrowed to `args.rewiredSeeds`'s half-open
  * `[start, end)` range when given (see `NullEvaluateArgs.rewiredSeeds`'s doc
  * comment), otherwise every seed in the index — unchanged from before the
- * flag existed.
+ * flag existed. Throws if any seed in the requested range is missing from
+ * the index (a typo'd range, or a range wider than the index actually
+ * contains, must fail loudly rather than silently scoring fewer seeds than
+ * requested -- a dual-review finding: an earlier version let an empty or
+ * partial match through silently, which for an empty match also drove
+ * `runCliMain`'s per-episode-ms summary to `Infinity`/`NaN`).
  */
 const selectedRewireSeeds = (
   index: Readonly<RewireIndex>,
@@ -325,7 +331,29 @@ const selectedRewireSeeds = (
   const seeds = sortedRewireSeeds(index);
   if (!args.rewiredSeeds) return seeds;
   const { start, end } = args.rewiredSeeds;
-  return seeds.filter((entry) => entry.seed >= start && entry.seed < end);
+  const selected = seeds.filter((entry) => entry.seed >= start && entry.seed < end);
+  const expectedCount = end - start;
+  if (selected.length !== expectedCount) {
+    // Sample-and-count rather than materializing every missing seed: a
+    // pathological range (e.g. a typo'd `--rewired-seeds 0:99999999999`)
+    // must fail fast, not hang or exhaust memory scanning billions of
+    // integers (a reviewer finding). `missingCount` is exact (arithmetic,
+    // not scan-dependent); the listed sample is capped and may be partial.
+    const foundSeeds = new Set(selected.map((entry) => entry.seed));
+    const missingCount = expectedCount - selected.length;
+    const SAMPLE_LIMIT = 10;
+    const SCAN_LIMIT = 1_000_000;
+    const sample: number[] = [];
+    for (let seed = start; seed < end && sample.length < SAMPLE_LIMIT && seed - start < SCAN_LIMIT; seed += 1) {
+      if (!foundSeeds.has(seed)) sample.push(seed);
+    }
+    const sampleText = sample.length < missingCount ? `${sample.join(', ')}, ...` : sample.join(', ');
+    throw new Error(
+      `null-evaluate: --rewired-seeds ${start}:${end} requested ${expectedCount} seed(s), but the index is ` +
+        `missing ${missingCount}: ${sampleText}`
+    );
+  }
+  return selected;
 };
 
 export const buildTasks = (
@@ -668,9 +696,33 @@ export const runMetaPathFor = (source: string, outPath: string): string => {
   return `${outPath.slice(0, -'.json'.length)}.run.json`;
 };
 
+/**
+ * `DEFAULT_OUT` (`training/runs/null/authored.json`) is the canonical,
+ * hours-long, full-index authored run -- not shipped, but still the single
+ * input every other WP1/WP2/WP3 script and the reproduction gate itself
+ * reads by default. A non-canonical run (a decoder variant, or a
+ * `--rewired-seeds`-restricted subset such as the reproduction gate's own
+ * `--rewired-seeds 0:5 --decoder authored`) must never silently overwrite it
+ * just because the caller forgot an explicit `--out` -- a dual-review
+ * finding: the plan's own reproduction-gate example command omits `--out`.
+ * Checked before any file is read or any shard forked.
+ */
+const guardCanonicalOutDefault = (args: Readonly<NullEvaluateArgs>): void => {
+  const isNonCanonical = args.decoder !== 'authored' || args.rewiredSeeds !== undefined;
+  if (isNonCanonical && resolve(args.out) === resolve(DEFAULT_OUT)) {
+    throw new Error(
+      `null-evaluate: refusing to write a non-canonical run (decoder="${args.decoder}"` +
+        `${args.rewiredSeeds ? `, --rewired-seeds ${args.rewiredSeeds.start}:${args.rewiredSeeds.end}` : ''}) ` +
+        `to the default --out (${DEFAULT_OUT}) -- that path is the canonical full-index authored run every other ` +
+        'script reads by default. Pass an explicit --out for this run.'
+    );
+  }
+};
+
 export const runNullEvaluate = async (
   args: Readonly<NullEvaluateArgs>
 ): Promise<{ out: string; runMetaOut: string; taskCount: number; elapsedMs: number }> => {
+  guardCanonicalOutDefault(args);
   const index = readRewireIndex(args.rewiredIndex);
   verifyRewiredFiles(index, args.graphsDir);
 
