@@ -207,7 +207,7 @@ describe('loadRewiringNull (shape validation, with a synthetic manifest sha256 t
     if (result.status === 'invalid') expect(result.reason).toMatch(/\[0, 1\]/);
   });
 
-  it('is "invalid" when null.n, rewired.length, and sum(bins.counts) disagree', async () => {
+  it('is "invalid" when null.n disagrees with rewired.length', async () => {
     const { manifest: manifestForBody } = manifestServing({
       ...validArtifact,
       null: { ...validArtifact.null, n: 5 }
@@ -215,6 +215,23 @@ describe('loadRewiringNull (shape validation, with a synthetic manifest sha256 t
     const result = await loadRewiringNull(manifestForBody, '/data');
     expect(result.status).toBe('invalid');
     if (result.status === 'invalid') expect(result.reason).toMatch(/counts disagree/);
+  });
+
+  // Round-2 dual review (guardian S1, confirmed by mutation testing): the
+  // test above only varies `null.n`, so it alone left `sum(bins.counts) !==
+  // rewired.length` unexercised — deleting that half of the `||` still
+  // passed every other test. `bins.counts` here sums to 2 while `null.n`
+  // and `rewired.length` still agree with each other at 1, isolating this
+  // specific clause. `null-report.ts`'s own history records exactly this
+  // failure mode (a bin total that drifted from the graph count).
+  it('is "invalid" when sum(bins.counts) disagrees with null.n/rewired.length even though those two agree with each other', async () => {
+    const { manifest: manifestForBody } = manifestServing({
+      ...validArtifact,
+      bins: { edges: [-2, 0, 2], counts: [1, 1] }
+    });
+    const result = await loadRewiringNull(manifestForBody, '/data');
+    expect(result.status).toBe('invalid');
+    if (result.status === 'invalid') expect(result.reason).toMatch(/sum\(bins\.counts\)=2/);
   });
 
   it('is "invalid" when a marker score (biological) falls outside the histogram bin domain', async () => {

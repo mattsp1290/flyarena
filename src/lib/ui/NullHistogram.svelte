@@ -55,10 +55,13 @@
   const domainSpan = $derived(Math.max(domainMax - domainMin, 1e-9));
 
   // Clamped to the plot's own domain (dual review, Important): the loader
-  // already rejects a marker score outside `[domainMin, domainMax]`, but
-  // clamping here too means a bar's own rounding at the domain edge can
-  // never place a coordinate outside the viewBox, where it would render
-  // invisibly while its legend entry still claims it is shown.
+  // already rejects a *marker* score outside `[domainMin, domainMax]` (bars
+  // are built straight from `edges` and are always in-domain by
+  // construction, so this backstop is really for markers). This is
+  // defense-in-depth for a caller that ever passes unverified `data`
+  // directly, not the primary guard — without it, an out-of-domain marker
+  // would render invisibly outside the viewBox while its legend entry still
+  // claims it is shown.
   const xForValue = (value: number): number =>
     PADDING.left + Math.min(1, Math.max(0, (value - domainMin) / domainSpan)) * PLOT_WIDTH;
 
@@ -204,9 +207,15 @@
   </ul>
 
   {#if data.null.degenerate}
+    <!-- Placed before the figcaption, so "the percentile below" (not
+         "above") is the accurate direction — round-2 dual review. Says "the
+         score" rather than naming a specific decoder, matching the same
+         data-driven approach `captionSentence` above takes for `condition`:
+         hardcoding a decoder name here would risk silently contradicting
+         the figcaption on a future run under a different condition. -->
     <p class="degenerate-note">
-      This null distribution is degenerate (its interquartile range is effectively zero): the authored decoder's
-      score barely varies across rewirings, so the percentile above is not very informative. See the full report.
+      This null distribution is degenerate (its interquartile range is effectively zero): the score barely varies
+      across rewirings, so the percentile below is not very informative. See the full report.
     </p>
   {/if}
 

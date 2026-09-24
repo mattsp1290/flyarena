@@ -246,6 +246,62 @@ describe('ExperimentController rewiring-null loading (WP4)', () => {
     expect(callbacks.rewiringNullResults).toHaveLength(1);
     expect(callbacks.rewiringNullResults[0]).toEqual({ status: 'missing', reason: 'stubbed for this test' });
   });
+
+  /**
+   * Round-2 dual review (cartographer S1): the leading `.catch` in
+   * `initialize()`'s `loadNull(...).catch(...).then(...)` chain had no
+   * regression coverage — every existing test's injected loader either
+   * resolves or never resolves, so a version of `controller.ts` with that
+   * `.catch` deleted would still pass them all.
+   */
+  it('maps a rejecting loadRewiringNull to an "invalid" onRewiringNull result instead of an unhandled rejection', async () => {
+    const callbacks = createCallbacks();
+    const controller = new ExperimentController({
+      seed: SEED,
+      totalTicks: TOTAL_TICKS,
+      initialTopology: { left: 'biological', right: 'rewired' },
+      createWorker,
+      callbacks,
+      loadRewiringNull: async () => {
+        throw new Error('boom');
+      }
+    });
+    trackController(controller);
+
+    await controller.initialize();
+
+    expect(callbacks.rewiringNullResults).toHaveLength(1);
+    const result = callbacks.rewiringNullResults[0];
+    expect(result.status).toBe('invalid');
+    if (result.status === 'invalid') expect(result.reason).toMatch(/unexpected error.*boom/);
+  });
+
+  /**
+   * The trailing `.catch` guards the opposite direction: `onRewiringNull`
+   * (host code, e.g. `App.svelte`) throwing instead of the loader.
+   */
+  it('routes a throwing onRewiringNull callback to onError instead of an unhandled rejection', async () => {
+    const callbacks = createCallbacks();
+    callbacks.onRewiringNull = () => {
+      throw new Error('host callback boom');
+    };
+    const controller = new ExperimentController({
+      seed: SEED,
+      totalTicks: TOTAL_TICKS,
+      initialTopology: { left: 'biological', right: 'rewired' },
+      createWorker,
+      callbacks,
+      loadRewiringNull: async () => ({ status: 'missing', reason: 'stubbed for this test' })
+    });
+    trackController(controller);
+
+    await controller.initialize();
+    // Let the rejected promise from the throwing callback settle.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(callbacks.errors.some((message) => message.includes('host callback boom'))).toBe(true);
+  });
 });
 
 describe('ExperimentController#changeTopology', () => {

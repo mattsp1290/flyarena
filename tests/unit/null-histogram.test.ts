@@ -98,6 +98,17 @@ describe('NullHistogram', () => {
     );
   });
 
+  // Round-2 dual review (guardian S6): the test above uses `seeds.count:
+  // 100`, the exact value an earlier version hardcoded — a regression back
+  // to "100 held-out seeds" would still pass it. This asserts a different
+  // count actually appears, closing that gap.
+  it('renders a seeds.count other than 100 in the caption (regression coverage for the earlier hardcoded value)', () => {
+    const { container } = render(NullHistogram, { data: { ...fixture, seeds: { ...fixture.seeds, count: 7 } } });
+    const figcaption = container.querySelector('figcaption');
+    expect(figcaption).toHaveTextContent('7 held-out seeds');
+    expect(figcaption).not.toHaveTextContent('100 held-out seeds');
+  });
+
   it('formats a nonzero percentile correctly', () => {
     const { container } = render(NullHistogram, { data: { ...fixture, bioPercentile: 0.337 } });
     const figcaption = container.querySelector('figcaption');
@@ -171,5 +182,33 @@ describe('NullHistogram', () => {
       expect(x1).toBeGreaterThanOrEqual(0);
       expect(x1).toBeLessThanOrEqual(WIDTH);
     }
+  });
+
+  /**
+   * Round-2 dual review (guardian S2, confirmed by mutation testing): the
+   * test above sets every marker's score exactly equal to `domainMin` (a
+   * zero-width domain), so `(value - domainMin) / domainSpan` is always `0`
+   * and the clamp never actually has anything to clamp — deleting the
+   * `Math.min(1, Math.max(0, …))` clamp still passed every test. This test
+   * uses a genuinely non-zero domain with a marker score outside it (the
+   * loader rejects this in production; this exercises the component's own
+   * defensive backstop directly, per its doc comment), and asserts the
+   * clamped coordinate lands exactly on the plot's edge, not beyond it.
+   */
+  it('clamps an out-of-domain marker score to the plot edge instead of drawing it outside the viewBox', () => {
+    const PADDING_LEFT = 10;
+    const WIDTH = 320;
+    const PADDING_RIGHT = 10;
+    const outOfDomain: RewiringNullArtifact = {
+      ...fixture,
+      biological: { ...fixture.biological, score: -99 }, // below bins.edges[0] = -2
+      disconnected: { ...fixture.disconnected, score: 99 } // above bins.edges[last] = 4
+    };
+    const { container } = render(NullHistogram, { data: outOfDomain });
+    const lines = Array.from(container.querySelectorAll('svg:not(.swatch) > line.marker'));
+    const biologicalLine = lines[0]; // `markers` orders biological first.
+    const disconnectedLine = lines[lines.length - 1]; // disconnected last.
+    expect(Number(biologicalLine.getAttribute('x1'))).toBe(PADDING_LEFT);
+    expect(Number(disconnectedLine.getAttribute('x1'))).toBe(WIDTH - PADDING_RIGHT);
   });
 });

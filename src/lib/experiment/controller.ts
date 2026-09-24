@@ -346,7 +346,17 @@ export class ExperimentController {
     // `onRewiringNull` is host code (`App.svelte`), and a throw there would
     // otherwise also become an unhandled rejection with no error reported
     // anywhere.
-    void loadNull(artifacts.manifest, dataBaseUrl)
+    // `Promise.resolve().then(...)` rather than calling `loadNull` directly:
+    // the production `loadRewiringNull` is `async` and can never throw
+    // synchronously, but `loadNull` here can also be a test-injected
+    // `ExperimentControllerOptions.loadRewiringNull` double, which is only
+    // typed as returning a `Promise` — nothing stops a non-async double from
+    // throwing before it ever produces one. Without this wrapper, that throw
+    // would propagate out of `initialize()` synchronously, after `onManifest`
+    // has already fired, bypassing both `.catch`es below entirely (round-2
+    // dual review, Suggestion).
+    void Promise.resolve()
+      .then(() => loadNull(artifacts.manifest, dataBaseUrl))
       .catch(
         (error: unknown): RewiringNullLoadResult => ({
           status: 'invalid',

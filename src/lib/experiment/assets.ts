@@ -722,9 +722,11 @@ export const loadTrainedReadoutArtifact = async (dataBaseUrl = '/data'): Promise
  * exist yet — deliberately typed `unknown` rather than a guessed shape:
  * `null-report.ts`'s `trained` section had not landed as of this WP, so any
  * hand-authored field list here would be unverified against a real
- * producer. `NullHistogram.svelte` narrows it defensively at render time and
- * renders nothing extra when it is absent or does not look like the shape
- * it expects — this artifact's own validation below never depends on it.
+ * producer. `NullHistogram.svelte` does not render anything from it at all
+ * in this WP (round-2 dual review: an earlier version guessed at its shape
+ * and rendered a strip from it, which was removed) — this artifact's own
+ * validation below never depends on it either. Rendering `trained` belongs
+ * to WP3, against `null-report.ts`'s real output.
  */
 export interface RewiringNullScoreStats {
   score: number;
@@ -786,7 +788,7 @@ export type RewiringNullLoadResult =
   | { status: 'missing'; reason: string }
   | { status: 'invalid'; reason: string };
 
-/** Exported so `NullHistogram.svelte` can reuse the exact same guard instead of re-declaring its own (dual review: two copies of the same one-line predicate could silently drift apart). */
+/** Exported as a small, reusable guard for any future caller that needs the same one-line predicate (round-2 dual review: the doc comment previously claimed `NullHistogram.svelte` imports this, but its own local copy — used for a since-removed `trained`-section narrowing — was deleted outright rather than replaced with this import). */
 export const isFiniteNumber = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
 
 const isPositiveInteger = (value: unknown): value is number => Number.isInteger(value) && (value as number) > 0;
