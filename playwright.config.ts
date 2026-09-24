@@ -8,7 +8,10 @@ import { defineConfig } from '@playwright/test';
 // (`dist`/`dist-fly`) so the two webServers never race on the same output
 // directory. This is the regression coverage for the root-absolute-asset-URL
 // bug (`src/lib/paths.ts`): CI never caught it before because every existing
-// build/preview here used the default root base.
+// build/preview here used the default root base. Any non-root base exercises
+// this bug class equally well; `/fly/` here just mirrors `scripts/deploy.sh`'s
+// default `DEPLOY_BASE` for familiarity — it does not need to stay in sync
+// with a future `DEPLOY_BASE` change for this coverage to remain valid.
 const ROOT_BASE_URL = 'http://127.0.0.1:4173';
 const FLY_BASE_URL = 'http://127.0.0.1:4174/fly/';
 
@@ -47,22 +50,27 @@ export default defineConfig({
     trace: process.env.CI ? 'retain-on-failure' : 'off',
     screenshot: process.env.CI ? 'only-on-failure' : 'off'
   },
-  // Each project owns its own `baseURL` and is scoped (via `testMatch`) to
-  // the one spec file that targets it, so the full `arena.spec.ts` suite
-  // never runs twice — `fly-base.spec.ts` only re-covers the base-path-
-  // sensitive slice (asset load -> ready -> Start -> running, and the
-  // ledger's provenance links) against the non-root build, keeping the
-  // added CI time small. `workers: 1` in CI (above) serializes both
+  // Each project owns its own `baseURL`. `fly-base` is scoped (via
+  // `testMatch`) to just `fly-base.spec.ts` — it only re-covers the
+  // base-path-sensitive slice (asset load -> ready -> Start -> running, and
+  // the ledger's provenance links) against the non-root build, keeping the
+  // added CI time small. `root-base` deliberately uses `testIgnore` rather
+  // than a `testMatch` allowlist (a dual review pass caught that a `arena.
+  // spec.ts`-only `testMatch` here would make any *future* spec file added
+  // under `tests/e2e/` match neither project and silently never run,
+  // anywhere, with no warning): every spec except `fly-base.spec.ts` keeps
+  // running under `root-base` by default, the same as before this file had
+  // more than one project. `workers: 1` in CI (above) serializes both
   // projects' tests, so they still never contend with each other for CPU.
   projects: [
     {
       name: 'root-base',
-      testMatch: /arena\.spec\.ts/,
+      testIgnore: /fly-base\.spec\.ts$/,
       use: { baseURL: ROOT_BASE_URL }
     },
     {
       name: 'fly-base',
-      testMatch: /fly-base\.spec\.ts/,
+      testMatch: /fly-base\.spec\.ts$/,
       use: { baseURL: FLY_BASE_URL }
     }
   ],

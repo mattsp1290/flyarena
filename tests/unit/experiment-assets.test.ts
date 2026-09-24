@@ -45,6 +45,7 @@ const manifest = JSON.parse(
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
 });
 
 describe('sha256Hex / decompressGzip (real artifact bytes)', () => {
@@ -110,16 +111,31 @@ describe('verifyAndDecompressArtifact', () => {
 });
 
 describe('loadArenaArtifacts (fetch -> gunzip -> hash-verify, against real committed files)', () => {
-  it('resolves its default dataBaseUrl from the Vite base path (publicAssetUrl(\'data\')) rather than a hard-coded "/data"', async () => {
-    // Regression coverage for the root-absolute-URL bug: under a non-root
-    // deployment base (e.g. `/fly/`) a literal '/data' default would fetch
-    // from the origin root and 404. This asserts the *default* argument
-    // (no explicit dataBaseUrl passed) still resolves correctly under the
-    // '/' base Vitest/jsdom provides — `tests/unit/paths.test.ts` covers
-    // the helper's own behavior under a non-root base directly.
-    vi.stubGlobal('fetch', createPublicDataFetch());
+  it('resolves its default dataBaseUrl from the Vite base path, not a hard-coded "/data" (regression: under a non-root deployment base a literal default 404s at the origin root)', async () => {
+    // A review pass caught that asserting this only under Vitest's own root
+    // base ('/') would pass identically whether or not the fix was actually
+    // applied — `publicAssetUrl('data')` and the old hard-coded '/data'
+    // default are indistinguishable at '/'. `vi.stubEnv` also stubs
+    // `import.meta.env` (confirmed directly against `src/lib/paths.ts`'s own
+    // suite, `tests/unit/paths.test.ts`), so this stubs a non-root base and
+    // asserts every fetched URL actually carries it — the one version of
+    // this test that would fail if the default ever regressed back to a
+    // hard-coded '/data'.
+    vi.stubEnv('BASE_URL', '/fly/');
+    const requestedUrls: string[] = [];
+    const dataFetch = createPublicDataFetch();
+    vi.stubGlobal('fetch', (input: RequestInfo | URL) => {
+      requestedUrls.push(typeof input === 'string' ? input : input.toString());
+      return dataFetch(input);
+    });
+
     const artifacts = await loadArenaArtifacts();
     expect(artifacts.manifest.neuronCount).toBe(manifest.neuronCount);
+
+    expect(requestedUrls.length).toBeGreaterThanOrEqual(3); // manifest + biological + rewired artifacts
+    for (const url of requestedUrls) {
+      expect(url).toMatch(/^\/fly\/data\//);
+    }
   });
 
   it('loads and verifies both arms via a fetch stand-in that serves the real public/data files', async () => {

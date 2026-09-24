@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { publicAssetUrl } from '../../src/lib/paths';
 
 /**
@@ -37,5 +37,26 @@ describe('publicAssetUrl', () => {
 
   it('defaults to import.meta.env.BASE_URL when no base is given (\'/\' under Vitest/jsdom)', () => {
     expect(publicAssetUrl('data')).toBe('/data');
+  });
+
+  describe('default base argument tracks import.meta.env.BASE_URL', () => {
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    // A review pass caught that the two tests above ("defaults to
+    // import.meta.env.BASE_URL...") only ever exercise Vitest's own root
+    // base ('/'), which is indistinguishable from the pre-fix hard-coded
+    // '/data' default — they'd still pass on a reverted, buggy
+    // implementation. `vi.stubEnv` (Vitest also special-cases
+    // `import.meta.env`, not just `process.env` — confirmed directly here)
+    // actually changes what the default argument resolves to, so this is
+    // the one test in this file that would fail if `publicAssetUrl` ever
+    // stopped reading `import.meta.env.BASE_URL` for its default.
+    it('resolves against a stubbed non-root BASE_URL when no base argument is given', () => {
+      vi.stubEnv('BASE_URL', '/fly/');
+      expect(publicAssetUrl('data')).toBe('/fly/data');
+      expect(publicAssetUrl('data/malecns-arena-v1.manifest.json')).toBe('/fly/data/malecns-arena-v1.manifest.json');
+    });
   });
 });

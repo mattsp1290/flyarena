@@ -15,8 +15,8 @@ import { expect, test, type Page } from '@playwright/test';
  * This spec runs the same asset-load-to-running path and the ledger's
  * provenance links against a *second* build/preview
  * (`npm run build:fly`/`preview:fly`, wired as the `fly-base` Playwright
- * project in `playwright.config.ts`) served at `http://127.0.0.1:4174/fly/`.
- * It's deliberately a small slice of `arena.spec.ts`'s full coverage, not a
+ * project in `playwright.config.ts`) served under `/fly/`. It's
+ * deliberately a small slice of `arena.spec.ts`'s full coverage, not a
  * duplicate of the whole suite — the base path only affects the handful of
  * asset-URL call sites `src/lib/paths.ts#publicAssetUrl` now funnels
  * through, not per-tick simulation behavior, which `arena.spec.ts` already
@@ -30,30 +30,44 @@ const waitForReady = (page: Page): Promise<void> =>
   expect(statusRegion(page)).toHaveText('ready', { timeout: 20_000 });
 
 /**
- * Navigates to this project's `baseURL` (`http://127.0.0.1:4174/fly/`)
- * itself, not a sibling path under it. This is deliberately `page.goto('')`
- * rather than the `page.goto('/')` every other spec in this suite uses:
- * Playwright resolves a relative navigation via the WHATWG `URL`
- * constructor, and a leading `/` is an *absolute-path* reference that
- * replaces baseURL's own path entirely — `new URL('/', 'http://h/fly/')` is
- * `http://h/`, silently dropping back to the origin root and defeating the
- * whole point of this spec. An empty string is not an absolute-path
- * reference, so it resolves to baseURL unchanged:
- * `new URL('', 'http://h/fly/')` is `http://h/fly/`.
+ * Navigates to this project's own `baseURL` (`use.baseURL` in
+ * `playwright.config.ts`'s `fly-base` project) itself, not a sibling path
+ * under it. This is deliberately `page.goto('')` rather than the
+ * `page.goto('/')` every other spec in this suite uses: Playwright resolves
+ * a relative navigation via the WHATWG `URL` constructor, and a leading `/`
+ * is an *absolute-path* reference that replaces `baseURL`'s own path
+ * entirely — `new URL('/', 'http://h/fly/')` is `http://h/`, dropping back
+ * to the origin root.
+ *
+ * `vite preview --base /fly/` (this spec's own dev/test server) happens to
+ * 302-redirect a bare `GET /` to `/fly/` — confirmed directly by curling it
+ * — so `page.goto('/')` would still *land* on the right page here even
+ * after that URL-resolution mistake, silently hiding the bug from this
+ * test. Production's Apache config (`.agents/deployment.md`) has no such
+ * redirect: it only redirects the exact path `/fly` (no trailing slash) to
+ * `/fly/`, never `/` to `/fly/`. `page.goto('')` avoids relying on this
+ * server's redirect at all, and the `toHaveURL` assertion right after every
+ * call below pins the actual landing URL so a future regression here fails
+ * loudly instead of silently passing via that redirect.
  */
-const gotoFlyBase = (page: Page): Promise<unknown> => page.goto('');
+const gotoFlyBase = async (page: Page, baseURL: string): Promise<void> => {
+  await page.goto('');
+  await expect(page).toHaveURL(baseURL);
+};
 
 test.describe('non-root deployment base (/fly/)', () => {
   test('asset load -> ready -> Start -> running, with every /data request served under /fly/data/', async ({
-    page
+    page,
+    baseURL
   }) => {
+    if (!baseURL) throw new Error('fly-base project must configure use.baseURL');
     const dataRequestUrls: string[] = [];
     page.on('request', (request) => {
       const url = request.url();
       if (url.includes('/data/')) dataRequestUrls.push(url);
     });
 
-    await gotoFlyBase(page);
+    await gotoFlyBase(page, baseURL);
     await waitForReady(page);
     await expect(startOrResumeButton(page)).toBeEnabled();
     await expect(startOrResumeButton(page)).toHaveText('Start');
@@ -61,26 +75,45 @@ test.describe('non-root deployment base (/fly/)', () => {
     await startOrResumeButton(page).click();
     await expect(statusRegion(page)).toHaveText('running');
 
-    // The manifest and both compressed graph artifacts must all have been
-    // fetched to get this far — assert every one of those requests actually
-    // went to `/fly/data/...`, not `/data/...` at the origin root.
-    expect(dataRequestUrls.length).toBeGreaterThanOrEqual(3);
+    // `loadArenaArtifacts` fetches exactly these three files (the manifest,
+    // then the two compressed graph artifacts it names) and nothing else —
+    // assert the exact set (not just a lower-bound count) so a future
+    // refactor that drops or duplicates one of them is caught here, and
+    // that every one of those requests actually went under this project's
+    // own `/fly/data/...` base, not `/data/...` at the origin root.
+    const requestedFilenames = dataRequestUrls.map((url) => new URL(url).pathname.split('/').pop()).sort();
+    expect(requestedFilenames).toEqual(
+      ['malecns-arena-v1-rewired-seed0.bin.gz', 'malecns-arena-v1.bin.gz', 'malecns-arena-v1.manifest.json'].sort()
+    );
     for (const url of dataRequestUrls) {
-      expect(url).toMatch(/^http:\/\/127\.0\.0\.1:4174\/fly\/data\//);
+      expect(url.startsWith(`${baseURL}data/`), url).toBe(true);
     }
   });
 
-  test('ledger provenance links point at /fly/data/, not the origin root', async ({ page }) => {
-    await gotoFlyBase(page);
+  test('ledger provenance links point at /fly/data/ and actually resolve there, not the origin root', async ({
+    page,
+    baseURL
+  }) => {
+    if (!baseURL) throw new Error('fly-base project must configure use.baseURL');
+    await gotoFlyBase(page, baseURL);
     await waitForReady(page);
 
-    await expect(page.getByRole('link', { name: 'Compiled artifact manifest (JSON)' })).toHaveAttribute(
-      'href',
-      '/fly/data/malecns-arena-v1.manifest.json'
-    );
-    await expect(page.getByRole('link', { name: 'Compiler ledger (JSON)' })).toHaveAttribute(
-      'href',
-      '/fly/data/malecns-arena-v1.ledger.json'
-    );
+    // Derived from `baseURL` (e.g. '/fly/') rather than a hard-coded
+    // '/fly/data/...' literal, so this stays correct if the project's base
+    // path ever changes without needing a matching edit here.
+    const basePath = new URL(baseURL).pathname;
+    const manifestLink = page.getByRole('link', { name: 'Compiled artifact manifest (JSON)' });
+    const ledgerLink = page.getByRole('link', { name: 'Compiler ledger (JSON)' });
+    await expect(manifestLink).toHaveAttribute('href', `${basePath}data/malecns-arena-v1.manifest.json`);
+    await expect(ledgerLink).toHaveAttribute('href', `${basePath}data/malecns-arena-v1.ledger.json`);
+
+    // The `href` string alone doesn't prove the file is actually served
+    // there — neither the app nor any other test in this spec ever fetches
+    // the ledger JSON. Follow both links for real.
+    for (const link of [manifestLink, ledgerLink]) {
+      const href = await link.getAttribute('href');
+      const response = await page.request.get(new URL(href!, baseURL).href);
+      expect(response.status(), href!).toBe(200);
+    }
   });
 });
