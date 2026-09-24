@@ -283,13 +283,31 @@ export const buildTasks = (
 const execArgvForChildren = (): string[] => process.execArgv.filter((flag) => !flag.startsWith('--inspect'));
 
 /**
- * Fork `shardCount` copies of `null-worker.ts`, hand each one tasks one at
- * a time (a worker that finishes gets the next queued task, so a slow
- * biological/disconnected task never blocks idle shards), and collect
- * every task's raw results keyed by `graphId`. Deterministic regardless of
- * which shard executes which task or in what order: the caller reassembles
- * output by iterating `tasks` (the canonical, seed-sorted order), not by
- * collection order.
+ * Fork `shardCount` copies of a worker script (`null-worker.ts` for this
+ * module's own callers; `null-trained-evaluate.ts` reuses this same
+ * function with `null-trained-worker.ts` — see that file), hand each one
+ * tasks one at a time (a worker that finishes gets the next queued task, so
+ * a slow biological/disconnected task never blocks idle shards), and
+ * collect every task's raw results keyed by `graphId`. Deterministic
+ * regardless of which shard executes which task or in what order: the
+ * caller reassembles output by iterating `tasks` (the canonical, seed-sorted
+ * order), not by collection order.
+ *
+ * Generic over the task/result/message shapes so `null-trained-evaluate.ts`
+ * (WP3) can reuse this exact sharding/failure-handling mechanism against its
+ * own worker protocol (weights-bearing tasks, not gzip-graph-bearing ones)
+ * without a second, drifting copy of it — the only structural requirements
+ * are that every task carries a `graphId` and the `heldOutSeeds` it was
+ * assigned, and every result carries the `seed` it was scored on, so this
+ * function can still verify a worker's reply matches what it was asked to
+ * do (see the self-checking protocol below). Every call site pins all three
+ * type parameters explicitly (TypeScript can't infer `Result`/`Message` from
+ * `tasks` alone, since neither appears in an argument position, and a
+ * default for `Message` can't itself reference `Result`'s default — TS
+ * checks default type-argument expressions against the *unsubstituted*
+ * constraint, not other parameters' defaults). This module's own
+ * `runNullEvaluate` pins `<NullWorkerTask, NullSeedResult, NullWorkerMessage>`;
+ * `null-trained-evaluate.ts` (WP3) pins its own equivalent types.
  *
  * Failure handling (a dual-review pass caught two real gaps in an earlier
  * version): the moment *any* task reports an error, or any child exits
@@ -303,12 +321,18 @@ const execArgvForChildren = (): string[] => process.execArgv.filter((flag) => !f
  * single source of truth for failure, so a killed sibling's own `exit`
  * event never itself throws — only the thing that caused the abort does.
  */
-export const runShardedEvaluation = async (
-  tasks: readonly NullWorkerTask[],
+export const runShardedEvaluation = async <
+  Task extends { readonly graphId: string; readonly heldOutSeeds: readonly number[] },
+  Result extends { readonly seed: number },
+  Message extends
+    | { readonly type: 'result'; readonly graphId: string; readonly results: readonly Result[] }
+    | { readonly type: 'error'; readonly graphId: string; readonly message: string }
+>(
+  tasks: readonly Task[],
   shardCount: number,
   workerPath: string
-): Promise<Map<string, readonly NullSeedResult[]>> => {
-  const results = new Map<string, readonly NullSeedResult[]>();
+): Promise<Map<string, readonly Result[]>> => {
+  const results = new Map<string, readonly Result[]>();
   const errors: string[] = [];
   const children = new Set<ReturnType<typeof fork>>();
   let nextTaskIndex = 0;
@@ -324,7 +348,7 @@ export const runShardedEvaluation = async (
       const child = fork(workerPath, [], { execArgv: execArgvForChildren() });
       children.add(child);
       let settled = false;
-      let inFlight: NullWorkerTask | undefined;
+      let inFlight: Task | undefined;
 
       const finish = (): void => {
         if (settled) return;
@@ -344,7 +368,7 @@ export const runShardedEvaluation = async (
         child.send(task);
       };
 
-      child.on('message', (message: NullWorkerMessage) => {
+      child.on('message', (message: Message) => {
         const expectedTask = inFlight;
         inFlight = undefined;
         // Self-checking protocol: a worker replying about a task this
@@ -545,7 +569,11 @@ export const runNullEvaluate = async (
   const workerPath = fileURLToPath(new URL('./null-worker.ts', import.meta.url));
 
   const started = performance.now();
-  const results = await runShardedEvaluation(tasks, args.shards, workerPath);
+  const results = await runShardedEvaluation<NullWorkerTask, NullSeedResult, NullWorkerMessage>(
+    tasks,
+    args.shards,
+    workerPath
+  );
   const elapsedMs = performance.now() - started;
   const perEpisodeMs = elapsedMs / (tasks.length * args.heldOutCount);
 

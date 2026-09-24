@@ -14,7 +14,7 @@ import { encodeGraphBinary } from '../../src/lib/connectome/format';
 import { createTraceGraph } from '../fixtures/trace-graph';
 import { createFixtureRewiredTraceGraph } from '../fixtures/trace-graph-rewire';
 import { parseNullEvaluateArgs, readRewireIndex, runShardedEvaluation } from '../../scripts/null/null-evaluate';
-import type { NullWorkerTask } from '../../scripts/null/null-worker';
+import type { NullSeedResult, NullWorkerMessage, NullWorkerTask } from '../../scripts/null/null-worker';
 
 /**
  * Coverage for `scripts/null/null-evaluate.ts`. Two halves:
@@ -352,7 +352,11 @@ describe('runShardedEvaluation: failure/abort paths (stub worker)', () => {
   it('collects every result regardless of which shard finishes which task first', async () => {
     // Reverse-order completion: task 0 is slowest, task 4 is fastest.
     const tasks = [0, 1, 2, 3, 4].map((i) => task(`t${i}`, (5 - i) * 15));
-    const results = await runShardedEvaluation(tasks, 5, stubWorkerPath);
+    const results = await runShardedEvaluation<NullWorkerTask, NullSeedResult, NullWorkerMessage>(
+      tasks,
+      5,
+      stubWorkerPath
+    );
     expect([...results.keys()].sort()).toEqual(['t0', 't1', 't2', 't3', 't4']);
   });
 
@@ -377,13 +381,17 @@ describe('runShardedEvaluation: failure/abort paths (stub worker)', () => {
     const tasks = [task('err'), ...Array.from({ length: remainingTaskCount }, (_, i) => task(`t${i}`, delayMs))];
     const regressionFloorMs = (remainingTaskCount / 2) * delayMs; // 3600ms
     const started = Date.now();
-    await expect(runShardedEvaluation(tasks, 2, stubWorkerPath)).rejects.toThrow(/stub-induced failure/);
+    await expect(
+      runShardedEvaluation<NullWorkerTask, NullSeedResult, NullWorkerMessage>(tasks, 2, stubWorkerPath)
+    ).rejects.toThrow(/stub-induced failure/);
     const elapsedMs = Date.now() - started;
     expect(elapsedMs).toBeLessThan(regressionFloorMs / 2); // generous 1800ms bound, still well below the 3600ms floor
   });
 
   it('a worker killed by a signal is reported as a failure, not treated as a clean exit', async () => {
     const tasks = [task('kill'), task('t1', 50), task('t2', 50)];
-    await expect(runShardedEvaluation(tasks, 3, stubWorkerPath)).rejects.toThrow(/exited unexpectedly/);
+    await expect(
+      runShardedEvaluation<NullWorkerTask, NullSeedResult, NullWorkerMessage>(tasks, 3, stubWorkerPath)
+    ).rejects.toThrow(/exited unexpectedly/);
   });
 });

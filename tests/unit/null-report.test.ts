@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { NullEvaluationRaw, NullGraphRaw } from '../../scripts/null/null-evaluate';
+import type { NullTrainedEvaluationRaw } from '../../scripts/null/null-trained-evaluate';
 import {
   DEFAULT_MANIFEST,
   DEFAULT_OUT,
@@ -65,6 +66,37 @@ const writeTestManifest = (path: string, binarySha256: string): void => {
   writeFileSync(path, `${JSON.stringify(manifest, null, 2)}\n`);
 };
 
+/** A small, internally-consistent `NullTrainedEvaluationRaw` (WP3) — 4 rewired seeds (0..3) and the three biological trainer seeds, enough to exercise `buildTrainedSection`/the merge path without a real training run. */
+const buildTrainedRaw = (overrides: Partial<NullTrainedEvaluationRaw> = {}): NullTrainedEvaluationRaw => {
+  const heldOutSeeds = [30001, 30002, 30003];
+  const graph = (base: number) => ({
+    heldOutSeeds,
+    movementScore: [base, base + 1, base + 2],
+    foodPickups: [1, 2, 3],
+    hazardContacts: [0, 0, 1]
+  });
+  return {
+    version: 1,
+    seeds: { start: 30001, count: 3 },
+    ticks: 20,
+    substeps: 4,
+    replicaSeed: 101,
+    rewired: [0, 1, 2, 3].map((seed) => ({ seed, ...graph(seed) })),
+    biological: [101, 202, 303].map((trainerSeed) => ({ trainerSeed, ...graph(trainerSeed / 100) })),
+    host: { arch: 'arm64', node: 'v22.22.3' },
+    d: 48,
+    bigqMergeCommit: '69b610d4a9da11b12a7ac180997e702cf9fd2a4f',
+    evaluatorGitRev: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+    cemConfig: { population: 128, elites: 32, generations: 150, alpha: 0.7, stdFloor: 0.02, initStd: 0.5, trainingSeedsPerGeneration: 16 },
+    cemConfigWarnings: [],
+    ...overrides
+  };
+};
+
+const writeTrainedReadoutManifest = (path: string, gpuRerunFitnessDelta = 6.354025749714424): void => {
+  writeFileSync(path, JSON.stringify({ gpuRerunFitnessDelta }));
+};
+
 describe('parseNullReportArgs', () => {
   it('applies defaults, with shards left undefined (resolved later from the run-meta sidecar)', () => {
     const args = parseNullReportArgs([]);
@@ -100,6 +132,7 @@ describe('resolveRunMeta', () => {
   const baseArgs = (authored: string, shards?: number): NullReportArgs => ({
     authored,
     trained: join(root, 'trained.json'),
+    trainedReadoutManifest: join(root, 'trained-readout-manifest.json'),
     out: join(root, 'out.json'),
     reportMd: join(root, 'out.md'),
     manifest: join(root, 'manifest.json'),
@@ -136,6 +169,7 @@ describe('buildArtifact', () => {
   const args: NullReportArgs = {
     authored: 'authored.json',
     trained: 'trained.json',
+    trainedReadoutManifest: 'trained-readout-manifest.json',
     out: 'out.json',
     reportMd: 'out.md',
     manifest: 'manifest.json',
@@ -228,6 +262,7 @@ describe('runNullReport', () => {
     args = {
       authored: authoredPath,
       trained: join(root, 'trained.json'), // does not exist -> --trained is a no-op
+      trainedReadoutManifest: join(root, 'trained-readout-manifest.json'), // only read when --trained's file exists
       out: outPath,
       reportMd: reportMdPath,
       manifest: manifestPath,
@@ -290,10 +325,50 @@ describe('runNullReport', () => {
     expect(() => readFileSync(outPath)).toThrow(); // nothing was written
   });
 
-  it('refuses to run when --trained points at a file that exists (WP3 not implemented yet)', () => {
-    const trainedPath = join(root, 'trained.json');
-    writeFileSync(trainedPath, '{}');
-    expect(() => runNullReport({ ...args, trained: trainedPath })).toThrow(/not implemented yet \(WP3\)/);
+  describe('with --trained (WP3 trained section)', () => {
+    let trainedArgs: NullReportArgs;
+
+    beforeEach(() => {
+      writeFileSync(args.trained, JSON.stringify(buildTrainedRaw()));
+      writeTrainedReadoutManifest(args.trainedReadoutManifest);
+      trainedArgs = args;
+    });
+
+    it('merges a trained section into the published artifact and report', () => {
+      const result = runNullReport(trainedArgs);
+      expect(result.artifact.trained).toBeDefined();
+      const trained = result.artifact.trained!;
+      expect(trained.rewired).toHaveLength(4);
+      expect(trained.biological).toHaveLength(3);
+      expect(trained.replicaSeed).toBe(101);
+      expect(trained.d).toBe(48);
+      expect(trained.bigqMergeCommit).toBe('69b610d4a9da11b12a7ac180997e702cf9fd2a4f');
+      expect(trained.percentileResolution).toBeCloseTo(0.25, 12); // 1/4 rewired replicas in this fixture
+      expect(trained.bigqGpuRerunFitnessDelta).toBeCloseTo(6.354025749714424, 10);
+      expect(trained.bioTrainerSeedSpread.label).toMatch(/trainer-noise variance/);
+
+      const reportMd = readFileSync(reportMdPath, 'utf8');
+      expect(reportMd).toContain('## Trained-readout sample');
+      expect(reportMd).toContain('69b610d4a9da11b12a7ac180997e702cf9fd2a4f');
+    });
+
+    it('running it twice with --trained present is still byte-identical', () => {
+      const first = runNullReport(trainedArgs);
+      const artifactAfterFirst = readFileSync(outPath);
+      const mdAfterFirst = readFileSync(reportMdPath);
+
+      const second = runNullReport(trainedArgs);
+      expect(readFileSync(outPath).equals(artifactAfterFirst)).toBe(true);
+      expect(readFileSync(reportMdPath).equals(mdAfterFirst)).toBe(true);
+      expect(second.artifactSha256).toBe(first.artifactSha256);
+    });
+
+    it('omits the trained section entirely when --trained does not exist (unchanged from before WP3)', () => {
+      const noTrained = { ...trainedArgs, trained: join(root, 'does-not-exist.json') };
+      const result = runNullReport(noTrained);
+      expect(result.artifact.trained).toBeUndefined();
+      expect(readFileSync(reportMdPath, 'utf8')).not.toContain('## Trained-readout sample');
+    });
   });
 
   it('does not write authored.run.json as part of publishing (that sidecar is null-evaluate.ts\'s output)', () => {

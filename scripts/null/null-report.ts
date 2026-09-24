@@ -11,11 +11,15 @@ import {
   buildHistogram,
   graphStats,
   nullSummary,
+  percentileResolution,
   rankStatistics,
+  trainerSeedSpread,
   type Histogram,
-  type NullSummary
+  type NullSummary,
+  type TrainerSeedSpread
 } from './null-stats';
 import type { NullEvaluationRaw, NullGraphRaw } from './null-evaluate';
+import type { NullTrainedEvaluationRaw } from './null-trained-evaluate';
 
 /**
  * `.agents/plans/rewiring-null/02-authored-null-evaluation.md`'s
@@ -40,6 +44,8 @@ const DEFAULT_TRAINED = resolve(repoRoot, 'training/runs/null/trained.json');
 export const DEFAULT_OUT = resolve(repoRoot, 'public/data/rewiring-null-v1.json');
 export const DEFAULT_REPORT_MD = resolve(repoRoot, 'docs/rewiring-null-report.md');
 export const DEFAULT_MANIFEST = resolve(repoRoot, 'public/data/malecns-arena-v1.manifest.json');
+/** The already-merged trained-readout study this report's trained section cites `gpuRerunFitnessDelta` from (see `buildTrainedSection`). */
+export const DEFAULT_TRAINED_READOUT_MANIFEST = resolve(repoRoot, 'public/data/trained-readout-v1.manifest.json');
 
 /** 'N','U','L','L' as a fixed default seed; arbitrary but stable across runs, matching `evaluate.ts`'s `DEFAULT_BOOTSTRAP_SEED` convention. */
 const DEFAULT_BOOTSTRAP_SEED = 0x4e554c4c;
@@ -55,6 +61,8 @@ const MIN_REWIRED_FOR_SHIPPED_DEFAULT = 500;
 export interface NullReportArgs {
   readonly authored: string;
   readonly trained: string;
+  /** `gpuRerunFitnessDelta`'s source (WP3's trained section cites it; see `buildTrainedSection`). Only read when `--trained`'s file exists. */
+  readonly trainedReadoutManifest: string;
   readonly out: string;
   readonly reportMd: string;
   readonly manifest: string;
@@ -74,6 +82,7 @@ export interface NullReportArgs {
 export const parseNullReportArgs = (argv: readonly string[]): NullReportArgs => {
   let authored = DEFAULT_AUTHORED;
   let trained = DEFAULT_TRAINED;
+  let trainedReadoutManifest = DEFAULT_TRAINED_READOUT_MANIFEST;
   let out = DEFAULT_OUT;
   let reportMd = DEFAULT_REPORT_MD;
   let manifest = DEFAULT_MANIFEST;
@@ -90,6 +99,9 @@ export const parseNullReportArgs = (argv: readonly string[]): NullReportArgs => 
       index += 2;
     } else if (flag === '--trained') {
       trained = resolve(process.cwd(), requireValue(flag, argv[index + 1]));
+      index += 2;
+    } else if (flag === '--trained-readout-manifest') {
+      trainedReadoutManifest = resolve(process.cwd(), requireValue(flag, argv[index + 1]));
       index += 2;
     } else if (flag === '--out') {
       out = resolve(process.cwd(), requireValue(flag, argv[index + 1]));
@@ -122,7 +134,18 @@ export const parseNullReportArgs = (argv: readonly string[]): NullReportArgs => 
   // enforces it on `--out` (a dual-review finding).
   if (!authored.endsWith('.json')) throw new Error(`--authored must end with ".json" (got "${authored}")`);
 
-  return { authored, trained, out, reportMd, manifest, bootstrapSeed, bootstrapResamples, histogramBins, shards };
+  return {
+    authored,
+    trained,
+    trainedReadoutManifest,
+    out,
+    reportMd,
+    manifest,
+    bootstrapSeed,
+    bootstrapResamples,
+    histogramBins,
+    shards
+  };
 };
 
 // ---------------------------------------------------------------------------
@@ -226,7 +249,160 @@ export interface RewiringNullArtifact {
   readonly host: { readonly arch: string; readonly node: string };
   /** Present only when `null-evaluate.ts`'s `.run.json` sidecar recorded it. */
   readonly timing?: { readonly elapsedMs: number; readonly perEpisodeMs: number };
+  /** Present only when `--trained`'s file exists (WP3's `null-trained-evaluate.ts` output) -- see `buildTrainedSection`. */
+  readonly trained?: TrainedSection;
 }
+
+// ---------------------------------------------------------------------------
+// Trained section (WP3, `.agents/plans/rewiring-null/03-trained-sample.md`)
+// ---------------------------------------------------------------------------
+
+export interface TrainedRewiredEntry extends ScoredEntry {
+  readonly seed: number;
+}
+
+export interface TrainedBiologicalEntry extends ScoredEntry {
+  readonly trainerSeed: number;
+}
+
+/**
+ * The trained-readout sample: 20 rewired graphs, each CEM-trained with the
+ * exact production config `flyarena-bigq` used for its biological replicas
+ * (`replicaSeed`, one trainer seed shared by every rewired run -- "isolates
+ * topology from trainer-seed variance", `00-overview.md`'s key decisions),
+ * compared against the three biological replicas bigq itself trained
+ * (`trainerSeed` 101/202/303).
+ *
+ * `bioTrainerSeedSpread` and `bioPercentile` measure two *different* kinds
+ * of variance and must never be read as comparable: `bioPercentile` places
+ * biological trainer-seed-101 among the 20 rewired scores -- **topology
+ * variance at a fixed trainer seed**. `bioTrainerSeedSpread` is the min/max
+ * spread across the three biological replicas' own trained scores, all at
+ * the *same* (biological) topology -- **trainer-noise variance at fixed
+ * topology**. Whether one spread happens to be larger or smaller than the
+ * other says nothing about whether topology "matters more" than trainer
+ * noise; see `bioTrainerSeedSpread.label` and this file's
+ * `renderReportMarkdown` trained section, which restates this in prose next
+ * to every place either number is printed.
+ */
+export interface TrainedSection {
+  readonly condition: 'trained, opponent parked';
+  readonly seeds: { readonly start: number; readonly count: number };
+  readonly ticks: number;
+  readonly substeps: number;
+  readonly replicaSeed: number;
+  readonly d: number;
+  /** Sorted by seed ascending; length 20 in the real study. */
+  readonly rewired: readonly TrainedRewiredEntry[];
+  /** Sorted by trainerSeed ascending; the three bigq replicas (101/202/303). */
+  readonly biological: readonly TrainedBiologicalEntry[];
+  /** Statistics over the 20 rewired trained scores. */
+  readonly null: NullSummary;
+  /** Biological trainer-seed-101's empirical percentile among the 20 rewired trained scores. */
+  readonly bioPercentile: number;
+  readonly pLow: number;
+  readonly pHigh: number;
+  /** `1/|rewired|` -- 5% at n=20. See `null-stats.ts`'s `percentileResolution`. */
+  readonly percentileResolution: number;
+  readonly bioTrainerSeedSpread: TrainerSeedSpread & { readonly label: string };
+  /** `trained-readout-v1.manifest.json`'s `gpuRerunFitnessDelta` (a CUDA rerun of the shipped biological replica moved held-out `trained` fitness by this much) -- cited here as evidence that trainer-seed/run-to-run noise at fixed topology can be large, motivating `bioTrainerSeedSpread`'s own existence. */
+  readonly bigqGpuRerunFitnessDelta: number;
+  readonly bigqMergeCommit: string;
+  readonly evaluatorGitRev: string | null;
+  readonly cemConfig: Record<string, unknown> | null;
+  readonly cemConfigWarnings: readonly string[];
+  readonly bootstrap: { readonly resamples: number; readonly seed: number };
+  /** Present only when `null-trained-evaluate.ts`'s `.run.json` sidecar recorded it. */
+  readonly timing?: { readonly elapsedMs: number; readonly perEpisodeMs: number };
+}
+
+/** Explicit label carried on `TrainedSection.bioTrainerSeedSpread` -- see that field's and `TrainedSection`'s own doc comments for the full explanation this is a condensed restatement of. */
+const BIO_TRAINER_SEED_SPREAD_LABEL =
+  "trainer-noise variance at fixed (biological) topology -- NOT comparable to the null's topology " +
+  'variance at a fixed trainer seed (bioPercentile, above); no overlap-based conclusion may be drawn ' +
+  'from comparing the two.';
+
+const SHIPPED_REPLICA_TRAINER_SEED = 101;
+
+/** `trained-readout-v1.manifest.json`'s `gpuRerunFitnessDelta` field -- see `TrainedSection.bigqGpuRerunFitnessDelta`'s doc comment. */
+const readBigqGpuRerunFitnessDelta = (manifestPath: string): number => {
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { gpuRerunFitnessDelta?: unknown };
+  if (typeof manifest.gpuRerunFitnessDelta !== 'number' || !Number.isFinite(manifest.gpuRerunFitnessDelta)) {
+    throw new Error(`null-report: ${manifestPath} has no numeric "gpuRerunFitnessDelta" field`);
+  }
+  return manifest.gpuRerunFitnessDelta;
+};
+
+/**
+ * Pure function of WP3's `trained.json` (never re-simulates anything, same
+ * convention as `buildArtifact`). Every bootstrap label is prefixed
+ * `trained|` so this section's resamples are independent of, and never
+ * collide with, the authored section's own per-graph labels (`graphStats`
+ * in `null-stats.ts`, keyed by `(bootstrapSeed, label)` — see
+ * `conditionRng`'s doc comment in `../training/stats.ts`).
+ */
+export const buildTrainedSection = (
+  raw: Readonly<NullTrainedEvaluationRaw>,
+  bootstrapSeed: number,
+  bootstrapResamples: number,
+  bigqGpuRerunFitnessDelta: number
+): TrainedSection => {
+  if (raw.version !== 1) {
+    throw new Error(`null-report: trained.json has unsupported version ${String(raw.version)}, expected 1`);
+  }
+  if (raw.rewired.length === 0) throw new Error('null-report: trained.json has no rewired entries');
+  if (raw.biological.length === 0) throw new Error('null-report: trained.json has no biological entries');
+
+  const rewiredStats = raw.rewired.map((entry) => ({
+    entry,
+    stats: graphStats(entry.movementScore, bootstrapSeed, `trained|rewired-${entry.seed}`, bootstrapResamples)
+  }));
+  const biologicalStats = raw.biological.map((entry) => ({
+    entry,
+    stats: graphStats(
+      entry.movementScore,
+      bootstrapSeed,
+      `trained|biological-${entry.trainerSeed}`,
+      bootstrapResamples
+    )
+  }));
+
+  const nullValues = rewiredStats.map(({ stats }) => stats.mean);
+  const summary = nullSummary(nullValues);
+
+  const shippedBio = biologicalStats.find(({ entry }) => entry.trainerSeed === SHIPPED_REPLICA_TRAINER_SEED);
+  if (!shippedBio) {
+    throw new Error(
+      `null-report: trained.json has no biological trainer-seed-${SHIPPED_REPLICA_TRAINER_SEED} entry (the shipped replica)`
+    );
+  }
+  const rank = rankStatistics(nullValues, shippedBio.stats.mean);
+
+  const spread = trainerSeedSpread(biologicalStats.map(({ stats }) => stats.mean));
+
+  return {
+    condition: 'trained, opponent parked',
+    seeds: raw.seeds,
+    ticks: raw.ticks,
+    substeps: raw.substeps,
+    replicaSeed: raw.replicaSeed,
+    d: raw.d,
+    rewired: rewiredStats.map(({ entry, stats }) => ({ seed: entry.seed, ...toScoredEntry(stats) })),
+    biological: biologicalStats.map(({ entry, stats }) => ({ trainerSeed: entry.trainerSeed, ...toScoredEntry(stats) })),
+    null: summary,
+    bioPercentile: rank.bioPercentile,
+    pLow: rank.pLow,
+    pHigh: rank.pHigh,
+    percentileResolution: percentileResolution(nullValues.length),
+    bioTrainerSeedSpread: { ...spread, label: BIO_TRAINER_SEED_SPREAD_LABEL },
+    bigqGpuRerunFitnessDelta,
+    bigqMergeCommit: raw.bigqMergeCommit,
+    evaluatorGitRev: raw.evaluatorGitRev,
+    cemConfig: raw.cemConfig,
+    cemConfigWarnings: raw.cemConfigWarnings,
+    bootstrap: { resamples: bootstrapResamples, seed: bootstrapSeed }
+  };
+};
 
 const toScoredEntry = (stats: ConditionStats): ScoredEntry => ({
   score: stats.mean,
@@ -487,6 +663,117 @@ const renderHistogramTable = (bins: Histogram): string => {
   return ['| range | count | |', '| --- | --- | --- |', ...rows].join('\n');
 };
 
+const renderTrainedRewiredTable = (trained: Readonly<TrainedSection>): string => {
+  const rows = trained.rewired.map(
+    (entry) => `| ${entry.seed} | ${fmt(entry.score)} (${fmt(entry.ci[0])}, ${fmt(entry.ci[1])}) |`
+  );
+  return ['| seed | trained score (95% CI) |', '| --- | --- |', ...rows].join('\n');
+};
+
+const renderTrainedBiologicalTable = (trained: Readonly<TrainedSection>): string => {
+  const rows = trained.biological.map(
+    (entry) => `| ${entry.trainerSeed} | ${fmt(entry.score)} (${fmt(entry.ci[0])}, ${fmt(entry.ci[1])}) |`
+  );
+  return ['| trainer seed | trained score (95% CI) |', '| --- | --- |', ...rows].join('\n');
+};
+
+/**
+ * WP3's trained-readout sample section, appended after the authored null's
+ * own sections when `artifact.trained` is present (`''` otherwise, so an
+ * authored-only report's markdown is byte-identical to before WP3
+ * existed). Every number here is labeled with the evaluator revision that
+ * produced it and the exact CEM config it was trained with, and the
+ * trainer-seed-variance/percentile-resolution caveats
+ * (`.agents/plans/rewiring-null/03-trained-sample.md`'s own required
+ * disclosures) are stated directly next to the numbers they qualify, not
+ * only in the Limitations section.
+ */
+const renderTrainedSection = (
+  trained: Readonly<TrainedSection> | undefined,
+  authoredNullSize: number
+): string => {
+  if (!trained) return '';
+
+  const cem = trained.cemConfig;
+  const cemSummary = cem
+    ? `: population ${cem.population}, elites ${cem.elites}, generations ${cem.generations}, alpha ${cem.alpha}, ` +
+      `stdFloor ${cem.stdFloor}, initStd ${cem.initStd}, E=${cem.trainingSeedsPerGeneration}`
+    : ' (no CEM config was recorded on any scored run directory)';
+  const cemWarning =
+    trained.cemConfigWarnings.length > 0
+      ? `\n\n> **CEM config warning(s):** ${trained.cemConfigWarnings.join('; ')}\n`
+      : '';
+  const timingRow = trained.timing
+    ? `\n| Wall time | ${(trained.timing.elapsedMs / 1000).toFixed(1)}s |\n| Per-episode time | ${trained.timing.perEpisodeMs.toFixed(1)} ms |`
+    : '';
+
+  return `
+## Trained-readout sample
+
+Where the biological MaleCNS topology's *trained* score — a readout CEM-trained specifically for that
+topology, not the fixed hand-authored mapping the sections above use — falls among ${trained.rewired.length}
+rewired topologies, each given its own readout trained with the identical production CEM configuration
+\`flyarena-bigq\` used for its own biological replicas.
+
+**Condition and config.** ${trained.condition}. \`T = ${trained.ticks}\`, \`K = ${trained.substeps}\`,
+\`D = ${trained.d}\`, held-out seeds \`${trained.seeds.start}..${trained.seeds.start + trained.seeds.count - 1}\`
+(n=${trained.seeds.count}) — the same held-out seeds the authored null above and
+[the trained-readout report](trained-readout-report.md) both use. Every rewired readout is trained at the
+single trainer seed \`replicaSeed = ${trained.replicaSeed}\` (isolating topology from trainer-seed
+variance, per this study's key decisions), with the exact CEM config copied from the merged
+\`flyarena-bigq\` manifest (commit \`${trained.bigqMergeCommit}\`)${cemSummary}. Rescored by evaluator git rev
+\`${trained.evaluatorGitRev ?? 'unknown'}\` — the same TS \`runEpisode\` authoritative path the authored null
+above uses, so every number in this section shares one evaluator revision with every other number in this
+section, never a PyTorch-side validation fitness.${cemWarning}
+
+### Rewired trained scores (n=${trained.rewired.length})
+
+${renderTrainedRewiredTable(trained)}
+
+### Biological trained scores (per trainer seed)
+
+${renderTrainedBiologicalTable(trained)}
+
+### Results
+
+| Quantity | Value |
+| --- | --- |
+| Null (rewired trained) mean | ${fmt(trained.null.mean)} |
+| Null median | ${fmt(trained.null.median)} |
+| Null std | ${fmt(trained.null.std)} |
+| Null 2.5–97.5% | ${fmt(trained.null.p2_5)} .. ${fmt(trained.null.p97_5)} |
+| Null IQR | ${fmt(trained.null.iqr)} |
+| Biological (trainer seed 101) percentile among the ${trained.rewired.length} rewired trained scores | ${pct(trained.bioPercentile)} |
+| Percentile resolution (1/n) | ${pct(trained.percentileResolution)} |
+| Rank statistic p_low | ${fmt(trained.pLow, 4)} |
+| Rank statistic p_high | ${fmt(trained.pHigh, 4)} |${timingRow}
+
+With only ${trained.rewired.length} rewired replicas, the percentile above has a resolution of only
+${pct(trained.percentileResolution)}: one more or fewer rewired replica scoring below biological shifts it
+by a full ${pct(trained.percentileResolution)} step. This is a much coarser distribution than the authored
+null's ${authoredNullSize}-replica, ${pct(percentileResolution(authoredNullSize))}-resolution percentile
+above, and percentile differences finer than ${pct(trained.percentileResolution)} are not meaningfully
+distinguishable at this sample size.
+
+### Trainer-seed variance context
+
+Biological trained scores across the three \`flyarena-bigq\` replicas (trainer seeds 101/202/303) span
+\`${fmt(trained.bioTrainerSeedSpread.min)}\` to \`${fmt(trained.bioTrainerSeedSpread.max)}\`
+(range \`${fmt(trained.bioTrainerSeedSpread.range)}\`) — **${trained.bioTrainerSeedSpread.label}** — at the
+*same* biological topology. For context on how large this kind of noise alone can be: the merged
+[\`trained-readout-v1.manifest.json\`](../public/data/trained-readout-v1.manifest.json)'s recorded CUDA
+rerun of the shipped biological replica moved TS held-out \`trained\` fitness by
+\`${fmt(trained.bigqGpuRerunFitnessDelta)}\` (rerun minus original, that report's sign convention) —
+comparable in magnitude to the trainer-seed spread above, and outside that replica's own 95% CI (see that
+report's Limitations). **This spread is not comparable to the ${pct(trained.bioPercentile)} percentile
+above**: the spread measures trainer-seed/run-to-run noise at *fixed* topology; the percentile measures
+where one topology (biological, at one trainer seed) falls among ${trained.rewired.length} different
+topologies, each at the *same* one trainer seed. Whether these two numbers happen to overlap, and neither's
+size relative to the other, supports any conclusion about topology "mattering more or less" than
+trainer-seed noise.
+`;
+};
+
 export const renderReportMarkdown = (artifact: Readonly<RewiringNullArtifact>): string => {
   const seed0 = artifact.rewired.find((entry) => entry.seed === 0);
   const seedRangeText = rewiredSeedRangeText(artifact.rewired);
@@ -580,7 +867,7 @@ opponent parked, 100 seeds, \`T=${artifact.ticks}\`), agrees in direction — bi
 (mean diff ${fmt(artifact.pairedBiologicalVsRewiredSeed0.meanDifference)}, 95% CI ${fmt(artifact.pairedBiologicalVsRewiredSeed0.ci95[0])} to ${fmt(artifact.pairedBiologicalVsRewiredSeed0.ci95[1])}) —
 but the two studies differ in agent/opponent condition, tick count, and seed count (and seed set), so this
 is corroborating evidence under a related-but-distinct condition, not a replication of the same measurement.
-
+${renderTrainedSection(artifact.trained, artifact.rewired.length)}
 ## Limitations
 
 - Scores come from a **single-agent condition with the opponent parked**, on the same held-out seeds and
@@ -594,7 +881,15 @@ is corroborating evidence under a related-but-distinct condition, not a replicat
 - **No causal or superiority claim is made.** The percentile and rank statistics above are descriptive: they
   say where the biological graph's score falls among this null model's rewirings under this exact evaluation
   setup, not that biological topology causes or predicts any particular score.
-${artifact.null.degenerate ? '- The null distribution is **degenerate** (IQR below threshold) — see the note above.\n' : ''}`;
+${artifact.null.degenerate ? '- The null distribution is **degenerate** (IQR below threshold) — see the note above.\n' : ''}${
+    artifact.trained
+      ? `- The trained section above (n=${artifact.trained.rewired.length} rewired replicas) reports the same kind ` +
+        `of descriptive percentile/rank statistics as the authored null, at a much coarser ` +
+        `${pct(artifact.trained.percentileResolution)} resolution, and makes no causal or superiority claim either. ` +
+        `Its trainer-seed variance context (\`bioTrainerSeedSpread\`) is trainer-noise variance at fixed topology, ` +
+        `explicitly not comparable to its own topology-variance percentile — see that section's own caveats.\n`
+      : ''
+  }`;
 
   // A non-degenerate report otherwise ends with a trailing blank line (the
   // template's own newline before the closing backtick, doubled up with the
@@ -663,23 +958,44 @@ const verifySourceGraphMatchesManifest = (
   }
 };
 
-export const runNullReport = (args: Readonly<NullReportArgs>): RunNullReportResult => {
-  // --trained is plumbed for WP3 ("Reads authored.json (and trained.json
-  // from WP3 if present)", 02-authored-null-evaluation.md) but WP3 isn't
-  // implemented yet. Rather than silently ignoring a real file an operator
-  // pointed --trained at (the flag was dead code otherwise — a dual-review
-  // finding), fail loudly if one exists; the common case (no WP3 output
-  // yet) hits neither branch.
-  if (existsSync(args.trained)) {
-    throw new Error(
-      `null-report: ${args.trained} exists, but merging a trained-readout section is not implemented yet (WP3). ` +
-        'Remove --trained or move/delete that file to publish the authored-only report.'
-    );
+/** `<trainedPath>.run.json`'s optional `elapsedMs`/`perEpisodeMs`, mirroring `resolveRunMeta`'s sidecar convention for `authored.json` -- see `null-trained-evaluate.ts`'s own `<out>.run.json` sidecar. Unlike `resolveRunMeta`, a missing sidecar is not an error: `TrainedSection.timing` is simply omitted (this study's own acceptance criteria don't require it, unlike the authored null's shard count). */
+const resolveTrainedTiming = (
+  trainedPath: string
+): { readonly elapsedMs: number; readonly perEpisodeMs: number } | undefined => {
+  if (!trainedPath.endsWith('.json')) {
+    throw new Error(`null-report: expected a ".json" trained path, got "${trainedPath}"`);
   }
+  const sidecarPath = `${trainedPath.slice(0, -'.json'.length)}.run.json`;
+  if (!existsSync(sidecarPath)) return undefined;
+  const sidecar = JSON.parse(readFileSync(sidecarPath, 'utf8')) as {
+    elapsedMs?: unknown;
+    perEpisodeMs?: unknown;
+  };
+  if (typeof sidecar.elapsedMs !== 'number' || typeof sidecar.perEpisodeMs !== 'number') return undefined;
+  return { elapsedMs: sidecar.elapsedMs, perEpisodeMs: sidecar.perEpisodeMs };
+};
 
+export const runNullReport = (args: Readonly<NullReportArgs>): RunNullReportResult => {
   const raw = JSON.parse(readFileSync(args.authored, 'utf8')) as NullEvaluationRaw;
   const runMeta = resolveRunMeta(args);
-  const artifact = buildArtifact(raw, args, runMeta);
+  const authoredArtifact = buildArtifact(raw, args, runMeta);
+
+  // `--trained` is optional: "Reads authored.json (and trained.json from
+  // WP3 if present)" (02-authored-null-evaluation.md). When present, its
+  // section is merged in; the common case (no WP3 output at `args.trained`)
+  // publishes the authored-only report exactly as before WP3 existed.
+  let artifact: RewiringNullArtifact = authoredArtifact;
+  if (existsSync(args.trained)) {
+    const trainedRaw = JSON.parse(readFileSync(args.trained, 'utf8')) as NullTrainedEvaluationRaw;
+    const trainedSection = buildTrainedSection(
+      trainedRaw,
+      args.bootstrapSeed,
+      args.bootstrapResamples,
+      readBigqGpuRerunFitnessDelta(args.trainedReadoutManifest)
+    );
+    const timing = resolveTrainedTiming(args.trained);
+    artifact = { ...authoredArtifact, trained: { ...trainedSection, ...(timing ? { timing } : {}) } };
+  }
 
   guardShippedDefault(args.out, DEFAULT_OUT, 'published artifact', artifact.rewired.length);
   guardShippedDefault(args.reportMd, DEFAULT_REPORT_MD, 'report', artifact.rewired.length);
