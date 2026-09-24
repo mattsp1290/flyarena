@@ -1,0 +1,38 @@
+[project]
+name = "flyarena-training"
+version = "0.1.0"
+description = "Batched PyTorch port of the FlyArena arena/rate model, for GPU-accelerated CEM training and TS parity checking."
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.4",
+    # WP2's change surface (`.agents/plans/trained-readout/02-gpu-port-and-parity.md`)
+    # lists numpy as a required dependency; this port ended up using plain
+    # Python floats + torch tensors only (see world.py's module doc for
+    # why world-state stepping stays per-item rather than array-batched),
+    # so it's currently unused directly but kept per the plan's explicit
+    # dependency list for WP3's forward compatibility.
+    "numpy>=1.26",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/flyarena_training"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
