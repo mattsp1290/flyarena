@@ -147,3 +147,36 @@ export const runSubsteps = (
   }
   aggregateOutputs(graph, state, outputs);
 };
+
+/**
+ * Run `substeps` consecutive `stepModel` calls with the same held-constant
+ * `channelValues`, zeroing every neuron rate at the indices in `lesion`
+ * before the loop and again after every substep -- clearing whatever state a
+ * lesioned neuron carried over from the previous call, so a fresh `stepModel`
+ * scatter never propagates it -- then aggregate into `outputs`, exactly as
+ * `runSubsteps` does for the unlesioned case. Shared by the authoritative
+ * episode runner (`scripts/training/episode.ts`) and the counterfactual
+ * workbench (`stepBranch`, `src/lib/counterfactual/engine.ts`) so their
+ * lesion semantics can never drift apart, per this module's own "same
+ * functions back both" principle above. `lesion` may be empty
+ * (`ArrayLike<number>` of length 0), in which case the zeroing loops are
+ * no-ops and this function is numerically identical to `runSubsteps`. Like
+ * every other function in this module, this allocates nothing per call --
+ * `lesion`, `channelValues`, and `outputs` are all caller-owned and reused.
+ */
+export const runLesionedSubsteps = (
+  graph: Readonly<ConnectomeGraph>,
+  state: NeuralModelState,
+  scratch: StepScratch,
+  channelValues: ArrayLike<number>,
+  lesion: ArrayLike<number>,
+  substeps: number,
+  outputs: Float32Array
+): void => {
+  for (let i = 0; i < lesion.length; i += 1) state.rate[lesion[i]] = 0;
+  for (let step = 0; step < substeps; step += 1) {
+    stepModel(graph, state, scratch, channelValues);
+    for (let i = 0; i < lesion.length; i += 1) state.rate[lesion[i]] = 0;
+  }
+  aggregateOutputs(graph, state, outputs);
+};

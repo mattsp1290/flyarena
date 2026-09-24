@@ -196,6 +196,24 @@ describe('runEpisode lesion parity vs the counterfactual engine: singleton lesio
     const baseline = runUnlesionedLeftActions(prepared.graph, seed, TICKS);
     expect(episode.actions).not.toEqual(baseline);
   }, 15_000);
+
+  it('a non-zero-index singleton lesion (indices.at(-1)) matches stepBranch with a one-element target', () => {
+    const outputTarget = prepared.targets.find((candidate) => candidate.id === 'output');
+    if (!outputTarget) throw new Error('missing output target');
+    const index = outputTarget.indices.at(-1);
+    if (index === undefined) throw new Error('output target has no indices');
+    expect(index).not.toBe(outputTarget.indices[0]);
+    const lesion = Int32Array.from([index]);
+
+    const episode = runEpisodeLesion(prepared.graph, seed, TICKS, lesion);
+    const engine = runEngineLesion(prepared.graph, seed, TICKS, [index]);
+
+    expect(episode.actions).toEqual(engine.actions);
+    expect(episode.score).toEqual(engine.score);
+
+    const baseline = runUnlesionedLeftActions(prepared.graph, seed, TICKS);
+    expect(episode.actions).not.toEqual(baseline);
+  }, 15_000);
 });
 
 describe('runEpisode lesion: decoder gating', () => {

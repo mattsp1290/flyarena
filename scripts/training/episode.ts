@@ -12,12 +12,11 @@ import type {
 import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import type { ConnectomeGraph } from '../../src/lib/connectome/format';
 import {
-  aggregateOutputs,
   createModelState,
   createOutputBuffer,
   createStepScratch,
-  runSubsteps,
-  stepModel
+  runLesionedSubsteps,
+  runSubsteps
 } from '../../src/lib/connectome/model';
 import {
   createReadoutOutput,
@@ -69,6 +68,16 @@ import {
  */
 export type EpisodeDecoderKind = 'authored' | 'trained' | 'silenced' | 'parked';
 
+/**
+ * True for the `authored` decoder family -- today just `authored` itself.
+ * Written as a predicate rather than the two independent `=== 'authored'` /
+ * `!== 'authored'` literals this replaced, so a future `authored-flip-*`
+ * kind (`.agents/plans/null-explanation/01-decoder-variants.md`) widens
+ * lesion support with one edit here instead of two call sites that can
+ * drift out of sync.
+ */
+const isAuthoredFamily = (decoder: EpisodeDecoderKind): boolean => decoder === 'authored';
+
 export interface AgentEpisodeConfig {
   readonly decoder: EpisodeDecoderKind;
   /** Required for every decoder except `parked`. */
@@ -78,17 +87,27 @@ export interface AgentEpisodeConfig {
   /**
    * Neuron indices to silence for the whole episode, matching the
    * counterfactual workbench's lesion semantics exactly
-   * (`src/lib/counterfactual/engine.ts` `stepBranch`): rates at these
-   * indices are zeroed before the substep loop and again after every
-   * substep, before `aggregateOutputs` runs. Valid only for the `authored`
-   * decoder -- `trained`, `silenced`, and `parked` runners never read
-   * per-neuron rate state the same way `authored` does and would silently
-   * ignore it, so `runEpisode` throws instead for those three. Indices
-   * must be sorted ascending, unique, and in `[0, graph.metadata.neuronCount)`;
-   * `runEpisode` throws on the first violation. An unset `lesion` takes the
-   * unchanged `runSubsteps` path, bit-identical to before this option
-   * existed; an empty (zero-length) `lesion` takes the explicit substep
-   * loop but zeroes nothing, so it is numerically identical to unset.
+   * (`runLesionedSubsteps`, `src/lib/connectome/model.ts`, shared with
+   * `stepBranch` in `src/lib/counterfactual/engine.ts`): rates at these
+   * indices are zeroed before the substep loop -- clearing whatever this
+   * agent's own last tick left there, exactly as `stepBranch` clears a
+   * fork's carried-over state before its first scatter -- and again after
+   * every substep, before `aggregateOutputs` runs. Valid only for the
+   * authored decoder family (`isAuthoredFamily` below); `trained`,
+   * `silenced`, and `parked` runners never read per-neuron rate state the
+   * same way `authored` does and would silently ignore it, so `runEpisode`
+   * throws instead for those. Indices must be sorted ascending, unique, and
+   * in `[0, graph.metadata.neuronCount)`; `runEpisode` throws on the first
+   * violation. The caller's array is defensively copied (`Int32Array.from`)
+   * before use, so mutating or reusing it after `runEpisode` starts has no
+   * effect on this episode; the `instanceof Int32Array` check runs on the
+   * caller's original value, before that copy, because a WP2 sharded worker
+   * deserializing a lesion set across a process boundary (JSON/IPC) can hand
+   * back a plain array-like that would otherwise copy zero elements
+   * silently instead of throwing. An unset `lesion` and an empty
+   * (zero-length) `lesion` are both numerically identical to no lesion at
+   * all: both drive the same `runLesionedSubsteps` call, whose zeroing
+   * loops are no-ops at length zero.
    */
   readonly lesion?: Int32Array;
 }
@@ -132,6 +151,14 @@ export interface EpisodeResult {
 }
 
 const ZERO_ACTION: readonly [number, number, number] = [0, 0, 0];
+
+/**
+ * Shared no-op lesion: zero-length, so `runLesionedSubsteps`'s zeroing loops
+ * never execute and it is numerically identical to `runSubsteps`. Lets
+ * `createNeuralRunner`'s authored branch use one `step` closure regardless
+ * of whether `config.lesion` was set.
+ */
+const EMPTY_LESION = new Int32Array(0);
 
 interface AgentRunner {
   step(world: Readonly<WorldState>): readonly [number, number, number];
@@ -188,54 +215,22 @@ const createNeuralRunner = (
   const scratch = createStepScratch(graph);
   const outputs = createOutputBuffer(graph);
 
-  if (config.decoder === 'authored') {
+  if (isAuthoredFamily(config.decoder)) {
+    let lesion: Int32Array = EMPTY_LESION;
     if (config.lesion) {
-      // The `instanceof` check runs on the caller's own value, *before* the
-      // defensive copy below: `Int32Array.from` on a non-`Int32Array`
-      // array-like (e.g. a plain `{0: 7}` object, which is what an
-      // `Int32Array` can turn into after a naive JSON/IPC round trip --
-      // WP2's sharded worker pattern will need to serialize lesion index
-      // sets) has no `length` and silently copies zero elements rather than
-      // throwing, which would make this guard vacuous if it ran on the
-      // copy instead.
+      // Checked on the caller's own value, before the defensive copy below,
+      // so a non-`Int32Array` array-like (see the `lesion` doc comment)
+      // throws instead of the copy silently producing an empty lesion.
       if (!(config.lesion instanceof Int32Array)) {
         throw new Error(`episode: agent "${agentId}" lesion must be an Int32Array`);
       }
-      // Copied, not a reference to the caller's array: the runner must not
-      // be exposed to a caller mutating (or reusing for a different agent)
-      // the array it originally passed in after `runEpisode` has started.
-      const lesion = Int32Array.from(config.lesion);
+      lesion = Int32Array.from(config.lesion);
       validateLesionIndices(agentId, lesion, graph.metadata.neuronCount);
-      return {
-        // Explicit substep loop mirroring `stepBranch`
-        // (`src/lib/counterfactual/engine.ts`) line for line: zero the
-        // lesioned rates once before the loop (clearing whatever this
-        // agent's own last tick left there, exactly as `stepBranch` clears
-        // a fork's carried-over state before its first scatter), then for
-        // every substep call `stepModel` and zero the lesioned rates again,
-        // then `aggregateOutputs`. The lesion-zeroing loops themselves
-        // allocate nothing per tick -- `lesion` is read-only and reused
-        // across every call -- matching this file's existing per-agent
-        // buffer reuse (`observeAgent`/`Array.from(outputs)` below still
-        // allocate per tick, exactly as the unlesioned path above already
-        // does; this option does not change that).
-        step: (world) => {
-          const observation = observeAgent(world, agentId);
-          for (let i = 0; i < lesion.length; i += 1) state.rate[lesion[i]] = 0;
-          for (let k = 0; k < substeps; k += 1) {
-            stepModel(graph, state, scratch, observation);
-            for (let i = 0; i < lesion.length; i += 1) state.rate[lesion[i]] = 0;
-          }
-          aggregateOutputs(graph, state, outputs);
-          const decoded = decodeAction(Array.from(outputs));
-          return [decoded.thrust, decoded.yaw, decoded.brake];
-        }
-      };
     }
     return {
       step: (world) => {
         const observation = observeAgent(world, agentId);
-        runSubsteps(graph, state, scratch, observation, substeps, outputs);
+        runLesionedSubsteps(graph, state, scratch, observation, lesion, substeps, outputs);
         const decoded = decodeAction(Array.from(outputs));
         return [decoded.thrust, decoded.yaw, decoded.brake];
       }
@@ -281,18 +276,10 @@ const createAgentRunner = (
   // the error fires before any decoder-specific "requires a graph/weights"
   // check -- a lesion on the wrong decoder kind is a caller error regardless
   // of what else the config is missing.
-  //
-  // TODO(.agents/plans/lesion-atlas/01-lesion-episodes.md): if
-  // `EpisodeDecoderKind` ever grows `authored-flip-*` kinds (the
-  // null-explanation plan's WP1, not yet merged as of this WP), this gate
-  // and the `config.decoder === 'authored'` branch in createNeuralRunner
-  // must both widen to include them -- lesion must work identically for
-  // every authored-family decoder, and this hard-coded `!== 'authored'`
-  // check would otherwise wrongly reject them.
-  if (config.lesion && config.decoder !== 'authored') {
+  if (config.lesion && !isAuthoredFamily(config.decoder)) {
     throw new Error(
       `episode: agent "${agentId}" decoder "${config.decoder}" does not support lesion ` +
-        '(authored decoders only)'
+        '(the authored decoder family only)'
     );
   }
   return config.decoder === 'parked' ? createParkedRunner() : createNeuralRunner(agentId, config, substeps);
