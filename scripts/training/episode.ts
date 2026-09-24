@@ -12,10 +12,12 @@ import type {
 import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import type { ConnectomeGraph } from '../../src/lib/connectome/format';
 import {
+  aggregateOutputs,
   createModelState,
   createOutputBuffer,
   createStepScratch,
-  runSubsteps
+  runSubsteps,
+  stepModel
 } from '../../src/lib/connectome/model';
 import {
   createReadoutOutput,
@@ -73,6 +75,22 @@ export interface AgentEpisodeConfig {
   readonly graph?: Readonly<ConnectomeGraph>;
   /** Required for `trained` and `silenced`; ignored otherwise. */
   readonly weights?: Readonly<ReadoutWeights>;
+  /**
+   * Neuron indices to silence for the whole episode, matching the
+   * counterfactual workbench's lesion semantics exactly
+   * (`src/lib/counterfactual/engine.ts` `stepBranch`): rates at these
+   * indices are zeroed before the substep loop and again after every
+   * substep, before `aggregateOutputs` runs. Valid only for the `authored`
+   * decoder -- `trained`, `silenced`, and `parked` runners never read
+   * per-neuron rate state the same way `authored` does and would silently
+   * ignore it, so `runEpisode` throws instead for those three. Indices
+   * must be sorted ascending, unique, and in `[0, graph.metadata.neuronCount)`;
+   * `runEpisode` throws on the first violation. An unset `lesion` takes the
+   * unchanged `runSubsteps` path, bit-identical to before this option
+   * existed; an empty (zero-length) `lesion` takes the explicit substep
+   * loop but zeroes nothing, so it is numerically identical to unset.
+   */
+  readonly lesion?: Int32Array;
 }
 
 export interface EpisodeConfig {
@@ -124,6 +142,32 @@ const createParkedRunner = (): AgentRunner => ({
 });
 
 /**
+ * Throws unless `lesion` is sorted strictly ascending (which also rules out
+ * duplicates) and every index is in `[0, neuronCount)`. Order does not
+ * change the numeric result -- zeroing a set of indices is
+ * order-independent -- but `AgentEpisodeConfig.lesion`'s documented contract
+ * is a sorted, unique, in-range `Int32Array`, and enforcing it here catches
+ * a caller's indexing bug (an out-of-range or repeated neuron id) instead of
+ * silently zeroing the wrong -- or the same -- neuron twice.
+ */
+const validateLesionIndices = (agentId: AgentId, lesion: Int32Array, neuronCount: number): void => {
+  for (let i = 0; i < lesion.length; i += 1) {
+    const index = lesion[i];
+    if (index < 0 || index >= neuronCount) {
+      throw new Error(
+        `episode: agent "${agentId}" lesion index ${index} is out of range [0, ${neuronCount})`
+      );
+    }
+    if (i > 0 && index <= lesion[i - 1]) {
+      throw new Error(
+        `episode: agent "${agentId}" lesion indices must be sorted ascending and unique, ` +
+          `got ${lesion[i - 1]} then ${index} at position ${i}`
+      );
+    }
+  }
+};
+
+/**
  * Builds the per-tick action producer for a non-parked agent. Neural state
  * (`createModelState`) starts at zero, matching WP3's "Neural state reset
  * to zero at episode start" and `createModelState`'s own zero-fill default
@@ -143,6 +187,32 @@ const createNeuralRunner = (
   const outputs = createOutputBuffer(graph);
 
   if (config.decoder === 'authored') {
+    if (config.lesion) {
+      const lesion = config.lesion;
+      validateLesionIndices(agentId, lesion, graph.metadata.neuronCount);
+      return {
+        // Explicit substep loop mirroring `stepBranch`
+        // (`src/lib/counterfactual/engine.ts`) line for line: zero the
+        // lesioned rates once before the loop (clearing whatever this
+        // agent's own last tick left there, exactly as `stepBranch` clears
+        // a fork's carried-over state before its first scatter), then for
+        // every substep call `stepModel` and zero the lesioned rates again,
+        // then `aggregateOutputs`. No allocation per tick -- `lesion` is
+        // read-only and reused across every call, matching this file's
+        // existing per-agent buffer reuse.
+        step: (world) => {
+          const observation = observeAgent(world, agentId);
+          for (let i = 0; i < lesion.length; i += 1) state.rate[lesion[i]] = 0;
+          for (let k = 0; k < substeps; k += 1) {
+            stepModel(graph, state, scratch, observation);
+            for (let i = 0; i < lesion.length; i += 1) state.rate[lesion[i]] = 0;
+          }
+          aggregateOutputs(graph, state, outputs);
+          const decoded = decodeAction(Array.from(outputs));
+          return [decoded.thrust, decoded.yaw, decoded.brake];
+        }
+      };
+    }
     return {
       step: (world) => {
         const observation = observeAgent(world, agentId);
@@ -186,7 +256,20 @@ const createAgentRunner = (
   agentId: AgentId,
   config: Readonly<AgentEpisodeConfig>,
   substeps: number
-): AgentRunner => (config.decoder === 'parked' ? createParkedRunner() : createNeuralRunner(agentId, config, substeps));
+): AgentRunner => {
+  // Checked before dispatch (not inside createNeuralRunner) so it also
+  // covers 'parked', which never reaches createNeuralRunner at all, and so
+  // the error fires before any decoder-specific "requires a graph/weights"
+  // check -- a lesion on the wrong decoder kind is a caller error regardless
+  // of what else the config is missing.
+  if (config.lesion && config.decoder !== 'authored') {
+    throw new Error(
+      `episode: agent "${agentId}" decoder "${config.decoder}" does not support lesion ` +
+        '(authored decoders only)'
+    );
+  }
+  return config.decoder === 'parked' ? createParkedRunner() : createNeuralRunner(agentId, config, substeps);
+};
 
 const toAgentScoreResult = (score: Readonly<AgentScore>): AgentScoreResult => ({
   foodPickups: score.foodPickups,
