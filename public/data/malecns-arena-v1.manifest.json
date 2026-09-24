@@ -2,7 +2,7 @@
   "artifact": "malecns-arena-v1.bin.gz",
   "binaryBytes": 399792,
   "binarySha256": "f1a0f982ffdfba12ecb2206d064c3dc1ceaae7cffa06a22049093d69a79098f7",
-  "compilerSourceSha256": "5236ebca01f643aeb9d3581eb0d945f74be0736f86b9d321ac48c067baf68a70",
+  "compilerSourceSha256": "80e02782e293f8ac971e8e2589a339db63a9537c739175b285716e987957e3fc",
   "edgeCount": 46311,
   "formatVersion": 1,
   "gzipBytes": 107391,
@@ -11,6 +11,15 @@
   "license": "CC-BY-4.0",
   "neuronCount": 1008,
   "outputPopulationCount": 3,
+  "positions": {
+    "artifact": "malecns-arena-v1.positions.json",
+    "coverage": {
+      "none": 165,
+      "soma": 834,
+      "tosoma": 9
+    },
+    "sha256": "b91b750d41905b324a63a795984192f8d93bae7a3ee5f45fe27b9ce2d9aca2fb"
+  },
   "rewiredArms": {
     "seed0": {
       "artifact": "malecns-arena-v1-rewired-seed0.bin.gz",

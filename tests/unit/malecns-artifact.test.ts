@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { readFileSync, readdirSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -22,18 +22,28 @@ const compilerSourceDir = resolve(here, '../../scripts/data');
 const sha256Hex = (data: Uint8Array): string => createHash('sha256').update(data).digest('hex');
 
 /**
+ * The exact filenames "the compiler" consists of -- kept in lockstep with
+ * Python's `COMPILER_SOURCE_FILENAMES` in scripts/data/compile.py. This is
+ * deliberately an explicit allowlist, not a `*.py` directory listing: a
+ * non-compiler sidecar script that also lives in scripts/data/ (such as
+ * positions.py, which joins the pinned annotations' soma columns onto the
+ * compiled graph's own biologicalIds but never influences the compiled
+ * .bin.gz bytes) must not change this hash.
+ */
+const COMPILER_SOURCE_FILENAMES = ['binfmt.py', 'compile.py', 'download.py', 'rewire.py'] as const;
+
+/**
  * Recomputes `compilerSourceSha256` from the working tree: must exactly
  * match `compiler_source_sha256()` in scripts/data/compile.py (sorted
- * `*.py` filenames, each contributing filename + NUL byte + raw bytes into
- * one sha256 hasher). Kept in lockstep with the Python implementation by
+ * `COMPILER_SOURCE_FILENAMES`, each contributing filename + NUL byte + raw
+ * bytes into one sha256 hasher). Kept in lockstep with the Python
+ * implementation by
  * `test_compiler_source_sha256_matches_committed_ledger_and_manifest` in
  * tests_python/test_compile.py, which performs the same check from the
  * Python side.
  */
 const computeCompilerSourceSha256 = (): string => {
-  const filenames = readdirSync(compilerSourceDir)
-    .filter((name) => name.endsWith('.py'))
-    .sort();
+  const filenames = [...COMPILER_SOURCE_FILENAMES].sort();
   const hash = createHash('sha256');
   for (const name of filenames) {
     hash.update(name, 'utf-8');

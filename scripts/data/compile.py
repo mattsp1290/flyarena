@@ -188,11 +188,26 @@ def git_revision() -> str:
 COMPILER_SOURCE_DIR = Path(__file__).resolve().parent
 
 
+#: The exact filenames "the compiler" consists of, for
+#: `compiler_source_sha256()` below: the modules whose code actually
+#: determines the compiled `.bin`/`.bin.gz` bytes. Deliberately an explicit
+#: allowlist rather than a `*.py` directory glob (which this function's
+#: first version used): `scripts/data/positions.py` is a sidecar script
+#: that joins the pinned annotations' soma columns onto the compiled
+#: graph's own `biologicalIds` after the fact -- it never influences
+#: `compile_graph`'s aggregation/CSR logic or the emitted `.bin.gz` bytes,
+#: and must not change this hash or force an unrelated recompile when it is
+#: added or edited. See docs/data-provenance.md's "Soma positions sidecar"
+#: section.
+COMPILER_SOURCE_FILENAMES: tuple[str, ...] = ("binfmt.py", "compile.py", "download.py", "rewire.py")
+
+
 def compiler_source_sha256(source_dir: Path = COMPILER_SOURCE_DIR) -> str:
-    """sha256 over this compiler's own Python source (`scripts/data/*.py`:
-    `binfmt.py`, `compile.py`, `download.py`, `rewire.py` -- not the
-    generated `__pycache__`), recorded as `compilerSourceSha256` in both the
-    manifest and the ledger.
+    """sha256 over this compiler's own Python source
+    (`COMPILER_SOURCE_FILENAMES`: `binfmt.py`, `compile.py`, `download.py`,
+    `rewire.py` -- not the generated `__pycache__`, and not any other
+    sidecar script that happens to also live in `scripts/data/`), recorded
+    as `compilerSourceSha256` in both the manifest and the ledger.
 
     Unlike `git_revision()`'s self-referential git SHA (see its docstring),
     this value is derived directly from the code that ran: recompiling
@@ -206,15 +221,16 @@ def compiler_source_sha256(source_dir: Path = COMPILER_SOURCE_DIR) -> str:
     class of bug a self-referential git SHA field had.
 
     Scheme (must exactly match the TypeScript recomputation in
-    `tests/unit/malecns-artifact.test.ts`): list `*.py` files directly in
-    `source_dir`, sort by filename, and for each file in that order feed
-    one sha256 hasher: the filename (UTF-8 bytes), then a single NUL byte,
-    then the file's raw bytes. Including the filename means two files
-    swapping content is not an accidental collision; the NUL byte gives an
-    unambiguous filename/content boundary.
+    `tests/unit/malecns-artifact.test.ts`): for each name in
+    `COMPILER_SOURCE_FILENAMES` sorted ascending, feed one sha256 hasher:
+    the filename (UTF-8 bytes), then a single NUL byte, then the file's raw
+    bytes. Including the filename means two files swapping content is not
+    an accidental collision; the NUL byte gives an unambiguous
+    filename/content boundary.
     """
     hasher = hashlib.sha256()
-    for path in sorted(source_dir.glob("*.py"), key=lambda p: p.name):
+    for name in sorted(COMPILER_SOURCE_FILENAMES):
+        path = source_dir / name
         hasher.update(path.name.encode("utf-8"))
         hasher.update(b"\0")
         hasher.update(path.read_bytes())

@@ -300,6 +300,84 @@ same edge index twice). See
 `malecns-arena-v1.manifest.json`'s `rewiredArms.seed0.swapStats` for the
 exact counts.
 
+## Soma positions sidecar
+
+`public/data/malecns-arena-v1.positions.json` is produced offline by
+`scripts/data/positions.py` from the already-pinned
+`body-annotations-male-cns-v1.0-minconf-0.5.feather` table -- no new source
+file is downloaded. It re-verifies that table's sha256 against
+`download.py`'s pin before joining anything (refusing to proceed on a
+mismatch, exactly like `compile.py`), decodes the compiled graph artifact
+(`rewire.decode_graph_binary`) to read its `biologicalIds` in compiled index
+order, and for each neuron emits:
+
+- **`role`** (`"sensory"` / `"bridge"` / `"descending"`), derived from the
+  *graph's own* `inputChannelIndex`/`outputPopulationIndex` arrays -- never
+  from the annotations table -- so it is guaranteed consistent with the
+  compiled artifact's actual channel/population wiring;
+- **`positionSource`** and **`xyz`**, following a strict fallback order:
+  the annotation table's `somaLocation` column (the measured soma position)
+  first, then `tosomaLocation` (a "soma-tract location" recorded for a
+  small minority of bodies whose soma itself wasn't segmented/located) if
+  `somaLocation` is absent, then `positionSource: "none"` / `xyz: null` if
+  neither is present. Coordinates are copied exactly as the source data
+  records them -- no centering, scaling, or class-centroid imputation
+  happens here, and a neuron with no measured position is never assigned
+  one.
+
+**Units.** MaleCNS's own documentation
+([male-cns.janelia.org/download](https://male-cns.janelia.org/download/))
+states the dataset's EM/segmentation volume is 8nm isotropic and that the
+sibling `syn-points` table's point-coordinate columns are "expressed in
+voxel units, i.e. 8nm". The `somaLocation`/`tosomaLocation` field names are
+the standard neuPrint `Neuron.somaLocation` convention this export derives
+from, and neuPrint's own (upstream, not MaleCNS-specific) documentation
+records that field as voxel coordinates. However, male-cns.janelia.org's
+own pages were checked directly (2026-09-24) and do not explicitly state
+the unit for `somaLocation`/`tosomaLocation` themselves -- only for the
+sibling `syn-points` table. Per this project's policy of never guessing
+silently, `positions.json`'s `"units"` field is therefore recorded as the
+literal string `"dataset voxel units (unverified)"` rather than asserted to
+be 8nm voxels. The current renderer only ever uses these coordinates
+relatively (after centering/scaling), so this does not block display, but
+no numeric claim about absolute distance should be made from them.
+
+**Coverage.** Real run against the pinned data: 834 of 1,008 compiled
+neurons have a `somaLocation`, 9 more have only a `tosomaLocation`, and 165
+have neither (`positionSource: "none"`) -- these neurons are the "position
+unavailable" case the anatomical activity view discloses rather than
+hides. `roleCounts` from this same run -- `{sensory: 160, bridge: 800,
+descending: 48}` -- match `malecns-arena-v1.ledger.json`'s
+`selectionCounts.{sensorySelectedCount,bridgeSelectedCount,descendingSelectedCount}`
+exactly, confirming every compiled neuron got exactly one role and the
+positions artifact's neuron set is the graph's neuron set.
+
+**Provenance fields.** `positions.json` carries its own `sourceFile` /
+`sourceSha256` (the verified annotations table) and `graphSha256` (sha256
+of the exact `--graph` file bytes it was joined against -- the same value
+as the manifest's `gzipSha256` for a default run), so the artifact is
+independently traceable without cross-referencing the manifest. Output is
+deterministic: sorted JSON keys, fixed separators, and a trailing newline,
+so re-running `positions.py` against unchanged inputs reproduces
+byte-identical output (verified directly, and by
+`tests_python/test_positions.py`).
+
+`positions.py` updates `malecns-arena-v1.manifest.json` in place with a
+`positions: {artifact, sha256, coverage}` entry and
+`malecns-arena-v1.ledger.json` with a `positionsCoverage: {soma, tosoma,
+none}` entry, following the same in-place-update convention
+`scripts/data/rewire.py` already uses for `rewiredArms`.
+
+`positions.py` is deliberately **not** part of "the compiler" -- see
+"Compiler provenance" below: it is excluded from `compilerSourceSha256` and
+never writes to or otherwise influences the `.bin.gz` artifact's bytes.
+
+```console
+$ uv run python scripts/data/positions.py --help
+$ uv run python scripts/data/positions.py       # writes public/data/malecns-arena-v1.positions.json,
+                                                 # updates manifest.json/ledger.json in place
+```
+
 ## Reproducing this artifact
 
 ```console
@@ -307,7 +385,8 @@ $ uv sync
 $ uv run python scripts/data/download.py       # idempotent, hash-verified
 $ uv run python scripts/data/compile.py         # writes public/data/malecns-arena-v1.{bin.gz,manifest.json,ledger.json}
 $ uv run python scripts/data/rewire.py --seed 0 # writes the rewired control arm and updates the manifest
-$ uv run pytest tests_python                    # compiler invariants, no raw data required
+$ uv run python scripts/data/positions.py       # writes the soma positions sidecar, see above
+$ uv run pytest tests_python                    # compiler + positions invariants, no raw data required
 ```
 
 `compile.py` is deterministic: re-running it against the same pinned source
@@ -319,11 +398,17 @@ also checked by running the real pipeline twice during development).
 
 Both `malecns-arena-v1.manifest.json` and `malecns-arena-v1.ledger.json`
 carry a `compilerSourceSha256` field: a sha256 over this compiler's own
-Python source (`scripts/data/*.py` -- `binfmt.py`, `compile.py`,
-`download.py`, `rewire.py`, not the generated `__pycache__`), sorted by
-filename, each file contributing its filename (UTF-8) + a single NUL byte +
-its raw bytes into one hasher (see `compiler_source_sha256()` in
-`scripts/data/compile.py` for the exact scheme). Because this is derived
+Python source -- the explicit allowlist `COMPILER_SOURCE_FILENAMES` in
+`scripts/data/compile.py` (`binfmt.py`, `compile.py`, `download.py`,
+`rewire.py`; not the generated `__pycache__`), sorted by filename, each
+file contributing its filename (UTF-8) + a single NUL byte + its raw bytes
+into one hasher (see `compiler_source_sha256()` for the exact scheme).
+This is deliberately an explicit allowlist rather than a `scripts/data/*.py`
+directory glob (which an earlier version of this function used): the "Soma
+positions sidecar" section above adds `scripts/data/positions.py` to this
+same directory, and it must not change this hash -- it never influences the
+compiled `.bin.gz` bytes, so folding it into "the compiler" would force an
+unrelated recompile/rehash every time it changed. Because this is derived
 directly from the code that ran rather than from a commit reference, it is
 self-consistent: re-running the pipeline after *any* change to those files
 -- even one that doesn't happen to change the compiled bytes, as with the
