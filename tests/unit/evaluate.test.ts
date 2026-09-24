@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -72,7 +72,7 @@ describe('runEvaluate (tiny fixture, trace graph)', () => {
     let weightSeed = 1;
     for (const arm of ['biological', 'rewired', 'disconnected'] as const) {
       const dir = join(root, 'runs', `${arm}-101`);
-      writeTinyRunDir({ dir, arm, trainerSeed: 101, D, H, substeps: TRACE_SUBSTEPS, weightSeed });
+      writeTinyRunDir({ dir, arm, trainerSeed: 101, D, H, substeps: TRACE_SUBSTEPS, weightSeed, includeEnv: true });
       runDirs.push(dir);
       weightSeed += 17;
     }
@@ -84,6 +84,7 @@ describe('runEvaluate (tiny fixture, trace graph)', () => {
     armsDir,
     runDirs,
     outDir,
+    outDirExplicit: true,
     ticks: 40,
     substeps: TRACE_SUBSTEPS,
     heldOutStart: 30001,
@@ -162,6 +163,114 @@ describe('runEvaluate (tiny fixture, trace graph)', () => {
       const result = runEvaluate(baseArgs(armsDir, substitutedRunDirs, outDir));
       expect(result.artifactWritten).toBe(false);
       expect(result.warnings.some((warning) => warning.includes('disconnected'))).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('report.json is byte-identical regardless of --runs argument order', () => {
+    const { root, armsDir, runDirs } = buildFixture();
+    try {
+      const outForward = join(root, 'out-forward');
+      const outReversed = join(root, 'out-reversed');
+
+      const forward = runEvaluate(baseArgs(armsDir, runDirs, outForward));
+      const reversed = runEvaluate(baseArgs(armsDir, [...runDirs].reverse(), outReversed));
+
+      expect(forward.artifactWritten).toBe(true);
+      expect(reversed.artifactWritten).toBe(true);
+      const reportForward = readFileSync(resolve(outForward, 'trained-readout-v1.report.json'));
+      const reportReversed = readFileSync(resolve(outReversed, 'trained-readout-v1.report.json'));
+      expect(reportReversed.equals(reportForward)).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('throws when a run was trained at a different substep count than --substeps', () => {
+    const { root, armsDir, runDirs } = buildFixture();
+    try {
+      const graph = createTraceGraph();
+      const mismatchedDir = join(root, 'runs', 'biological-mismatched-substeps');
+      writeTinyRunDir({
+        dir: mismatchedDir,
+        arm: 'biological',
+        trainerSeed: 202,
+        D: outputNeuronIndices(graph).length,
+        H: 4,
+        substeps: TRACE_SUBSTEPS + 95, // deliberately different from baseArgs' substeps
+        weightSeed: 5
+      });
+      const outDir = join(root, 'out-substeps-mismatch');
+      expect(() => runEvaluate(baseArgs(armsDir, [...runDirs, mismatchedDir], outDir))).toThrow(/substeps/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects config.json fields with the wrong type (e.g. a string trainerSeed)', () => {
+    const { root, armsDir, runDirs } = buildFixture();
+    try {
+      const graph = createTraceGraph();
+      const badDir = join(root, 'runs', 'biological-bad-config');
+      writeTinyRunDir({
+        dir: badDir,
+        arm: 'biological',
+        trainerSeed: 303,
+        D: outputNeuronIndices(graph).length,
+        H: 4,
+        substeps: TRACE_SUBSTEPS,
+        weightSeed: 6
+      });
+      const configPath = resolve(badDir, 'config.json');
+      const config = JSON.parse(readFileSync(configPath, 'utf8')) as Record<string, unknown>;
+      config.trainerSeed = '303'; // string instead of number
+      writeFileSync(configPath, JSON.stringify(config));
+
+      const outDir = join(root, 'out-bad-config');
+      expect(() => runEvaluate(baseArgs(armsDir, [...runDirs, badDir], outDir))).toThrow(/trainerSeed/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an arm bundle whose content does not match its own recorded sha256 (tampered/stale)', () => {
+    const { root, armsDir, runDirs } = buildFixture();
+    try {
+      const bundlePath = resolve(armsDir, 'rewired.json');
+      const bundle = JSON.parse(readFileSync(bundlePath, 'utf8')) as { contactMagnitudes: number[] };
+      bundle.contactMagnitudes = bundle.contactMagnitudes.map((value) => value * 5);
+      writeFileSync(bundlePath, JSON.stringify(bundle));
+
+      const outDir = join(root, 'out-tampered-bundle');
+      expect(() => runEvaluate(baseArgs(armsDir, runDirs, outDir))).toThrow(/sha256/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a bundle whose "arm" field does not match its filename (mislabeled bundle)', () => {
+    const { root, armsDir, runDirs } = buildFixture();
+    try {
+      const biologicalPath = resolve(armsDir, 'biological.json');
+      const rewiredPath = resolve(armsDir, 'rewired.json');
+      writeFileSync(rewiredPath, readFileSync(biologicalPath)); // copy biological over rewired verbatim
+
+      const outDir = join(root, 'out-mislabeled-bundle');
+      expect(() => runEvaluate(baseArgs(armsDir, runDirs, outDir))).toThrow(/declares arm/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses to write to the default --out (public/data) in trace-graph mode', () => {
+    const { root, armsDir, runDirs } = buildFixture();
+    try {
+      const args: EvaluateArgs = {
+        ...baseArgs(armsDir, runDirs, 'public/data'),
+        outDirExplicit: false
+      };
+      expect(() => runEvaluate(args)).toThrow(/public\/data/);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

@@ -1,17 +1,19 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-import { validateGraph } from '../../src/lib/connectome/format';
+import { encodeGraphBinary, validateGraph } from '../../src/lib/connectome/format';
 import { outputNeuronIndices } from '../../src/lib/connectome/readout';
 import {
   computeGraphIdentity,
   deserializeArmBundle,
+  ExportArmsGateError,
   parseExportArmsArgs,
   runExportArms,
   type SerializedArmBundle
 } from '../../scripts/training/export-arms';
+import { createTraceGraph } from '../fixtures/trace-graph';
 
 describe('parseExportArmsArgs', () => {
   it('rejects --fixture-rewire combined with --graph', () => {
@@ -100,6 +102,52 @@ describe('runExportArms (trace-graph mode)', () => {
       const result = runExportArms({ outDir, fixtureRewire: false, fixtureRewireSeed: 0 });
       expect(result.outDir).toBe(resolve(outDir, identity.graphArtifactSha256));
       expect(existsSync(result.outDir)).toBe(true);
+    } finally {
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a --rewired artifact whose node set does not match --graph (D equal, but a different graph)', () => {
+    const outDir = mkdtempSync(join(tmpdir(), 'export-arms-'));
+    try {
+      const biological = createTraceGraph();
+      // Same D, same edge/degree structure, but a different node identity
+      // (biologicalIds shifted) — exactly the "compiled from a different
+      // graph with the same output-neuron count" case the D-only gate
+      // could not catch.
+      const differentGraph = {
+        ...biological,
+        biologicalIds: BigUint64Array.from(biological.biologicalIds, (id) => id + 1000n)
+      };
+      expect(outputNeuronIndices(differentGraph).length).toBe(outputNeuronIndices(biological).length);
+
+      const bioPath = resolve(outDir, 'biological.bin');
+      const rewiredPath = resolve(outDir, 'different.bin');
+      writeFileSync(bioPath, Buffer.from(encodeGraphBinary(biological)));
+      writeFileSync(rewiredPath, Buffer.from(encodeGraphBinary(differentGraph)));
+
+      expect(() =>
+        runExportArms({ graphPath: bioPath, rewiredPath, fixtureRewire: false, fixtureRewireSeed: 0, outDir })
+      ).toThrow(ExportArmsGateError);
+      expect(() =>
+        runExportArms({ graphPath: bioPath, rewiredPath, fixtureRewire: false, fixtureRewireSeed: 0, outDir })
+      ).toThrow(/node set/);
+    } finally {
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+
+  it('removes a stale rewired.json left from a previous export when re-exporting without --rewired/--fixture-rewire', () => {
+    const outDir = mkdtempSync(join(tmpdir(), 'export-arms-'));
+    try {
+      const first = runExportArms({ outDir, fixtureRewire: true, fixtureRewireSeed: 7 });
+      const rewiredPath = resolve(first.outDir, 'rewired.json');
+      expect(existsSync(rewiredPath)).toBe(true);
+
+      const second = runExportArms({ outDir, fixtureRewire: false, fixtureRewireSeed: 0 });
+      expect(second.outDir).toBe(first.outDir);
+      expect([...second.written].sort()).toEqual(['biological', 'disconnected']);
+      expect(existsSync(rewiredPath)).toBe(false);
     } finally {
       rmSync(outDir, { recursive: true, force: true });
     }

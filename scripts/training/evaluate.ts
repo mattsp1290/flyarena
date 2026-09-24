@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -12,15 +13,20 @@ import {
 import type { ConnectomeGraph } from '../../src/lib/connectome/format';
 import { mulberry32 } from '../../src/lib/random/mulberry32';
 import {
+  computeArmBundleSha256,
   computeGraphIdentity,
   deserializeArmBundle,
+  expectedProvenanceKind,
   DEFAULT_ARMS_OUT_DIR,
   type ArmName,
+  type ArmProvenance,
   type SerializedArmBundle
 } from './export-arms';
 import { runEpisode } from './episode';
 import { readNpyFloat32Array } from './npy';
 import { TRACE_SUBSTEPS } from './export-traces';
+
+const ARM_NAMES: readonly ArmName[] = ['biological', 'rewired', 'disconnected'];
 
 /**
  * The authoritative TypeScript rescorer: the Node code the browser's own
@@ -51,10 +57,19 @@ import { TRACE_SUBSTEPS } from './export-traces';
  *     "the published candidate: the final CEM mean"
  *     (`03-cem-training.md`), not `theta_best.npy` (best-ever candidate;
  *     not read by this evaluator).
- *   - `env.json` (optional): torch/CUDA/device provenance, copied into the
- *     shipped manifest when present; a missing file is recorded as a
- *     report warning, not an error.
+ *   - `env.json` (optional): torch/CUDA/device provenance. When present for
+ *     the shipped replica (trainerSeed 101), it is copied into
+ *     `trained-readout-v1.manifest.json`'s `env` map, keyed by arm; a
+ *     missing `env.json` for a shipped replica is recorded as a report
+ *     warning, not an error (see `runEvaluate`'s shipped-artifact section).
  *   - `generations.csv` (optional): not read by this evaluator.
+ *
+ * `substeps` must equal the evaluation's own `--substeps` (`args.substeps`,
+ * default `TRACE_SUBSTEPS`): `runEvaluate` throws if any run was trained at
+ * a different `K`, rather than silently rescoring under different dynamics
+ * than it was trained on. `armBundleSha256`, when present, is cross-checked
+ * against the (verified) arm bundle actually loaded, so a WP3 driver can
+ * pin exactly which exported bundle it trained against.
  */
 export interface RunConfig {
   readonly arm: ArmName;
@@ -64,12 +79,32 @@ export interface RunConfig {
   readonly H: number;
   readonly parameterCount: number;
   readonly substeps: number;
+  /** Optional: the `export-arms.ts` bundle sha256 this run was trained against. */
+  readonly armBundleSha256?: string;
 }
 
 /** Replica 0 (`03-cem-training.md`: "Replica 0 is the one shipped to the browser"). */
 const SHIPPED_TRAINER_SEED = 101;
 
 const sha256Hex = (data: Uint8Array | string): string => createHash('sha256').update(data).digest('hex');
+
+/**
+ * `git rev-parse HEAD` for the manifest's `evaluatorGitRev` field (the
+ * plan's "evaluator git rev" manifest field). `null` on any failure (not a
+ * git checkout, `git` not on `PATH`, etc.) — informational provenance, not
+ * a gate. Never called from `report.json`'s construction, which must stay
+ * byte-identical across repeated runs in the same checkout; a manifest is
+ * expected to change when the evaluator's own code does.
+ */
+const evaluatorGitRev = (): string | null => {
+  try {
+    return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'ignore'] })
+      .toString('utf8')
+      .trim();
+  } catch {
+    return null;
+  }
+};
 
 interface LoadedRun {
   readonly dir: string;
@@ -79,17 +114,25 @@ interface LoadedRun {
   readonly env: unknown | null;
 }
 
-const REQUIRED_RUN_CONFIG_FIELDS = ['arm', 'trainerSeed', 'D', 'H', 'parameterCount', 'substeps'] as const;
+const POSITIVE_INT_RUN_CONFIG_FIELDS = ['trainerSeed', 'D', 'H', 'parameterCount', 'substeps'] as const;
 
 const readRunDir = (dir: string): LoadedRun => {
   const configPath = resolve(dir, 'config.json');
-  const config = JSON.parse(readFileSync(configPath, 'utf8')) as Partial<RunConfig>;
-  for (const field of REQUIRED_RUN_CONFIG_FIELDS) {
-    if (config[field] === undefined) {
-      throw new Error(`evaluate: ${configPath} is missing required field "${field}"`);
+  const config = JSON.parse(readFileSync(configPath, 'utf8')) as Record<string, unknown>;
+
+  if (typeof config.arm !== 'string' || !ARM_NAMES.includes(config.arm as ArmName)) {
+    throw new Error(`evaluate: ${configPath}'s "arm" must be one of ${ARM_NAMES.join(', ')}, got ${JSON.stringify(config.arm)}`);
+  }
+  for (const field of POSITIVE_INT_RUN_CONFIG_FIELDS) {
+    const value = config[field];
+    if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
+      throw new Error(`evaluate: ${configPath}'s "${field}" must be a positive integer, got ${JSON.stringify(value)}`);
     }
   }
-  const runConfig = config as RunConfig;
+  if (config.armBundleSha256 !== undefined && typeof config.armBundleSha256 !== 'string') {
+    throw new Error(`evaluate: ${configPath}'s "armBundleSha256" must be a string when present`);
+  }
+  const runConfig = config as unknown as RunConfig;
   const { D, H, parameterCount } = runConfig;
   const expectedLength = readoutParameterCount(D, H);
   if (parameterCount !== expectedLength) {
@@ -135,10 +178,30 @@ interface ArmGraphs {
   readonly rewired?: ConnectomeGraph;
   readonly disconnected?: ConnectomeGraph;
   readonly graphArtifactSha256: string;
+  readonly bundleSha256: Partial<Record<ArmName, string>>;
+  readonly bundleProvenance: Partial<Record<ArmName, ArmProvenance>>;
 }
 
-const loadArmGraphs = (armsDir: string, needed: ReadonlySet<ArmName>): ArmGraphs => {
+/**
+ * Loads and *verifies* each requested arm's exported bundle
+ * (`export-arms.ts`'s `SerializedArmBundle`): a bundle's own `sha256`,
+ * `arm` field, and `provenance.kind` are otherwise self-declared claims a
+ * hand-edited or mislabeled file could lie about (e.g. copying
+ * `biological.json` over `rewired.json`, or hand-tweaking magnitudes after
+ * export). Recomputing the hash and cross-checking `arm`/`provenance`
+ * against what this evaluator actually expects for that arm + graph source
+ * is what makes `export-arms.ts`'s "a fixture swap can never be mistaken
+ * for the product's rewired arm" claim true at the one place it matters:
+ * here, right before the numbers it produces get published.
+ */
+const loadArmGraphs = (
+  armsDir: string,
+  needed: ReadonlySet<ArmName>,
+  expectedGraphSource: 'artifact' | 'trace-graph-fixture'
+): ArmGraphs => {
   const graphs: Partial<Record<ArmName, ConnectomeGraph>> = {};
+  const bundleSha256: Partial<Record<ArmName, string>> = {};
+  const bundleProvenance: Partial<Record<ArmName, ArmProvenance>> = {};
   let graphArtifactSha256: string | undefined;
   for (const arm of needed) {
     const bundlePath = resolve(armsDir, `${arm}.json`);
@@ -149,7 +212,33 @@ const loadArmGraphs = (armsDir: string, needed: ReadonlySet<ArmName>): ArmGraphs
       );
     }
     const bundle = JSON.parse(readFileSync(bundlePath, 'utf8')) as SerializedArmBundle;
+    if (bundle.formatVersion !== 1) {
+      throw new Error(`evaluate: ${bundlePath} has unsupported formatVersion ${bundle.formatVersion}`);
+    }
+    if (bundle.arm !== arm) {
+      throw new Error(`evaluate: ${bundlePath} declares arm "${bundle.arm}", expected "${arm}"`);
+    }
+    const { sha256, ...withoutHash } = bundle;
+    if (computeArmBundleSha256(withoutHash) !== sha256) {
+      throw new Error(`evaluate: ${bundlePath}'s sha256 does not match its content (tampered or stale file?)`);
+    }
+    if (bundle.graphSource !== expectedGraphSource) {
+      throw new Error(
+        `evaluate: ${bundlePath}'s graphSource "${bundle.graphSource}" does not match the ` +
+          `evaluation graph's source "${expectedGraphSource}"`
+      );
+    }
+    const expectedKind = expectedProvenanceKind(arm, bundle.graphSource);
+    if (bundle.provenance.kind !== expectedKind) {
+      throw new Error(
+        `evaluate: ${bundlePath}'s provenance.kind "${bundle.provenance.kind}" is not valid for ` +
+          `arm "${arm}" with graphSource "${bundle.graphSource}" (expected "${expectedKind}")`
+      );
+    }
+
     graphs[arm] = deserializeArmBundle(bundle);
+    bundleSha256[arm] = bundle.sha256;
+    bundleProvenance[arm] = bundle.provenance;
     if (graphArtifactSha256 === undefined) {
       graphArtifactSha256 = bundle.graphArtifactSha256;
     } else if (graphArtifactSha256 !== bundle.graphArtifactSha256) {
@@ -159,7 +248,7 @@ const loadArmGraphs = (armsDir: string, needed: ReadonlySet<ArmName>): ArmGraphs
   if (graphArtifactSha256 === undefined) {
     throw new Error('evaluate: no arms requested (no run directories given)');
   }
-  return { ...graphs, graphArtifactSha256 };
+  return { ...graphs, graphArtifactSha256, bundleSha256, bundleProvenance };
 };
 
 // ---------------------------------------------------------------------------
@@ -257,6 +346,8 @@ export interface EvaluateArgs {
   readonly armsDir?: string;
   readonly runDirs: readonly string[];
   readonly outDir: string;
+  /** True only when `--out` was actually passed, not merely defaulted (see `runEvaluate`'s public/data guard). */
+  readonly outDirExplicit: boolean;
   readonly ticks: number;
   readonly substeps: number;
   readonly heldOutStart: number;
@@ -264,6 +355,8 @@ export interface EvaluateArgs {
   readonly bootstrapResamples: number;
   readonly bootstrapSeed: number;
 }
+
+const DEFAULT_OUT_DIR = 'public/data';
 
 /** 'E','V','A','L' as a fixed default seed; arbitrary but stable across runs. */
 const DEFAULT_BOOTSTRAP_SEED = 0x4556_414c;
@@ -288,11 +381,22 @@ const requirePositiveInt = (flag: string, value: string | undefined): number => 
   return parsed;
 };
 
+/** Like `requirePositiveInt`, but accepts 0 — for seed-like flags, where 0 is a meaningful seed. */
+const requireNonNegativeInt = (flag: string, value: string | undefined): number => {
+  const raw = requireValue(flag, value);
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`${flag} must be a non-negative integer, got "${raw}"`);
+  }
+  return parsed;
+};
+
 export const parseEvaluateArgs = (argv: readonly string[]): EvaluateArgs => {
   let graphPath: string | undefined;
   let armsDir: string | undefined;
   const runDirs: string[] = [];
-  let outDir = 'public/data';
+  let outDir = DEFAULT_OUT_DIR;
+  let outDirExplicit = false;
   let ticks = DEFAULT_TICKS;
   let substeps = TRACE_SUBSTEPS;
   let heldOutStart = DEFAULT_HELD_OUT_START;
@@ -320,6 +424,7 @@ export const parseEvaluateArgs = (argv: readonly string[]): EvaluateArgs => {
       if (consumed === 0) throw new Error('--runs requires at least one run directory');
     } else if (flag === '--out') {
       outDir = requireValue(flag, argv[index + 1]);
+      outDirExplicit = true;
       index += 2;
     } else if (flag === '--ticks') {
       ticks = requirePositiveInt(flag, argv[index + 1]);
@@ -337,7 +442,7 @@ export const parseEvaluateArgs = (argv: readonly string[]): EvaluateArgs => {
       bootstrapResamples = requirePositiveInt(flag, argv[index + 1]);
       index += 2;
     } else if (flag === '--bootstrap-seed') {
-      bootstrapSeed = requirePositiveInt(flag, argv[index + 1]);
+      bootstrapSeed = requireNonNegativeInt(flag, argv[index + 1]);
       index += 2;
     } else {
       throw new Error(`Unknown argument: ${flag}`);
@@ -351,6 +456,7 @@ export const parseEvaluateArgs = (argv: readonly string[]): EvaluateArgs => {
     armsDir,
     runDirs,
     outDir,
+    outDirExplicit,
     ticks,
     substeps,
     heldOutStart,
@@ -372,6 +478,25 @@ export interface RunEvaluateResult {
 
 /** Core logic, separated from CLI parsing/`main` so tests can call it in-process without a subprocess. */
 export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => {
+  const graphIdentity = computeGraphIdentity(args.graphPath);
+
+  // Trace-graph dev mode (no --graph) must never silently overwrite the
+  // real shipped artifact: `npm run training:evaluate -- --runs <dirs>`
+  // with no --graph defaults to the trace graph AND to --out public/data,
+  // which would otherwise clobber the product's public/data/trained-readout-v1.*
+  // with fixture output. Mirrors export-traces.ts's --out overwrite guard.
+  if (graphIdentity.graphSource !== 'artifact') {
+    const resolvedOutDir = resolve(process.cwd(), args.outDir);
+    const resolvedDefaultOutDir = resolve(process.cwd(), DEFAULT_OUT_DIR);
+    if (!args.outDirExplicit || resolvedOutDir === resolvedDefaultOutDir) {
+      throw new Error(
+        'evaluate: trace-graph mode (no --graph) refuses to write to the default --out ' +
+          `(${DEFAULT_OUT_DIR}); pass --out <scratch dir> explicitly, or pass --graph <artifact> ` +
+          'for a real evaluation run.'
+      );
+    }
+  }
+
   const runs = args.runDirs.map((dir) => readRunDir(dir));
   const seenKeys = new Set<string>();
   for (const run of runs) {
@@ -380,18 +505,33 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
       throw new Error(`evaluate: duplicate run for arm "${run.config.arm}" trainerSeed ${run.config.trainerSeed}`);
     }
     seenKeys.add(key);
+    if (run.config.substeps !== args.substeps) {
+      throw new Error(
+        `evaluate: ${run.dir}/config.json was trained at substeps=${run.config.substeps} but ` +
+          `evaluation is running at --substeps ${args.substeps}; pass --substeps ${run.config.substeps} ` +
+          'or re-check which run this is.'
+      );
+    }
   }
 
   const neededArms = new Set(runs.map((run) => run.config.arm));
-  const graphIdentity = computeGraphIdentity(args.graphPath);
   const armsDir = args.armsDir ?? resolve(DEFAULT_ARMS_OUT_DIR, graphIdentity.graphArtifactSha256);
-  const armGraphs = loadArmGraphs(armsDir, neededArms);
+  const armGraphs = loadArmGraphs(armsDir, neededArms, graphIdentity.graphSource);
   if (armGraphs.graphArtifactSha256 !== graphIdentity.graphArtifactSha256) {
     throw new Error(
       `evaluate: arm bundles under ${armsDir} were exported from a different graph ` +
         `(bundle graphArtifactSha256=${armGraphs.graphArtifactSha256}) than --graph resolves to ` +
         `(${graphIdentity.graphArtifactSha256})`
     );
+  }
+  for (const run of runs) {
+    const loadedSha256 = armGraphs.bundleSha256[run.config.arm];
+    if (run.config.armBundleSha256 && loadedSha256 && run.config.armBundleSha256 !== loadedSha256) {
+      throw new Error(
+        `evaluate: ${run.dir}/config.json was trained against arm bundle sha256 ` +
+          `${run.config.armBundleSha256}, but the loaded "${run.config.arm}" bundle is ${loadedSha256}`
+      );
+    }
   }
 
   const armNames = (['biological', 'rewired', 'disconnected'] as const).filter((arm) => armGraphs[arm]);
@@ -433,6 +573,17 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
     if (!armReplicas.has(run.config.arm)) armReplicas.set(run.config.arm, new Map());
     armReplicas.get(run.config.arm)!.set(run.config.trainerSeed, run);
   }
+  /**
+   * Ascending-by-trainerSeed entries for one arm's replicas. `armReplicas`'s
+   * `Map` iterates in insertion order, which is the order run dirs appeared
+   * on `--runs` — sorting here makes every downstream loop order (and
+   * therefore the single shared bootstrap `rng`'s draw sequence, and
+   * `armPairs`'s element order) independent of `--runs` argument order, so
+   * the same *set* of runs always produces the same `report.json` bytes,
+   * not just the same argv.
+   */
+  const sortedReplicas = (arm: ArmName): Array<[number, LoadedRun]> =>
+    [...(armReplicas.get(arm) ?? new Map<number, LoadedRun>())].sort(([a], [b]) => a - b);
 
   const warnings: string[] = [];
 
@@ -444,9 +595,8 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
     const authoredScores = heldOutSeeds.map((seed) => computeLeftScore(arm, 'authored', null, null, seed));
     const authoredStats = conditionStats(authoredScores, args.bootstrapResamples, rng);
 
-    const replicaMap = armReplicas.get(arm) ?? new Map<number, LoadedRun>();
     const replicasReport: Record<string, unknown> = {};
-    for (const [trainerSeed, run] of replicaMap) {
+    for (const [trainerSeed, run] of sortedReplicas(arm)) {
       validateReadoutWeights(run.weights, graph);
       const trainedScores = heldOutSeeds.map((seed) => computeLeftScore(arm, 'trained', trainerSeed, run.weights, seed));
       const silencedScores = heldOutSeeds.map((seed) => computeLeftScore(arm, 'silenced', trainerSeed, run.weights, seed));
@@ -462,7 +612,13 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
       };
     }
 
-    armsReport[arm] = { D, authored: authoredStats, replicas: replicasReport };
+    armsReport[arm] = {
+      D,
+      provenance: armGraphs.bundleProvenance[arm],
+      armBundleSha256: armGraphs.bundleSha256[arm],
+      authored: authoredStats,
+      replicas: replicasReport
+    };
   }
 
   const armPairs: unknown[] = [];
@@ -481,9 +637,8 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
         pairedDifference: pairedStats(authoredA, authoredB, args.bootstrapResamples, rng)
       });
 
-      const replicasA = armReplicas.get(armA) ?? new Map<number, LoadedRun>();
       const replicasB = armReplicas.get(armB) ?? new Map<number, LoadedRun>();
-      for (const [trainerSeed, runA] of replicasA) {
+      for (const [trainerSeed, runA] of sortedReplicas(armA)) {
         const runB = replicasB.get(trainerSeed);
         if (!runB) continue;
         for (const condition of ['trained', 'silenced'] as const) {
@@ -526,9 +681,8 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
       pairedLeftMinusRight: pairedStats(leftAuthored, rightAuthored, args.bootstrapResamples, rng)
     });
 
-    const bioReplicas = armReplicas.get('biological') ?? new Map<number, LoadedRun>();
     const rewiredReplicas = armReplicas.get('rewired') ?? new Map<number, LoadedRun>();
-    for (const [trainerSeed, bioRun] of bioReplicas) {
+    for (const [trainerSeed, bioRun] of sortedReplicas('biological')) {
       const rewiredRun = rewiredReplicas.get(trainerSeed);
       if (!rewiredRun) continue;
       const leftTrained: number[] = [];
@@ -561,25 +715,46 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
     );
   }
 
-  // Shipped artifact (replica 0 = trainerSeed 101) for every requested arm.
+  // Shipped artifact (replica 0 = trainerSeed 101): the plan's format is
+  // `arms: { biological, rewired, disconnected }` — all three, always — so
+  // completeness requires all three `ARM_NAMES`, not merely the arms this
+  // invocation happened to evaluate. Every skip reason is pushed as a
+  // warning: a silently-missing shipped artifact is exactly the kind of
+  // mistake a WP5 production run must not be able to make quietly.
   const shippedWeights: Partial<Record<ArmName, ReadoutWeights>> = {};
+  const shippedEnv: Partial<Record<ArmName, unknown>> = {};
   let shippedD: number | null = null;
   let shippedH: number | null = null;
-  let complete = armNames.length > 0;
-  for (const arm of armNames) {
-    const run = (armReplicas.get(arm) ?? new Map<number, LoadedRun>()).get(SHIPPED_TRAINER_SEED);
+  let complete = true;
+  for (const arm of ARM_NAMES) {
+    const run = armReplicas.get(arm)?.get(SHIPPED_TRAINER_SEED);
     if (!run) {
       complete = false;
-      warnings.push(`trained-readout-v1.json not written: no replica 0 (trainerSeed ${SHIPPED_TRAINER_SEED}) run for arm "${arm}".`);
+      warnings.push(
+        `trained-readout-v1.json not written: no replica 0 (trainerSeed ${SHIPPED_TRAINER_SEED}) run for arm "${arm}".`
+      );
       continue;
     }
+    if (shippedD !== null && shippedD !== run.config.D) {
+      complete = false;
+      warnings.push(
+        `trained-readout-v1.json not written: arm "${arm}"'s D (${run.config.D}) differs from ${shippedD}.`
+      );
+    }
+    if (shippedH !== null && shippedH !== run.config.H) {
+      complete = false;
+      warnings.push(
+        `trained-readout-v1.json not written: arm "${arm}"'s H (${run.config.H}) differs from ${shippedH}.`
+      );
+    }
     shippedWeights[arm] = run.weights;
-    if (shippedD === null) shippedD = run.config.D;
-    else if (shippedD !== run.config.D) complete = false;
-    if (shippedH === null) shippedH = run.config.H;
-    else if (shippedH !== run.config.H) complete = false;
+    shippedEnv[arm] = run.env;
+    if (run.env === null) {
+      warnings.push(`arm "${arm}" replica 0 run "${run.dir}" has no env.json; manifest omits its device/torch provenance.`);
+    }
+    shippedD ??= run.config.D;
+    shippedH ??= run.config.H;
   }
-  if (armNames.length === 0) complete = false;
 
   const report = {
     formatVersion: 1,
@@ -611,7 +786,7 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
     const encodeBase64 = (values: Float32Array): string =>
       Buffer.from(values.buffer, values.byteOffset, values.byteLength).toString('base64');
     const arms: Record<string, unknown> = {};
-    for (const arm of armNames) {
+    for (const arm of ARM_NAMES) {
       const weights = shippedWeights[arm]!;
       arms[arm] = {
         w1: encodeBase64(weights.w1),
@@ -625,23 +800,31 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
     writeFileSync(resolve(outDir, 'trained-readout-v1.json'), artifactContents);
     const artifactSha256 = sha256Hex(artifactContents);
 
+    // Already-verified (loadArmGraphs recomputed and checked each of
+    // these against its bundle's own content) — no need to re-read and
+    // re-trust the files from disk a second time here.
     const armBundleSha256: Record<string, string> = {};
-    for (const arm of armNames) {
-      const bundlePath = resolve(armsDir, `${arm}.json`);
-      const bundle = JSON.parse(readFileSync(bundlePath, 'utf8')) as SerializedArmBundle;
-      armBundleSha256[arm] = bundle.sha256;
+    const armProvenance: Record<string, ArmProvenance> = {};
+    for (const arm of ARM_NAMES) {
+      armBundleSha256[arm] = armGraphs.bundleSha256[arm]!;
+      armProvenance[arm] = armGraphs.bundleProvenance[arm]!;
     }
 
     const manifest = {
       version: 1,
       artifactSha256,
       graphArtifactSha256: graphIdentity.graphArtifactSha256,
+      graphSource: graphIdentity.graphSource,
       armBundleSha256,
+      armProvenance,
       D: shippedD,
       H: shippedH,
       parameterCount: readoutParameterCount(shippedD, shippedH),
       shippedReplicaTrainerSeed: SHIPPED_TRAINER_SEED,
-      heldOutSeeds: { start: args.heldOutStart, count: args.heldOutCount }
+      heldOutSeeds: { start: args.heldOutStart, count: args.heldOutCount },
+      /** Per-arm shipped-replica torch/CUDA/device provenance, when its run had an `env.json`; `null` otherwise. */
+      env: shippedEnv,
+      evaluatorGitRev: evaluatorGitRev()
     };
     writeFileSync(resolve(outDir, 'trained-readout-v1.manifest.json'), JSON.stringify(manifest));
     artifactWritten = true;
@@ -651,8 +834,8 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
 };
 
 const main = (): void => {
-  const args = parseEvaluateArgs(process.argv.slice(2));
   try {
+    const args = parseEvaluateArgs(process.argv.slice(2));
     const result = runEvaluate(args);
     // eslint-disable-next-line no-console -- CLI tool: this is its user-facing output.
     console.log(

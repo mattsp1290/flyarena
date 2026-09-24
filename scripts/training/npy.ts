@@ -59,6 +59,9 @@ export const readNpyFloat32Array = (path: string): Float32Array => {
     );
   }
   const elementCount = shapeNumbers[0];
+  if (!Number.isInteger(elementCount) || elementCount < 0) {
+    throw new Error(`Invalid .npy file at ${path}: malformed shape (${shapeMatch[1]})`);
+  }
   const descr = descrMatch[1];
   const dataStart = headerStart + headerLength;
   const dataBytes = buffer.subarray(dataStart);

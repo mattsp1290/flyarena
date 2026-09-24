@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, extname, resolve } from 'node:path';
 
 import {
@@ -43,11 +43,16 @@ import { DEFAULT_GRAPH_ID, loadGraphArtifact } from './export-traces';
  *   recorded with `provenance.kind === 'disconnected-runtime-zero-edge'`.
  *
  * Gate: `D` (the output-neuron count, `outputNeuronIndices(graph).length`)
- * must be equal across every arm actually exported, or this script exits
+ * must be equal across every arm actually exported, AND every non-biological
+ * arm's node set / I/O maps (`biologicalIds`, `outputNeuronIndices`,
+ * `outputPopulationIndex`, `inputChannelIndex`) must exactly match the
+ * biological arm's (`assertMatchingNodeSet`), or this script exits
  * non-zero. Rewiring/disconnection preserve the node set by construction,
  * so this is expected to hold trivially; the gate exists to catch a
- * provenance mismatch (e.g. a `--rewired` artifact from a different graph)
- * rather than to guard against an expected failure mode.
+ * provenance mismatch (e.g. a `--rewired` artifact from a different graph,
+ * or one whose output neurons landed in a different order) rather than to
+ * guard against an expected failure mode. D-equality alone cannot catch
+ * either of those — see `assertMatchingNodeSet`'s doc comment.
  */
 
 const sha256Hex = (data: Uint8Array | string): string => createHash('sha256').update(data).digest('hex');
@@ -57,9 +62,36 @@ export type ArmName = 'biological' | 'rewired' | 'disconnected';
 export type ArmProvenance =
   | { readonly kind: 'biological-artifact'; readonly artifactPath: string; readonly artifactSha256: string }
   | { readonly kind: 'biological-trace-graph-fixture' }
-  | { readonly kind: 'rewired-artifact'; readonly artifactPath: string; readonly artifactSha256: string }
+  | {
+      readonly kind: 'rewired-artifact';
+      readonly artifactPath: string;
+      readonly artifactSha256: string;
+      /**
+       * The rewiring seed recorded in the biological graph's sibling
+       * `<graph>.manifest.json` (`rewiredArms.<key>.swapStats.seed`,
+       * matched by this artifact's own gzip sha256 — see
+       * `docs/data-provenance.md`'s "Rewired control arm" section), when
+       * that manifest is present and has a matching entry. `null` when no
+       * matching entry was found (e.g. a rewired artifact not produced by
+       * `scripts/data/rewire.py`, or no manifest alongside `--graph`) —
+       * best-effort provenance, not a requirement.
+       */
+      readonly rewiringSeed: number | null;
+    }
   | { readonly kind: 'rewired-fixture-only-swap'; readonly seed: number }
   | { readonly kind: 'disconnected-runtime-zero-edge' };
+
+/** The exact `ArmProvenance.kind` a valid bundle must have for a given arm + graph source. */
+export const expectedProvenanceKind = (
+  arm: ArmName,
+  graphSource: 'artifact' | 'trace-graph-fixture'
+): ArmProvenance['kind'] => {
+  if (arm === 'disconnected') return 'disconnected-runtime-zero-edge';
+  if (arm === 'biological') {
+    return graphSource === 'artifact' ? 'biological-artifact' : 'biological-trace-graph-fixture';
+  }
+  return graphSource === 'artifact' ? 'rewired-artifact' : 'rewired-fixture-only-swap';
+};
 
 /**
  * One arm's exported CSR bundle: everything `training/`'s (not yet built)
@@ -204,6 +236,16 @@ export const computeGraphIdentity = (graphPath?: string): GraphIdentity => {
   };
 };
 
+/**
+ * The bundle's self-certifying hash: sha256 over its own canonical JSON
+ * with `sha256` itself set to `""`. Shared by `buildArmBundle` (which
+ * writes it) and `evaluate.ts`'s `loadArmGraphs` (which recomputes it to
+ * verify a bundle was not hand-edited or swapped after export — a bundle's
+ * `sha256` field is otherwise a self-declared claim, not a check).
+ */
+export const computeArmBundleSha256 = (bundle: Omit<SerializedArmBundle, 'sha256'>): string =>
+  sha256Hex(JSON.stringify({ ...bundle, sha256: '' }));
+
 const buildArmBundle = (
   arm: ArmName,
   graph: Readonly<ConnectomeGraph>,
@@ -223,11 +265,75 @@ const buildArmBundle = (
     outputNeuronIndices: indices,
     ...toPlainArrays(graph)
   };
-  const sha256 = sha256Hex(JSON.stringify({ ...withoutHash, sha256: '' }));
-  return { ...withoutHash, sha256 };
+  return { ...withoutHash, sha256: computeArmBundleSha256(withoutHash) };
 };
 
 export class ExportArmsGateError extends Error {}
+
+/**
+ * Best-effort lookup of the rewiring seed for `--rewired <rewiredPath>`,
+ * paired with the biological graph at `graphPath`. Reads
+ * `<graphPath-without-its-.bin[.gz]-extension>.manifest.json` (the
+ * convention `scripts/data/compile.py`/`rewire.py` use — see
+ * `public/data/malecns-arena-v1.manifest.json`'s `rewiredArms` block) and
+ * matches its entries by `gzipSha256` against `rewiredPath`'s own raw
+ * bytes. Returns `null` on any miss (no manifest, no matching entry, or a
+ * malformed one) — this is provenance enrichment, not a validity gate; the
+ * real pairing proof is `assertMatchingNodeSet` below, which is exact.
+ */
+const lookupRewiringSeed = (graphPath: string, rewiredArtifactSha256: string): number | null => {
+  try {
+    const base = graphPath.endsWith('.bin.gz')
+      ? graphPath.slice(0, -'.bin.gz'.length)
+      : graphPath.replace(extname(graphPath), '');
+    const manifestPath = `${base}.manifest.json`;
+    if (!existsSync(manifestPath)) return null;
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
+      rewiredArms?: Record<string, { gzipSha256?: string; swapStats?: { seed?: number } }>;
+    };
+    for (const entry of Object.values(manifest.rewiredArms ?? {})) {
+      if (entry.gzipSha256 === rewiredArtifactSha256 && typeof entry.swapStats?.seed === 'number') {
+        return entry.swapStats.seed;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+};
+
+const sameNumericArray = (a: ArrayLike<number>, b: ArrayLike<number>): boolean =>
+  a.length === b.length && Array.prototype.every.call(a, (value: number, index: number) => value === b[index]);
+const sameStringArray = (a: ArrayLike<string>, b: ArrayLike<string>): boolean =>
+  a.length === b.length && Array.prototype.every.call(a, (value: string, index: number) => value === b[index]);
+
+/**
+ * Exact node-set / I/O-map equality against the biological bundle. `D`
+ * equality alone (this script's older gate) cannot catch a `--rewired`
+ * artifact compiled from a different graph that happens to have the same
+ * output-neuron count — degree-preserving rewiring preserves the node set
+ * and every per-neuron I/O mapping exactly
+ * (`docs/data-provenance.md`'s "Rewired control arm" section), so this
+ * comparison is expected to hold, not merely likely to.
+ */
+const assertMatchingNodeSet = (biological: SerializedArmBundle, other: SerializedArmBundle): void => {
+  const mismatches: string[] = [];
+  if (other.metadata.neuronCount !== biological.metadata.neuronCount) mismatches.push('neuronCount');
+  if (!sameStringArray(other.biologicalIds, biological.biologicalIds)) mismatches.push('biologicalIds');
+  if (!sameNumericArray(other.outputNeuronIndices, biological.outputNeuronIndices)) {
+    mismatches.push('outputNeuronIndices');
+  }
+  if (!sameNumericArray(other.outputPopulationIndex, biological.outputPopulationIndex)) {
+    mismatches.push('outputPopulationIndex');
+  }
+  if (!sameNumericArray(other.inputChannelIndex, biological.inputChannelIndex)) mismatches.push('inputChannelIndex');
+  if (mismatches.length > 0) {
+    throw new ExportArmsGateError(
+      `arm "${other.arm}" node set / I/O map differs from "biological" (${mismatches.join(', ')}); ` +
+        `is --rewired paired with the wrong biological --graph?`
+    );
+  }
+};
 
 export const DEFAULT_ARMS_OUT_DIR = 'training/runs/arms';
 
@@ -329,10 +435,12 @@ export const runExportArms = (args: Readonly<ExportArmsArgs>): ExportArmsResult 
     const raw = readFileSync(args.rewiredPath);
     const rewiredGraph = loadGraphArtifact(args.rewiredPath);
     validateGraph(rewiredGraph);
+    const artifactSha256 = sha256Hex(raw);
+    const rewiringSeed = args.graphPath ? lookupRewiringSeed(args.graphPath, artifactSha256) : null;
     bundles.rewired = buildArmBundle(
       'rewired',
       rewiredGraph,
-      { kind: 'rewired-artifact', artifactPath: args.rewiredPath, artifactSha256: sha256Hex(raw) },
+      { kind: 'rewired-artifact', artifactPath: args.rewiredPath, artifactSha256, rewiringSeed },
       identity
     );
   } else if (args.fixtureRewire) {
@@ -359,6 +467,13 @@ export const runExportArms = (args: Readonly<ExportArmsArgs>): ExportArmsResult 
     const detail = entries.map(([arm, bundle]) => `${arm}=${bundle.D}`).join(', ');
     throw new ExportArmsGateError(`D (output-neuron count) differs across arms: ${detail}`);
   }
+  // D equality alone cannot catch a --rewired artifact compiled from a
+  // different graph with the same output-neuron count (or with its output
+  // neurons in a different order) — see assertMatchingNodeSet's doc
+  // comment. This is exact, not a count heuristic.
+  for (const [, bundle] of entries) {
+    if (bundle.arm !== 'biological') assertMatchingNodeSet(bundles.biological!, bundle);
+  }
 
   const outDir = resolve(process.cwd(), args.outDir, identity.graphArtifactSha256);
   mkdirSync(outDir, { recursive: true });
@@ -367,13 +482,26 @@ export const runExportArms = (args: Readonly<ExportArmsArgs>): ExportArmsResult 
     writeFileSync(resolve(outDir, `${arm}.json`), JSON.stringify(bundle));
     written.push(arm);
   }
+  // Stale-bundle cleanup: an arm not written this invocation (most
+  // commonly "rewired", when re-exporting without --rewired/--fixture-rewire)
+  // must not leave a bundle from a previous invocation behind for
+  // evaluate.ts to silently pick up.
+  for (const arm of ['biological', 'rewired', 'disconnected'] as const) {
+    if (written.includes(arm)) continue;
+    const stalePath = resolve(outDir, `${arm}.json`);
+    if (existsSync(stalePath)) {
+      unlinkSync(stalePath);
+      // eslint-disable-next-line no-console -- CLI tool: user-facing diagnostic.
+      console.warn(`export-arms: removed stale ${stalePath} (not exported this run)`);
+    }
+  }
 
   return { outDir, written, d: entries[0][1].D };
 };
 
 const main = (): void => {
-  const args = parseExportArmsArgs(process.argv.slice(2));
   try {
+    const args = parseExportArmsArgs(process.argv.slice(2));
     const { outDir, written, d } = runExportArms(args);
     // eslint-disable-next-line no-console -- CLI tool: this is its user-facing output.
     console.log(`export-arms: wrote ${written.length} bundle(s) to ${outDir} (D=${d}): ${written.join(', ')}`);
