@@ -42,7 +42,7 @@
   },
   "rewiringNull": {
     "artifact": "rewiring-null-v1.json",
-    "sha256": "32d2c2fc1fe37a517c6a92abc32c46bf1a467de30c8456951d764c944eca47ab"
+    "sha256": "592446bb387acbc5354db807ae2f824547d168d9e338d3a55f94f525e39083d1"
   },
   "sourceDataset": "male-cns:v1.0 (Janelia FlyEM Male CNS connectome)"
 }

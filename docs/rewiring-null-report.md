@@ -24,6 +24,8 @@ null set `N` is the 500 rewired graphs' mean scores.
 | Substeps (K) | 4 |
 | Rewired graphs | 500 (seeds 0..499) |
 | Evaluation shards | 18 |
+| Wall time | 1610.3s |
+| Per-episode time | 32.1 ms |
 | Bootstrap resamples | 10000 |
 | Bootstrap seed | 1314212940 |
 | Histogram bins | 30 |
@@ -38,13 +40,13 @@ equal-width bins over `[min(N ∪ {biological, disconnected}), max(N ∪ {biolog
 
 | range | count | |
 | --- | --- | --- |
-| -1.860 to -1.591 | 1 | # |
+| -1.860 to -1.591 | 0 |  |
 | -1.591 to -1.322 | 0 |  |
 | -1.322 to -1.054 | 0 |  |
 | -1.054 to -0.785 | 0 |  |
 | -0.785 to -0.516 | 0 |  |
 | -0.516 to -0.247 | 0 |  |
-| -0.247 to 0.021 | 1 | # |
+| -0.247 to 0.021 | 0 |  |
 | 0.021 to 0.290 | 1 | # |
 | 0.290 to 0.559 | 1 | # |
 | 0.559 to 0.828 | 11 | ###### |
@@ -98,4 +100,3 @@ equal-width bins over `[min(N ∪ {biological, disconnected}), max(N ∪ {biolog
 - **No causal or superiority claim is made.** The percentile and rank statistics above are descriptive: they
   say where the biological graph's score falls among this null model's rewirings under this exact evaluation
   setup, not that biological topology causes or predicts any particular score.
-
