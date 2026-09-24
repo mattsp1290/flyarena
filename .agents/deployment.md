@@ -12,8 +12,8 @@ deployment URL, SSH destination, and confirmed dedicated app directory. `.env`
 is trusted shell configuration and is ignored by Git. Never put actual hostnames,
 IP addresses, or SSH destinations in tracked documentation, scripts, or `VITE_*`
 variables. The backend placement requested by the owner is recorded as
-`BACKEND_SSH` in `.env`. This app currently has no backend, database, or daemon;
-deploy any future backend services on that designated machine.
+`BACKEND_SSH` in `.env`. The default arena and counterfactual workbench have no backend. The optional
+synthetic sandbox has a separate service; place it on that designated machine.
 
 ## Hosting contract
 

@@ -1,7 +1,8 @@
 import { loadPreparedGraph } from './targets';
 import { experiment } from './engine';
 import { serializeEvidence } from './evidence';
-import { validateRequest } from './types';
+import { validateRequest, type Request } from './types';
+import type { GraphMode } from '../connectome/format';
 import type { WorkerCommand, WorkerEvent } from './protocol';
 
 const send = (message: WorkerEvent) => self.postMessage(message);
@@ -12,8 +13,13 @@ self.onmessage = async (event: MessageEvent<WorkerCommand>) => {
   try {
     const command = event.data;
     if (command.type !== 'prepare' && command.type !== 'run') throw new Error('Invalid worker command');
-    const request = command.type === 'run' ? validateRequest(command.request) : undefined;
-    const prepared = await loadPreparedGraph(command.baseUrl, command.type === 'prepare' ? command.topology : validateRequest(command.request).topology);
+    let request: Request | undefined;
+    let topology: GraphMode;
+    if (command.type === 'run') {
+      request = validateRequest(command.request);
+      topology = request.topology;
+    } else topology = command.topology;
+    const prepared = await loadPreparedGraph(command.baseUrl, topology);
     send({ type: 'prepared', preparation: { identity: prepared.identity, targets: prepared.targets } });
     if (!request) return;
     const started = performance.now();

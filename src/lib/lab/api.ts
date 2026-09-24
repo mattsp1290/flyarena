@@ -1,5 +1,11 @@
 import type { Job, Options } from "./types";
 
+export class LabApiError extends Error {
+  constructor(readonly status: number, detail: string) {
+    super(`${status}: ${detail}`);
+  }
+}
+
 export class LabApi {
   private base: string;
   constructor(
@@ -48,7 +54,7 @@ export class LabApi {
         typeof data.detail === "string"
           ? data.detail
           : "Invalid request settings.";
-      throw new Error(`${response.status}: ${detail}`);
+      throw new LabApiError(response.status, detail);
     }
     return data as T;
   }

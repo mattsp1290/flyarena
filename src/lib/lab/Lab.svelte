@@ -1,23 +1,19 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
-  import { LabApi } from './api';
+  import { LabSession, initialSession, sessionActive } from './session';
   import Replay from './Replay.svelte';
-  import type { Job, Options, Result } from './types';
+  import type { Options } from './types';
   let endpoint = $state('http://127.0.0.1:8765');
   let token = $state('');
   import './lab.css';
   let options = $state<Options>({ seed: 17, device: 'cuda', population: 32, generations: 12,
     training_seeds: 8, heldout_seeds: 16, ticks: 240 });
-  let job = $state<Job | null>(null);
-  let result = $state<Result | null>(null);
-  let error = $state('');
-  let busy = $state(false);
+  let sessionState = $state(initialSession());
+  const session = new LabSession(next => { sessionState = next; });
+  let job = $derived(sessionState.job);
+  let result = $derived(job?.status === 'completed' ? job.result : null);
+  let busy = $derived(sessionActive(sessionState.status));
   let selected = $state(3);
-  let client: LabApi | null = null;
-  let pollStopped = false;
-  let controller: AbortController | null = null;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  let identifier = $state<string | null>(null);
   let generation = $derived(job?.progress?.generation ?? 0);
   let scale = $derived(result ? Math.max(1, ...result.arms.map(a => Math.max(Math.abs(a.effect.low), Math.abs(a.effect.high)))) : 1);
   let historyPoints = $derived.by(() => {
@@ -27,51 +23,6 @@
     return history.map((v, i) => `${10 + i * 480 / (history.length - 1)},${90 - (v - low) * 70 / Math.max(1, high - low)}`).join(' ');
   });
   const number = (n: number) => n.toFixed(2);
-  const active = (status: string) => ['queued', 'running', 'cancelling'].includes(status);
-  function apply(next: Job) {
-    job = next;
-    busy = active(next.status);
-    if (next.status === 'completed') result = next.result;
-    if (next.status === 'failed') error = next.error ?? 'Experiment failed.';
-  }
-  async function poll() {
-    if (!client || !controller || !identifier) return;
-    pollStopped = false;
-    try {
-      apply(await client.status(identifier, controller.signal));
-      if (busy) timer = setTimeout(poll, 600);
-    } catch (e) {
-      if (controller?.signal.aborted) return;
-      pollStopped = true;
-      error = `${e instanceof Error ? e.message : 'Connection failed.'} Reconnect to inspect the existing job.`;
-      // Keep the job identity; a network error must not create a duplicate experiment.
-    }
-  }
-  async function start() {
-    clearTimeout(timer);
-    controller?.abort();
-    controller = new AbortController();
-    error = ''; result = null; job = null; identifier = null; busy = true;
-    try {
-      client = new LabApi(endpoint, token);
-      const created = await client.submit(options, controller.signal);
-      identifier = created.id;
-      await poll();
-    } catch (e) {
-      if (controller.signal.aborted) return;
-      busy = false;
-      error = `${e instanceof Error ? e.message : 'Connection failed.'} Submission is not retried automatically.`;
-    }
-  }
-  async function cancel() {
-    if (!client || !identifier || !controller) return;
-    try {
-      apply(await client.cancel(identifier, controller.signal));
-      if (pollStopped) { error = ''; await poll(); }
-    }
-    catch (e) { error = e instanceof Error ? e.message : 'Cancellation failed.'; }
-  }
-  function reconnect() { clearTimeout(timer); error = ''; void poll(); }
   function exportResult() {
     if (!result) return;
     const url = URL.createObjectURL(new Blob([JSON.stringify(result)], { type: 'application/json' }));
@@ -79,14 +30,7 @@
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
   function quick() { options = { ...options, population: 4, generations: 1, training_seeds: 4, heldout_seeds: 8, ticks: 30 }; }
-  onDestroy(() => {
-    clearTimeout(timer);
-    // Preserve the cancellation request when polling's controller is aborted.
-    if (busy && client && identifier) {
-      void client.cancel(identifier, new AbortController().signal).catch(() => {});
-    }
-    controller?.abort();
-  });
+  onDestroy(() => session.dispose());
 </script>
 
 <div class="dgx-sandbox">
@@ -99,7 +43,7 @@
   <aside class="panel controls" aria-label="Experiment controls">
     <p class="eyebrow">01 / Design the experiment</p><h2>One brain. Matched worlds.</h2>
     <p class="subtle">64 recurrent units, eight groups, a learned motor readout. Every intervention uses the same held-out seeds.</p>
-    <form onsubmit={e => { e.preventDefault(); void start(); }}>
+    <form onsubmit={e => { e.preventDefault(); void session.start(endpoint, token, { ...options }); }}>
       <fieldset disabled={busy}>
         <details open><summary>Backend connection</summary>
           <label>Backend URL<input type="url" bind:value={endpoint} required /></label>
@@ -119,14 +63,14 @@
         <button class="primary" type="submit">Train & probe circuit <span aria-hidden="true">↗</span></button>
       </fieldset>
     </form>
-    {#if busy}<button class="cancel" onclick={cancel} disabled={!identifier || job?.status === 'cancelling'}>Cancel experiment</button>{/if}
+    {#if busy}<button class="cancel" onclick={() => session.cancel()} disabled={!sessionState.id || job?.status === 'cancelling'}>Cancel experiment</button>{/if}
     <div class="job-status" role="status" aria-live="polite">
-      <strong>{job?.status ?? (busy ? 'Connecting' : 'Ready for an experiment')}</strong>
-      {#if identifier}<span data-testid="lab-job-id">Job {identifier}</span>{/if}
+      <strong>{sessionState.status === 'idle' ? 'Ready for an experiment' : sessionState.status}</strong>
+      {#if sessionState.id}<span data-testid="lab-job-id">Job {sessionState.id}</span>{/if}
       {#if job?.progress.phase}<span>{job.progress.phase} · generation {generation} / {job.progress.generations}</span>{/if}
       {#if busy}<progress max={options.generations + 1} value={generation}>Running</progress>{/if}
     </div>
-    {#if error}<p role="alert" class="error">{error}</p>{#if identifier}<button onclick={reconnect}>Reconnect to job</button>{/if}{/if}
+    {#if sessionState.error}<p role="alert" class="error">{sessionState.error}</p>{#if sessionState.id}<button onclick={() => session.reconnect()}>Reconnect to job</button>{/if}{/if}
     <p class="subtle">Jobs are ephemeral. Export a completed run before restarting the backend.</p>
   </aside>
 

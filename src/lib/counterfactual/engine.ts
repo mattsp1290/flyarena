@@ -105,18 +105,14 @@ export function evidenceHeader(prepared: PreparedGraph, input: unknown): Omit<Ev
 
 /** Generator allows Worker progress between seeds without browser dependencies. */
 export function* experiment(prepared: PreparedGraph, input: unknown): Generator<number, Evidence> {
-  const request = validateRequest(input);
-  if (request.topology !== prepared.identity.topology) throw new Error('Prepared topology does not match request');
-  const target = prepared.targets.find(t => t.id === request.target);
-  if (!target?.indices.length) throw new Error('Selected target has no neurons');
-  const seeds = seedsFor(request);
+  const header = evidenceHeader(prepared, input);
   const results: SeedResult[] = [];
-  for (const seed of seeds) {
-    results.push(runSeed(prepared, request, seed));
+  for (const seed of header.seeds) {
+    results.push(runSeed(prepared, header.request, seed));
     yield results.length;
   }
   return {
-    ...evidenceHeader(prepared, request),
+    ...header,
     results,
     summary: {
       means: { baseline: meanScore(results.map(r => r.branches.baseline.outcome)), sham: meanScore(results.map(r => r.branches.sham.outcome)), lesion: meanScore(results.map(r => r.branches.lesion.outcome)) },
