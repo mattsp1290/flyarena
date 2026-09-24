@@ -26,6 +26,7 @@ import {
   validateReadoutWeights,
   type ReadoutWeights
 } from '../../src/lib/connectome/readout';
+import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import { mulberry32 } from '../../src/lib/random/mulberry32';
 import { createTraceGraph } from '../../tests/fixtures/trace-graph';
 
@@ -69,10 +70,15 @@ import { createTraceGraph } from '../../tests/fixtures/trace-graph';
  * leaves no room for pretty-printing whitespace.
  */
 
-/** Neural substeps per world tick. Until `flyarena-bb45` fixes the closed
- * loop's real substep count, this is a documented constant, recorded in
- * every exported file. */
-export const TRACE_SUBSTEPS = 4;
+/**
+ * Neural substeps per world tick, recorded in every exported file. Aliases
+ * the real closed-loop's own substep count (`src/lib/connectome/constants.ts`)
+ * rather than restating the number here, so the two can never silently
+ * drift apart — the golden traces this exporter produces are only a
+ * faithful record of the real closed loop's dynamics if this matches it
+ * exactly.
+ */
+export const TRACE_SUBSTEPS = NEURAL_SUBSTEPS_PER_TICK;
 
 /**
  * Ticks per exported trace.

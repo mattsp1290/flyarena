@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ArenaScene, ArenaSceneUnavailableError, tracePanelPath } from '../../src/lib/render/ArenaScene';
+import { ArenaScene, ArenaSceneUnavailableError, topologyLabelFor, tracePanelPath } from '../../src/lib/render/ArenaScene';
+import type { GraphMode } from '../../src/lib/connectome/format';
 
 /**
  * jsdom implements no WebGL, matching a real browser with no GPU/software
@@ -37,6 +38,31 @@ describe('ArenaScene WebGL availability', () => {
  * itself can't be constructed under jsdom (no WebGL) to exercise this
  * end-to-end, so this tests the extracted drawing helper directly.
  */
+/**
+ * Regression coverage for a real shipped honesty bug: `ArenaScene` used to
+ * hardcode the left agent's label to "BIO" and the right agent's to
+ * "REWIRED" for the scene's entire lifetime, so switching an arm's topology
+ * (e.g. to "disconnected") left the canvas still claiming biological
+ * provenance for an arm that had none. `ArenaScene` itself cannot be
+ * constructed under jsdom (no WebGL — see the describe block above), so the
+ * mode -> label mapping it renders from is tested directly here, the same
+ * way `tracePanelPath` is.
+ */
+describe('topologyLabelFor', () => {
+  it('maps every GraphMode to its own distinct, honest label', () => {
+    expect(topologyLabelFor('biological').text).toBe('BIO');
+    expect(topologyLabelFor('rewired').text).toBe('REWIRED');
+    expect(topologyLabelFor('disconnected').text).toBe('DISCONNECTED');
+  });
+
+  it('never reads BIO for a non-biological mode', () => {
+    const nonBiological: GraphMode[] = ['rewired', 'disconnected'];
+    for (const mode of nonBiological) {
+      expect(topologyLabelFor(mode).text).not.toBe('BIO');
+    }
+  });
+});
+
 describe('tracePanelPath', () => {
   it('uses roundRect when the browser supports it', () => {
     const roundRect = vi.fn();

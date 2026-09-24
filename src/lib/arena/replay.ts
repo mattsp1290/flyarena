@@ -188,6 +188,16 @@ export interface ExperimentReplayExport {
   seed: number;
   configFingerprint: string;
   topology: Record<AgentId, GraphMode>;
+  /**
+   * sha256 of each arm's manifest-verified compiled graph artifact, when one
+   * exists (see `src/lib/experiment/runner.ts`'s `AgentRunnerInfo`). A key
+   * is simply absent for an arm with no separate verified artifact of its
+   * own (the runtime-derived 'disconnected' control) — never a placeholder
+   * value. Lets a downloaded replay self-attest to exactly which compiled
+   * artifact produced it (pinning it against future re-compiles of
+   * `public/data/*`) without embedding the connectome itself.
+   */
+  graphBinarySha256: Partial<Record<AgentId, string>>;
   substepsPerTick: number;
   totalTicks: number;
   finalSummary: ReplaySummary;
@@ -199,6 +209,7 @@ export const createExperimentReplayExport = (
   world: Readonly<WorldState>,
   options: {
     topology: Record<AgentId, GraphMode>;
+    graphBinarySha256?: Partial<Record<AgentId, string>>;
     substepsPerTick: number;
     totalTicks: number;
     trace: readonly ExperimentTraceEntry[];
@@ -210,6 +221,11 @@ export const createExperimentReplayExport = (
     seed: world.seed,
     configFingerprint: world.configFingerprint,
     topology: { ...options.topology },
+    // Undefined-valued keys (an arm with no verified artifact) are dropped
+    // by JSON.stringify automatically, so a downloaded/serialized replay
+    // never carries a misleading "graphBinarySha256": null/"" for an arm
+    // that simply has none.
+    graphBinarySha256: { left: options.graphBinarySha256?.left, right: options.graphBinarySha256?.right },
     substepsPerTick: options.substepsPerTick,
     totalTicks: options.totalTicks,
     finalSummary,

@@ -3,7 +3,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gunzipSync } from 'node:zlib';
 import { describe, expect, it } from 'vitest';
-import { hashReplaySummary } from '../../src/lib/arena/replay';
+import { createReplaySummary, hashReplaySummary } from '../../src/lib/arena/replay';
 import {
   createDisconnectedGraph,
   encodeGraphBinary,
@@ -50,6 +50,46 @@ const runToFinished = (runner: ExperimentRunner): Promise<void> =>
     runner.start();
   });
 
+/**
+ * An externally-resolvable/rejectable promise, used below to control
+ * exactly when a binding's `step`/`reset` call settles — instead of racing
+ * a real `setTimeout` margin against another real timer (see the doc
+ * comments on the tests that use this for why: a fixed-ms guess can, in
+ * principle, take longer than assumed under a loaded/throttled CI runner,
+ * turning a currently-passing test flaky rather than fixing a bug).
+ */
+const createDeferred = <T = void>(): { promise: Promise<T>; resolve: (value: T) => void } => {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+};
+
+/**
+ * Poll `predicate` on a short real interval (same pattern as `runToFinished`
+ * above) until it's true, instead of guessing a fixed "should be enough"
+ * delay and hoping the awaited condition has settled by then. The
+ * difference from the anti-pattern this replaces: a guessed sleep duration
+ * can, in principle, be too short under a loaded/throttled CI runner,
+ * silently turning a currently-passing test flaky; a poll that only
+ * resolves once the condition is actually observed true has no such
+ * failure mode — it simply takes as long as it takes.
+ */
+const waitUntil = (predicate: () => boolean): Promise<void> =>
+  new Promise((resolve) => {
+    if (predicate()) {
+      resolve();
+      return;
+    }
+    const poll = setInterval(() => {
+      if (predicate()) {
+        clearInterval(poll);
+        resolve();
+      }
+    }, 1);
+  });
+
 describe('NEURAL_SUBSTEPS_PER_TICK', () => {
   it('is a small positive constant within the Worker protocol bound', () => {
     expect(NEURAL_SUBSTEPS_PER_TICK).toBeGreaterThan(0);
@@ -79,25 +119,11 @@ describe('ExperimentRunner determinism', () => {
         targetTickIntervalMs: 0
       });
       await runToFinished(runner);
-      const world = runner.getWorld();
-      return hashReplaySummary({
-        schemaVersion: 2,
-        configFingerprint: world.configFingerprint,
-        seed: world.seed,
-        rngState: world.rngState,
-        ticks: world.tick,
-        timeSeconds: world.timeSeconds,
-        agents: world.agents.map((agent) => ({
-          id: agent.id,
-          position: { ...agent.position },
-          velocity: { ...agent.velocity },
-          heading: agent.heading,
-          activeHazardIds: [...agent.activeHazardIds].sort(),
-          score: { ...agent.score }
-        })),
-        foods: world.foods.map((food) => ({ id: food.id, position: { ...food.position }, radius: food.radius, respawns: food.respawns })),
-        hazards: world.hazards.map((hazard) => ({ id: hazard.id, position: { ...hazard.position }, velocity: { ...hazard.velocity }, radius: hazard.radius }))
-      });
+      // Reuse the real production summary-construction path rather than a
+      // hand-maintained parallel copy of its field mapping: this also means
+      // a bug in `createReplaySummary` itself would actually be caught by
+      // this determinism test, instead of being invisible to it.
+      return hashReplaySummary(createReplaySummary(runner.getWorld()));
     };
 
     const [first, second] = await Promise.all([runOnce(), runOnce()]);
@@ -122,25 +148,7 @@ describe('ExperimentRunner determinism', () => {
       });
       await runToFinished(runner);
       const world = runner.getWorld();
-      const summary = {
-        schemaVersion: 2 as const,
-        configFingerprint: world.configFingerprint,
-        seed: world.seed,
-        rngState: world.rngState,
-        ticks: world.tick,
-        timeSeconds: world.timeSeconds,
-        agents: world.agents.map((agent) => ({
-          id: agent.id,
-          position: { ...agent.position },
-          velocity: { ...agent.velocity },
-          heading: agent.heading,
-          activeHazardIds: [...agent.activeHazardIds].sort(),
-          score: { ...agent.score }
-        })),
-        foods: world.foods.map((food) => ({ id: food.id, position: { ...food.position }, radius: food.radius, respawns: food.respawns })),
-        hazards: world.hazards.map((hazard) => ({ id: hazard.id, position: { ...hazard.position }, velocity: { ...hazard.velocity }, radius: hazard.radius }))
-      };
-      return { hash: hashReplaySummary(summary), tick: world.tick };
+      return { hash: hashReplaySummary(createReplaySummary(world)), tick: world.tick };
     };
 
     const [slow, fast] = await Promise.all([runWithJitter(1), runWithJitter(999)]);
@@ -346,36 +354,42 @@ describe('ExperimentRunner full-length run', () => {
 
 describe('ExperimentRunner pause/resume/reset', () => {
   it('pause stops advancing ticks; resume continues from the same world state', async () => {
+    // Pauses exactly once, at tick 10 — this test resumes the run
+    // afterward (below) and must not keep re-pausing every subsequent tick.
+    let pausedOnce = false;
     const runner = new ExperimentRunner({
       seed: 3,
       totalTicks: 500,
-      // A tiny real (macrotask) per-step delay so ticks actually yield to
-      // the event loop between ticks — otherwise an unpaced run over pure
-      // microtask-resolving step functions can blow through all 500 ticks
-      // before this test's own `setInterval` poll ever gets a turn.
-      agents: buildFixtureAgents(0x3, () => 1),
-      targetTickIntervalMs: 0
+      agents: buildFixtureAgents(0x3),
+      targetTickIntervalMs: 0,
+      onTelemetry: (telemetry) => {
+        // `pause()` called synchronously from *inside* the tick loop's own
+        // `onTelemetry` callback, which fires before `runLoop` decides
+        // whether to observe the next tick (see runner.ts's `runLoop`: this
+        // callback runs, then `transition({type:'tickCompleted'})`/
+        // `setStatus`, then the `while` re-check) — so by construction, no
+        // further tick can already be in flight once this fires. This
+        // replaces a wall-clock "give any in-flight tick a moment to
+        // settle" wait with a genuinely race-free trigger: no real timer,
+        // no assumed margin.
+        if (!pausedOnce && telemetry.tick >= 10) {
+          pausedOnce = true;
+          runner.pause();
+        }
+      }
     });
 
-    let pausedAtTick = -1;
     runner.start();
-    await new Promise<void>((resolveWait) => {
-      const poll = setInterval(() => {
-        if (runner.getWorld().tick >= 10) {
-          runner.pause();
-          clearInterval(poll);
-          resolveWait();
-        }
-      }, 1);
-    });
-    // Give the in-flight tick (if any) a moment to settle after pause().
-    await new Promise((r) => setTimeout(r, 10));
-    expect(runner.getStatus()).toBe('paused');
-    pausedAtTick = runner.getWorld().tick;
+    await waitUntil(() => runner.getStatus() === 'paused');
+    const pausedAtTick = runner.getWorld().tick;
     expect(pausedAtTick).toBeGreaterThanOrEqual(10);
 
-    // Tick count must not advance further while paused.
-    await new Promise((r) => setTimeout(r, 20));
+    // Tick count must not advance further while paused. No real time needs
+    // to pass to prove this: the loop already exited synchronously inside
+    // the `onTelemetry` callback above (`runLoop` breaks once
+    // `status !== 'running'`, right after the tick that triggered this
+    // callback), so nothing is left pending that could advance it later
+    // regardless of how long this test waits.
     expect(runner.getWorld().tick).toBe(pausedAtTick);
 
     runner.start();
@@ -387,8 +401,22 @@ describe('ExperimentRunner pause/resume/reset', () => {
   it('reset discards an in-flight tick instead of applying it to the fresh world', async () => {
     const graph = createRandomGraph(0x5, { neuronCount: 16, inputChannelCount: 8, outputPopulationCount: 3 });
     const buffer = encodeGraphBinary(graph);
-    const slow = createOracleAgentBinding({ graphBuffer: buffer.slice(0), mode: 'biological', simulatedLatencyMs: () => 30 });
+    const base = createOracleAgentBinding({ graphBuffer: buffer.slice(0), mode: 'biological' });
     const fast = createOracleAgentBinding({ graphBuffer: buffer.slice(0), mode: 'biological' });
+
+    // A step the test resolves on its own terms, rather than racing a real
+    // `setTimeout` against a guessed "long enough" margin for `reset()` to
+    // land mid-flight.
+    const releaseStep = createDeferred<void>();
+    let callCount = 0;
+    const slow: AgentBinding = {
+      ...base,
+      step: async (input) => {
+        callCount += 1;
+        if (callCount === 1) await releaseStep.promise;
+        return base.step(input);
+      }
+    };
 
     const runner = new ExperimentRunner({
       seed: 9,
@@ -397,24 +425,28 @@ describe('ExperimentRunner pause/resume/reset', () => {
       targetTickIntervalMs: 0
     });
     runner.start();
-    // Let a tick get in flight (slow agent takes 30ms), then reset mid-flight.
-    await new Promise((r) => setTimeout(r, 5));
+    // `ExperimentRunner#start()` runs synchronously through `runLoop` ->
+    // `runOneTick` -> `AgentBinding#step` up to their first real `await` —
+    // see the mid-flight-reset test below for the full trace — so by the
+    // time `start()` returns here, `slow.step()`'s first (gated) call has
+    // already been invoked. No wall-clock wait is needed before this reset
+    // genuinely races an in-flight tick.
     runner.reset(9);
     expect(runner.getWorld().tick).toBe(0);
 
-    // Wait past the in-flight tick's resolution time; it must not have applied.
-    await new Promise((r) => setTimeout(r, 60));
+    releaseStep.resolve();
+    await waitUntil(() => runner.getStatus() !== 'running');
     expect(runner.getStatus()).toBe('ready');
     expect(runner.getWorld().tick).toBe(0);
   });
 
   it('a run started after a mid-flight reset produces the same final hash as a clean, uninterrupted run — the interrupted binding’s neural state is truly zeroed, not left dirty by a late-arriving stale step', async () => {
-    // The oracle binding's `step` await (via `simulatedLatencyMs`) can still
-    // be pending when `reset()` synchronously zeroes neural state; without
-    // serializing `step`/`reset` on the binding itself (see
-    // bindings.ts#createOracleAgentBinding), that stale step would run
-    // `runSubsteps` *after* the reset and leave a nonzero rate behind, even
-    // though the runner correctly discards the stale *tick*.
+    // The oracle binding's `step` can still be pending when `reset()`
+    // synchronously zeroes neural state; without serializing `step`/`reset`
+    // on the binding itself (see bindings.ts#createOracleAgentBinding),
+    // that stale step would run `runSubsteps` *after* the reset and leave a
+    // nonzero rate behind, even though the runner correctly discards the
+    // stale *tick*.
     const graph = createRandomGraph(0x6, { neuronCount: 16, inputChannelCount: 8, outputPopulationCount: 3 });
     const buffer = encodeGraphBinary(graph);
     const seed = 12345;
@@ -433,9 +465,23 @@ describe('ExperimentRunner pause/resume/reset', () => {
         targetTickIntervalMs: 0
       });
       runner.start();
-      await new Promise((r) => setTimeout(r, 3)); // interrupt mid-flight
+      // No wall-clock "interrupt mid-flight" wait: `ExperimentRunner#start()`
+      // synchronously drives `runLoop` -> `runOneTick` -> `Promise.all` ->
+      // `timedStep` -> `AgentBinding#step` before yielding at its first real
+      // `await` (`left`'s `simulatedLatencyMs`-gated `setTimeout`). That
+      // whole chain runs synchronously in this call stack, so `left.step()`
+      // has already been invoked — and, critically, already enqueued onto
+      // the oracle binding's own internal FIFO `serialize` queue — by the
+      // time `start()` returns here. Calling `reset()` immediately
+      // therefore reliably enqueues `left`'s `reset` *behind* that
+      // already-in-flight `step` on the binding's own queue, exactly the
+      // FIFO ordering this test exists to verify, with no guessed margin.
       runner.reset(seed);
-      await new Promise((r) => setTimeout(r, 30)); // let the stale step (if any) fully settle
+      // `runToFinished` (below) only resolves once the run genuinely
+      // reaches `finished`, so it — not a fixed sleep — is what proves the
+      // stale step (and the reset behind it) have both long since settled
+      // by the time this assertion runs. `runToFinished` itself calls
+      // `runner.start()` again, resuming the run after the reset above.
       await runToFinished(runner);
       return runner.getReplayExport().finalHash;
     };
@@ -457,16 +503,18 @@ describe('ExperimentRunner pause/resume/reset', () => {
     const buffer = encodeGraphBinary(graph);
     const base = createOracleAgentBinding({ graphBuffer: buffer.slice(0), mode: 'biological' });
 
-    // Rejects (simulating a disposed/terminated Worker) on its first call,
-    // and succeeds normally afterward — modeling a Worker that failed mid
-    // topology-switch/reset but is healthy again once reinitialized.
+    // Rejects (simulating a disposed/terminated Worker) on its first call —
+    // on the test's own signal, not a real timer — and succeeds normally
+    // afterward, modeling a Worker that failed mid topology-switch/reset
+    // but is healthy again once reinitialized.
     let callCount = 0;
+    const failureGate = createDeferred<void>();
     const flaky: AgentBinding = {
       ...base,
       step: async (input) => {
         callCount += 1;
         if (callCount === 1) {
-          await new Promise((r) => setTimeout(r, 15));
+          await failureGate.promise;
           throw new Error('simulated stale Worker failure');
         }
         return base.step(input);
@@ -483,12 +531,21 @@ describe('ExperimentRunner pause/resume/reset', () => {
       onStatusChange: (next) => statuses.push(next)
     });
     runner.start();
-    // Reset before the flaky first step rejects, so its eventual rejection
-    // is from a superseded generation.
-    await new Promise((r) => setTimeout(r, 3));
+    // `flaky.step()`'s first call is already synchronously in flight by
+    // this point (see the mid-flight-reset test above for the full trace),
+    // so this reset reliably supersedes it before it ever rejects — no
+    // wall-clock wait needed.
     runner.reset(3);
-    // Let the stale rejection land.
-    await new Promise((r) => setTimeout(r, 30));
+
+    // Let the stale rejection land deterministically, on this test's own
+    // terms, rather than guessing a wall-clock margin for it to have
+    // settled: releasing the gate now is what actually causes
+    // `flaky.step()` to reject, and `waitUntil` below polls the runner's
+    // real status — rather than assuming a fixed delay was long enough —
+    // for that rejection's effects (`runOneTick`'s generation-mismatch
+    // discard) to finish propagating.
+    failureGate.resolve();
+    await waitUntil(() => runner.getStatus() !== 'running');
 
     expect(runner.getStatus()).toBe('ready');
     expect(statuses).not.toContain('error');

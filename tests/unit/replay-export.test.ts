@@ -82,7 +82,50 @@ describe('createExperimentReplayExport', () => {
       trace: []
     });
     expect(Object.keys(replay).sort()).toEqual(
-      ['schemaVersion', 'seed', 'configFingerprint', 'topology', 'substepsPerTick', 'totalTicks', 'finalSummary', 'finalHash', 'trace'].sort()
+      [
+        'schemaVersion',
+        'seed',
+        'configFingerprint',
+        'topology',
+        'graphBinarySha256',
+        'substepsPerTick',
+        'totalTicks',
+        'finalSummary',
+        'finalHash',
+        'trace'
+      ].sort()
     );
+  });
+
+  it('threads each arm’s manifest-verified graph binarySha256 through, and omits it (rather than a placeholder) for an arm with none — e.g. the runtime-derived disconnected control', () => {
+    const world = buildWorld();
+    const hash = 'a'.repeat(64);
+    const replay = createExperimentReplayExport(world, {
+      topology: { left: 'biological', right: 'disconnected' },
+      graphBinarySha256: { left: hash },
+      substepsPerTick: 4,
+      totalTicks: 2700,
+      trace: []
+    });
+
+    expect(replay.graphBinarySha256.left).toBe(hash);
+    expect(replay.graphBinarySha256.right).toBeUndefined();
+
+    // Round-trip through JSON (what the actual download does): the missing
+    // 'right' hash must be dropped, never serialized as null/"".
+    const parsed = JSON.parse(JSON.stringify(replay)) as typeof replay;
+    expect(Object.keys(parsed.graphBinarySha256)).toEqual(['left']);
+  });
+
+  it('omits graphBinarySha256 entirely (an empty object, never undefined) when the caller supplies none', () => {
+    const world = buildWorld();
+    const replay = createExperimentReplayExport(world, {
+      topology: { left: 'biological', right: 'rewired' },
+      substepsPerTick: 4,
+      totalTicks: 2700,
+      trace: []
+    });
+    expect(replay.graphBinarySha256).toBeDefined();
+    expect(Object.keys(JSON.parse(JSON.stringify(replay)).graphBinarySha256)).toEqual([]);
   });
 });

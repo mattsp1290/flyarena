@@ -1,13 +1,16 @@
 /**
  * Fetch, gunzip, and hash-verify the two checked-in MaleCNS-derived graph
  * artifacts (WP6 item 2) before the experiment is allowed to start. Nothing
- * here is Svelte-specific; `src/App.svelte` is the only caller.
+ * here is Svelte-specific; `src/lib/experiment/controller.ts` is the only
+ * caller.
  *
  * Every function below is a plain async function over `ArrayBuffer`s (no
  * dependency on a real network) so `tests/unit/experiment-assets.test.ts`
  * can exercise the real integrity-check logic against the real committed
  * `public/data/` files (read via `node:fs`) without a server.
  */
+
+import { parseGraphBinary } from '../connectome/format';
 
 export class ArtifactIntegrityError extends Error {
   constructor(message: string) {
@@ -202,6 +205,28 @@ export const loadArenaArtifacts = async (
     verifyAndDecompressArtifact(biologicalGzip, manifest),
     verifyAndDecompressArtifact(rewiredGzip, rewiredEntry)
   ]);
+
+  // The hash/length checks above only prove `biological`'s bytes match what
+  // the manifest declares byte-for-byte — they say nothing about whether
+  // the manifest's own *descriptive* `neuronCount`/`edgeCount` fields (read
+  // by the ledger panel, never re-derived from the parsed graph) are still
+  // accurate. A manifest that is internally consistent (hashes/lengths
+  // correct) but was hand-edited or left stale after a forgotten compiler
+  // re-run would pass every check above and only surface as a silently
+  // wrong number in the UI. Parse a throwaway copy (never the buffer
+  // returned to the caller — `parseGraphBinary` only reads it, but a
+  // defensive copy keeps this check from ever being able to alias/mutate
+  // what the caller receives) and cross-check its actual counts.
+  const parsedBiological = parseGraphBinary(biological.slice(0));
+  if (
+    parsedBiological.metadata.neuronCount !== manifest.neuronCount ||
+    parsedBiological.metadata.edgeCount !== manifest.edgeCount
+  ) {
+    throw new ArtifactIntegrityError(
+      `manifest neuronCount/edgeCount (${manifest.neuronCount}/${manifest.edgeCount}) does not match the ` +
+        `parsed biological artifact (${parsedBiological.metadata.neuronCount}/${parsedBiological.metadata.edgeCount})`
+    );
+  }
 
   return { manifest, biological, rewired };
 };

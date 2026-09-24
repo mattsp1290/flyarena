@@ -4,12 +4,10 @@
   import { createSnapshot, createWorld } from './lib/arena/world';
   import type { AgentId } from './lib/arena/types';
   import type { ArenaManifest } from './lib/experiment/assets';
-  import { loadArenaArtifacts } from './lib/experiment/assets';
-  import { buildGraphBufferForMode, createWorkerAgentBinding } from './lib/experiment/bindings';
-  import { ExperimentRunner, type ExperimentTelemetry } from './lib/experiment/runner';
-  import { transition, type ExperimentStatus } from './lib/experiment/state';
+  import { ExperimentController } from './lib/experiment/controller';
+  import type { ExperimentTelemetry } from './lib/experiment/runner';
+  import type { ExperimentStatus } from './lib/experiment/state';
   import type { GraphMode } from './lib/connectome/format';
-  import { createWorkerClient, type WorkerClient } from './lib/worker/client';
   import ExperimentPanel from './lib/ui/ExperimentPanel.svelte';
   import TelemetryPanel from './lib/ui/TelemetryPanel.svelte';
   import LedgerPanel from './lib/ui/LedgerPanel.svelte';
@@ -25,7 +23,7 @@
   // Set the instant the component unmounts, so any in-flight async work
   // (renderer chunk load, artifact fetch/verify, topology switch) can't
   // construct a scene, mutate reactive state, or reach into a disposed
-  // runner after teardown has already run.
+  // controller/runner after teardown has already run.
   let destroyed = false;
   let reducedMotionQuery: MediaQueryList | undefined;
 
@@ -44,107 +42,40 @@
   let telemetry = $state<ExperimentTelemetry | undefined>(undefined);
   /**
    * Number of in-flight (queued or running) topology-switch operations per
-   * arm — see `handleTopologyChange`. A count rather than a boolean: a
-   * second switch for the same arm can be queued behind a first one that
-   * is still running, and the first's own `finally` must not clear the
-   * "busy" flag out from under the still-pending second one.
+   * arm, mirrored from `ExperimentController`'s own internal counters via
+   * its `onTopologySwitchCountChange` callback. A count rather than a
+   * boolean: a second switch for the same arm can be queued behind a first
+   * one that is still running, and the first's own completion must not
+   * clear the "busy" flag out from under the still-pending second one.
    */
   let topologySwitchCount = $state<Record<AgentId, number>>({ left: 0, right: 0 });
   const topologySwitchPending = $derived(topologySwitchCount.left > 0 || topologySwitchCount.right > 0);
 
+  /** True while running/loading — locks Start and Seed. Pause/Reset are governed by `topologySwitchPending` directly instead (see `ExperimentPanel`): they must stay clickable for the entire duration of a run, which is most of what this flag being true actually means. */
   const controlsLocked = $derived(status === 'running' || status === 'loading' || topologySwitchPending);
   /** Topology selectors additionally require `ready`/`finished` — a switch is never allowed mid-run (see `ExperimentRunner#setAgentBinding`), including while merely `paused`. */
   const topologyControlsLocked = $derived(controlsLocked || (status !== 'ready' && status !== 'finished'));
 
-  // Plain (non-reactive) orchestration handles: the runner/worker clients own
-  // their own internal state and only ever reach the UI through the $state
-  // variables above, via the runner's onStatusChange/onTelemetry/onError
-  // callbacks — these do not need to be reactive themselves.
-  let runner: ExperimentRunner | undefined;
-  let workerClients: Record<AgentId, WorkerClient> | undefined;
-  let biologicalGraphBuffer: ArrayBuffer | undefined;
-  let rewiredGraphBuffer: ArrayBuffer | undefined;
-  /** Rendered while `runner` does not exist yet (during asset loading) so the canvas has something real to draw immediately. */
+  // Plain (non-reactive) orchestration handle: `ExperimentController`
+  // (`./lib/experiment/controller.ts`) owns asset loading, Worker/binding
+  // construction, the `ExperimentRunner` itself, and topology-switch
+  // serialization. It only ever reaches this component through the
+  // callbacks passed to its constructor below, which assign into the
+  // `$state` variables above — so this handle does not need to be reactive
+  // itself. See that module's doc comment for why this logic lives there
+  // and not here.
+  let controller: ExperimentController | undefined;
+  /** Rendered while the controller's runner does not exist yet (during asset loading) so the canvas has something real to draw immediately. */
   const idleWorld = createWorld(DEFAULT_SEED);
 
   const createNeuralWorker = (): Worker =>
     new Worker(new URL('./lib/worker/neural.worker.ts', import.meta.url), { type: 'module' });
 
-  /**
-   * WP6 item 2: fetch both graph artifacts, gunzip, and sha256-verify them
-   * against the manifest before anything is allowed to start. WP6 item 3:
-   * one dedicated Worker per arm (see `docs/architecture.md`), initialized
-   * with the default biological (left) vs rewired (right) topology.
-   *
-   * This function calls `transition()` directly (rather than through
-   * `ExperimentRunner#fail()`) because `runner` does not exist yet during
-   * this phase — there is nothing for the runner to own until the graphs
-   * are loaded and both Worker bindings exist. Every failure path *after*
-   * `runner` is constructed goes through `runner.fail()` instead, so the
-   * UI and the runner's own status can never disagree once a run exists.
-   */
-  const initializeExperiment = async (): Promise<void> => {
-    let artifacts: Awaited<ReturnType<typeof loadArenaArtifacts>>;
-    try {
-      artifacts = await loadArenaArtifacts();
-    } catch (error) {
-      if (destroyed) return;
-      errorMessage = error instanceof Error ? error.message : String(error);
-      status = transition(status, { type: 'assetsFailed' });
-      return;
-    }
-    if (destroyed) return;
-
-    manifest = artifacts.manifest;
-    biologicalGraphBuffer = artifacts.biological;
-    rewiredGraphBuffer = artifacts.rewired;
-
-    try {
-      const left = createNeuralWorker();
-      const right = createNeuralWorker();
-      workerClients = { left: createWorkerClient(left), right: createWorkerClient(right) };
-
-      const [leftBinding, rightBinding] = await Promise.all([
-        createWorkerAgentBinding(
-          workerClients.left,
-          buildGraphBufferForMode(biologicalGraphBuffer, rewiredGraphBuffer, topology.left),
-          topology.left
-        ),
-        createWorkerAgentBinding(
-          workerClients.right,
-          buildGraphBufferForMode(biologicalGraphBuffer, rewiredGraphBuffer, topology.right),
-          topology.right
-        )
-      ]);
-      if (destroyed) return;
-
-      runner = new ExperimentRunner({
-        seed,
-        totalTicks: TOTAL_TICKS,
-        agents: { left: leftBinding, right: rightBinding },
-        onStatusChange: (next) => {
-          if (!destroyed) status = next;
-        },
-        onTelemetry: (next) => {
-          if (!destroyed) telemetry = next;
-        },
-        onError: (error) => {
-          if (!destroyed) errorMessage = error.message;
-        }
-      });
-      telemetry = runner.getTelemetry();
-      status = runner.getStatus();
-    } catch (error) {
-      if (destroyed) return;
-      errorMessage = error instanceof Error ? error.message : String(error);
-      status = transition(status, { type: 'assetsFailed' });
-    }
-  };
-
-  const handleStart = (): void => runner?.start();
-  const handlePause = (): void => runner?.pause();
+  const handleStart = (): void => controller?.getRunner()?.start();
+  const handlePause = (): void => controller?.getRunner()?.pause();
 
   const handleReset = (): void => {
+    const runner = controller?.getRunner();
     runner?.reset(seed);
     // reset() doesn't go through the tick loop's onTelemetry callback (there
     // may be no further tick at all if the run never restarts), so refresh
@@ -156,69 +87,25 @@
   /**
    * Only auto-applies immediately when the run is idle at `ready` (nothing
    * to lose). While `paused`/`finished`, the new seed is just stored — it
-   * takes effect the next time the user presses Reset (`handleReset` below
+   * takes effect the next time the user presses Reset (`handleReset` above
    * always resets with the current `seed`) — rather than silently
    * discarding a paused run or a finished run's not-yet-downloaded replay.
    */
   const handleSeedInput = (nextSeed: number): void => {
     seed = nextSeed;
+    const runner = controller?.getRunner();
     if (runner && runner.getStatus() === 'ready') {
       runner.reset(nextSeed);
       telemetry = runner.getTelemetry();
     }
   };
 
-  /**
-   * Per-arm serialization for topology switches. `handleTopologyChange`
-   * chains each switch behind any earlier one for the *same* arm via
-   * `topologySwitchChains[agentId]`, so `dispose()`/`init()` calls against
-   * that arm's `WorkerClient` can never interleave — the Worker protocol
-   * only allows one `init` per `dispose` (see `neural.worker.ts`), and two
-   * overlapping switches previously raced it straight into the terminal
-   * `error` state. `topologySwitchCount` (rendered as `controlsLocked`/
-   * `topologyControlsLocked` above) keeps every other control disabled for
-   * the same window, since `runner.setAgentBinding` only accepts a swap
-   * from `ready`/`finished` and a run that raced in via Start/Resume/Reset
-   * during the swap would hit the same failure.
-   */
-  let topologySwitchChains: Record<AgentId, Promise<unknown>> = { left: Promise.resolve(), right: Promise.resolve() };
-
-  /** Re-initializes just one arm's Worker with a freshly derived graph buffer for the chosen topology; only valid from `ready`/`finished` (enforced here, by `ExperimentRunner#setAgentBinding`, and by `ExperimentPanel`'s disabled selects). Always implies a reset — see `setAgentBinding`'s doc comment. */
   const handleTopologyChange = (agentId: AgentId, mode: GraphMode): void => {
-    if (!runner || !workerClients || !biologicalGraphBuffer || !rewiredGraphBuffer) return;
-    const currentStatus = runner.getStatus();
-    if (currentStatus !== 'ready' && currentStatus !== 'finished') return;
-
-    topology = { ...topology, [agentId]: mode };
-    const client = workerClients[agentId];
-    const buffer = buildGraphBufferForMode(biologicalGraphBuffer, rewiredGraphBuffer, mode);
-    topologySwitchCount = { ...topologySwitchCount, [agentId]: topologySwitchCount[agentId] + 1 };
-
-    topologySwitchChains[agentId] = topologySwitchChains[agentId]
-      .then(async () => {
-        try {
-          await client.dispose();
-          if (destroyed || !runner) return;
-          const binding = await createWorkerAgentBinding(client, buffer, mode);
-          if (destroyed || !runner) return;
-          runner.setAgentBinding(agentId, binding);
-          telemetry = runner.getTelemetry();
-        } catch (error) {
-          if (destroyed) return;
-          // Route through the runner so the UI and the runner's own status
-          // can never disagree (see docs/architecture.md's state-machine
-          // note) — never write `status` directly here.
-          runner?.fail(error);
-        }
-      })
-      .finally(() => {
-        if (!destroyed) {
-          topologySwitchCount = { ...topologySwitchCount, [agentId]: topologySwitchCount[agentId] - 1 };
-        }
-      });
+    controller?.changeTopology(agentId, mode);
   };
 
   const handleDownloadReplay = (): void => {
+    const runner = controller?.getRunner();
     if (!runner) return;
     const replay = runner.getReplayExport();
     const blob = new Blob([JSON.stringify(replay, null, 2)], { type: 'application/json' });
@@ -237,6 +124,7 @@
 
   const frame = (nowMs: number): void => {
     try {
+      const runner = controller?.getRunner();
       const snapshot = runner ? runner.getSnapshot(nowMs) : createSnapshot(idleWorld, 1);
       scene?.update(snapshot, nowMs);
     } catch (error) {
@@ -259,7 +147,39 @@
   };
 
   onMount(() => {
-    void initializeExperiment();
+    controller = new ExperimentController({
+      seed,
+      totalTicks: TOTAL_TICKS,
+      initialTopology: topology,
+      createWorker: createNeuralWorker,
+      callbacks: {
+        onStatusChange: (next) => {
+          if (!destroyed) status = next;
+        },
+        onTelemetry: (next) => {
+          if (!destroyed) telemetry = next;
+        },
+        onError: (message) => {
+          if (!destroyed) errorMessage = message;
+        },
+        onManifest: (nextManifest) => {
+          if (!destroyed) manifest = nextManifest;
+        },
+        onTopologyApplied: (agentId, mode) => {
+          if (destroyed) return;
+          topology = { ...topology, [agentId]: mode };
+          // No-ops safely if the scene hasn't been constructed yet (e.g.
+          // asset loading finished before the renderer chunk did) — the
+          // scene-construction path below syncs to the then-current
+          // `topology` itself once it exists, so no update is ever lost.
+          scene?.setAgentTopology(agentId, mode);
+        },
+        onTopologySwitchCountChange: (counts) => {
+          if (!destroyed) topologySwitchCount = { ...counts };
+        }
+      }
+    });
+    void controller.initialize();
 
     if (!canvasEl) return;
     reducedMotionQuery = window.matchMedia?.('(prefers-reduced-motion: reduce)');
@@ -305,6 +225,18 @@
         return;
       }
 
+      // Sync both labels to whatever the *current* topology actually is at
+      // the moment the scene starts existing — not a hardcoded default.
+      // Asset loading and this renderer-chunk load race independently, so
+      // by the time the scene is ready, `topology` may already reflect a
+      // switch the controller applied before the scene existed (in which
+      // case `onTopologyApplied` above already no-op'd against an
+      // undefined `scene`). This is the other half of that guarantee — see
+      // `ArenaScene#setAgentTopology`'s doc comment for why both calls
+      // matter.
+      scene?.setAgentTopology('left', topology.left);
+      scene?.setAgentTopology('right', topology.right);
+
       rafId = requestAnimationFrame(frame);
     };
 
@@ -317,9 +249,7 @@
     reducedMotionQuery = undefined;
     if (rafId !== undefined) cancelAnimationFrame(rafId);
     rafId = undefined;
-    runner?.dispose();
-    workerClients?.left.terminate();
-    workerClients?.right.terminate();
+    controller?.dispose();
     scene?.dispose();
   });
 </script>
@@ -376,6 +306,7 @@
       {seed}
       {topology}
       {controlsLocked}
+      {topologySwitchPending}
       {topologyControlsLocked}
       onStart={handleStart}
       onPause={handlePause}

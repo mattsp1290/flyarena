@@ -4,10 +4,14 @@ import { createExperimentReplayExport, type ExperimentReplayExport, type Experim
 import { observeAgent } from '../arena/sensors';
 import type { ActionsByAgent, AgentId, ArenaSnapshot, WorldState } from '../arena/types';
 import { createSnapshot, createWorld, stepWorld } from '../arena/world';
+import { NEURAL_SUBSTEPS_PER_TICK } from '../connectome/constants';
 import type { GraphMode } from '../connectome/format';
 import type { NeuralTelemetry } from '../connectome/telemetry';
 import { MAX_SUBSTEPS_PER_TICK } from '../worker/protocol';
 import { canPause, canReset, canResume, canStart, transition, type ExperimentStatus } from './state';
+
+/** Re-exported so existing call sites (this module, its tests) keep working; see `connectome/constants.ts` for why the value itself lives there. */
+export { NEURAL_SUBSTEPS_PER_TICK };
 
 /**
  * The tick-driven async closed-loop orchestrator (WP6 item 3): observe both
@@ -21,26 +25,6 @@ import { canPause, canReset, canResume, canStart, transition, type ExperimentSta
  * the browser. Determinism does not depend on which one is plugged in, or on
  * how long either call takes — see the "in-flight tick" discussion below.
  */
-
-/**
- * Neural substeps run per world tick, for every arm. A world tick is
- * `1/30`s of simulated time (`ARENA_CONFIG.fixedDeltaSeconds`); this many
- * `stepModel` calls run against the *same* held-constant observation before
- * the outputs are decoded and the world advances — see
- * `src/lib/connectome/model.ts#runSubsteps`. Chosen as a small constant well
- * under `MAX_SUBSTEPS_PER_TICK` (64): frequent enough re-observation (every
- * 1/30s) matters more for this arena than deep intra-tick integration, and 4
- * keeps worst-case per-tick Worker latency low. Exported so a later training
- * readout bean imports this exact value rather than restating it (see the
- * bean's own note in `implementation.md`).
- */
-export const NEURAL_SUBSTEPS_PER_TICK = 4;
-
-if (NEURAL_SUBSTEPS_PER_TICK > MAX_SUBSTEPS_PER_TICK) {
-  throw new Error(
-    `NEURAL_SUBSTEPS_PER_TICK (${NEURAL_SUBSTEPS_PER_TICK}) exceeds MAX_SUBSTEPS_PER_TICK (${MAX_SUBSTEPS_PER_TICK})`
-  );
-}
 
 export interface AgentStepInput {
   channelValues: readonly number[];
@@ -59,6 +43,18 @@ export interface AgentRunnerInfo {
   topology: GraphMode;
   neuronCount: number;
   edgeCount: number;
+  /**
+   * sha256 of the manifest-verified compiled graph artifact that produced
+   * this arm's current binding, when one exists. Absent for the
+   * runtime-derived 'disconnected' control, which is built on the fly from
+   * an already-loaded arm rather than shipped as its own verified artifact
+   * (see `connectome/format.ts#createDisconnectedGraph`) — there is no
+   * separate manifest entry for it to cite. Threaded into
+   * `ExperimentReplayExport` so a downloaded replay can self-attest to
+   * exactly which compiled artifact produced it, without embedding the
+   * artifact itself.
+   */
+  graphBinarySha256?: string;
 }
 
 export interface AgentBinding {
@@ -230,6 +226,10 @@ export class ExperimentRunner {
   getReplayExport(): ExperimentReplayExport {
     return createExperimentReplayExport(this.world, {
       topology: { left: this.agents.left.info.topology, right: this.agents.right.info.topology },
+      graphBinarySha256: {
+        left: this.agents.left.info.graphBinarySha256,
+        right: this.agents.right.info.graphBinarySha256
+      },
       substepsPerTick: this.substepsPerTick,
       totalTicks: this.options.totalTicks,
       trace: this.trace

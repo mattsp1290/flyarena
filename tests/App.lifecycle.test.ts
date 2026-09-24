@@ -24,6 +24,7 @@ const instances: Array<{
   update: ReturnType<typeof vi.fn>;
   dispose: ReturnType<typeof vi.fn>;
   setReducedMotion: ReturnType<typeof vi.fn>;
+  setAgentTopology: ReturnType<typeof vi.fn>;
 }> = [];
 
 vi.mock('../src/lib/render/ArenaScene', () => {
@@ -33,6 +34,7 @@ vi.mock('../src/lib/render/ArenaScene', () => {
     update = vi.fn();
     dispose = vi.fn();
     setReducedMotion = vi.fn();
+    setAgentTopology = vi.fn();
     constructor(options: MockArenaSceneOptions) {
       this.options = options;
       instances.push(this);
@@ -209,12 +211,24 @@ describe('App experiment controls wiring', () => {
     });
 
     const pauseButton = screen.getByRole('button', { name: /^pause$/i });
+    const resetButtonWhileRunning = screen.getByRole('button', { name: /^reset$/i });
+    // Regression guard for a real shipped bug: Pause/Reset were briefly
+    // wired to the same blanket `controlsLocked` flag Start/Seed use, which
+    // is unconditionally `true` for the entire duration of every run — so
+    // both buttons were disabled the whole time and could never actually be
+    // clicked. `fireEvent.click` below does not itself respect `disabled`
+    // (unlike a real click or `userEvent.click`), so only this explicit
+    // assertion — checked *before* clicking — actually catches it.
+    expect(pauseButton).not.toBeDisabled();
+    expect(resetButtonWhileRunning).not.toBeDisabled();
+
     await fireEvent.click(pauseButton);
     await waitFor(() => expect(screen.getByLabelText(/experiment status: paused/i)).toBeInTheDocument(), {
       timeout: 5000
     });
 
     const resetButton = screen.getByRole('button', { name: /^reset$/i });
+    expect(resetButton).not.toBeDisabled();
     await fireEvent.click(resetButton);
     await waitFor(() => expect(screen.getByLabelText(/experiment status: ready/i)).toBeInTheDocument());
   });
@@ -227,6 +241,47 @@ describe('App experiment controls wiring', () => {
     await fireEvent.change(seedInput, { target: { value: '4242' } });
 
     await waitFor(() => expect(screen.getAllByText('4242').length).toBeGreaterThan(0));
+  });
+});
+
+describe('App 3D scene topology honesty (regression: the canvas label must track the real topology)', () => {
+  it('syncs ArenaScene#setAgentTopology to the default topology on initial load, and to the switched mode after a successful switch — never a stale/no-op label', async () => {
+    const instance = await mountAndAwaitScene();
+    await waitForReady();
+
+    // Initial load must sync both slots exactly once each, with the
+    // default topology — this is what stands between the canvas and the
+    // "always says BIO" honesty bug a prior review caught (see
+    // `ArenaScene.ts`'s `setAgentTopology` doc comment).
+    expect(instance.setAgentTopology).toHaveBeenCalledWith('left', 'biological');
+    expect(instance.setAgentTopology).toHaveBeenCalledWith('right', 'rewired');
+
+    // Initial load legitimately syncs 'left' more than once (both the
+    // scene-construction-time sync and the controller's own initial-load
+    // callback fire, belt-and-suspenders against their independent
+    // construction-order races — see `App.svelte`'s `onTopologyApplied`
+    // callback comment) — capture that count so the post-switch assertion
+    // below only looks at calls made *after* the switch was requested.
+    const leftCallsBeforeSwitch = instance.setAgentTopology.mock.calls.filter(
+      (call: unknown[]) => call[0] === 'left'
+    ).length;
+
+    const leftSelect = screen.getByLabelText(/left arm topology/i) as HTMLSelectElement;
+    await fireEvent.change(leftSelect, { target: { value: 'disconnected' } });
+    await waitFor(() => expect(leftSelect).toBeEnabled(), { timeout: 5000 });
+
+    // The most recent call for the switched arm must reflect the new mode —
+    // never leave the scene claiming the arm is still 'biological' (or any
+    // other stale mode) once the switch has actually succeeded.
+    const leftCalls = instance.setAgentTopology.mock.calls.filter(
+      (call: unknown[]) => call[0] === 'left'
+    );
+    expect(leftCalls.at(-1)).toEqual(['left', 'disconnected']);
+    // No call made *after* the switch was requested may claim 'biological'
+    // again for this now-switched arm.
+    expect(leftCalls.slice(leftCallsBeforeSwitch).some((call: unknown[]) => call[1] === 'biological')).toBe(
+      false
+    );
   });
 });
 

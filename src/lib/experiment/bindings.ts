@@ -58,6 +58,8 @@ export interface CreateOracleBindingOptions {
    * Never set in production.
    */
   simulatedLatencyMs?: () => number;
+  /** See `AgentRunnerInfo.graphBinarySha256` (`./runner.ts`) — passed straight through into the resulting binding's `info`. */
+  graphBinarySha256?: string;
 }
 
 /**
@@ -111,7 +113,12 @@ export const createOracleAgentBinding = (options: CreateOracleBindingOptions): A
   return {
     step,
     reset,
-    info: { topology: options.mode, neuronCount: graph.metadata.neuronCount, edgeCount: graph.metadata.edgeCount }
+    info: {
+      topology: options.mode,
+      neuronCount: graph.metadata.neuronCount,
+      edgeCount: graph.metadata.edgeCount,
+      graphBinarySha256: options.graphBinarySha256
+    }
   };
 };
 
@@ -123,7 +130,9 @@ export const createOracleAgentBinding = (options: CreateOracleBindingOptions): A
 export const createWorkerAgentBinding = async (
   client: WorkerClient,
   graphBuffer: ArrayBuffer,
-  mode: GraphMode
+  mode: GraphMode,
+  /** See `AgentRunnerInfo.graphBinarySha256` (`./runner.ts`) — passed straight through into the resulting binding's `info`. */
+  graphBinarySha256?: string
 ): Promise<AgentBinding> => {
   const initResult = await client.init(graphBuffer, mode);
 
@@ -139,6 +148,11 @@ export const createWorkerAgentBinding = async (
   return {
     step,
     reset,
-    info: { topology: mode, neuronCount: initResult.neuronCount, edgeCount: initResult.edgeCount }
+    info: {
+      topology: mode,
+      neuronCount: initResult.neuronCount,
+      edgeCount: initResult.edgeCount,
+      graphBinarySha256
+    }
   };
 };

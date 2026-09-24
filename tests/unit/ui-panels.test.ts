@@ -15,6 +15,7 @@ describe('ExperimentPanel accessibility and wiring', () => {
     seed: 1234,
     topology: { left: 'biological' as const, right: 'rewired' as const },
     controlsLocked: false,
+    topologySwitchPending: false,
     topologyControlsLocked: false,
     onStart: vi.fn(),
     onPause: vi.fn(),
@@ -119,11 +120,40 @@ describe('ExperimentPanel accessibility and wiring', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
-  it('controlsLocked disables Start/Pause/Reset/Seed even when their own status would otherwise allow them', () => {
+  it('controlsLocked disables Start/Seed even when their own status would otherwise allow them', () => {
     render(ExperimentPanel, { ...baseProps(), status: 'paused', controlsLocked: true });
     expect(screen.getByRole('button', { name: /^resume$/i })).toBeDisabled();
-    expect(screen.getByRole('button', { name: /^reset$/i })).toBeDisabled();
     expect(screen.getByLabelText(/^seed$/i)).toBeDisabled();
+  });
+
+  // Regression coverage for a real shipped bug: Pause/Reset were briefly
+  // wired to `disabled={!canX || controlsLocked}` — the same blanket flag
+  // Start/Seed use — and `controlsLocked` is unconditionally `true` for the
+  // entire duration of every run (it exists to lock Start while running),
+  // so both buttons were disabled for the whole run and could never
+  // actually be clicked. `fireEvent.click` (used by `tests/App.lifecycle.test.ts`)
+  // does not itself respect `disabled`, so only an explicit `toBeDisabled`/
+  // `toBeEnabled` assertion like this one catches the regression.
+  it('controlsLocked alone does NOT disable Pause/Reset — only topologySwitchPending does (regression)', () => {
+    render(ExperimentPanel, {
+      ...baseProps(),
+      status: 'running',
+      controlsLocked: true,
+      topologySwitchPending: false
+    });
+    expect(screen.getByRole('button', { name: /^pause$/i })).toBeEnabled();
+    expect(screen.getByRole('button', { name: /^reset$/i })).toBeEnabled();
+  });
+
+  it('topologySwitchPending disables Pause/Reset independent of controlsLocked', () => {
+    render(ExperimentPanel, {
+      ...baseProps(),
+      status: 'running',
+      controlsLocked: false,
+      topologySwitchPending: true
+    });
+    expect(screen.getByRole('button', { name: /^pause$/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /^reset$/i })).toBeDisabled();
   });
 
   it('topologyControlsLocked disables only the topology selectors, independent of controlsLocked', () => {
@@ -192,9 +222,14 @@ describe('TelemetryPanel', () => {
     expect(screen.getByText('12.0%')).toBeInTheDocument();
   });
 
-  it('flags a slower-than-30Hz run', () => {
+  it('shows the tick count and the behind-realtime warning together, never one instead of the other', () => {
     render(TelemetryPanel, { telemetry: { ...telemetry, behindRealtime: true } });
-    expect(screen.getByText(/slower than 30/i)).toBeInTheDocument();
+    const heading = screen.getByText(/slower than 30/i);
+    // Regression coverage: this used to be a ternary that replaced the tick
+    // counter with the warning, hiding the one number a viewer would want
+    // to see keep changing during a live demo that's fallen behind pace.
+    expect(heading).toHaveTextContent(`Tick ${telemetry.tick} / ${telemetry.totalTicks}`);
+    expect(heading).toHaveTextContent(/slower than 30 hz/i);
   });
 });
 

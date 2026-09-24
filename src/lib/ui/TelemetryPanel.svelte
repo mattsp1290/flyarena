@@ -23,7 +23,11 @@
 <section class="panel" aria-labelledby="telemetry-heading">
   <div class="section-heading">
     <h2 id="telemetry-heading">Telemetry</h2>
-    <span>{telemetry.behindRealtime ? 'Running slower than 30 Hz' : `Tick ${telemetry.tick} / ${telemetry.totalTicks}`}</span>
+    <span>
+      {`Tick ${telemetry.tick} / ${telemetry.totalTicks}`}{telemetry.behindRealtime
+        ? ' — running slower than 30 Hz'
+        : ''}
+    </span>
   </div>
 
   <dl>

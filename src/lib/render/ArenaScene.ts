@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { ARENA_CONFIG, type ArenaConfig } from '../arena/config';
 import type { AgentId, ArenaSnapshot, FoodState, Vec2 } from '../arena/types';
+import type { GraphMode } from '../connectome/format';
 import { disposeObject3D, disposeRenderer } from './dispose';
 import {
   agentTransform,
@@ -59,10 +60,45 @@ export class ArenaSceneUnavailableError extends Error {
   }
 }
 
-const AGENT_LABEL: Record<AgentId, { text: string; accent: string }> = {
-  left: { text: 'BIO', accent: '#f4c95d' },
-  right: { text: 'REWIRED', accent: '#7fd7ff' }
+/**
+ * Fixed per-*slot* (left/right position), not per-topology, accent used for
+ * the body material and trail color. This never changes when an arm's
+ * topology switches — see `buildAgentBody`'s doc comment for why body
+ * shape/color identify *which agent*, never *which topology* is currently
+ * running on it.
+ */
+const AGENT_SLOT_ACCENT: Record<AgentId, string> = {
+  left: '#f4c95d',
+  right: '#7fd7ff'
 };
+
+const TOPOLOGY_MODES = ['biological', 'rewired', 'disconnected'] as const satisfies readonly GraphMode[];
+
+/**
+ * Text + accent for each of the three labels a slot's label sprite can
+ * show. All three are preallocated per agent at construction time (see
+ * `buildAgentBody`) and toggled via `visible` — never rebuilt — so
+ * `setAgentTopology` never allocates a canvas/texture/material per call.
+ * `disconnected` gets its own warning-toned accent (distinct from either
+ * slot's body accent) so a negative-control arm reads as visually distinct
+ * from both "biological" and "rewired", not merely as a third color choice.
+ */
+const TOPOLOGY_LABEL: Record<GraphMode, { text: string; accent: string }> = {
+  biological: { text: 'BIO', accent: '#f4c95d' },
+  rewired: { text: 'REWIRED', accent: '#7fd7ff' },
+  disconnected: { text: 'DISCONNECTED', accent: '#ef476f' }
+};
+
+/**
+ * Pure `mode -> label` mapping, exported for direct unit testing: like
+ * `tracePanelPath` below, `ArenaScene` itself cannot be constructed under
+ * jsdom (no WebGL), so the honesty-critical mapping this scene renders from
+ * is tested here directly rather than only indirectly through a mounted
+ * scene. Regression coverage for a real shipped bug: a fixed "BIO" label
+ * that never tracked the arm's actual topology (see `setAgentTopology`'s
+ * doc comment).
+ */
+export const topologyLabelFor = (mode: GraphMode): { text: string; accent: string } => TOPOLOGY_LABEL[mode];
 
 const FPS_SMOOTHING = 0.15;
 const TRAIL_CAPACITY = 240;
@@ -127,6 +163,8 @@ const createLabelSprite = (text: string, accent: string): THREE.Sprite => {
 
 interface AgentVisual {
   group: THREE.Group;
+  /** All three preallocated per-topology label sprites for this agent — see `buildAgentBody`. Exactly one is `visible` at a time; `setAgentTopology` only ever toggles `visible`, never creates or replaces one. */
+  labelSprites: Record<GraphMode, THREE.Sprite>;
   trail: {
     positions: Float32Array;
     filled: number;
@@ -142,20 +180,32 @@ interface PooledEffect {
 }
 
 /**
- * Build the two agent bodies with unmistakable, non-color-only identity:
- * the biological arm is a smooth low-poly icosahedron labeled "BIO"; the
- * rewired arm is an angular octahedron with a contrasting wireframe overlay
- * (evoking rewritten circuitry) labeled "REWIRED". Both also carry a nose
+ * Build one agent's body with unmistakable, non-color-only identity by
+ * *slot*: the left slot is a smooth low-poly icosahedron; the right slot is
+ * an angular octahedron with a contrasting wireframe overlay (evoking
+ * rewired circuitry). This shape/color pairing is fixed by slot for the
+ * lifetime of the scene — it identifies *which agent* (left/right), never
+ * which topology is currently running on it. Both bodies also carry a nose
  * cone so heading is legible from any camera angle.
+ *
+ * The label sprite above each body is the only thing that identifies
+ * topology, and it is the only part of this group `setAgentTopology` ever
+ * touches — see that method's doc comment for why the two must never be
+ * conflated. All three possible labels (`TOPOLOGY_LABEL`) are built once,
+ * right here, and added to the group with only one `visible` at a time, so
+ * a later topology switch never allocates a canvas/texture/material.
  */
-const buildAgentBody = (id: AgentId, radius: number): THREE.Group => {
+const buildAgentBody = (
+  id: AgentId,
+  radius: number
+): { group: THREE.Group; labelSprites: Record<GraphMode, THREE.Sprite> } => {
   const group = new THREE.Group();
-  const label = AGENT_LABEL[id];
+  const accent = AGENT_SLOT_ACCENT[id];
 
   if (id === 'left') {
     const geometry = new THREE.IcosahedronGeometry(radius, 1);
     const material = new THREE.MeshStandardMaterial({
-      color: label.accent,
+      color: accent,
       flatShading: true,
       roughness: 0.55,
       metalness: 0.05
@@ -164,7 +214,7 @@ const buildAgentBody = (id: AgentId, radius: number): THREE.Group => {
   } else {
     const geometry = new THREE.OctahedronGeometry(radius, 0);
     const material = new THREE.MeshStandardMaterial({
-      color: label.accent,
+      color: accent,
       flatShading: true,
       roughness: 0.3,
       metalness: 0.25
@@ -186,11 +236,25 @@ const buildAgentBody = (id: AgentId, radius: number): THREE.Group => {
   nose.position.z = radius * 0.95;
   group.add(nose);
 
-  const sprite = createLabelSprite(label.text, label.accent);
-  sprite.position.y = radius * LABEL_HEIGHT_FACTOR;
-  group.add(sprite);
+  const labelSprites = {} as Record<GraphMode, THREE.Sprite>;
+  for (const mode of TOPOLOGY_MODES) {
+    const label = TOPOLOGY_LABEL[mode];
+    const sprite = createLabelSprite(label.text, label.accent);
+    sprite.position.y = radius * LABEL_HEIGHT_FACTOR;
+    sprite.visible = false;
+    group.add(sprite);
+    labelSprites[mode] = sprite;
+  }
+  // Default visible label mirrors this slot's conventional default topology
+  // (`App.svelte`'s initial `topology` state), so the scene never shows no
+  // label at all before the host's first explicit `setAgentTopology` call —
+  // the host still calls `setAgentTopology` once right after construction
+  // to reconcile this against whatever the *actual* current topology is by
+  // the time the scene exists (see that method's doc comment).
+  const defaultMode: GraphMode = id === 'left' ? 'biological' : 'rewired';
+  labelSprites[defaultMode].visible = true;
 
-  return group;
+  return { group, labelSprites };
 };
 
 const buildTrail = (color: string): AgentVisual['trail'] => {
@@ -322,11 +386,11 @@ export class ArenaScene {
       this.buildFloorAndWalls();
 
       for (const id of ['left', 'right'] as const) {
-        const group = buildAgentBody(id, this.config.agentRadius);
+        const { group, labelSprites } = buildAgentBody(id, this.config.agentRadius);
         this.scene.add(group);
-        const trail = buildTrail(AGENT_LABEL[id].accent);
+        const trail = buildTrail(AGENT_SLOT_ACCENT[id]);
         this.scene.add(trail.line);
-        this.agentVisuals.set(id, { group, trail });
+        this.agentVisuals.set(id, { group, labelSprites, trail });
       }
 
       this.foodGeometry = new THREE.SphereGeometry(this.config.foodRadius, 10, 8);
@@ -428,6 +492,38 @@ export class ArenaScene {
     if (this.disposed || this.reducedMotion === value) return;
     this.reducedMotion = value;
     this.controls.enableDamping = !value;
+  }
+
+  /**
+   * Switch which of `agentId`'s three preallocated label sprites is
+   * `visible`, without creating any new canvas/texture/material — see
+   * `buildAgentBody`'s doc comment. The body's shape/color never changes:
+   * shape identifies the *slot* (left/right); this label is the only thing
+   * that identifies *topology*.
+   *
+   * The host must call this once per agent right after construction (with
+   * whichever topology is actually in effect at that point — see
+   * `App.svelte`'s pairing of scene construction with its own `topology`
+   * state) and again after every topology switch that has *already*
+   * succeeded — never speculatively before a switch is confirmed, or the
+   * label would claim a topology that isn't actually running yet.
+   *
+   * This is the fix for a real shipped honesty bug: an earlier revision of
+   * this file hardcoded the left agent's label to "BIO" and the right
+   * agent's to "REWIRED" for the lifetime of the scene, so switching either
+   * arm's topology (e.g. to "Disconnected") left the 3D canvas still
+   * displaying "BIO" above a slot that was, by then, provably running zero
+   * edges — the most visually prominent surface in the whole demo silently
+   * asserting biological provenance for an arm that had none. `setAgentTopology`
+   * is the only thing standing between this scene and that bug recurring.
+   */
+  setAgentTopology(agentId: AgentId, mode: GraphMode): void {
+    if (this.disposed) return;
+    const visual = this.agentVisuals.get(agentId);
+    if (!visual) return;
+    for (const candidate of TOPOLOGY_MODES) {
+      visual.labelSprites[candidate].visible = candidate === mode;
+    }
   }
 
   /** Explicit resize hook, also used internally by the `ResizeObserver` callback. */

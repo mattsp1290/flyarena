@@ -5,9 +5,17 @@
  * unit-testable independent of timing, fetch, or Worker plumbing. See
  * `tests/unit/experiment-state.test.ts`.
  *
- * `ExperimentRunner` (`./runner.ts`) is the only production caller: it owns
- * the actual async work (asset loading, ticking) and calls `transition` to
- * decide its own next `status` after each step.
+ * `ExperimentRunner` (`./runner.ts`) is the only caller once a run exists:
+ * it owns the actual async work (ticking, reset, topology swaps) and calls
+ * `transition` to decide its own next `status` after each step.
+ *
+ * `ExperimentController` (`./controller.ts`) is a deliberate exception,
+ * calling `transition` directly during its own pre-runner asset-loading
+ * phase (`initialize()`'s `assetsFailed` paths) — there is nothing for a
+ * not-yet-constructed runner to own at that point. See that method's doc
+ * comment for why this is safe: every failure path *after* the runner
+ * exists still goes through `ExperimentRunner#fail()` instead, so this
+ * module's transition table is never bypassed once a run is live.
  */
 
 export type ExperimentStatus = 'loading' | 'ready' | 'running' | 'paused' | 'finished' | 'error';

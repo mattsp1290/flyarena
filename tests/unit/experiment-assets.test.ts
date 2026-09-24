@@ -127,6 +127,25 @@ describe('loadArenaArtifacts (fetch -> gunzip -> hash-verify, against real commi
     expect(artifacts.rewired.byteLength).toBe(manifest.rewiredArms.seed0.binaryBytes);
   });
 
+  it('rejects with ArtifactIntegrityError when the manifest neuronCount/edgeCount does not match the parsed biological artifact (e.g. a stale manifest after a forgotten compiler re-run)', async () => {
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('.manifest.json')) {
+        // Hashes/lengths are still correct for the real bytes — only the
+        // descriptive neuronCount is now stale, the exact scenario this
+        // check exists to catch (see assets.ts#loadArenaArtifacts).
+        return new Response(JSON.stringify({ ...manifest, neuronCount: manifest.neuronCount + 1 }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        });
+      }
+      return createPublicDataFetch()(input);
+    });
+    await expect(loadArenaArtifacts('/data', 'malecns-arena-v1.manifest.json')).rejects.toBeInstanceOf(
+      ArtifactIntegrityError
+    );
+  });
+
   it('rejects when the manifest has no seed0 rewired entry', async () => {
     vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
       const url = typeof input === 'string' ? input : input.toString();

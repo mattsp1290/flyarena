@@ -9,13 +9,16 @@
    * `<button>`/`<input>`/`<select>` elements only, no custom widgets) and
    * every control carries an explicit label — see `tests/unit/ui-experiment-panel.test.ts`.
    *
-   * Labels the two arms by the renderer's own fixed shape identity ("BIO
-   * shape" = the left agent's icosahedron, "REWIRED shape" = the right
-   * agent's octahedron — see `render/ArenaScene.ts`'s `AGENT_LABEL`), not by
-   * whatever topology happens to be selected for that arm right now: a
-   * selector can point the left/BIO-shaped agent at the disconnected
-   * control, and the shape name must not then misreport it as biological.
-   * The selector's own value is the single source of truth for topology.
+   * Labels the two selectors by *slot* ("Left arm topology" / "Right arm
+   * topology") rather than by any topology name: the selector's own value —
+   * and, on the 3D canvas, `ArenaScene#setAgentTopology`'s label sprite —
+   * are the only things that identify topology. The left/right body
+   * shape+color pairing (`render/ArenaScene.ts`'s `AGENT_SLOT_ACCENT`) is
+   * fixed for the scene's lifetime and identifies *which agent*, never
+   * which topology is currently selected for it — labeling the selector
+   * itself with a shape/topology name (e.g. the former "(BIO shape)"
+   * suffix) risked implying the two were the same thing, which they are
+   * not once a topology switch has happened.
    */
 
   interface Props {
@@ -23,8 +26,10 @@
     errorMessage?: string;
     seed: number;
     topology: Record<AgentId, GraphMode>;
-    /** True while running/loading, or while any topology switch is in flight — locks Start/Pause/Reset/Seed. */
+    /** True while running/loading — locks Start and Seed. Does *not* lock Pause/Reset (see `topologySwitchPending`): those two must stay clickable for the entire duration of a run, which is most of what `controlsLocked` being true actually means. */
     controlsLocked: boolean;
+    /** True while any topology switch is in flight. Locks Pause/Reset (a switch always implies a reset already in progress; a fresh explicit reset/pause request would race it) in addition to their own status-based rule; see `topologyControlsLocked` for the selectors' own, stricter lock. */
+    topologySwitchPending: boolean;
     /** `controlsLocked`, plus true whenever the run isn't idle at `ready`/`finished` — a topology switch is never allowed mid-run, including merely `paused`. */
     topologyControlsLocked: boolean;
     onStart: () => void;
@@ -41,6 +46,7 @@
     seed,
     topology,
     controlsLocked,
+    topologySwitchPending,
     topologyControlsLocked,
     onStart,
     onPause,
@@ -107,8 +113,8 @@
     <button type="button" onclick={onStart} disabled={!canStartOrResume || controlsLocked}>
       {startLabel}
     </button>
-    <button type="button" onclick={onPause} disabled={!canPauseNow || controlsLocked}>Pause</button>
-    <button type="button" onclick={onReset} disabled={!canResetNow || controlsLocked}>Reset</button>
+    <button type="button" onclick={onPause} disabled={!canPauseNow || topologySwitchPending}>Pause</button>
+    <button type="button" onclick={onReset} disabled={!canResetNow || topologySwitchPending}>Reset</button>
   </div>
 
   <div class="field">
@@ -125,7 +131,7 @@
   </div>
 
   <div class="field">
-    <label for="topology-left">Left arm topology (BIO shape)</label>
+    <label for="topology-left">Left arm topology</label>
     <select
       id="topology-left"
       name="topology-left"
@@ -140,7 +146,7 @@
   </div>
 
   <div class="field">
-    <label for="topology-right">Right arm topology (REWIRED shape)</label>
+    <label for="topology-right">Right arm topology</label>
     <select
       id="topology-right"
       name="topology-right"
