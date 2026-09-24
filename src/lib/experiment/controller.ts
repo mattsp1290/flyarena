@@ -108,6 +108,13 @@ export interface ExperimentControllerOptions {
   loadArtifacts?: typeof loadArenaArtifacts;
   /** Injectable for tests; defaults to `./assets.ts#loadTrainedReadoutArtifact`. */
   loadTrainedReadout?: typeof loadTrainedReadoutArtifact;
+  /**
+   * Injectable for tests; defaults to `./assets.ts#loadRewiringNull`.
+   * Without this seam, a test could never observe the `destroyed` guard on
+   * this load's own `.then` (dual review, Important) — every other loader
+   * here is injectable for exactly the same reason.
+   */
+  loadRewiringNull?: typeof loadRewiringNull;
   /** Passed straight through to the constructed `ExperimentRunner` (see `ExperimentRunnerOptions.targetTickIntervalMs`); `0` disables real-time pacing entirely, which unit tests use to run a many-tick determinism check without waiting out real seconds. Omitted in production, matching the runner's own real-time default. */
   targetTickIntervalMs?: number;
 }
@@ -307,6 +314,7 @@ export class ExperimentController {
   async initialize(): Promise<void> {
     const load = this.options.loadArtifacts ?? loadArenaArtifacts;
     const loadReadout = this.options.loadTrainedReadout ?? loadTrainedReadoutArtifact;
+    const loadNull = this.options.loadRewiringNull ?? loadRewiringNull;
     const dataBaseUrl = `${import.meta.env.BASE_URL}data`;
     let artifacts: LoadedArenaArtifacts;
     try {
@@ -327,13 +335,32 @@ export class ExperimentController {
     // WP4: fire-and-forget, deliberately not awaited here (unlike the
     // trained-readout load just below) — "loading must not block Start"
     // means this must not sit in this method's own `await` chain ahead of
-    // Worker construction. `loadRewiringNull` never throws (see its own doc
-    // comment), so no `.catch` is needed to keep this from becoming an
-    // unhandled rejection.
-    void loadRewiringNull(artifacts.manifest, dataBaseUrl).then((result) => {
-      if (this.destroyed) return;
-      this.options.callbacks.onRewiringNull(result);
-    });
+    // Worker construction. `loadRewiringNull` documents itself as "never
+    // throws", but the leading `.catch` enforces that contract at the call
+    // site too (dual review, Important — mirrors `App.svelte`'s own
+    // `onManifest` handler, which added the equivalent `.catch` around
+    // `loadPositions` for the same reason): without it, an unexpected throw
+    // anywhere in the loader's chain would become an unhandled rejection and
+    // leave `rewiringNullStatus` `undefined` forever (the ledger row stuck
+    // on "Loading…"). The trailing `.catch` guards the *callback* instead —
+    // `onRewiringNull` is host code (`App.svelte`), and a throw there would
+    // otherwise also become an unhandled rejection with no error reported
+    // anywhere.
+    void loadNull(artifacts.manifest, dataBaseUrl)
+      .catch(
+        (error: unknown): RewiringNullLoadResult => ({
+          status: 'invalid',
+          reason: `unexpected error while loading the rewiring null: ${error instanceof Error ? error.message : String(error)}`
+        })
+      )
+      .then((result) => {
+        if (this.destroyed) return;
+        this.options.callbacks.onRewiringNull(result);
+      })
+      .catch((error: unknown) => {
+        if (this.destroyed) return;
+        this.options.callbacks.onError(error instanceof Error ? error.message : String(error));
+      });
 
     // Trained-readout artifact: optional relative to the required arena
     // graph artifacts above — `loadTrainedReadoutArtifact` never throws, and

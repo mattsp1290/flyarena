@@ -462,8 +462,11 @@ describe('LedgerPanel', () => {
     // `<figcaption>`) — scope this assertion to the visible figcaption
     // specifically, rather than an unscoped `getByText` that would match
     // both and fail with "multiple elements found".
+    // The caption is built from the fixture's own `data.null.n`/`data.seeds.count`
+    // (2 and 100 here), not a hardcoded "500" — regression coverage for the
+    // dual review finding that an earlier version hardcoded these numbers.
     const figcaption = container.querySelector('figcaption');
-    expect(figcaption).toHaveTextContent(/scored above 0\.0% of 500 degree-preserving rewirings/i);
+    expect(figcaption).toHaveTextContent(/scored above 0\.0% of 2 degree-preserving rewirings/i);
     expect(figcaption).toHaveTextContent(/opponent parked/i);
     expect(screen.getByRole('link', { name: /rewiring-null result \(json\)/i })).toHaveAttribute(
       'href',
@@ -484,8 +487,8 @@ describe('LedgerPanel', () => {
     expect(screen.queryByRole('link', { name: /rewiring-null result \(json\)/i })).not.toBeInTheDocument();
   });
 
-  it('shows the honest verification-failure message when the rewiring-null artifact is invalid', () => {
-    render(LedgerPanel, {
+  it('shows the honest verification-failure message when the rewiring-null artifact is invalid, and labels the ledger row "unavailable"', () => {
+    const { container } = render(LedgerPanel, {
       manifest,
       decoder: 'authored',
       trainedReadout: undefined,
@@ -493,5 +496,18 @@ describe('LedgerPanel', () => {
     });
     const message = screen.getByText(/null-distribution result failed verification/i);
     expect(message).toHaveTextContent(/sha256 mismatch/i);
+    expect(ledgerRow(container, 'Topology null distribution')).toHaveTextContent('Computed (offline) — unavailable');
+    expect(screen.getByRole('heading', { name: /topology null distribution/i })).toBeInTheDocument();
+  });
+
+  it('shows "Loading…" for the ledger row and no section at all while rewiringNull is still undefined', () => {
+    const { container } = render(LedgerPanel, {
+      manifest,
+      decoder: 'authored',
+      trainedReadout: undefined,
+      rewiringNull: undefined
+    });
+    expect(ledgerRow(container, 'Topology null distribution')).toHaveTextContent('Loading…');
+    expect(screen.queryByRole('heading', { name: /topology null distribution/i })).not.toBeInTheDocument();
   });
 });

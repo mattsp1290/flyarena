@@ -786,15 +786,28 @@ export type RewiringNullLoadResult =
   | { status: 'missing'; reason: string }
   | { status: 'invalid'; reason: string };
 
-const isFiniteNumber = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
+/** Exported so `NullHistogram.svelte` can reuse the exact same guard instead of re-declaring its own (dual review: two copies of the same one-line predicate could silently drift apart). */
+export const isFiniteNumber = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
 
+const isPositiveInteger = (value: unknown): value is number => Number.isInteger(value) && (value as number) > 0;
+
+const isUnitInterval = (value: unknown): value is number => isFiniteNumber(value) && value >= 0 && value <= 1;
+
+/** `ci[0] <= ci[1]` — a confidence interval whose bounds are swapped is itself a sign of a producer bug, not a real interval (dual review). */
 const isFiniteCiPair = (value: unknown): value is readonly [number, number] =>
-  Array.isArray(value) && value.length === 2 && isFiniteNumber(value[0]) && isFiniteNumber(value[1]);
+  Array.isArray(value) &&
+  value.length === 2 &&
+  isFiniteNumber(value[0]) &&
+  isFiniteNumber(value[1]) &&
+  (value[0] as number) <= (value[1] as number);
 
 const isScoreStats = (value: unknown): value is RewiringNullScoreStats => {
   if (typeof value !== 'object' || value === null) return false;
   const v = value as Record<string, unknown>;
-  return isFiniteNumber(v.score) && isFiniteNumber(v.median) && isFiniteNumber(v.std) && isFiniteCiPair(v.ci);
+  // `std` is a standard deviation: never negative for real data (dual review).
+  return (
+    isFiniteNumber(v.score) && isFiniteNumber(v.median) && isFiniteNumber(v.std) && (v.std as number) >= 0 && isFiniteCiPair(v.ci)
+  );
 };
 
 const isRewiredEntry = (value: unknown): value is RewiringNullRewiredEntry => {
@@ -812,13 +825,16 @@ const isSummary = (value: unknown): value is RewiringNullSummary => {
   if (typeof value !== 'object' || value === null) return false;
   const v = value as Record<string, unknown>;
   return (
-    isFiniteNumber(v.n) &&
+    isPositiveInteger(v.n) &&
     isFiniteNumber(v.mean) &&
     isFiniteNumber(v.median) &&
     isFiniteNumber(v.std) &&
+    (v.std as number) >= 0 &&
     isFiniteNumber(v.p2_5) &&
     isFiniteNumber(v.p97_5) &&
+    (v.p2_5 as number) <= (v.p97_5 as number) &&
     isFiniteNumber(v.iqr) &&
+    (v.iqr as number) >= 0 &&
     typeof v.degenerate === 'boolean'
   );
 };
@@ -828,7 +844,8 @@ const isSummary = (value: unknown): value is RewiringNullSummary => {
  * increasing equal-width edges, but non-decreasing is the weakest check that
  * still catches a shuffled/corrupted array without rejecting a legitimate
  * degenerate bin) and `counts` must have exactly one fewer entry than
- * `edges`, every one a finite, non-negative count.
+ * `edges`, every one a finite, non-negative integer count (dual review:
+ * "finite" alone let a fractional count like `0.5` through).
  */
 const isBins = (value: unknown): value is RewiringNullBins => {
   if (typeof value !== 'object' || value === null) return false;
@@ -840,18 +857,23 @@ const isBins = (value: unknown): value is RewiringNullBins => {
     if (i > 0 && (v.edges[i] as number) < (v.edges[i - 1] as number)) return false;
   }
   for (const count of v.counts) {
-    if (!isFiniteNumber(count) || count < 0) return false;
+    if (!Number.isInteger(count) || (count as number) < 0) return false;
   }
   return true;
 };
 
 /**
- * Structural validation only (version 1, sorted bins, finite numbers) —
- * mirrors `loadPositions`'s "never throws, always return a reasoned status"
- * contract. Every top-level field the UI actually reads
- * (`NullHistogram.svelte`/`LedgerPanel.svelte`) is checked; `trained` is
- * deliberately left unchecked (see `RewiringNullArtifact.trained`'s doc
- * comment) — a malformed `trained` section never fails the whole artifact.
+ * Structural validation (version 1, sorted bins, finite numbers) *plus* the
+ * cross-field consistency the UI relies on but a per-field check alone
+ * cannot catch (dual review, both reviewers, Important): a hash-valid
+ * artifact can still contain internally-contradictory numbers (a
+ * `bioPercentile` outside `[0, 1]`, a bin-count total that disagrees with
+ * `null.n`/`rewired.length`, or a marker score that falls outside the
+ * histogram's own domain and would render off-canvas while its legend entry
+ * still claims it is shown). Mirrors `loadPositions`'s "never throws,
+ * always return a reasoned status" contract. `trained` is deliberately left
+ * unchecked (see `RewiringNullArtifact.trained`'s doc comment) — a
+ * malformed `trained` section never fails the whole artifact.
  */
 const validateRewiringNullShape = (value: unknown): { ok: true; data: RewiringNullArtifact } | { ok: false; reason: string } => {
   if (typeof value !== 'object' || value === null) {
@@ -864,7 +886,7 @@ const validateRewiringNullShape = (value: unknown): { ok: true; data: RewiringNu
     typeof v.seeds !== 'object' ||
     v.seeds === null ||
     !isFiniteNumber((v.seeds as Record<string, unknown>).start) ||
-    !isFiniteNumber((v.seeds as Record<string, unknown>).count)
+    !isPositiveInteger((v.seeds as Record<string, unknown>).count)
   ) {
     return { ok: false, reason: 'rewiring-null artifact has a malformed "seeds" field' };
   }
@@ -879,11 +901,50 @@ const validateRewiringNullShape = (value: unknown): { ok: true; data: RewiringNu
   if (!Array.isArray(v.rewired) || v.rewired.length === 0 || !v.rewired.every(isRewiredEntry)) {
     return { ok: false, reason: 'rewiring-null artifact has a malformed "rewired" array' };
   }
+  const rewired = v.rewired as RewiringNullRewiredEntry[];
+  // The bars claim to be "the N rewired graphs only" (`NullHistogram.svelte`'s
+  // own non-negotiable) — a duplicated seed would double-count one graph
+  // and silently misrepresent the null set.
+  if (new Set(rewired.map((entry) => entry.seed)).size !== rewired.length) {
+    return { ok: false, reason: 'rewiring-null artifact has duplicate seeds in "rewired"' };
+  }
   if (!isSummary(v.null)) return { ok: false, reason: 'rewiring-null artifact has a malformed "null" summary field' };
-  if (!isFiniteNumber(v.bioPercentile) || !isFiniteNumber(v.pLow) || !isFiniteNumber(v.pHigh)) {
-    return { ok: false, reason: 'rewiring-null artifact is missing bioPercentile/pLow/pHigh' };
+  const summary = v.null as RewiringNullSummary;
+  if (!isUnitInterval(v.bioPercentile) || !isUnitInterval(v.pLow) || !isUnitInterval(v.pHigh)) {
+    return { ok: false, reason: 'rewiring-null artifact has bioPercentile/pLow/pHigh outside [0, 1]' };
   }
   if (!isBins(v.bins)) return { ok: false, reason: 'rewiring-null artifact has a malformed or unsorted "bins" field' };
+  const bins = v.bins as RewiringNullBins;
+
+  // The bars are drawn straight from `bins.counts` and captioned as "the N
+  // rewired graphs" (`data.null.n`) — these three counts must agree, or the
+  // chart and its own caption would each tell a different story.
+  const binTotal = bins.counts.reduce((sum, count) => sum + count, 0);
+  if (summary.n !== rewired.length || binTotal !== rewired.length) {
+    return {
+      ok: false,
+      reason: `rewiring-null counts disagree (null.n=${summary.n}, rewired.length=${rewired.length}, sum(bins.counts)=${binTotal})`
+    };
+  }
+
+  // Every marker `NullHistogram.svelte` draws (biological, disconnected,
+  // and the shipped rewired-seed-0 control, when present) must fall inside
+  // the histogram's own domain — `null-report.ts` widens the bin edges to
+  // guarantee exactly this, so a marker outside `[edges[0], edges[last]]`
+  // means the artifact is internally inconsistent, not merely that this
+  // loader forgot to clamp it.
+  const domainLow = bins.edges[0];
+  const domainHigh = bins.edges[bins.edges.length - 1];
+  const inDomain = (score: number): boolean => score >= domainLow && score <= domainHigh;
+  const biological = v.biological as RewiringNullScoreStats;
+  const disconnected = v.disconnected as RewiringNullScoreStats;
+  const seed0 = rewired.find((entry) => entry.seed === 0);
+  if (!inDomain(biological.score) || !inDomain(disconnected.score) || (seed0 && !inDomain(seed0.score))) {
+    return {
+      ok: false,
+      reason: 'rewiring-null artifact has a marker (biological/disconnected/rewired-seed-0) outside the histogram bin domain'
+    };
+  }
 
   return { ok: true, data: value as RewiringNullArtifact };
 };
@@ -938,5 +999,32 @@ export const loadRewiringNull = async (
 
   const validated = validateRewiringNullShape(parsed);
   if (!validated.ok) return { status: 'invalid', reason: validated.reason };
-  return { status: 'ok', data: validated.data };
+  const data = validated.data;
+
+  // The sha256 check above only proves these bytes are the ones the
+  // manifest's `rewiringNull` entry pins — it says nothing about whether
+  // this artifact actually describes *this* manifest's graphs (a
+  // hand-edited or merge-conflicted manifest could re-pin `rewiringNull` to
+  // a null distribution computed against a different biological/rewired
+  // graph, including a "shipped" seed-0 marker that is not really the
+  // shipped control arm). `loadPositions` above already runs the equivalent
+  // staleness check for its own sidecar artifact ("positions.graphSha256
+  // does not match the manifest's compiled graph gzip sha256") — this
+  // mirrors that precedent (dual review, Important).
+  if (data.sourceGraphSha256 !== manifest.binarySha256) {
+    return {
+      status: 'invalid',
+      reason: `rewiring-null sourceGraphSha256 ${data.sourceGraphSha256} does not match the manifest's biological graph (${manifest.binarySha256}) — stale artifact`
+    };
+  }
+  const seed0 = data.rewired.find((entry) => entry.seed === 0);
+  const shippedSeed0GzipSha256 = manifest.rewiredArms.seed0?.gzipSha256;
+  if (seed0 && shippedSeed0GzipSha256 && seed0.gzipSha256 !== shippedSeed0GzipSha256) {
+    return {
+      status: 'invalid',
+      reason: 'rewiring-null seed 0 does not match the shipped rewired control arm (rewiredArms.seed0)'
+    };
+  }
+
+  return { status: 'ok', data };
 };

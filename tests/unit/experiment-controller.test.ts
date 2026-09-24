@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { ExperimentController } from '../../src/lib/experiment/controller';
 import type { ConnectomeGraph, GraphMode } from '../../src/lib/connectome/format';
-import type { ArenaManifest } from '../../src/lib/experiment/assets';
+import type { ArenaManifest, RewiringNullLoadResult } from '../../src/lib/experiment/assets';
 import type { WorkerRequest, WorkerResponse } from '../../src/lib/worker/protocol';
 import { createPublicDataFetch, FakeNeuralWorker } from '../helpers/fake-worker';
 import { createCallbacks, createWorker, SEED, TOTAL_TICKS, useControllerTestLifecycle } from './experiment-controller-test-helpers';
@@ -170,7 +170,7 @@ describe('ExperimentController rewiring-null loading (WP4)', () => {
     if (result.status === 'invalid') expect(result.reason).toMatch(/sha256/i);
   });
 
-  it('does not fire onRewiringNull once disposed before initialize() resolves', async () => {
+  it('does not fire onRewiringNull once disposed before initialize() resolves at all', async () => {
     const callbacks = createCallbacks();
     const controller = new ExperimentController({
       seed: SEED,
@@ -186,6 +186,65 @@ describe('ExperimentController rewiring-null loading (WP4)', () => {
     await initializing;
 
     expect(callbacks.rewiringNullResults).toHaveLength(0);
+  });
+
+  /**
+   * The test above disposes before `initialize()`'s first `await` even
+   * resolves, so it never actually reaches the `if (this.destroyed) return;`
+   * guard on the null load's own `.then` (`controller.ts`'s
+   * `loadNull(...).catch(...).then(...)`) — a version of `controller.ts`
+   * with that guard deleted would still pass it (dual review, Important).
+   * This test uses the injectable `loadRewiringNull` option to hold the null
+   * load pending past `ready`, so `dispose()` races the load's own
+   * resolution and specifically exercises that guard.
+   */
+  it('drops a rewiring-null result that settles after dispose() — the actual post-ready race the destroyed guard exists for', async () => {
+    let resolveNull!: (result: RewiringNullLoadResult) => void;
+    const callbacks = createCallbacks();
+    const controller = new ExperimentController({
+      seed: SEED,
+      totalTicks: TOTAL_TICKS,
+      initialTopology: { left: 'biological', right: 'rewired' },
+      createWorker,
+      callbacks,
+      loadRewiringNull: () =>
+        new Promise((resolve) => {
+          resolveNull = resolve;
+        })
+    });
+    trackController(controller);
+
+    await controller.initialize();
+    expect(callbacks.statuses).toContain('ready');
+    // Reaching `ready` while the null load is still pending is itself proof
+    // that loading it never blocks Start (this stubbed loader never
+    // resolves at all until the assertion below does so explicitly).
+    expect(callbacks.rewiringNullResults).toHaveLength(0);
+
+    controller.dispose();
+    resolveNull({ status: 'missing', reason: 'settled after dispose' });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(callbacks.rewiringNullResults).toHaveLength(0);
+  });
+
+  it('with the injectable loader, reports a result that resolves before dispose() normally', async () => {
+    const callbacks = createCallbacks();
+    const controller = new ExperimentController({
+      seed: SEED,
+      totalTicks: TOTAL_TICKS,
+      initialTopology: { left: 'biological', right: 'rewired' },
+      createWorker,
+      callbacks,
+      loadRewiringNull: async () => ({ status: 'missing', reason: 'stubbed for this test' })
+    });
+    trackController(controller);
+
+    await controller.initialize();
+
+    expect(callbacks.rewiringNullResults).toHaveLength(1);
+    expect(callbacks.rewiringNullResults[0]).toEqual({ status: 'missing', reason: 'stubbed for this test' });
   });
 });
 

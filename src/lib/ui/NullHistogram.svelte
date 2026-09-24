@@ -6,25 +6,34 @@
    * distribution (`.agents/plans/rewiring-null/04-ledger-histogram.md`).
    * `LedgerPanel.svelte` is the only caller, and only renders this once
    * `rewiringNull.status === 'ok'` — this component assumes `data` already
-   * passed `assets.ts#loadRewiringNull`'s sha256 and shape verification.
+   * passed `assets.ts#loadRewiringNull`'s sha256, shape, and (dual review)
+   * cross-consistency verification: `bioPercentile`/`pLow`/`pHigh` are in
+   * `[0, 1]`, `sum(bins.counts) === rewired.length === null.n`, and every
+   * marker score falls inside `[bins.edges[0], bins.edges[last]]`. `xForValue`
+   * below still clamps defensively (belt-and-suspenders, not the primary
+   * guard) in case a caller ever passes unverified data directly.
    *
    * Non-negotiables this component is responsible for:
-   * - The bars are the 500 rewired graphs only (`data.bins`, pre-binned by
-   *   the report generator — never rebinned here). Biological, the shipped
+   * - The bars are the rewired graphs only (`data.bins`, pre-binned by the
+   *   report generator — never rebinned here). Biological, the shipped
    *   rewired-seed-0 control, and disconnected are drawn as vertical line
    *   markers, not bars, so they are never miscounted as part of the null
    *   set.
    * - Every marker is identified by a distinct dash pattern *and* a text
-   *   label (the legend below the chart) — never color alone.
+   *   label with its own score (the legend below the chart) — never color
+   *   alone.
    * - The `<figcaption>` states biological's percentile and the condition in
-   *   plain, descriptive words (no causal/superiority claim) and links the
-   *   human-readable report. Since `docs/` is not part of the deployed
-   *   static site, that link is a GitHub blob URL — the same pattern
-   *   `LedgerPanel.svelte` already uses for
-   *   `docs/trained-readout-report.md` (WP6/nom6).
+   *   plain, descriptive words (no causal/superiority claim), built from the
+   *   verified artifact's own `null.n`/`seeds.count`/`condition` fields
+   *   (dual review, Important — an earlier version hard-coded "500"/"100
+   *   held-out seeds", which would silently disagree with the data on any
+   *   re-run with a different N), and links the human-readable report.
+   *   Since `docs/` is not part of the deployed static site, that link is a
+   *   GitHub blob URL — the same pattern `LedgerPanel.svelte` already uses
+   *   for `docs/trained-readout-report.md` (WP6/nom6).
    * - The SVG has `role="img"` with an `aria-label` that repeats the same
-   *   sentence, plus a `<title>`/`<desc>`, so a screen-reader user gets the
-   *   result without parsing the drawing.
+   *   sentence, so a screen-reader user gets the result without parsing the
+   *   drawing.
    */
   interface Props {
     data: RewiringNullArtifact;
@@ -45,7 +54,13 @@
   // otherwise turn every x coordinate into NaN and silently blank the SVG.
   const domainSpan = $derived(Math.max(domainMax - domainMin, 1e-9));
 
-  const xForValue = (value: number): number => PADDING.left + ((value - domainMin) / domainSpan) * PLOT_WIDTH;
+  // Clamped to the plot's own domain (dual review, Important): the loader
+  // already rejects a marker score outside `[domainMin, domainMax]`, but
+  // clamping here too means a bar's own rounding at the domain edge can
+  // never place a coordinate outside the viewBox, where it would render
+  // invisibly while its legend entry still claims it is shown.
+  const xForValue = (value: number): number =>
+    PADDING.left + Math.min(1, Math.max(0, (value - domainMin) / domainSpan)) * PLOT_WIDTH;
 
   const maxCount = $derived(Math.max(1, ...data.bins.counts));
 
@@ -92,23 +107,43 @@
 
   // Non-negotiable: distinct dash patterns, never color alone, for
   // biological/rewired-seed-0/disconnected (`04-ledger-histogram.md`'s
-  // change-surface row for this component).
+  // change-surface row for this component). Each label carries its own
+  // score too (dual review, Suggestion) — the per-bar `<title>` tooltip is
+  // the only other place a value appears, and that needs a mouse hover, so
+  // it is invisible to keyboard/screen-reader users; the legend is not.
   const markers = $derived<Marker[]>(
     [
-      { key: 'biological', label: 'Biological', value: data.biological.score, dash: 'none' },
+      { key: 'biological', label: `Biological (${data.biological.score.toFixed(2)})`, value: data.biological.score, dash: 'none' },
       rewiredSeed0
-        ? { key: 'rewired-seed0', label: 'Rewired (seed 0, shipped)', value: rewiredSeed0.score, dash: '6 3' }
+        ? {
+            key: 'rewired-seed0',
+            label: `Rewired (seed 0, shipped) (${rewiredSeed0.score.toFixed(2)})`,
+            value: rewiredSeed0.score,
+            dash: '6 3'
+          }
         : undefined,
-      { key: 'disconnected', label: 'Disconnected', value: data.disconnected.score, dash: '2 3' }
+      {
+        key: 'disconnected',
+        label: `Disconnected (${data.disconnected.score.toFixed(2)})`,
+        value: data.disconnected.score,
+        dash: '2 3'
+      }
     ].filter((marker): marker is Marker => marker !== undefined)
   );
 
   const percentileLabel = $derived(`${(data.bioPercentile * 100).toFixed(1)}%`);
 
-  /** The plan's literal sentence (`04-ledger-histogram.md`), descriptive only — no causal or superiority claim. */
+  /**
+   * The plan's literal sentence template (`04-ledger-histogram.md`),
+   * descriptive only — no causal or superiority claim — but every number
+   * and the condition text now come from the verified artifact itself
+   * (dual review, Important) rather than being hard-coded, so a future
+   * re-run with a different rewiring count or seed count can never leave
+   * this sentence silently describing the wrong run.
+   */
   const captionSentence = $derived(
-    `Biological scored above ${percentileLabel} of 500 degree-preserving rewirings ` +
-      `(authored decoder, opponent parked, 100 held-out seeds).`
+    `Biological scored above ${percentileLabel} of ${data.null.n} degree-preserving rewirings ` +
+      `(${data.condition}, ${data.seeds.count} held-out seeds).`
   );
 
   /**
@@ -120,47 +155,26 @@
    */
   const GITHUB_REPORT_URL = 'https://github.com/mattsp1290/flyarena/blob/main/docs/rewiring-null-report.md';
 
-  /**
-   * Best-effort, forward-compatible narrowing of WP3's `trained` section —
-   * see `RewiringNullArtifact.trained`'s doc comment for why this is not a
-   * hand-authored strict type. Renders nothing extra when `data.trained` is
-   * absent or does not have this shape (degrade gracefully, per the bean's
-   * own instruction), rather than failing or guessing at unconfirmed field
-   * names.
-   */
-  interface TrainedSampleShape {
-    rewired: readonly { seed: number; score: number }[];
-    biological: readonly { trainerSeed: number; score: number }[];
-  }
-
-  const isFiniteNumber = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
-
-  const isTrainedEntryArray = (value: unknown, key: 'seed' | 'trainerSeed'): boolean =>
-    Array.isArray(value) &&
-    value.length > 0 &&
-    value.every(
-      (entry) =>
-        typeof entry === 'object' &&
-        entry !== null &&
-        isFiniteNumber((entry as Record<string, unknown>)[key]) &&
-        isFiniteNumber((entry as Record<string, unknown>).score)
-    );
-
-  const trainedSample = $derived<TrainedSampleShape | undefined>(
-    (() => {
-      const trained = data.trained;
-      if (typeof trained !== 'object' || trained === null) return undefined;
-      const v = trained as Record<string, unknown>;
-      if (!isTrainedEntryArray(v.rewired, 'seed') || !isTrainedEntryArray(v.biological, 'trainerSeed')) return undefined;
-      return { rewired: v.rewired, biological: v.biological } as TrainedSampleShape;
-    })()
-  );
+  // No local narrowing/rendering of WP3's `trained` section is done in this
+  // WP (dual review, Suggestion — an earlier version hand-authored a guess
+  // at its shape and rendered a strip from it): `RewiringNullArtifact.trained`
+  // is deliberately typed `unknown` because no real producer output exists
+  // yet to verify a shape against, and a hand-guessed field list here would
+  // carry exactly that same risk — silently rendering nothing, or worse,
+  // wrong numbers, once WP3 lands with different real field names. That
+  // rendering belongs in WP3, against `null-report.ts`'s real `trained`
+  // output.
 </script>
 
 <figure class="null-histogram">
   <svg viewBox={`0 0 ${WIDTH} ${HEIGHT}`} role="img" aria-label={captionSentence} focusable="false">
+    <!-- No `<desc>` (dual review, Suggestion): `aria-label` already carries
+         the full result sentence as this image's accessible name, and the
+         same sentence is repeated a third time in the visible `<figcaption>`
+         below — a `<desc>` here would be a screen reader's fourth reading of
+         the same text. `<title>` stays as a short structural name for tools
+         that expose it independently of `aria-label` (e.g. a mouse tooltip). -->
     <title>Topology null distribution</title>
-    <desc>{captionSentence}</desc>
     {#each bars as bar (bar.index)}
       <rect x={bar.x} y={bar.y} width={bar.width} height={bar.height} class="bar">
         <title>{bar.rangeLabel}: {bar.count}</title>
@@ -189,14 +203,11 @@
     {/each}
   </ul>
 
-  {#if trainedSample}
-    <div class="trained-sample-strip">
-      <p>
-        Trained sample: {trainedSample.rewired.length} rewired graphs retrained with a per-graph readout, versus
-        {trainedSample.biological.length} biological trainer-seed replicas — trainer-seed noise at fixed topology,
-        not comparable to the topology-only null above (see the full report).
-      </p>
-    </div>
+  {#if data.null.degenerate}
+    <p class="degenerate-note">
+      This null distribution is degenerate (its interquartile range is effectively zero): the authored decoder's
+      score barely varies across rewirings, so the percentile above is not very informative. See the full report.
+    </p>
   {/if}
 
   <figcaption>
@@ -255,14 +266,15 @@
     flex: none;
   }
 
-  .trained-sample-strip {
-    margin-top: 0.6rem;
+  .degenerate-note {
+    margin: 0.6rem 0 0;
+    padding: 0.4rem 0.6rem;
+    border: 1px solid #5a6b3f;
+    border-radius: 0.3rem;
+    background: rgb(214 197 94 / 8%);
+    color: #d6c55e;
     font-size: 0.75rem;
-    color: #9aacc2;
-  }
-
-  .trained-sample-strip p {
-    margin: 0;
+    line-height: 1.4;
   }
 
   figcaption {

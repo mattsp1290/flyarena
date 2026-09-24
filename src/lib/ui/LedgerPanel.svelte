@@ -83,8 +83,20 @@
    */
   const GITHUB_REPORT_URL = 'https://github.com/mattsp1290/flyarena/blob/main/docs/trained-readout-report.md';
 
-  /** WP4's counterpart to `reportUrl` above, for the rewiring-null artifact's own JSON — `NullHistogram.svelte`'s figcaption links the human-readable report. */
-  const rewiringNullJsonUrl = $derived(`${import.meta.env.BASE_URL}data/rewiring-null-v1.json`);
+  /**
+   * WP4's counterpart to `reportUrl` above, for the rewiring-null artifact's
+   * own JSON — `NullHistogram.svelte`'s figcaption links the human-readable
+   * report. Built from `manifest.rewiringNull.artifact` (the same field
+   * `assets.ts#loadRewiringNull` itself fetches), not a hardcoded filename
+   * (dual review, Suggestion) — the manifest is the single source of truth
+   * for this artifact's name, already available here as a prop. Falls back
+   * to the conventional filename only for the (impossible in practice) case
+   * where this section renders `rewiringNull.status === 'ok'` from a
+   * `manifest` that is somehow `undefined` at the same tick.
+   */
+  const rewiringNullJsonUrl = $derived(
+    `${import.meta.env.BASE_URL}data/${manifest?.rewiringNull?.artifact ?? 'rewiring-null-v1.json'}`
+  );
 </script>
 
 <section class="panel ledger" aria-labelledby="ledger-heading">
@@ -153,23 +165,29 @@
     </dl>
   {/if}
 
-  {#if rewiringNull?.status === 'ok' || rewiringNull?.status === 'invalid'}
+  {#if rewiringNull && rewiringNull.status !== 'missing'}
+    <!-- One block, not two separately-conditioned `{#if}`s (dual review,
+         Suggestion — the earlier version had to keep the heading's own
+         `{#if}` in sync with this body's by hand). This also lets
+         `rewiringNull.status` narrow inside the `{#if}/{:else}` below
+         without `?.`, since the outer condition already excludes `undefined`
+         and `'missing'`. -->
     <h3>Topology null distribution</h3>
-  {/if}
-  {#if rewiringNull?.status === 'ok'}
-    <!-- `NullHistogram`'s own `<figcaption>` already links "Full
-         rewiring-null report" (the bean's non-negotiable) — this list adds
-         only the machine-readable JSON, matching the "JSON is linked too"
-         instruction without duplicating the same link text/target twice on
-         one page. -->
-    <NullHistogram data={rewiringNull.data} />
-    <ul class="links">
-      <li><a href={rewiringNullJsonUrl} target="_blank" rel="noreferrer">Rewiring-null result (JSON)</a></li>
-    </ul>
-  {:else if rewiringNull?.status === 'invalid'}
-    <p class="error-message">
-      Null-distribution result failed verification: {rewiringNull.reason}
-    </p>
+    {#if rewiringNull.status === 'ok'}
+      <!-- `NullHistogram`'s own `<figcaption>` already links "Full
+           rewiring-null report" (the bean's non-negotiable) — this list adds
+           only the machine-readable JSON, matching the "JSON is linked too"
+           instruction without duplicating the same link text/target twice on
+           one page. -->
+      <NullHistogram data={rewiringNull.data} />
+      <ul class="links">
+        <li><a href={rewiringNullJsonUrl} target="_blank" rel="noreferrer">Rewiring-null result (JSON)</a></li>
+      </ul>
+    {:else}
+      <p class="error-message">
+        Null-distribution result failed verification: {rewiringNull.reason}
+      </p>
+    {/if}
   {/if}
 
   <h3>Provenance and licensing</h3>

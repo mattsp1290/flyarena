@@ -293,13 +293,16 @@ test.describe('model ledger and provenance', () => {
     await expect(page.getByRole('heading', { name: 'Topology null distribution' })).toBeVisible();
     const histogram = page.locator('.null-histogram');
     await expect(histogram).toBeVisible();
+    // The sentence is built from the verified artifact's own `null.n`
+    // (500)/`condition` ("authored, opponent parked")/`seeds.count` (100),
+    // not hardcoded (dual review, Important).
     await expect(histogram.locator('svg[role="img"]')).toHaveAttribute(
       'aria-label',
-      /Biological scored above \d+(\.\d+)?% of 500 degree-preserving rewirings \(authored decoder, opponent parked, 100 held-out seeds\)\./
+      /Biological scored above \d+(\.\d+)?% of 500 degree-preserving rewirings \(authored, opponent parked, 100 held-out seeds\)\./
     );
     // The markers are labeled in a visible legend, never color alone —
     // scoped to the legend list specifically, since the same words also
-    // appear inside the SVG's `<desc>`/`<figcaption>` sentence.
+    // appear inside the SVG's `aria-label`/visible `<figcaption>` sentence.
     const legend = histogram.locator('.marker-legend');
     await expect(legend.getByText('Biological')).toBeVisible();
     await expect(legend.getByText('Rewired (seed 0, shipped)')).toBeVisible();
