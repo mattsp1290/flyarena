@@ -3,7 +3,7 @@ import type { GraphMode } from '../connectome/format';
 import { createWorkerClient, type WorkerClient } from '../worker/client';
 import { loadArenaArtifacts, type ArenaManifest, type LoadedArenaArtifacts } from './assets';
 import { buildGraphBufferForMode, createWorkerAgentBinding } from './bindings';
-import { ExperimentRunner, type ExperimentTelemetry } from './runner';
+import { ExperimentRunner, isNotInitializedRejection, type ExperimentTelemetry } from './runner';
 import { transition, type ExperimentStatus } from './state';
 
 /**
@@ -241,6 +241,22 @@ export class ExperimentController {
           if (this.runner.isActivityStreaming()) {
             binding.setActivity?.(true).catch((error: unknown) => {
               if (this.destroyed) return;
+              if (isNotInitializedRejection(error)) {
+                // Expected, self-healing race (thermo review S2, applies
+                // here for the same reason as `ExperimentRunner
+                // #setActivityStreaming`'s own catch): a second switch on
+                // this same arm can begin (and dispose this arm's Worker
+                // again) before this fire-and-forget re-apply's own round
+                // trip has settled, since neither this call nor the rest of
+                // this `.then()` block awaits it. `console.debug`, not
+                // `console.error`, so this routine race doesn't drown out a
+                // genuine re-apply failure.
+                console.debug(
+                  `ExperimentController: re-applying activity streaming for ${agentId} rejected (expected: not-initialized during a topology switch)`,
+                  error
+                );
+                return;
+              }
               console.error(`ExperimentController: re-applying activity streaming for ${agentId} failed`, error);
             });
           }

@@ -28,11 +28,17 @@ export const MAX_SUBSTEPS_PER_TICK = 64;
 /**
  * Integer version of this request/response shape. Bumped whenever a request
  * or response type gains/loses/reshapes a field in a way a caller might need
- * to branch on; not currently read by any caller (the main thread and the
- * Worker are always built from the same bundle), but recorded here as the
- * shape's version of record — see `docs/architecture.md`'s "versioned
- * message protocol" note. `1` marks the shape as of `set-activity`/
- * `StepWorkerSuccess.rates` (this addition).
+ * to branch on. Echoed back in `InitWorkerSuccess.protocolVersion` and
+ * checked by `createWorkerClient`'s `init` (`../worker/client.ts`) against
+ * this same constant, rejecting with a structured
+ * `protocol-version-mismatch` `WorkerClientError` on a mismatch — the main
+ * thread and the Worker are always built from the same bundle today, so this
+ * should never actually fire in production, but it turns a future
+ * build-skew bug (e.g. a stale cached Worker script surviving a deploy) into
+ * an immediate, diagnosable rejection instead of the Worker and main thread
+ * silently disagreeing about a response shape — see
+ * `docs/architecture.md`'s "versioned message protocol" note. `1` marks the
+ * shape as of `set-activity`/`StepWorkerSuccess.rates` (this addition).
  */
 export const WORKER_PROTOCOL_VERSION = 1;
 
@@ -113,6 +119,8 @@ export interface InitWorkerSuccess {
   outputPopulationCount: number;
   /** Echoes `InitWorkerRequest.mode`, so a caller can confirm which arm the Worker actually initialized. */
   mode?: GraphMode;
+  /** Echoes `WORKER_PROTOCOL_VERSION` as of this Worker build; `createWorkerClient#init` checks this against its own copy of the constant. */
+  protocolVersion: number;
 }
 
 export interface ResetWorkerSuccess {

@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gunzipSync } from 'node:zlib';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createReplaySummary, hashReplaySummary } from '../../src/lib/arena/replay';
 import {
   createDisconnectedGraph,
@@ -51,6 +51,33 @@ const runToFinished = (runner: ExperimentRunner): Promise<void> =>
     }, 1);
     runner.start();
   });
+
+/**
+ * Cleanup registry (thermo-architecture I1 fix): every `ExperimentRunner`
+ * constructed by a test is registered here via `trackRunner` immediately
+ * after construction, and the `afterEach` below disposes every tracked
+ * runner unconditionally once the test finishes. Without this, a runner
+ * left `running` (e.g. a test that calls `start()` and returns without an
+ * explicit `pause()`/`dispose()`) keeps its `runLoop` issuing real
+ * Worker/timer-driven ticks in the background past its own test's
+ * completion — reproduced as an intermittent uncaught `DataCloneError`
+ * attributed to whichever test last touched a still-ticking runner, only
+ * visible when the *full* `npm run test:unit` suite runs all 44 files
+ * together (a file-scoped loop of just the changed file does not reproduce
+ * it). `ExperimentRunner#dispose()` is documented as idempotent and safe to
+ * call regardless of current status (`runner.ts`), so calling it here even
+ * for a runner a test already paused/disposed itself is harmless.
+ */
+const activeRunners: ExperimentRunner[] = [];
+const trackRunner = (runner: ExperimentRunner): ExperimentRunner => {
+  activeRunners.push(runner);
+  return runner;
+};
+
+afterEach(() => {
+  for (const runner of activeRunners) runner.dispose();
+  activeRunners.length = 0;
+});
 
 /**
  * An externally-resolvable/rejectable promise, used below to control
@@ -146,6 +173,7 @@ describe('ExperimentRunner determinism', () => {
         agents: buildFixtureAgents(0x55),
         targetTickIntervalMs: 0
       });
+      trackRunner(runner);
       await runToFinished(runner);
       // Reuse the real production summary-construction path rather than a
       // hand-maintained parallel copy of its field mapping: this also means
@@ -174,6 +202,7 @@ describe('ExperimentRunner determinism', () => {
         agents: buildFixtureAgents(0x66, nextJitterMs),
         targetTickIntervalMs: 0
       });
+      trackRunner(runner);
       await runToFinished(runner);
       const world = runner.getWorld();
       return { hash: hashReplaySummary(createReplaySummary(world)), tick: world.tick };
@@ -260,6 +289,7 @@ describe('ExperimentRunner determinism', () => {
         agents: buildFixtureAgents(0x51, createStepLatencyMs()),
         targetTickIntervalMs: 0
       });
+      trackRunner(runner);
       let frameCount = 0;
       const ticksAtFrame: number[] = [];
       let frameTimer: ReturnType<typeof setTimeout> | undefined;
@@ -333,6 +363,7 @@ describe('ExperimentRunner determinism', () => {
     const runWithStreaming = async (streaming: boolean): Promise<string> => {
       const agents = await buildWorkerAgents();
       const runner = new ExperimentRunner({ seed, totalTicks, agents, targetTickIntervalMs: 0 });
+      trackRunner(runner);
       if (streaming) await runner.setActivityStreaming(true);
       await runToFinished(runner);
       return hashReplaySummary(createReplaySummary(runner.getWorld()));
@@ -373,6 +404,7 @@ describe('ExperimentRunner backpressure', () => {
       agents: { left: trackedLeft, right: buildFixtureAgents(0x1).right },
       targetTickIntervalMs: 0
     });
+    trackRunner(runner);
     await runToFinished(runner);
     expect(maxInFlight).toBe(1);
   });
@@ -389,6 +421,7 @@ describe('ExperimentRunner backpressure', () => {
       agents: { left: slowLeft, right },
       targetTickIntervalMs: 5 // deliberately below the 20ms simulated latency
     });
+    trackRunner(runner);
     await runToFinished(runner);
     expect(runner.getTelemetry().behindRealtime).toBe(true);
     // Every tick must still have actually run to completion (1..totalTicks reached, not skipped).
@@ -407,6 +440,7 @@ describe('ExperimentRunner backpressure', () => {
       agents: { left: slowLeft, right: fastRight },
       targetTickIntervalMs: 0
     });
+    trackRunner(runner);
     await runToFinished(runner);
 
     const telemetry = runner.getTelemetry();
@@ -433,6 +467,7 @@ describe('ExperimentRunner setAgentBinding', () => {
       agents: { left: makeBinding(), right: makeBinding() },
       targetTickIntervalMs: 0
     });
+    trackRunner(runner);
 
     // ready: allowed.
     expect(() => runner.setAgentBinding('left', makeBinding())).not.toThrow();
@@ -468,6 +503,7 @@ describe('ExperimentRunner setAgentBinding', () => {
       agents: { left: makeBinding(), right: makeBinding() },
       targetTickIntervalMs: 0
     });
+    trackRunner(runner);
     await runToFinished(runner);
     expect(runner.getWorld().tick).toBe(10);
 
@@ -514,6 +550,7 @@ describe('ExperimentRunner disconnected vs biological (real MaleCNS artifact)', 
       },
       targetTickIntervalMs: 0
     });
+    trackRunner(runner);
     await runToFinished(runner);
 
     expect(seenNonZero.biological).toBe(true);
@@ -533,6 +570,7 @@ describe('ExperimentRunner full-length run', () => {
       agents: buildFixtureAgents(0x2a),
       targetTickIntervalMs: 0
     });
+    trackRunner(runner);
     await runToFinished(runner);
     expect(runner.getStatus()).toBe('finished');
     expect(runner.getWorld().tick).toBe(2700);
@@ -566,6 +604,7 @@ describe('ExperimentRunner pause/resume/reset', () => {
         }
       }
     });
+    trackRunner(runner);
 
     runner.start();
     await waitUntil(() => runner.getStatus() === 'paused');
@@ -612,6 +651,7 @@ describe('ExperimentRunner pause/resume/reset', () => {
       agents: { left: slow, right: fast },
       targetTickIntervalMs: 0
     });
+    trackRunner(runner);
     runner.start();
     // `ExperimentRunner#start()` runs synchronously through `runLoop` ->
     // `runOneTick` -> `AgentBinding#step` up to their first real `await` —
@@ -652,6 +692,7 @@ describe('ExperimentRunner pause/resume/reset', () => {
         agents: { left, right },
         targetTickIntervalMs: 0
       });
+      trackRunner(runner);
       runner.start();
       // No wall-clock "interrupt mid-flight" wait: `ExperimentRunner#start()`
       // synchronously drives `runLoop` -> `runOneTick` -> `Promise.all` ->
@@ -678,6 +719,7 @@ describe('ExperimentRunner pause/resume/reset', () => {
       const left = createOracleAgentBinding({ graphBuffer: buffer.slice(0), mode: 'biological' });
       const right = createOracleAgentBinding({ graphBuffer: buffer.slice(0), mode: 'biological' });
       const runner = new ExperimentRunner({ seed, totalTicks: 60, agents: { left, right }, targetTickIntervalMs: 0 });
+      trackRunner(runner);
       await runToFinished(runner);
       return runner.getReplayExport().finalHash;
     };
@@ -718,6 +760,7 @@ describe('ExperimentRunner pause/resume/reset', () => {
       targetTickIntervalMs: 0,
       onStatusChange: (next) => statuses.push(next)
     });
+    trackRunner(runner);
     runner.start();
     // `flaky.step()`'s first call is already synchronously in flight by
     // this point (see the mid-flight-reset test above for the full trace),
@@ -790,6 +833,7 @@ describe('ExperimentRunner activity streaming', () => {
       right: withStepDelay(built.right, 5)
     };
     const runner = new ExperimentRunner({ seed: 1, totalTicks: 200, agents, targetTickIntervalMs: 0 });
+    trackRunner(runner);
 
     expect(runner.isActivityStreaming()).toBe(false);
     expect(runner.getLatestRates('left')).toBeUndefined();
@@ -834,6 +878,7 @@ describe('ExperimentRunner activity streaming', () => {
     const buffer = encodeGraphBinary(graph);
     const agents = await buildWorkerAgents(buffer);
     const runner = new ExperimentRunner({ seed: 2, totalTicks: 500, agents, targetTickIntervalMs: 0 });
+    trackRunner(runner);
 
     await runner.setActivityStreaming(true);
     runner.start();
@@ -862,6 +907,7 @@ describe('ExperimentRunner activity streaming', () => {
       right: createOracleAgentBinding({ graphBuffer: buffer.slice(0), mode: 'biological' })
     };
     const runner = new ExperimentRunner({ seed: 3, totalTicks: 10, agents, targetTickIntervalMs: 0 });
+    trackRunner(runner);
 
     await expect(runner.setActivityStreaming(true)).resolves.toBeUndefined();
     expect(runner.isActivityStreaming()).toBe(true);
@@ -914,6 +960,7 @@ describe('ExperimentRunner activity streaming', () => {
     };
     const agents: Record<'left' | 'right', AgentBinding> = { left, right: delayed.right };
     const runner = new ExperimentRunner({ seed: 4, totalTicks: 300, agents, targetTickIntervalMs: 0 });
+    trackRunner(runner);
 
     await runner.setActivityStreaming(true);
     runner.start();
@@ -939,5 +986,106 @@ describe('ExperimentRunner activity streaming', () => {
     expect(runner.isActivityStreaming()).toBe(false);
     expect(runner.getLatestRates('left')).toBeUndefined();
     expect(runner.getLatestRates('right')).toBeUndefined();
+  });
+
+  /** A minimal always-succeeding binding, used below as the "other arm" so `setActivityStreaming` has exactly one genuinely failing arm to isolate. */
+  const makeQuietBinding = (setActivity: AgentBinding['setActivity']): AgentBinding => ({
+    step: async () => ({ actionFeatures: [0], telemetry: { meanRate: 0, minRate: 0, maxRate: 0, activeFraction: 0 } }),
+    reset: async () => {},
+    info: { topology: 'biological', neuronCount: 1, edgeCount: 0 },
+    setActivity
+  });
+
+  it('supportsActivityStreaming reports per-arm capability, distinct from isActivityStreaming\'s requested-intent flag (thermo maintainability review S3)', async () => {
+    const graph = createRandomGraph(0x9b, { neuronCount: 10, inputChannelCount: 4, outputPopulationCount: 2 });
+    const buffer = encodeGraphBinary(graph);
+    // `left` is a `WorkerClient`-backed binding (implements `setActivity`);
+    // `right` is the oracle/CPU binding, which omits it entirely (see
+    // `bindings.ts#createOracleAgentBinding`'s "not supported" contract).
+    const workerAgents = await buildWorkerAgents(buffer);
+    const oracleRight = createOracleAgentBinding({ graphBuffer: buffer.slice(0), mode: 'biological' });
+    const runner = new ExperimentRunner({
+      seed: 1,
+      totalTicks: 10,
+      agents: { left: workerAgents.left, right: oracleRight },
+      targetTickIntervalMs: 0
+    });
+    trackRunner(runner);
+
+    // Capability is per-arm and independent of whether streaming has been
+    // requested at all.
+    expect(runner.supportsActivityStreaming('left')).toBe(true);
+    expect(runner.supportsActivityStreaming('right')).toBe(false);
+    expect(runner.isActivityStreaming()).toBe(false);
+
+    // Requesting streaming makes `isActivityStreaming()` true for *both*
+    // arms (it reports intent, not per-arm effect — this is the exact
+    // ambiguity `supportsActivityStreaming` exists to disambiguate), even
+    // though `right` can never actually produce `rates`.
+    await runner.setActivityStreaming(true);
+    expect(runner.isActivityStreaming()).toBe(true);
+    expect(runner.supportsActivityStreaming('left')).toBe(true);
+    expect(runner.supportsActivityStreaming('right')).toBe(false);
+  });
+
+  it('setActivityStreaming logs a genuine (non-not-initialized) setActivity failure at console.error, not console.debug (thermo review S2)', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const debugSpy = vi.spyOn(console, 'debug').mockImplementation(() => {});
+    try {
+      const failing = makeQuietBinding(async () => {
+        throw new Error('internal-error: simulated genuine Worker failure');
+      });
+      const ok = makeQuietBinding(async () => {});
+      const runner = new ExperimentRunner({
+        seed: 1,
+        totalTicks: 10,
+        agents: { left: failing, right: ok },
+        targetTickIntervalMs: 0
+      });
+      trackRunner(runner);
+
+      await runner.setActivityStreaming(true);
+
+      expect(errorSpy).toHaveBeenCalled();
+      expect(debugSpy).not.toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
+      debugSpy.mockRestore();
+    }
+  });
+
+  it('setActivityStreaming logs an expected not-initialized rejection at console.debug, not console.error (thermo review S2)', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const debugSpy = vi.spyOn(console, 'debug').mockImplementation(() => {});
+    try {
+      // Duck-typed to match `WorkerClientError`'s `code` field
+      // (`worker/client.ts`) — what a real `WorkerClient`-backed binding
+      // actually rejects with when its Worker is genuinely `idle` mid
+      // `ExperimentController#changeTopology`'s dispose -> init window; see
+      // `runner.ts#isNotInitializedRejection`.
+      const notInitialized = makeQuietBinding(async () => {
+        const error = new Error('not-initialized: Neural worker has not been initialized') as Error & {
+          code: string;
+        };
+        error.code = 'not-initialized';
+        throw error;
+      });
+      const ok = makeQuietBinding(async () => {});
+      const runner = new ExperimentRunner({
+        seed: 1,
+        totalTicks: 10,
+        agents: { left: notInitialized, right: ok },
+        targetTickIntervalMs: 0
+      });
+      trackRunner(runner);
+
+      await runner.setActivityStreaming(true);
+
+      expect(debugSpy).toHaveBeenCalled();
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
+      debugSpy.mockRestore();
+    }
   });
 });

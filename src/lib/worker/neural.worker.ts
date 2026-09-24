@@ -9,7 +9,7 @@ import {
   type StepScratch
 } from '../connectome/model';
 import { computeTelemetry } from '../connectome/telemetry';
-import { MAX_SUBSTEPS_PER_TICK } from './protocol';
+import { MAX_SUBSTEPS_PER_TICK, WORKER_PROTOCOL_VERSION } from './protocol';
 import type { WorkerErrorCode, WorkerFailure, WorkerRequest, WorkerResponse } from './protocol';
 
 /**
@@ -153,7 +153,8 @@ export const handleWorkerRequest = (
           edgeCount: graph.metadata.edgeCount,
           inputChannelCount: graph.metadata.inputChannelCount,
           outputPopulationCount: graph.metadata.outputPopulationCount,
-          mode: request.mode
+          mode: request.mode,
+          protocolVersion: WORKER_PROTOCOL_VERSION
         });
       }
 

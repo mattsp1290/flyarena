@@ -1,10 +1,12 @@
 import type { GraphMode } from '../connectome/format';
+import { WORKER_PROTOCOL_VERSION } from './protocol';
 import type {
   DisposeWorkerSuccess,
   InitWorkerSuccess,
   ResetWorkerSuccess,
   SetActivityWorkerSuccess,
   StepWorkerSuccess,
+  WorkerErrorCode,
   WorkerRequest,
   WorkerResponse
 } from './protocol';
@@ -45,13 +47,26 @@ export interface WorkerLike {
 }
 
 export class WorkerClientError extends Error {
-  constructor(message: string) {
+  /**
+   * Machine-checkable failure category: a `WorkerErrorCode` when this wraps
+   * a structured `WorkerError` from an actual Worker response (see
+   * `handleMessage` below), `'protocol-version-mismatch'` for `init`'s own
+   * version check, or `'client-error'` for every other client-side
+   * condition (termination, a prior Worker `error`/`messageerror` event, a
+   * malformed response) that has no `WorkerErrorCode` of its own. Lets a
+   * caller branch on failure kind without parsing `message`.
+   */
+  readonly code: WorkerErrorCode | 'protocol-version-mismatch' | 'client-error';
+
+  constructor(message: string, code: WorkerErrorCode | 'protocol-version-mismatch' | 'client-error' = 'client-error') {
     super(message);
     this.name = 'WorkerClientError';
+    this.code = code;
   }
 }
 
 export interface WorkerClient {
+  /** Rejects with a `WorkerClientError` (`code: 'protocol-version-mismatch'`) if the Worker's echoed `InitWorkerSuccess.protocolVersion` does not match this bundle's own `WORKER_PROTOCOL_VERSION`. */
   init: (graphBuffer: ArrayBuffer, mode?: GraphMode) => Promise<InitWorkerSuccess>;
   reset: () => Promise<ResetWorkerSuccess>;
   /** Resolves with the full `StepWorkerSuccess`, including `rates` when activity streaming is currently enabled. */
@@ -104,7 +119,7 @@ export const createWorkerClient = (worker: WorkerLike): WorkerClient => {
     if (response.ok) {
       entry.resolve(response);
     } else {
-      entry.reject(new WorkerClientError(`${response.error.code}: ${response.error.message}`));
+      entry.reject(new WorkerClientError(`${response.error.code}: ${response.error.message}`, response.error.code));
     }
   };
 
@@ -142,11 +157,27 @@ export const createWorkerClient = (worker: WorkerLike): WorkerClient => {
   };
 
   return {
-    init: (graphBuffer, mode) =>
-      send<InitWorkerSuccess>(
+    init: async (graphBuffer, mode) => {
+      const result = await send<InitWorkerSuccess>(
         { type: 'init', requestId: nextRequestId(), graphBuffer, mode },
         [graphBuffer]
-      ),
+      );
+      // The Worker has already transitioned to `ready` by the time this
+      // check runs (the check is purely a main-thread-side comparison of
+      // the echoed `protocolVersion` against this bundle's own constant),
+      // so a mismatch here means the two bundles disagree about the
+      // request/response shape itself — worth surfacing as a distinct,
+      // structured failure (`code: 'protocol-version-mismatch'`) rather than
+      // letting a caller discover it indirectly via a malformed later `step`/
+      // `set-activity` response.
+      if (result.protocolVersion !== WORKER_PROTOCOL_VERSION) {
+        throw new WorkerClientError(
+          `Worker protocol version mismatch: main thread expects ${WORKER_PROTOCOL_VERSION}, Worker reported ${String(result.protocolVersion)}`,
+          'protocol-version-mismatch'
+        );
+      }
+      return result;
+    },
     reset: () => send<ResetWorkerSuccess>({ type: 'reset', requestId: nextRequestId() }),
     step: (channelValues, substeps) =>
       send<StepWorkerSuccess>({ type: 'step', requestId: nextRequestId(), channelValues, substeps }),

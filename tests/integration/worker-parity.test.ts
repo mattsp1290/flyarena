@@ -219,8 +219,17 @@ describe('oracle vs Worker parity', () => {
       // `handleWorkerRequest` returns `rates` as a fresh copy, so this is a
       // true value-equality check, not an identity/aliasing accident.
       expect(Array.from(enabledResponse.rates!)).toEqual(Array.from(oracleEnabled.state.rate));
-      // `rates.buffer` is exactly the one Transferable this response carries.
-      expect(enabledResult.transfer).toEqual([enabledResponse.rates!.buffer]);
+      // `rates.buffer` is exactly the one Transferable this response
+      // carries — asserted by reference (`toBe`), not `toEqual`: `toEqual`
+      // on an array containing an `ArrayBuffer` compares by byte content, so
+      // it would also pass if `transfer[0]` were a *different* buffer
+      // instance that merely holds identical bytes to `rates.buffer`,
+      // rather than proving it is the exact same object a real
+      // `postMessage(response, transfer)` call would detach out from under
+      // the Worker (thermo-maintainability review S4 — this is the
+      // invariant this assertion is actually meant to pin down).
+      expect(enabledResult.transfer).toHaveLength(1);
+      expect(enabledResult.transfer![0]).toBe(enabledResponse.rates!.buffer);
 
       // Disabled response carries no `rates` key at all — not merely an
       // `undefined` value — matching the closed-view contract.

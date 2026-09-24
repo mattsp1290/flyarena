@@ -45,12 +45,36 @@ const createCallbacks = (): ExperimentControllerCallbacks & {
   };
 };
 
+/**
+ * Cleanup registry (thermo-architecture I1 fix, applied here too on audit):
+ * every `ExperimentController` constructed by a test is registered via
+ * `trackController` immediately after construction (including inside the
+ * two `setUp()` helpers below, so every test that goes through one is
+ * covered without its own explicit cleanup call). The `afterEach` below
+ * disposes every tracked controller — which in turn disposes its
+ * `ExperimentRunner` and terminates both arms' `WorkerClient`s — before
+ * unstubbing the `fetch`/`Worker` globals, so a runner a test started via
+ * `runner.start()`/`changeTopology()` and never explicitly paused/disposed
+ * cannot keep ticking in the background past its own test (see
+ * `experiment-runner.test.ts`'s identical registry for the reproduced
+ * flake this pattern closes). `ExperimentController#dispose()` is
+ * documented as idempotent, so calling it here is harmless even for a test
+ * that already disposed its own controller.
+ */
+const activeControllers: ExperimentController[] = [];
+const trackController = (controller: ExperimentController): ExperimentController => {
+  activeControllers.push(controller);
+  return controller;
+};
+
 beforeEach(() => {
   vi.stubGlobal('fetch', createPublicDataFetch());
   vi.stubGlobal('Worker', FakeNeuralWorker as unknown as typeof Worker);
 });
 
 afterEach(() => {
+  for (const controller of activeControllers) controller.dispose();
+  activeControllers.length = 0;
   vi.unstubAllGlobals();
 });
 
@@ -66,6 +90,7 @@ describe('ExperimentController#initialize', () => {
       createWorker,
       callbacks
     });
+    trackController(controller);
 
     await controller.initialize();
 
@@ -87,6 +112,7 @@ describe('ExperimentController#initialize', () => {
       createWorker,
       callbacks
     });
+    trackController(controller);
 
     await controller.initialize();
 
@@ -105,6 +131,7 @@ describe('ExperimentController#initialize', () => {
       createWorker,
       callbacks
     });
+    trackController(controller);
 
     const initializing = controller.initialize();
     controller.dispose();
@@ -124,6 +151,7 @@ describe('ExperimentController#changeTopology', () => {
       createWorker,
       callbacks
     });
+    trackController(controller);
     await controller.initialize();
     return { controller, callbacks };
   };
@@ -193,6 +221,7 @@ describe('ExperimentController#changeTopology', () => {
       createWorker,
       callbacks
     });
+    trackController(controller);
 
     // Deliberately not awaited yet: `initialize()` is genuinely in flight
     // (assets still fetching/verifying, no runner/workerClients/manifest
@@ -455,6 +484,7 @@ describe('ExperimentController activity streaming', () => {
       createWorker,
       callbacks
     });
+    trackController(controller);
     await controller.initialize();
     return { controller, callbacks };
   };
@@ -491,10 +521,15 @@ describe('ExperimentController activity streaming', () => {
    * `setActivity` call against that still-`idle` Worker is expected to fail
    * with `not-initialized` (caught and logged inside `ExperimentRunner`, per
    * its doc comment — never rejects to this test): this test asserts that
-   * rejection is actually exercised (via a `console.error` spy), not merely
-   * that the end state looks right despite it never having run.
+   * rejection is actually exercised (via a `console.debug` spy — thermo
+   * review S2's downgrade, so this expected/routine race no longer logs at
+   * `console.error`), not merely that the end state looks right despite it
+   * never having run, and that `console.error` itself stays silent for this
+   * expected case (a genuine Worker failure still must log there — see
+   * `runner.ts#isNotInitializedRejection` and its one other caller,
+   * `controller.ts#changeTopology`'s re-apply catch).
    */
-  it('setActivityStreaming(true) racing changeTopology through the dispose window resolves without an unhandled rejection, logs the expected not-initialized failure, and streaming is active on both arms afterward', async () => {
+  it('setActivityStreaming(true) racing changeTopology through the dispose window resolves without an unhandled rejection, logs the expected not-initialized failure at debug (not error) level, and streaming is active on both arms afterward', async () => {
     let gatedWorker: GatedDisposeWorker | undefined;
     let createCount = 0;
     const createGatedWorker = (): Worker => {
@@ -507,6 +542,7 @@ describe('ExperimentController activity streaming', () => {
     };
 
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const debugSpy = vi.spyOn(console, 'debug').mockImplementation(() => {});
     try {
       const callbacks = createCallbacks();
       const controller = new ExperimentController({
@@ -516,6 +552,7 @@ describe('ExperimentController activity streaming', () => {
         createWorker: createGatedWorker,
         callbacks
       });
+      trackController(controller);
       await controller.initialize();
       const runner = controller.getRunner();
       expect(runner).toBeDefined();
@@ -547,8 +584,10 @@ describe('ExperimentController activity streaming', () => {
       // Proves the `not-initialized` rejection path in
       // `ExperimentRunner#setActivityStreaming` actually ran for the left
       // arm's old (now-idle) binding, not merely that the end state below
-      // happens to look right regardless.
-      expect(errorSpy).toHaveBeenCalled();
+      // happens to look right regardless — logged at `console.debug`, and
+      // `console.error` never fires for this expected case.
+      expect(debugSpy).toHaveBeenCalled();
+      expect(errorSpy).not.toHaveBeenCalled();
 
       expect(runner!.isActivityStreaming()).toBe(true);
       expect(callbacks.errors).toHaveLength(0);
@@ -558,6 +597,7 @@ describe('ExperimentController activity streaming', () => {
       await vi.waitFor(() => expect(runner!.getLatestRates('right')).toBeDefined());
     } finally {
       errorSpy.mockRestore();
+      debugSpy.mockRestore();
     }
   });
 
@@ -592,6 +632,7 @@ describe('ExperimentController activity streaming', () => {
         createWorker: createGatedWorker,
         callbacks
       });
+      trackController(controller);
       await controller.initialize();
       const runner = controller.getRunner();
       expect(runner).toBeDefined();
@@ -659,6 +700,7 @@ describe('ExperimentController activity streaming', () => {
         createWorker: createFailingWorker,
         callbacks
       });
+      trackController(controller);
       await controller.initialize();
       const runner = controller.getRunner();
       expect(runner).toBeDefined();
@@ -702,6 +744,7 @@ describe('ExperimentController#dispose', () => {
       createWorker,
       callbacks
     });
+    trackController(controller);
     await controller.initialize();
 
     expect(() => {

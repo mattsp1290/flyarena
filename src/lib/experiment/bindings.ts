@@ -156,6 +156,16 @@ export const createWorkerAgentBinding = async (
     await client.reset();
   };
 
+  // Satisfies `AgentBinding#setActivity`'s synchronous-post ordering
+  // contract (`runner.ts`'s doc comment): `client.setActivity` ->
+  // `WorkerClient`'s internal `send` calls `worker.postMessage` inside the
+  // `Promise` executor it returns, before `send` itself returns — so the
+  // `set-activity` message is already posted by the time this `async`
+  // function reaches its own first (and only) `await`, regardless of how
+  // long the returned Promise then takes to settle. This is what lets
+  // `ExperimentController#changeTopology` call this without awaiting it and
+  // still trust FIFO ordering against whatever it posts next on the same
+  // Worker.
   const setActivity: AgentBinding['setActivity'] = async (enabled) => {
     await client.setActivity(enabled);
   };

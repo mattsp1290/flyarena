@@ -47,6 +47,24 @@ export interface AgentStepResult {
 /** One neural control step for one arm. Must resolve with the outputs for exactly the observation it was given — never a stale/reused action. */
 export type AgentStepFn = (input: AgentStepInput) => Promise<AgentStepResult>;
 
+/**
+ * True when `error` looks like a structured `not-initialized` rejection
+ * (see `worker/client.ts#WorkerClientError`'s `code` field) — duck-typed on
+ * a `code` property rather than an `instanceof WorkerClientError` check, so
+ * this module (and `controller.ts`, which reuses this same helper) stays
+ * agnostic of which concrete `AgentBinding#setActivity` implementation
+ * issued the rejection, per this file's own "step-function-agnostic" module
+ * doc comment. `not-initialized` is the one rejection reason that is
+ * *expected* and self-healing when it fires from a `setActivity` call
+ * racing `ExperimentController#changeTopology`'s dispose -> init window for
+ * the same arm (see `ExperimentRunner#setActivityStreaming` and
+ * `controller.ts#changeTopology`'s own re-apply, which recovers it) — every
+ * other rejection reason is a genuine failure and must still be logged
+ * loudly.
+ */
+export const isNotInitializedRejection = (error: unknown): boolean =>
+  typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'not-initialized';
+
 export interface AgentRunnerInfo {
   topology: GraphMode;
   neuronCount: number;
@@ -86,6 +104,23 @@ export interface AgentBinding {
    * supported" contract — `ExperimentRunner#setActivityStreaming` treats a
    * missing `setActivity` as a no-op for that arm, not an error). A
    * `WorkerClient`-backed binding implements it with `client.setActivity`.
+   *
+   * **Ordering contract an implementation must uphold:** the underlying
+   * request must be *posted* synchronously — before this call's first
+   * `await`/microtask hop, i.e. from inside the executor of the `Promise`
+   * this method returns, not after some other awaited step — even though
+   * the returned `Promise` itself may still take a full round trip to
+   * settle. `ExperimentController#changeTopology`'s re-apply
+   * (`controller.ts`) deliberately does not `await` this call before
+   * issuing a later `step`/`dispose` on the same binding, relying entirely
+   * on this ordering guarantee (plus `Worker`'s own FIFO message delivery)
+   * to keep `set-activity` strictly ahead of anything posted after it — see
+   * that method's own doc comment. `createWorkerAgentBinding`
+   * (`bindings.ts`) satisfies this today because `WorkerClient#setActivity`
+   * -> `send` calls `worker.postMessage` synchronously inside the
+   * `Promise` executor, before returning to its own caller; a future
+   * `AgentBinding` implementation must preserve that same synchronous-post
+   * property to stay safe for a fire-and-forget re-apply.
    */
   setActivity?: (enabled: boolean) => Promise<void>;
 }
@@ -295,6 +330,26 @@ export class ExperimentRunner {
   }
 
   /**
+   * Whether `agentId`'s *current* binding can actually stream full-neuron
+   * rates at all — i.e. whether it implements `AgentBinding#setActivity`
+   * (`this.agents[agentId].setActivity !== undefined`) — as distinct from
+   * `isActivityStreaming()`, which reports whether streaming has been
+   * *requested* for both arms regardless of whether either one supports it
+   * (thermo-maintainability review S3). The oracle/CPU binding
+   * (`bindings.ts#createOracleAgentBinding`) omits `setActivity` entirely,
+   * so `isActivityStreaming()` can read `true` for an arm that will never
+   * actually produce `rates`; a per-arm UI indicator (e.g. WP3's activity
+   * view) should gate on this method, not `isActivityStreaming()` alone, to
+   * tell "requested but unsupported for this arm" apart from "requested and
+   * active." Reflects the arm's *current* binding, so it can change across
+   * a `setAgentBinding`/`changeTopology` call (e.g. swapping in a binding
+   * type that does support it).
+   */
+  supportsActivityStreaming(agentId: AgentId): boolean {
+    return this.agents[agentId].setActivity !== undefined;
+  }
+
+  /**
    * Latest full per-neuron rate vector for `agentId`, or `undefined` until
    * streaming is enabled and a tick has run since. Replaced (a new
    * `Float32Array` reference every tick — `!==` against a previously-read
@@ -359,6 +414,22 @@ export class ExperimentRunner {
           // (`runner.ts`'s reset()); never call `this.fail()` here, since a
           // per-arm streaming-toggle failure is not a run failure.
           if (this.disposed || generationAtStart !== this.generation) return;
+          if (isNotInitializedRejection(error)) {
+            // Expected, self-healing race (thermo review S2): this call
+            // landed on an arm's binding while its Worker was genuinely
+            // `idle` mid `ExperimentController#changeTopology`'s dispose ->
+            // init window — the controller's own re-apply recovers it on
+            // the rebuilt binding immediately after, and this method's flag
+            // stays authoritative regardless (see this method's own doc
+            // comment). `console.debug`, not `console.error`, so this
+            // routine race doesn't drown out a genuine Worker failure in
+            // production logs.
+            console.debug(
+              `ExperimentRunner: setActivity(${enabled}) rejected for agent ${agentId} (expected: not-initialized during a topology switch)`,
+              error
+            );
+            return;
+          }
           console.error(`ExperimentRunner: setActivity(${enabled}) failed for agent ${agentId}`, error);
         }
       })
