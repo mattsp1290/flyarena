@@ -75,6 +75,15 @@ h2 {
 main {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(18rem, 25rem);
+  /* `row 1 = auto` sizes to the arena's own natural content height; `row 2 =
+     1fr` absorbs whatever height the sidebar's `grid-row: 1 / span 2` (see
+     `.sidebar` below) needs beyond that. Without this, both `auto` rows
+     split the sidebar's extra height evenly between them, and default
+     `align-items: stretch` then stretches the arena and the activity panel
+     to fill it — a real regression a round-2 review caught and confirmed in
+     a browser: the collapsed activity panel measured ~700px tall around
+     ~73px of actual content. */
+  grid-template-rows: auto 1fr;
   gap: 1rem;
   max-width: 1440px;
   margin: 0 auto;
@@ -163,16 +172,16 @@ main {
   display: grid;
   gap: 1rem;
   align-content: start;
-  /* WP3 added a second row-1 item (`.activity`, the anatomical activity
-     panel — see `ActivityPanel.svelte`) that spans only column 1, sitting
-     below the arena. Without an explicit placement here, CSS grid's sparse
-     auto-placement algorithm advances its placement cursor forward past
-     row 1 once `.activity` claims the rest of row 1 in column 1, and never
-     revisits row 1 column 2 — so the sidebar (next in DOM order, with no
-     explicit placement of its own) would land in row 3 column 1, *below*
-     `.activity`, leaving the entire column-2 slot next to the arena empty
-     for the whole page (confirmed in a real browser during review). Pinning
-     it to column 2 across both rows keeps it beside the arena, exactly
+  /* WP3 added a second item (`.activity`, the anatomical activity panel —
+     see `ActivityPanel.svelte`) between the arena and this sidebar in DOM
+     order, pinned to column 1 (row 2, by CSS grid's own sparse
+     auto-placement: the arena already fills row 1 column 1, so `.activity`
+     — column 1, any row — advances to the next free cell in that column).
+     Without a placement of its own, this sidebar (auto/auto, next in DOM
+     order) would then land beside `.activity` in row 2 column 2 — pushed
+     down from the arena's row, with row 1 column 2 left empty above it
+     (confirmed in a real browser during round-2 review). Pinning it to
+     column 2 across both rows keeps it beside the arena instead, exactly
      where it sat before this panel was added. */
   grid-column: 2;
   grid-row: 1 / span 2;

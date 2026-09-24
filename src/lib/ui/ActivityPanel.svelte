@@ -266,7 +266,7 @@
       </p>
       {#if positionsStatus.positions.coverage.none > 0}
         <p class="coverage strip-label">
-          The row of points along the bottom of each arm is the
+          The rows of points along the bottom of each arm are the
           <strong>position unavailable</strong> strip — {positionsStatus.positions.coverage.none} neurons with no soma
           annotation, laid out for visibility only. It is not an anatomical location.
         </p>
@@ -300,6 +300,11 @@
           <span class="legend-bar"></span>
           <span>{positionsStatus.rateMax.toFixed(2)}</span>
         </div>
+        <!-- Matches `ActivityScene.ts#NO_DATA_COLOR` — grey, deliberately
+             outside the viridis bar above, shown before the first tick and
+             whenever an arm's rates go from present to absent (e.g. after
+             a reset). -->
+        <span class="legend-no-data" aria-hidden="true"><span class="swatch"></span>No data yet</span>
         <ul class="legend-roles">
           <li><span class="shape circle" aria-hidden="true"></span>Sensory</li>
           <li><span class="shape square" aria-hidden="true"></span>Bridge</li>
@@ -314,14 +319,22 @@
   /* `App.svelte`'s `<main>` is a two-column grid (arena + sidebar); this
      panel sits directly below the arena, in the arena's own column, per the
      plan's placement (`03-activity-view.md`). Deliberately column 1 only
-     (not `1 / -1`): a full-width span here pushes the sidebar's sparse
-     grid auto-placement down into a third row below this panel instead of
-     staying beside the arena — see `.sidebar`'s own comment in
-     `src/app.css`, which pins it back to column 2 to compensate either way,
-     but staying out of its way here keeps the two rules from having to
-     agree on which one "wins". */
+     (not `1 / -1`): a full-width span here would collide with `.sidebar`'s
+     own `grid-row: 1 / span 2` pin in `src/app.css` and push this panel to
+     a third row instead of sitting under the arena — see that rule's own
+     comment for the exact placement trace.
+
+     `align-self: start` (overriding the grid's default `stretch`): row 2 is
+     `main`'s `1fr` track, sized to whatever height `.sidebar`'s two-row
+     span needs beyond the arena's own row-1 height (see `main`'s own
+     comment in `src/app.css`) — usually taller than this panel's actual
+     content, especially collapsed. Without `align-self: start`, default
+     stretch alignment fills that whole row-2 height with this panel
+     regardless, leaving a large empty bordered box below the arena — a
+     real regression a round-2 review caught and confirmed in a browser. */
   .activity {
     grid-column: 1;
+    align-self: start;
   }
 
   .reason {
@@ -414,6 +427,22 @@
     height: 8px;
     border-radius: 4px;
     background: linear-gradient(to right, #440154, #3b528b, #21918c, #5ec962, #fde725);
+  }
+
+  .legend-no-data {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+  }
+
+  .legend-no-data .swatch {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    /* Matches `ActivityScene.ts#NO_DATA_COLOR` (0.32, 0.35, 0.4 in linear
+       0-1 RGB) converted to an sRGB hex approximation for CSS. */
+    background: #6b7484;
   }
 
   .legend-roles {
