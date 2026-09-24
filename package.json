@@ -24,6 +24,8 @@
     "null:lookup-rewired-artifact": "tsx scripts/null/lookup-rewired-artifact.ts",
     "null:regime-check": "tsx scripts/null/regime-check.ts",
     "analysis:fixture": "tsx scripts/analysis/export-trace-graph-fixture.ts",
+    "lesion:evaluate": "tsx scripts/lesion/atlas-evaluate.ts",
+    "lesion:report": "tsx scripts/lesion/atlas-report.ts",
     "test:subpath": "playwright test --config playwright.subpath.config.ts"
   },
   "dependencies": {
