@@ -300,6 +300,34 @@ describe('loadTrainedReadoutArtifact (against the real committed WP5 production 
     expect(result.status).toBe('unavailable');
     if (result.status === 'unavailable') {
       expect(result.reason).toMatch(/does not match the artifact/);
+      // Thermo-maintainability review S3: name the diverging field(s), not
+      // just a blanket "doesn't match" — this mutation only touches `D`, so
+      // only `D` should be named as diverging, not `H`/`parameterCount` too.
+      expect(result.reason).toMatch(/diverges from the artifact on D\b/);
+      expect(result.reason).not.toMatch(/diverges from the artifact on [^:]*H/);
+    }
+  });
+
+  it('names only parameterCount when D/H both still match but parameterCount alone is stale (thermo-maintainability review S3)', async () => {
+    const realManifest = JSON.parse(
+      readFileSync(resolve(publicDataDir, 'trained-readout-v1.manifest.json'), 'utf8')
+    ) as Record<string, unknown>;
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('trained-readout-v1.manifest.json')) {
+        return new Response(
+          JSON.stringify({ ...realManifest, parameterCount: (realManifest.parameterCount as number) + 1 }),
+          { status: 200, headers: { 'content-type': 'application/json' } }
+        );
+      }
+      return createPublicDataFetch()(input);
+    });
+    const result = await loadTrainedReadoutArtifact('/data');
+    expect(result.status).toBe('unavailable');
+    if (result.status === 'unavailable') {
+      expect(result.reason).toMatch(/diverges from the artifact on parameterCount/);
+      expect(result.reason).not.toMatch(/diverges from the artifact on [^:]*D/);
+      expect(result.reason).not.toMatch(/diverges from the artifact on [^:]*H\b/);
     }
   });
 });

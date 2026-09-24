@@ -96,24 +96,29 @@
    * including while merely `paused`. Locking on `controlsLocked` (which now
    * includes `decoderSwitchPending`) also closes the matching race on this
    * side: `ExperimentController#changeTopology` itself now bails out while
-   * a decoder switch is in flight (`decoderSwitchInFlight`, `controller.ts`)
+   * a decoder switch is in flight (the `DecoderSwitch` collaborator, `controller.ts`)
    * — this UI lock keeps a same-tick topology click from being a confusing,
    * unexplained no-op rather than a disabled control during that window.
    */
   const topologyControlsLocked = $derived(controlsLocked || (status !== 'ready' && status !== 'finished'));
   /**
-   * The decoder radio group's own lock, distinct from `controlsLocked`:
+   * The decoder radio group's own lock — an alias of `controlsLocked`, not
+   * a separate formula. A thermo review caught that an earlier version of
+   * this comment claimed a real distinction from `controlsLocked`
+   * (specifically, that this excludes `status === 'loading'`/`paused`) that
+   * the code had never actually implemented: both were the same
+   * byte-identical `$derived` expression. They turn out to need the same
+   * set of conditions for a different reason each:
    * `ExperimentController#setDecoder` allows switching from `paused` (only
-   * `running` itself is disallowed — see that method's doc comment), so this
-   * does not include `status === 'loading'`/`paused` the way `controlsLocked`
-   * does; it locks on `running`, on a topology switch in flight (avoids
-   * racing `setDecoder`'s own Worker messages against a topology switch's
-   * dispose/init window), on a decoder switch already in flight, and while
-   * `loading` (no runner exists yet for `setDecoder` to act on).
+   * `running` itself is disallowed — see that method's own doc comment) and
+   * requires a runner to exist (excluded via `loading`), which happens to
+   * match exactly what `controlsLocked` already locks on
+   * (`running`/`loading`/`topologySwitchPending`/`decoderSwitchPending` —
+   * see that value's own doc comment). Aliased here, rather than
+   * hand-duplicated, so the two can never again silently drift apart the
+   * way the comment above did from the code.
    */
-  const decoderControlsLocked = $derived(
-    status === 'running' || status === 'loading' || topologySwitchPending || decoderSwitchPending
-  );
+  const decoderControlsLocked = $derived(controlsLocked);
   const trainedDecoderUnavailableReason = $derived(
     trainedReadoutStatus?.status === 'unavailable' ? trainedReadoutStatus.reason : undefined
   );
@@ -187,7 +192,18 @@
   const handleDownloadReplay = (): void => {
     const runner = controller?.getRunner();
     if (!runner) return;
-    const replay = runner.getReplayExport();
+    // `runner` itself has no notion of "decoder" (see `getReplayExport`'s
+    // doc comment) — `controller` is the source of truth for which decoder
+    // is currently selected and, for Trained, the trained-readout
+    // artifact's own manifest-verified sha256 (never the weights
+    // themselves; see `ExperimentReplayExport.trainedReadoutArtifactSha256`'s
+    // doc comment for why one hash already covers every arm).
+    const trainedReadoutStatusNow = controller?.getTrainedReadoutStatus();
+    const replay = runner.getReplayExport({
+      decoder: controller?.getDecoder(),
+      trainedReadoutArtifactSha256:
+        trainedReadoutStatusNow?.status === 'ok' ? trainedReadoutStatusNow.manifest.artifactSha256 : undefined
+    });
     const blob = new Blob([JSON.stringify(replay, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');

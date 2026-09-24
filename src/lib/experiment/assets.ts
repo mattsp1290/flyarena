@@ -598,8 +598,21 @@ export type TrainedReadoutLoadResult =
   | { status: 'ok'; manifest: TrainedReadoutManifest; weightsByMode: Readonly<Record<GraphMode, ReadoutWeights>> }
   | { status: 'unavailable'; reason: string };
 
-/** Every `GraphMode` the trained-readout artifact carries a per-arm entry for (`TrainedReadoutArtifactJson.arms`'s required keys). */
-const READOUT_ARMS: readonly GraphMode[] = ['biological', 'rewired', 'disconnected'];
+/**
+ * Every `GraphMode` the trained-readout artifact carries a per-arm entry
+ * for (`TrainedReadoutArtifactJson.arms`'s required keys). Built from an
+ * exhaustiveness-checked map, not a bare array literal: `READOUT_ARMS_MAP`'s
+ * type (`Record<GraphMode, true>`) has no structural link a plain
+ * `readonly GraphMode[]` array would — a future `GraphMode` variant added
+ * to `format.ts` without a matching entry here fails to compile on this
+ * object literal, instead of silently type-checking while
+ * `readoutWeightsForMode()` (`controller.ts`) would return `undefined` for
+ * the new arm at runtime with no error anywhere (round-1 dual review,
+ * carried over as an open suggestion into the thermo-maintainability
+ * review's S2).
+ */
+const READOUT_ARMS_MAP: Record<GraphMode, true> = { biological: true, rewired: true, disconnected: true };
+const READOUT_ARMS: readonly GraphMode[] = Object.keys(READOUT_ARMS_MAP) as GraphMode[];
 
 /**
  * Fetch, sha256-verify, and base64-decode `trained-readout-v1.{json,manifest.json}`
@@ -648,15 +661,22 @@ export const loadTrainedReadoutArtifact = async (dataBaseUrl = '/data'): Promise
     // `validateReadoutWeights` against the loaded graph); this is a
     // display-honesty gate, not a numerical-correctness one.
     const expectedParameterCount = readoutParameterCount(json.inputSize, json.hiddenSize);
-    if (
-      manifest.D !== json.inputSize ||
-      manifest.H !== json.hiddenSize ||
-      manifest.parameterCount !== expectedParameterCount
-    ) {
+    // Named per-field, not just a blanket mismatch (thermo-maintainability
+    // review S3): the manifest and the artifact can diverge on any subset
+    // of D/H/parameterCount independently (e.g. only `parameterCount` stale
+    // after a hand-edit, with `D`/`H` both still correct) — naming exactly
+    // which field(s) diverged makes the ledger's failure reason faster to
+    // diagnose from a bug report than always restating every field.
+    const divergingFields: string[] = [];
+    if (manifest.D !== json.inputSize) divergingFields.push('D');
+    if (manifest.H !== json.hiddenSize) divergingFields.push('H');
+    if (manifest.parameterCount !== expectedParameterCount) divergingFields.push('parameterCount');
+    if (divergingFields.length > 0) {
       return {
         status: 'unavailable',
         reason:
-          `trained-readout-v1.manifest.json (D=${manifest.D}, H=${manifest.H}, parameterCount=${manifest.parameterCount}) ` +
+          `trained-readout-v1.manifest.json diverges from the artifact on ${divergingFields.join(', ')}: ` +
+          `manifest (D=${manifest.D}, H=${manifest.H}, parameterCount=${manifest.parameterCount}) ` +
           `does not match the artifact's own inputSize=${json.inputSize}/hiddenSize=${json.hiddenSize} ` +
           `(expected parameterCount ${expectedParameterCount})`
       };

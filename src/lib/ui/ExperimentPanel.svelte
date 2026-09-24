@@ -51,11 +51,15 @@
     decoder: DecoderKind;
     /**
      * True while the decoder radio group must be disabled entirely: while
-     * `running` (WP6's "disabled while running" contract — unlike
-     * `controlsLocked`, `paused` does *not* lock this group, matching
-     * `ExperimentController#setDecoder`'s own "not running" gate), a
-     * topology switch is in flight, or a decoder switch is itself in
-     * flight.
+     * `running` or `loading` (`controlsLocked`'s own two status-based
+     * conditions — `ExperimentController#setDecoder` is a no-op before a
+     * runner exists, so there is nothing for it to act on during
+     * `loading`), a topology switch is in flight, or a decoder switch is
+     * itself in flight. Currently identical to `controlsLocked` — see that
+     * prop's own doc comment and `App.svelte`'s `decoderControlsLocked`
+     * derivation for why a formula this narrow already covers every case
+     * `ExperimentController#setDecoder`'s own gate (`status !== 'running'`)
+     * needs.
      */
     decoderControlsLocked: boolean;
     /** Non-empty exactly when the Trained option must be shown disabled with this reason (a missing/hash-mismatched/graph-mismatched trained-readout artifact); `undefined` when Trained is selectable. */
@@ -219,17 +223,35 @@
       />
       Trained (offline)
     </label>
+    {#if decoderSwitchPending}
+      <!--
+        Thermo-maintainability review (a11y, Important): the fieldset itself
+        disables during a decoder switch (`decoderControlsLocked`, which
+        includes `decoderSwitchPending`), which a sighted mouse user sees as
+        the dimmed `button:disabled`/`input:disabled` styling below, but
+        nothing was previously announced to assistive tech, and nothing
+        textual explained the pause to a sighted keyboard user either — a
+        screen-reader user who activates the Trained radio heard nothing
+        further until the fieldset re-enabled a moment later,
+        indistinguishable from the click having silently failed.
+        `aria-live="polite"` announces this transient status without
+        interrupting whatever the user is doing.
+      -->
+      <p class="hint" aria-live="polite">Switching decoder…</p>
+    {/if}
     {#if trainedDecoderUnavailableReason}
       <!--
-        No `role="status"`: `App.svelte`'s header status span already owns
-        that role page-wide (`tests/e2e/arena.spec.ts`'s `statusRegion`
-        helper assumes exactly one `[role="status"]` element), and this
-        hint's visibility is already reactively tied to
-        `trainedDecoderUnavailableReason` — a live-region role would only
-        duplicate that, not add anything a locator/visibility assertion
-        can't already see.
+        `aria-live="polite"` (thermo-maintainability review, a11y,
+        Important): announces when Trained becomes unavailable (e.g. after
+        `initialize()`'s trained-readout load/validate step resolves) to
+        assistive tech, not just sighted users reading the fieldset's
+        visible hint text. Distinct from `App.svelte`'s header
+        `role="status"` region, which reports the run's `status`
+        (loading/ready/running/…), not trained-readout artifact
+        availability — a screen-reader user relying on that region alone
+        would never hear this.
       -->
-      <p class="hint">Trained unavailable: {trainedDecoderUnavailableReason}</p>
+      <p class="hint" aria-live="polite">Trained unavailable: {trainedDecoderUnavailableReason}</p>
     {/if}
   </fieldset>
 

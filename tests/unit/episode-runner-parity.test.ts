@@ -8,11 +8,14 @@ import { describe, expect, it } from 'vitest';
 import { decodeAction } from '../../src/lib/arena/actions';
 import type { AgentId, DecodedAction, ReadonlyWorldState } from '../../src/lib/arena/types';
 import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
-import { parseGraphBinary, type ConnectomeGraph } from '../../src/lib/connectome/format';
+import { createDisconnectedGraph, parseGraphBinary, type ConnectomeGraph, type GraphMode } from '../../src/lib/connectome/format';
+import { decodeReadoutArtifact, validateReadoutWeights, type ReadoutWeights, type TrainedReadoutArtifactJson } from '../../src/lib/connectome/readout';
 import type { NeuralTelemetry } from '../../src/lib/connectome/telemetry';
-import { createOracleAgentBinding } from '../../src/lib/experiment/bindings';
+import { buildGraphBufferForMode, createOracleAgentBinding, createWorkerAgentBinding } from '../../src/lib/experiment/bindings';
 import { ExperimentRunner, type AgentBinding, type AgentStepInput, type AgentStepResult } from '../../src/lib/experiment/runner';
+import { createWorkerClient } from '../../src/lib/worker/client';
 import { runEpisode, type AgentScoreResult } from '../../scripts/training/episode';
+import { FakeNeuralWorker } from '../helpers/fake-worker';
 
 /**
  * WP1 episode re-grounding gate
@@ -273,5 +276,182 @@ describe('episode.ts runEpisode vs ExperimentRunner: per-tick closed-loop parity
       },
       15_000
     );
+  }
+});
+
+/**
+ * WP6/thermo-architecture review addendum: the authored-decoder describe
+ * block above is the pre-existing gate; this second block closes the
+ * companion coverage gap a thermo review found (`reviews/feat-nom6-trained-toggle-thermo-2026-09-24-766f09c/thermo-architecture/01-critical-and-important.md`) —
+ * this branch's own stated purpose is that the browser's Trained decoder
+ * reproduces `episode.ts`'s published numbers, but nothing in the suite
+ * checked that end to end: `tests/integration/worker-parity.test.ts`'s
+ * trained-decoder coverage compares `handleWorkerRequest` against a direct
+ * `runSubsteps` + `readoutForward` computation, not against `episode.ts`,
+ * and not routed through `ExperimentRunner`.
+ *
+ * This block drives the same real production stack the authored block
+ * above does — `ExperimentRunner` + `createWorkerAgentBinding` — but backed
+ * by a real `WorkerClient` (`createWorkerClient`) wrapping a
+ * `FakeNeuralWorker` (`tests/helpers/fake-worker.ts`) instead of the
+ * in-thread oracle binding: `createOracleAgentBinding` has no
+ * `decoder`/`readout` parameter at all (it always runs the authored path),
+ * so a trained comparison needs the same Worker-backed binding
+ * `App.svelte` actually uses in production, not a same-thread shortcut.
+ * `FakeNeuralWorker` forwards every message to `handleWorkerRequest`
+ * (`neural.worker.ts`) — the exact function a real dedicated Worker
+ * runs — so this is not a reimplementation of the Worker at any layer.
+ *
+ * Covers all three arms (biological/rewired/disconnected) — matching
+ * `ExperimentController#validateTrainedReadout`'s own all-three-arms
+ * validation — across two of the plan's held-out seeds (30001, 30002;
+ * `loadTrainedReadoutArtifact`'s real, committed
+ * `public/data/trained-readout-v1.json` weights, hash-verified in
+ * production but loaded directly from disk here the same way the
+ * authored block above loads the graph artifacts directly, since this
+ * `@vitest-environment node` file has no `fetch` to stub).
+ */
+
+const TRAINED_ARMS: readonly GraphMode[] = ['biological', 'rewired', 'disconnected'];
+const TRAINED_SEEDS: readonly number[] = [30001, 30002];
+
+const loadRewiredGraph = (): LoadedGraph => {
+  const gzipBytes = readFileSync(resolve(publicDataDir, 'malecns-arena-v1-rewired-seed0.bin.gz'));
+  const binary = gunzipSync(gzipBytes);
+  const buffer = binary.buffer.slice(binary.byteOffset, binary.byteOffset + binary.byteLength);
+  return { graph: parseGraphBinary(buffer.slice(0)), buffer };
+};
+
+const loadTrainedArtifactJson = (): TrainedReadoutArtifactJson =>
+  JSON.parse(readFileSync(resolve(publicDataDir, 'trained-readout-v1.json'), 'utf8')) as TrainedReadoutArtifactJson;
+
+describe('episode.ts runEpisode vs ExperimentRunner: per-tick closed-loop parity (decoder: trained)', () => {
+  // Loaded once and shared across every arm/seed `it` below — same safety
+  // argument as the authored block's own module-scope `graph`/`buffer`
+  // (see that describe block's comment just above it): every graph object
+  // here is read-only static structure, and every Worker binding built
+  // below gets its own fresh buffer (`buildGraphBufferForMode` always
+  // returns a new `ArrayBuffer`; see that function's own doc comment).
+  const { graph: biologicalGraph, buffer: biologicalBuffer } = loadBiologicalGraph();
+  const { graph: rewiredGraph, buffer: rewiredBuffer } = loadRewiredGraph();
+  const disconnectedGraph = createDisconnectedGraph(biologicalGraph);
+  const trainedArtifactJson = loadTrainedArtifactJson();
+
+  const graphForArm = (mode: GraphMode): ConnectomeGraph =>
+    mode === 'biological' ? biologicalGraph : mode === 'rewired' ? rewiredGraph : disconnectedGraph;
+
+  /**
+   * Decoded and graph-validated per arm, mirroring
+   * `ExperimentController#validateTrainedReadout`'s own per-arm
+   * `validateReadoutWeights` check against each arm's actual parsed graph
+   * (not just decoded and trusted blind).
+   */
+  const weightsForArm = (mode: GraphMode): ReadoutWeights =>
+    validateReadoutWeights(decodeReadoutArtifact(trainedArtifactJson, mode), graphForArm(mode));
+
+  /**
+   * Builds the left `AgentBinding` the same way `ExperimentController#initialize`
+   * does in production: a `WorkerClient` (real request/response matching,
+   * not stubbed) wrapping a Worker-shaped stand-in, initialized with this
+   * arm's readout weights at `init` (matching `createWorkerAgentBinding`'s
+   * own "always passed at init regardless of which decoder is initially
+   * active" contract), then switched to Trained via
+   * `client.setDecoder('trained')` — the same two-step sequence
+   * `ExperimentController#setDecoder` performs against the real arms'
+   * Workers.
+   */
+  const createTrainedWorkerBinding = async (mode: GraphMode): Promise<AgentBinding> => {
+    const client = createWorkerClient(new FakeNeuralWorker());
+    const graphBuffer = buildGraphBufferForMode(biologicalBuffer, rewiredBuffer, mode);
+    const binding = await createWorkerAgentBinding(client, graphBuffer, mode, undefined, weightsForArm(mode));
+    await client.setDecoder('trained');
+    return binding;
+  };
+
+  for (const mode of TRAINED_ARMS) {
+    for (const seed of TRAINED_SEEDS) {
+      it(
+        `arm ${mode}, seed ${seed}: left (trained) per-tick decoded actions and both arms' final scores match, right (parked) never moves`,
+        async () => {
+          const armGraph = graphForArm(mode);
+          const armWeights = weightsForArm(mode);
+
+          // --- Path A: the real product `runEpisode` call, decoder: 'trained'. ---
+          const episodeLeftActions: DecodedAction[] = [];
+          const episodeRightActions: DecodedAction[] = [];
+          const episodeRightPositions: Position[] = [];
+          const episodeResult = runEpisode({
+            seed,
+            ticks: TICKS,
+            substeps: NEURAL_SUBSTEPS_PER_TICK,
+            left: { decoder: 'trained', graph: armGraph, weights: armWeights },
+            right: { decoder: 'parked' },
+            onTick: (_tick, actions, world) => {
+              episodeLeftActions.push(actions.left);
+              episodeRightActions.push(actions.right);
+              episodeRightPositions.push(capturePosition(world, 'right'));
+            }
+          });
+          expect(episodeLeftActions).toHaveLength(TICKS);
+          expect(episodeResult.right.distanceTravelled).toBe(0);
+          const zeroAction = decodeAction([0, 0, 0]);
+          for (const action of episodeRightActions) {
+            expect(action).toEqual(zeroAction);
+          }
+
+          // --- Path B: the product closed-loop orchestrator,
+          // ExperimentRunner + a real Worker-protocol-backed binding
+          // (createWorkerAgentBinding + WorkerClient + handleWorkerRequest
+          // via FakeNeuralWorker), decoder switched to 'trained'. ---
+          const leftActions: DecodedAction[] = [];
+          const leftBinding = recordingBinding(await createTrainedWorkerBinding(mode), leftActions);
+          const rightBinding = createZeroAgentBinding(armGraph.metadata.neuronCount);
+          const rightPositions: Position[] = [];
+          const errorSink: { current?: Error } = {};
+          const runner = new ExperimentRunner({
+            seed,
+            totalTicks: TICKS,
+            agents: { left: leftBinding, right: rightBinding },
+            substepsPerTick: NEURAL_SUBSTEPS_PER_TICK,
+            targetTickIntervalMs: 0,
+            onError: (error) => {
+              errorSink.current = error;
+            },
+            onTelemetry: () => {
+              rightPositions.push(capturePosition(runner.getWorld(), 'right'));
+            }
+          });
+          const initialRightPosition = capturePosition(runner.getWorld(), 'right');
+          await runToFinished(runner, errorSink);
+          expect(runner.getWorld().tick).toBe(TICKS);
+
+          // --- Comparison 1: per-tick left decoded actions. ---
+          const divergentTick = firstDivergentTickIndex(episodeLeftActions, leftActions);
+          if (divergentTick !== -1) {
+            throw new Error(
+              `arm ${mode} seed ${seed}: episode.ts and ExperimentRunner (trained) left-agent decoded actions first ` +
+                `diverge at tick ${divergentTick} of ${TICKS}: runEpisode=${JSON.stringify(episodeLeftActions[divergentTick])}, ` +
+                `ExperimentRunner=${JSON.stringify(leftActions[divergentTick])}`
+            );
+          }
+          expect(leftActions).toHaveLength(TICKS);
+
+          // --- Comparison 2: final score, both arms. ---
+          const telemetry = runner.getTelemetry();
+          expect(toScoreResult(telemetry.agents.left)).toEqual(episodeResult.left);
+          expect(toScoreResult(telemetry.agents.right)).toEqual(episodeResult.right);
+
+          // --- Comparison 3: the right (parked) agent never moves, on either path. ---
+          expect(rightPositions).toHaveLength(TICKS);
+          for (const position of rightPositions) {
+            expect(position).toEqual(initialRightPosition);
+          }
+          for (const position of episodeRightPositions) {
+            expect(position).toEqual(initialRightPosition);
+          }
+        },
+        20_000
+      );
+    }
   }
 });

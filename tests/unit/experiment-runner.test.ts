@@ -1089,3 +1089,46 @@ describe('ExperimentRunner activity streaming', () => {
     }
   });
 });
+
+/**
+ * Thermo-architecture review (Important): `ExperimentReplayExport` gained a
+ * `decoder`/`trainedReadoutArtifactSha256` provenance pair
+ * (`tests/unit/replay-export.test.ts` covers `createExperimentReplayExport`
+ * itself directly). `ExperimentRunner` has no decoder concept of its own —
+ * this only checks that `getReplayExport(options)` actually threads its
+ * caller-supplied `options` through to that function rather than dropping
+ * them, and that the default (no `options`) still reports the honest
+ * `'authored'` default `ExperimentController` itself starts every arm at.
+ */
+describe('ExperimentRunner#getReplayExport decoder threading', () => {
+  it('defaults to decoder: "authored" with no trainedReadoutArtifactSha256 when called with no options', async () => {
+    const runner = new ExperimentRunner({
+      seed: 1,
+      totalTicks: 5,
+      agents: buildFixtureAgents(0xd1),
+      targetTickIntervalMs: 0
+    });
+    trackRunner(runner);
+    await runToFinished(runner);
+
+    const replay = runner.getReplayExport();
+    expect(replay.decoder).toBe('authored');
+    expect(replay.trainedReadoutArtifactSha256).toBeUndefined();
+  });
+
+  it('threads a caller-supplied decoder and trained-readout artifact sha256 through', async () => {
+    const runner = new ExperimentRunner({
+      seed: 1,
+      totalTicks: 5,
+      agents: buildFixtureAgents(0xd2),
+      targetTickIntervalMs: 0
+    });
+    trackRunner(runner);
+    await runToFinished(runner);
+
+    const artifactSha256 = 'e'.repeat(64);
+    const replay = runner.getReplayExport({ decoder: 'trained', trainedReadoutArtifactSha256: artifactSha256 });
+    expect(replay.decoder).toBe('trained');
+    expect(replay.trainedReadoutArtifactSha256).toBe(artifactSha256);
+  });
+});

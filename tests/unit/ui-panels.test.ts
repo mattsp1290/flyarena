@@ -220,6 +220,40 @@ describe('ExperimentPanel accessibility and wiring', () => {
     // Start etc. are still governed by controlsLocked/status, not this flag.
     expect(screen.getByRole('button', { name: /^start$/i })).toBeEnabled();
   });
+
+  /**
+   * Thermo-maintainability review (a11y, Important): a screen-reader user
+   * who activates the Trained radio previously heard nothing further while
+   * the decoder fieldset was disabled for the duration of the switch —
+   * indistinguishable from the click having silently failed. This asserts
+   * an `aria-live="polite"` status announcement exists exactly while
+   * `decoderSwitchPending` is true, and is gone once it clears.
+   */
+  it('shows an aria-live="polite" "Switching decoder…" status while decoderSwitchPending is true, and not otherwise', () => {
+    const { unmount } = render(ExperimentPanel, { ...baseProps(), decoderSwitchPending: true });
+    const status = screen.getByText(/switching decoder/i);
+    expect(status).toBeInTheDocument();
+    expect(status).toHaveAttribute('aria-live', 'polite');
+    unmount();
+
+    render(ExperimentPanel, { ...baseProps(), decoderSwitchPending: false });
+    expect(screen.queryByText(/switching decoder/i)).not.toBeInTheDocument();
+  });
+
+  /**
+   * Same review finding: the "Trained unavailable" hint was visible to
+   * sighted users but carried no live-region role at all, so a
+   * screen-reader user was never told Trained had become unavailable
+   * unless they happened to be focused inside the fieldset already.
+   */
+  it('shows the Trained-unavailable hint with aria-live="polite"', () => {
+    render(ExperimentPanel, {
+      ...baseProps(),
+      trainedDecoderUnavailableReason: 'trained-readout-v1.json sha256 mismatch'
+    });
+    const hint = screen.getByText(/trained-readout-v1\.json sha256 mismatch/i);
+    expect(hint).toHaveAttribute('aria-live', 'polite');
+  });
 });
 
 describe('TelemetryPanel', () => {
