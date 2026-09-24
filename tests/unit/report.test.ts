@@ -7,7 +7,15 @@ import { outputNeuronIndices } from '../../src/lib/connectome/readout';
 import { TRACE_SUBSTEPS } from '../../scripts/training/export-traces';
 import { runExportArms } from '../../scripts/training/export-arms';
 import { resolveReportMdPath, runEvaluate, type EvaluateArgs } from '../../scripts/training/evaluate';
-import { OPPONENT_PARKED_DISCLOSURE } from '../../scripts/training/report';
+import {
+  nearInputIndependentPolicyArms,
+  OPPONENT_PARKED_DISCLOSURE,
+  renderReportMarkdown,
+  structurallyZeroReadoutInputArms,
+  type ArmReplicaReport,
+  type ArmReport,
+  type EvaluationReport
+} from '../../scripts/training/report';
 import { createTraceGraph } from '../fixtures/trace-graph';
 import { writeTinyRunDir } from '../fixtures/trained-readout-run';
 
@@ -269,5 +277,158 @@ describe('runEvaluate: docs/trained-readout-report.md generation', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+/**
+ * `00-overview.md`'s risk / `05-production-run.md`'s WP5 acceptance risk:
+ * "If every trained arm scores within the authored decoder's CI and the
+ * silenced control matches trained, the report must state that the readout
+ * learned a near-input-independent policy." Exercised directly against
+ * constructed report fixtures (not a real CEM run, whose trained/authored/
+ * silenced scores can't be steered to a specific relationship) so both the
+ * "true" and "false" cases are deterministic.
+ */
+describe('nearInputIndependentPolicyArms / the near-input-independent finding section', () => {
+  const stats = (mean: number, ci95: readonly [number, number]) => ({ n: 4, mean, median: mean, std: 0.1, ci95 });
+  const paired = (meanDifference: number, ci95: readonly [number, number]) => ({ n: 4, meanDifference, ci95 });
+
+  const replica = (overrides: Partial<ArmReplicaReport> = {}): ArmReplicaReport => ({
+    H: 4,
+    parameterCount: 100,
+    weightsSha256: 'deadbeef',
+    env: null,
+    trained: stats(10, [8, 12]),
+    silenced: stats(10, [8, 12]),
+    pairedTrainedVsAuthored: paired(0, [-1, 1]),
+    pairedTrainedVsSilenced: paired(0, [-0.5, 0.5]), // includes 0: "silenced matches trained"
+    ...overrides
+  });
+
+  const armReport = (replicas: Readonly<Record<string, ArmReplicaReport>>, authoredCi: readonly [number, number] = [8, 12]): ArmReport => ({
+    D: 6,
+    provenance: undefined,
+    armBundleSha256: undefined,
+    authored: stats(10, authoredCi), // trained's mean (10) falls inside [8, 12]
+    replicas
+  });
+
+  const baseEvaluation: EvaluationReport['evaluation'] = {
+    ticks: 40,
+    substeps: 4,
+    heldOutSeeds: { start: 30001, count: 4 },
+    bootstrap: { resamples: 50, seed: 1 },
+    opponentParked: true
+  };
+
+  const report = (arms: Readonly<Record<string, ArmReport>>): EvaluationReport => ({
+    formatVersion: 1,
+    graph: { source: 'trace-graph-fixture', path: null, sha256: 'x' },
+    evaluation: baseEvaluation,
+    arms,
+    armPairs: [],
+    sideBySide: [],
+    warnings: []
+  });
+
+  it('flags an arm as near-input-independent when trained is within authored CI and silenced matches trained', () => {
+    const r = report({ biological: armReport({ '101': replica() }) });
+    expect(nearInputIndependentPolicyArms(r)).toEqual(['biological']);
+  });
+
+  it('does not flag an arm when trained falls outside the authored CI', () => {
+    const r = report({
+      biological: armReport({ '101': replica({ trained: stats(50, [45, 55]) }) }, [8, 12])
+    });
+    expect(nearInputIndependentPolicyArms(r)).toEqual([]);
+  });
+
+  it('does not flag an arm when the trained-vs-silenced CI excludes zero (a real difference)', () => {
+    const r = report({
+      biological: armReport({ '101': replica({ pairedTrainedVsSilenced: paired(5, [3, 7]) }) })
+    });
+    expect(nearInputIndependentPolicyArms(r)).toEqual([]);
+  });
+
+  it('requires every replica of an arm to qualify, not just one', () => {
+    const r = report({
+      biological: armReport({
+        '101': replica(),
+        '202': replica({ pairedTrainedVsSilenced: paired(5, [3, 7]) })
+      })
+    });
+    expect(nearInputIndependentPolicyArms(r)).toEqual([]);
+  });
+
+  it('renders the "every arm" finding statement when all evaluated arms qualify', () => {
+    const r = report({
+      biological: armReport({ '101': replica() }),
+      rewired: armReport({ '101': replica() })
+    });
+    const markdown = renderReportMarkdown(r);
+    expect(markdown).toContain('## Finding: near-input-independent policy');
+    expect(markdown).toContain('learned a near-input-independent policy for every arm');
+    expect(markdown).not.toMatch(/\bbetter\b|\bsuperior\b|\boutperform/i);
+  });
+
+  it('renders the partial-arm finding statement when only some evaluated arms qualify', () => {
+    const r = report({
+      biological: armReport({ '101': replica() }),
+      rewired: armReport({ '101': replica({ trained: stats(50, [45, 55]) }) }, [8, 12])
+    });
+    const markdown = renderReportMarkdown(r);
+    expect(markdown).toContain('## Finding: near-input-independent policy');
+    expect(markdown).toContain('but not every evaluated arm');
+    expect(markdown).toContain('biological');
+  });
+
+  it('omits the finding section entirely when no arm qualifies', () => {
+    const r = report({
+      biological: armReport({ '101': replica({ trained: stats(50, [45, 55]) }) }, [8, 12])
+    });
+    const markdown = renderReportMarkdown(r);
+    expect(markdown).not.toContain('## Finding: near-input-independent policy');
+  });
+
+  // structurallyZeroReadoutInputArms: distinct from nearInputIndependentPolicyArms
+  // above — it fires purely on an *exact* trained-vs-silenced identity
+  // (paired difference 0, CI exactly [0, 0]), regardless of how `trained`
+  // compares to `authored`. The real disconnected-arm production run hit
+  // exactly this case: trained clearly beat authored (no CI overlap), so
+  // nearInputIndependentPolicyArms does NOT flag it, but trained/silenced
+  // were bit-identical because the zero-edge graph never moves the
+  // output-assigned neurons' rates away from zero.
+  it('flags an arm whose trained/silenced paired difference is exactly [0, 0], even when trained clearly beats authored', () => {
+    const r = report({
+      disconnected: armReport(
+        { '101': replica({ trained: stats(35, [33, 37]), pairedTrainedVsSilenced: paired(0, [0, 0]) }) },
+        [-2, -1] // authored's CI: nowhere near trained's 35 — nearInputIndependentPolicyArms must NOT fire
+      )
+    });
+    expect(nearInputIndependentPolicyArms(r)).toEqual([]);
+    expect(structurallyZeroReadoutInputArms(r)).toEqual(['disconnected']);
+
+    const markdown = renderReportMarkdown(r);
+    expect(markdown).not.toContain('## Finding: near-input-independent policy');
+    expect(markdown).toContain('## Finding: readout input was structurally zero');
+    expect(markdown).toContain('disconnected');
+    expect(markdown).not.toMatch(/\bbetter\b|\bsuperior\b|\boutperform/i);
+  });
+
+  it('does not flag an arm whose trained/silenced CI is merely close to zero (not exactly [0, 0])', () => {
+    const r = report({
+      disconnected: armReport({ '101': replica({ pairedTrainedVsSilenced: paired(0.001, [-0.5, 0.5]) }) })
+    });
+    expect(structurallyZeroReadoutInputArms(r)).toEqual([]);
+  });
+
+  it('requires every replica of an arm to be exactly [0, 0], not just one', () => {
+    const r = report({
+      disconnected: armReport({
+        '101': replica({ pairedTrainedVsSilenced: paired(0, [0, 0]) }),
+        '202': replica({ pairedTrainedVsSilenced: paired(3, [1, 5]) })
+      })
+    });
+    expect(structurallyZeroReadoutInputArms(r)).toEqual([]);
   });
 });

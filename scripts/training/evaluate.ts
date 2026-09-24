@@ -23,7 +23,7 @@ import {
 } from './export-arms';
 import { runEpisode } from './episode';
 import { TRACE_SUBSTEPS } from './export-traces';
-import { requireNonNegativeInt, requirePositiveInt, requireValue } from './cli';
+import { requireFloat, requireNonNegativeInt, requirePositiveInt, requireValue } from './cli';
 import { readRunDir, type LoadedRun } from './run-dir';
 import { conditionRng, conditionStats, pairedStats } from './stats';
 import {
@@ -173,6 +173,27 @@ export interface EvaluateArgs {
   readonly heldOutCount: number;
   readonly bootstrapResamples: number;
   readonly bootstrapSeed: number;
+  /**
+   * The WP5 production-run parity gate this evaluation was run under
+   * (`.agents/plans/trained-readout/05-production-run.md` step 2a /
+   * acceptance: "Real-graph parity ... passed at the production K, recorded
+   * in the manifest as `parity: { graphSha, K, passedAt }`"). All three or
+   * none: a partial set is refused (see `parseEvaluateArgs`) rather than
+   * publishing a manifest that looks like it recorded a real gate result
+   * from an incomplete one.
+   */
+  readonly parityGraphSha256?: string;
+  readonly parityK?: number;
+  /** ISO-8601 timestamp the parity suite passed at (recorded by hand from the run, not computed here). */
+  readonly parityPassedAt?: string;
+  /**
+   * One CUDA rerun of one replica's training, measured and recorded as
+   * informational (never a gate) per 05's acceptance criterion: "its max-abs
+   * `theta_final` diff and its TS held-out fitness difference are recorded
+   * in the manifest as `gpuRerunMaxAbsDiff` / `gpuRerunFitnessDelta`".
+   */
+  readonly gpuRerunMaxAbsDiff?: number;
+  readonly gpuRerunFitnessDelta?: number;
 }
 
 const DEFAULT_OUT_DIR = 'public/data';
@@ -198,6 +219,11 @@ export const parseEvaluateArgs = (argv: readonly string[]): EvaluateArgs => {
   let heldOutCount = DEFAULT_HELD_OUT_COUNT;
   let bootstrapResamples = DEFAULT_BOOTSTRAP_RESAMPLES;
   let bootstrapSeed = DEFAULT_BOOTSTRAP_SEED;
+  let parityGraphSha256: string | undefined;
+  let parityK: number | undefined;
+  let parityPassedAt: string | undefined;
+  let gpuRerunMaxAbsDiff: number | undefined;
+  let gpuRerunFitnessDelta: number | undefined;
 
   let index = 0;
   while (index < argv.length) {
@@ -242,12 +268,38 @@ export const parseEvaluateArgs = (argv: readonly string[]): EvaluateArgs => {
     } else if (flag === '--bootstrap-seed') {
       bootstrapSeed = requireNonNegativeInt(flag, argv[index + 1]);
       index += 2;
+    } else if (flag === '--parity-graph-sha256') {
+      parityGraphSha256 = requireValue(flag, argv[index + 1]);
+      index += 2;
+    } else if (flag === '--parity-k') {
+      parityK = requirePositiveInt(flag, argv[index + 1]);
+      index += 2;
+    } else if (flag === '--parity-passed-at') {
+      parityPassedAt = requireValue(flag, argv[index + 1]);
+      index += 2;
+    } else if (flag === '--gpu-rerun-max-abs-diff') {
+      gpuRerunMaxAbsDiff = requireFloat(flag, argv[index + 1]);
+      index += 2;
+    } else if (flag === '--gpu-rerun-fitness-delta') {
+      gpuRerunFitnessDelta = requireFloat(flag, argv[index + 1]);
+      index += 2;
     } else {
       throw new Error(`Unknown argument: ${flag}`);
     }
   }
 
   if (runDirs.length === 0) throw new Error('--runs requires at least one run directory');
+
+  const parityFlagsGiven = [parityGraphSha256, parityK, parityPassedAt].filter((v) => v !== undefined).length;
+  if (parityFlagsGiven > 0 && parityFlagsGiven < 3) {
+    throw new Error(
+      '--parity-graph-sha256/--parity-k/--parity-passed-at must be passed together (all three or none), ' +
+        'so the manifest never records a partial parity gate result'
+    );
+  }
+  if (gpuRerunMaxAbsDiff !== undefined && gpuRerunMaxAbsDiff < 0) {
+    throw new Error(`--gpu-rerun-max-abs-diff must be non-negative, got ${gpuRerunMaxAbsDiff}`);
+  }
 
   return {
     graphPath,
@@ -261,7 +313,12 @@ export const parseEvaluateArgs = (argv: readonly string[]): EvaluateArgs => {
     heldOutStart,
     heldOutCount,
     bootstrapResamples,
-    bootstrapSeed
+    bootstrapSeed,
+    parityGraphSha256,
+    parityK,
+    parityPassedAt,
+    gpuRerunMaxAbsDiff,
+    gpuRerunFitnessDelta
   };
 };
 
@@ -600,6 +657,7 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
   // mistake a WP5 production run must not be able to make quietly.
   const shippedWeights: Partial<Record<ArmName, ReadoutWeights>> = {};
   const shippedEnv: Partial<Record<ArmName, unknown>> = {};
+  const shippedConfig: Partial<Record<ArmName, LoadedRun['config']>> = {};
   let shippedD: number | null = null;
   let shippedH: number | null = null;
   let complete = true;
@@ -626,11 +684,71 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
     }
     shippedWeights[arm] = run.weights;
     shippedEnv[arm] = run.env;
+    shippedConfig[arm] = run.config;
     if (run.env === null) {
       warnings.push(`arm "${arm}" replica 0 run "${run.dir}" has no env.json; manifest omits its device/torch provenance.`);
     }
     shippedD ??= run.config.D;
     shippedH ??= run.config.H;
+  }
+
+  // CEM hyperparameters + training-seed RNG policy: every arm's replica-0
+  // run is required to share an identical config except --arm/--replica-seed
+  // (`05-production-run.md` step 4), so this reports one representative
+  // (arbitrarily, the first ARM_NAMES entry present) and flags any arm whose
+  // recorded hyperparameters actually disagree with it, rather than silently
+  // publishing whichever arm happened to load last.
+  const CEM_CONFIG_FIELDS = [
+    'population',
+    'elites',
+    'generations',
+    'alpha',
+    'stdFloor',
+    'initStd',
+    'trainingSeedsPerGeneration',
+    'trainingSeedRange',
+    'trainingSeedRng',
+    'validationSeedRange',
+    'heldOutSeedRange'
+  ] as const;
+  let trainingBlock: Record<string, unknown> | null = null;
+  for (const arm of ARM_NAMES) {
+    const config = shippedConfig[arm];
+    if (!config) continue;
+    const candidate: Record<string, unknown> = {};
+    for (const field of CEM_CONFIG_FIELDS) candidate[field] = config[field];
+    if (trainingBlock === null) {
+      trainingBlock = candidate;
+    } else if (JSON.stringify(candidate) !== JSON.stringify(trainingBlock)) {
+      warnings.push(
+        `arm "${arm}" replica 0's CEM config/training-seed policy differs from another shipped arm's ` +
+          "(run must use identical config except --arm/--replica-seed); manifest's training block " +
+          'reports the first arm seen, not this one.'
+      );
+    }
+  }
+  // A run dir with none of `CEM_CONFIG_FIELDS` set (e.g. an older/tiny test
+  // fixture) would otherwise produce a `training` block of every field
+  // explicitly `undefined` — `JSON.stringify` drops those keys anyway, but
+  // `null` says plainly "no training metadata available" rather than
+  // publishing an object that merely serializes as empty.
+  if (trainingBlock !== null && Object.values(trainingBlock).every((value) => value === undefined)) {
+    trainingBlock = null;
+  }
+
+  // Real-graph (production) evaluation must record the WP5 parity gate that
+  // is supposed to have passed before any production CEM run
+  // (`05-production-run.md` step 2a / acceptance) — flagged here, not
+  // silently omitted, when the shipped artifact is actually being written.
+  if (graphIdentity.graphSource === 'artifact' && complete) {
+    const parityGiven =
+      args.parityGraphSha256 !== undefined && args.parityK !== undefined && args.parityPassedAt !== undefined;
+    if (!parityGiven) {
+      warnings.push(
+        'manifest omits the parity block: pass --parity-graph-sha256/--parity-k/--parity-passed-at to ' +
+          'record the WP5 real-graph parity gate result.'
+      );
+    }
   }
 
   const report: EvaluationReport = {
@@ -705,7 +823,27 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
       heldOutSeeds: { start: args.heldOutStart, count: args.heldOutCount },
       /** Per-arm shipped-replica torch/CUDA/device provenance, when its run had an `env.json`; `null` otherwise. */
       env: shippedEnv,
-      evaluatorGitRev: evaluatorGitRev()
+      evaluatorGitRev: evaluatorGitRev(),
+      /**
+       * CEM hyperparameters (population/elites/generations/etc.) and the
+       * training-seed RNG policy, from the shipped replicas' `config.json`
+       * (`00-overview.md`/`03-cem-training.md`); `null` when no shipped run
+       * recorded these fields (e.g. an older run dir).
+       */
+      training: trainingBlock,
+      /**
+       * The WP5 real-graph parity gate result (`05-production-run.md` step
+       * 2a), from `--parity-graph-sha256`/`--parity-k`/`--parity-passed-at`;
+       * `null` when not passed (see the "manifest omits the parity block"
+       * warning above).
+       */
+      parity:
+        args.parityGraphSha256 !== undefined && args.parityK !== undefined && args.parityPassedAt !== undefined
+          ? { graphSha: args.parityGraphSha256, K: args.parityK, passedAt: args.parityPassedAt }
+          : null,
+      /** One CUDA rerun of one replica's training, informational only (never a gate); `null` when not measured/passed. */
+      gpuRerunMaxAbsDiff: args.gpuRerunMaxAbsDiff ?? null,
+      gpuRerunFitnessDelta: args.gpuRerunFitnessDelta ?? null
     };
     writeFileSync(resolve(outDir, 'trained-readout-v1.manifest.json'), JSON.stringify(manifest));
     artifactWritten = true;

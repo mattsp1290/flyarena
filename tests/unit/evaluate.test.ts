@@ -30,6 +30,44 @@ describe('parseEvaluateArgs', () => {
     expect(args.runDirs).toEqual(['a', 'b']);
     expect(args.ticks).toBe(10);
   });
+
+  it('parses --parity-* and --gpu-rerun-* flags', () => {
+    const args = parseEvaluateArgs([
+      '--runs',
+      'a',
+      '--parity-graph-sha256',
+      'deadbeef',
+      '--parity-k',
+      '4',
+      '--parity-passed-at',
+      '2026-09-24T00:00:00Z',
+      '--gpu-rerun-max-abs-diff',
+      '0.0012',
+      '--gpu-rerun-fitness-delta',
+      '-3.5'
+    ]);
+    expect(args.parityGraphSha256).toBe('deadbeef');
+    expect(args.parityK).toBe(4);
+    expect(args.parityPassedAt).toBe('2026-09-24T00:00:00Z');
+    expect(args.gpuRerunMaxAbsDiff).toBeCloseTo(0.0012);
+    expect(args.gpuRerunFitnessDelta).toBeCloseTo(-3.5);
+  });
+
+  it('rejects a partial set of --parity-* flags', () => {
+    expect(() => parseEvaluateArgs(['--runs', 'a', '--parity-k', '4'])).toThrow(/together/);
+    expect(() =>
+      parseEvaluateArgs(['--runs', 'a', '--parity-graph-sha256', 'x', '--parity-k', '4'])
+    ).toThrow(/together/);
+  });
+
+  it('rejects a negative --gpu-rerun-max-abs-diff', () => {
+    expect(() => parseEvaluateArgs(['--runs', 'a', '--gpu-rerun-max-abs-diff', '-1'])).toThrow(/non-negative/);
+  });
+
+  it('accepts a negative --gpu-rerun-fitness-delta (a signed difference)', () => {
+    const args = parseEvaluateArgs(['--runs', 'a', '--gpu-rerun-fitness-delta', '-2.5']);
+    expect(args.gpuRerunFitnessDelta).toBeCloseTo(-2.5);
+  });
 });
 
 interface TinyArtifactArm {
@@ -132,6 +170,98 @@ describe('runEvaluate (tiny fixture, trace graph)', () => {
       expect(report.sideBySide.length).toBeGreaterThan(0);
       expect(report.armPairs.length).toBeGreaterThan(0);
       expect(report.warnings).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('manifest records the CEM config/training-seed RNG note and the parity/gpuRerun fields when passed', () => {
+    const root = mkdtempSync(join(tmpdir(), 'evaluate-manifest-fixture-'));
+    try {
+      const armsRoot = join(root, 'arms');
+      const exportResult = runExportArms({ outDir: armsRoot, fixtureRewire: true, fixtureRewireSeed: 3 });
+      const graph = createTraceGraph();
+      const D = outputNeuronIndices(graph).length;
+      const H = 4;
+      const cemConfig = {
+        population: 128,
+        elites: 32,
+        generations: 150,
+        alpha: 0.7,
+        stdFloor: 0.02,
+        initStd: 0.5,
+        trainingSeedsPerGeneration: 16,
+        trainingSeedRange: [1, 10000] as const,
+        trainingSeedRng: 'default_rng([trainerSeed, generation])',
+        validationSeedRange: [20001, 20064] as const,
+        heldOutSeedRange: [30001, 30100] as const
+      };
+
+      const runDirs: string[] = [];
+      let weightSeed = 1;
+      for (const arm of ['biological', 'rewired', 'disconnected'] as const) {
+        const dir = join(root, 'runs', `${arm}-101`);
+        writeTinyRunDir({ dir, arm, trainerSeed: 101, D, H, substeps: TRACE_SUBSTEPS, weightSeed, includeEnv: true, cemConfig });
+        runDirs.push(dir);
+        weightSeed += 17;
+      }
+
+      const outDir = join(root, 'out');
+      const args: EvaluateArgs = {
+        ...baseArgs(exportResult.outDir, runDirs, outDir),
+        parityGraphSha256: 'deadbeef',
+        parityK: 4,
+        parityPassedAt: '2026-09-24T00:00:00Z',
+        gpuRerunMaxAbsDiff: 0.0007,
+        gpuRerunFitnessDelta: -1.25
+      };
+      const result = runEvaluate(args);
+      expect(result.artifactWritten).toBe(true);
+      // These flags are informational, not tied to graphSource==='artifact'
+      // (only the "manifest omits the parity block" warning is); passing
+      // them should never itself produce a warning.
+      expect(result.warnings).toEqual([]);
+
+      const manifest = JSON.parse(readFileSync(resolve(outDir, 'trained-readout-v1.manifest.json'), 'utf8')) as {
+        training: Record<string, unknown> | null;
+        parity: { graphSha: string; K: number; passedAt: string } | null;
+        gpuRerunMaxAbsDiff: number | null;
+        gpuRerunFitnessDelta: number | null;
+      };
+      expect(manifest.training).toMatchObject({
+        population: 128,
+        elites: 32,
+        generations: 150,
+        trainingSeedRng: 'default_rng([trainerSeed, generation])'
+      });
+      expect(manifest.parity).toEqual({ graphSha: 'deadbeef', K: 4, passedAt: '2026-09-24T00:00:00Z' });
+      expect(manifest.gpuRerunMaxAbsDiff).toBeCloseTo(0.0007);
+      expect(manifest.gpuRerunFitnessDelta).toBeCloseTo(-1.25);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('manifest omits training/parity/gpuRerun fields (nulls) and records no spurious warning in trace-graph mode without them', () => {
+    const { root, armsDir, runDirs } = buildFixture();
+    try {
+      const outDir = join(root, 'out-no-parity');
+      const result = runEvaluate(baseArgs(armsDir, runDirs, outDir));
+      expect(result.artifactWritten).toBe(true);
+      // Trace-graph fixture runs (graphSource 'trace-graph-fixture') are not
+      // production evaluations, so the missing-parity warning must not fire.
+      expect(result.warnings).toEqual([]);
+      const manifest = JSON.parse(readFileSync(resolve(outDir, 'trained-readout-v1.manifest.json'), 'utf8')) as {
+        parity: unknown;
+        gpuRerunMaxAbsDiff: unknown;
+        gpuRerunFitnessDelta: unknown;
+        training: unknown;
+      };
+      expect(manifest.parity).toBeNull();
+      expect(manifest.gpuRerunMaxAbsDiff).toBeNull();
+      expect(manifest.gpuRerunFitnessDelta).toBeNull();
+      // No cemConfig fields were written by the tiny fixture runs (buildFixture doesn't pass cemConfig).
+      expect(manifest.training).toBeNull();
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

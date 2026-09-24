@@ -35,3 +35,13 @@ export const requireNonNegativeInt = (flag: string, value: string | undefined): 
   }
   return parsed;
 };
+
+/** Any finite real number — for measured/informational values (e.g. `evaluate.ts`'s `--gpu-rerun-*` flags) that may be negative (a signed delta) or non-integer. */
+export const requireFloat = (flag: string, value: string | undefined): number => {
+  const raw = requireValue(flag, value);
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`${flag} must be a finite number, got "${raw}"`);
+  }
+  return parsed;
+};

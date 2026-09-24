@@ -394,12 +394,127 @@ const renderWhatThisDoesNotShow = (): string =>
   ['## What this does not show', '', OPPONENT_PARKED_DISCLOSURE].join('\n');
 
 /**
+ * Distinct from `nearInputIndependentPolicyArms` below: an arm whose
+ * `trained` and `silenced` conditions are numerically *identical* for every
+ * held-out seed of every replica (paired difference exactly 0, so its
+ * bootstrap CI is exactly `[0, 0]`) regardless of how `trained` compares to
+ * `authored`. This is a structural fact about the graph, not a statistical
+ * "not distinguishable from zero": it means the readout's gathered input
+ * (the output-assigned neurons' rates) was exactly zero on every tick of
+ * every episode, so `trained` and a version of itself with its input forced
+ * to zero computed the identical function — any score the readout achieved
+ * came entirely from its learned bias terms (a fixed action), never from
+ * sensory information, however that score compares to the authored decoder.
+ * The `disconnected` control arm (zero edges) is the expected case this
+ * catches: with no edges and no output-assigned neuron directly wired to an
+ * input channel, `runSubsteps` can never move those neurons' rates away
+ * from their zero initial state.
+ */
+const armHasStructurallyZeroReadoutInput = (armReport: Readonly<ArmReport>): boolean => {
+  const replicas = replicasInOrder(armReport);
+  if (replicas.length === 0) return false;
+  return replicas.every(
+    ([, replica]) =>
+      replica.pairedTrainedVsSilenced.meanDifference === 0 &&
+      replica.pairedTrainedVsSilenced.ci95[0] === 0 &&
+      replica.pairedTrainedVsSilenced.ci95[1] === 0
+  );
+};
+
+/** Exported alongside `nearInputIndependentPolicyArms` for direct testing. */
+export const structurallyZeroReadoutInputArms = (report: Readonly<EvaluationReport>): readonly ArmName[] =>
+  armsInOrder(report.arms)
+    .filter(([, armReport]) => armHasStructurallyZeroReadoutInput(armReport))
+    .map(([arm]) => arm);
+
+const renderStructurallyZeroReadoutInputFinding = (report: Readonly<EvaluationReport>): string | null => {
+  const arms = structurallyZeroReadoutInputArms(report);
+  if (arms.length === 0) return null;
+  return [
+    '## Finding: readout input was structurally zero',
+    '',
+    `For ${arms.join(', ')}, every replica’s \`trained\` and \`silenced\` scores were numerically ` +
+      'identical on every held-out seed (paired difference exactly 0, 95% CI exactly [0, 0]). This is ' +
+      'a structural fact, not a statistical non-difference: the readout’s gathered input (the ' +
+      'output-assigned neurons’ rates) was exactly zero on every tick, so `trained` and `silenced` ' +
+      'computed the identical function for that arm. Any score above `authored` for that arm reflects ' +
+      'only the readout’s learned bias terms — a fixed action — never any use of sensory information. ' +
+      'This finding is descriptive only: it does not rank or compare arms against each other.'
+  ].join('\n');
+};
+
+/**
+ * Whether one arm's replicas all look like a near-input-independent policy:
+ * every replica's `trained` mean falls inside the arm's `authored` 95% CI,
+ * AND every replica's `trained` vs. `silenced` paired-difference 95% CI
+ * includes zero (not distinguishable from no difference). An arm with no
+ * replicas evaluated is never "near-input-independent" (there is nothing to
+ * judge).
+ */
+const armLooksNearInputIndependent = (armReport: Readonly<ArmReport>): boolean => {
+  const replicas = replicasInOrder(armReport);
+  if (replicas.length === 0) return false;
+  return replicas.every(([, replica]) => {
+    const trainedWithinAuthoredCI =
+      replica.trained.mean >= armReport.authored.ci95[0] && replica.trained.mean <= armReport.authored.ci95[1];
+    const silencedIndistinguishableFromTrained =
+      replica.pairedTrainedVsSilenced.ci95[0] <= 0 && replica.pairedTrainedVsSilenced.ci95[1] >= 0;
+    return trainedWithinAuthoredCI && silencedIndistinguishableFromTrained;
+  });
+};
+
+/**
+ * `00-overview.md`'s risk: "If every trained arm scores within the authored
+ * decoder's CI and the silenced control matches trained, the report must
+ * state that the readout learned a near-input-independent policy." Also
+ * used by `05-production-run.md`'s WP5 acceptance risk (identical wording).
+ * Exported so `tests/unit/report.test.ts` can exercise the detection logic
+ * directly against constructed report fixtures, independent of markdown
+ * rendering.
+ */
+export const nearInputIndependentPolicyArms = (report: Readonly<EvaluationReport>): readonly ArmName[] =>
+  armsInOrder(report.arms)
+    .filter(([, armReport]) => armLooksNearInputIndependent(armReport))
+    .map(([arm]) => arm);
+
+const renderNearInputIndependentFinding = (report: Readonly<EvaluationReport>): string | null => {
+  const evaluatedArms = armsInOrder(report.arms).map(([arm]) => arm);
+  if (evaluatedArms.length === 0) return null;
+  const nearIndependentArms = nearInputIndependentPolicyArms(report);
+  if (nearIndependentArms.length === 0) return null;
+
+  const lines = ['## Finding: near-input-independent policy', ''];
+  if (nearIndependentArms.length === evaluatedArms.length) {
+    lines.push(
+      'Every evaluated arm’s trained readout scored within its authored decoder’s 95% confidence ' +
+        'interval, and every replica’s trained-vs-silenced paired difference was not distinguishable ' +
+        'from zero (its 95% CI includes 0). Per the plan’s stated risk, this means the trained readout ' +
+        'learned a near-input-independent policy for every arm: its behavior did not depend on the ' +
+        'gathered per-neuron output rates in a way that materially changed the held-out score, ' +
+        'relative to both the authored decoder and a version of itself with its input silenced. This ' +
+        'finding is descriptive only: it does not rank or compare arms against each other.'
+    );
+  } else {
+    lines.push(
+      `For ${nearIndependentArms.join(', ')} (but not every evaluated arm), the trained readout scored ` +
+        'within the authored decoder’s 95% confidence interval, and its trained-vs-silenced paired ' +
+        'difference was not distinguishable from zero (its 95% CI includes 0) for every replica of that ' +
+        'arm — the trained readout for that arm looks near-input-independent. This finding is ' +
+        'descriptive only: it does not rank or compare arms against each other.'
+    );
+  }
+  return lines.join('\n');
+};
+
+/**
  * Render `report` (the exact object `runEvaluate` builds, before it is
  * `JSON.stringify`'d to `trained-readout-v1.report.json`) as
  * `docs/trained-readout-report.md`'s markdown contents.
  */
-export const renderReportMarkdown = (report: EvaluationReport): string =>
-  [
+export const renderReportMarkdown = (report: EvaluationReport): string => {
+  const nearIndependentFinding = renderNearInputIndependentFinding(report);
+  const structurallyZeroFinding = renderStructurallyZeroReadoutInputFinding(report);
+  return [
     '# Trained-Readout Evaluation Report',
     '',
     renderMethod(report),
@@ -414,6 +529,9 @@ export const renderReportMarkdown = (report: EvaluationReport): string =>
     '',
     renderLimitations(report),
     '',
+    ...(nearIndependentFinding !== null ? [nearIndependentFinding, ''] : []),
+    ...(structurallyZeroFinding !== null ? [structurallyZeroFinding, ''] : []),
     renderWhatThisDoesNotShow(),
     ''
   ].join('\n');
+};

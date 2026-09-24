@@ -45,6 +45,35 @@ export interface RunConfig {
   readonly substeps: number;
   /** Optional: the `export-arms.ts` bundle sha256 this run was trained against. */
   readonly armBundleSha256?: string;
+  /**
+   * CEM hyperparameters and seed policy, as written by `flyarena-train`'s
+   * `_build_run_config` (`training/src/flyarena_training/cli.py`). All
+   * optional here because older/tiny test-fixture run dirs
+   * (`tests/fixtures/trained-readout-run.ts`) predate these fields;
+   * `evaluate.ts`'s manifest `training` block copies them from a real run's
+   * `config.json` verbatim when present.
+   */
+  readonly population?: number;
+  readonly elites?: number;
+  readonly generations?: number;
+  readonly alpha?: number;
+  readonly stdFloor?: number;
+  readonly initStd?: number;
+  readonly trainingSeedsPerGeneration?: number;
+  readonly trainingSeedRange?: readonly [number, number];
+  /**
+   * Records the CLI's deliberate deviation from
+   * `.agents/plans/trained-readout/03-cem-training.md`'s literal
+   * `trainer_seed + generation` training-seed formula (aliases replicas on
+   * shared generation values) in favor of
+   * `numpy.random.default_rng([trainerSeed, generation])`
+   * (`training/src/flyarena_training/seeds.py`), so the manifest can state
+   * it rather than silently assume the plan's formula.
+   */
+  readonly trainingSeedRng?: string;
+  readonly validationSeedRange?: readonly [number, number];
+  readonly heldOutSeedRange?: readonly [number, number];
+  readonly bestValidationFitness?: number;
 }
 
 export interface LoadedRun {
