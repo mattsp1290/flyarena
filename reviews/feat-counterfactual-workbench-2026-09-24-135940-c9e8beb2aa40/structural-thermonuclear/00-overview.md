@@ -50,3 +50,13 @@ Reviewed remedy content SHA-256:
 - `lab-session.test.ts`: `4861a2b69114b667226174ddcc8c4094edb959b20157905cdd62d07316594073`
 
 The full live rubric's structural approval bar is now met. **APPROVE** the reviewed source plus this correction. S1 is nonblocking. The root agent still owns the complete regression/live-backend rerun and final merge/deployment gates; this approval does not claim those operations have occurred.
+
+## Deployment archive fix re-review — 2026-09-24 14:09 UTC
+
+Base: merged main `bba244ada8c1`. Reviewed the uncommitted `scripts/deploy.sh` patch and complete surrounding script. Reviewed file SHA-256: `859379206c10c17b1c63af9af99b174f8fc09dbb2711610a81cc44d2178a38ee`.
+
+**APPROVE.** Creating the tarball outside the directory being traversed directly removes the source/destination ownership conflict behind GNU tar's `.: file changed as we read it` failure. The existing filename exclusion remains, so an older archive is not recursively packaged. The temporary file has an EXIT cleanup trap until `tar` succeeds and `mv` publishes it into `dist`; `set -e` still stops the script before upload on any failed packaging step. Clearing that trap after publication does not interfere with the later, separately scoped verification-directory cleanup trap.
+
+Applied the same full live thermonuclear rubric to this narrow fix: (0/3) it deletes the underlying incidental conflict rather than retrying or suppressing a failure; (1) no file-size threshold issue; (2) no new mode-specific branches or shared-flow tangling; (4) direct shell primitives, no magic wrapper; (5) quoted paths and explicit failure boundary; (6) packaging remains in the existing canonical deployment script; (7) packaging completes before upload and temporary cleanup owns its full lifetime. None of the approval-bar blockers applies. There are no new findings or requested refactors.
+
+Independently ran `bash -n scripts/deploy.sh`: passed. Root owns real build-only/archive inspection, merging this correction to main before retrying deployment, and public release verification; this addendum does not claim those remaining operations succeeded.

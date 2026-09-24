@@ -67,7 +67,13 @@ npm ci --no-audit --no-fund
 npm run check
 npm run build -- --base "$base"
 [[ -f dist/index.html ]] || die 'Build did not produce dist/index.html.'
-tar -czf dist/flyarena.tar.gz --exclude=flyarena.tar.gz -C dist .
+# Create outside dist: adding the archive there while tar reads '.' changes its
+# directory metadata and can make GNU tar fail before upload.
+archive=$(mktemp)
+trap 'rm -f -- "$archive"' EXIT
+tar -czf "$archive" --exclude=flyarena.tar.gz -C dist .
+mv -- "$archive" dist/flyarena.tar.gz
+trap - EXIT
 printf 'Built dist/ and dist/flyarena.tar.gz for %s\n' "$base"
 [[ "$mode" == --deploy ]] || exit 0
 
