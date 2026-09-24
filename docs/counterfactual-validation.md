@@ -128,3 +128,12 @@ arena long task 88 ms, no counterfactual long tasks, throttled load 2099 ms.
 Remote CI passed for the prior packaging revision `0d86c39`; this does not imply
 remote success for later revisions. The following release record supersedes the
 initial byte-only deployment verification above.
+
+Final deployed code revision: `bc10c22bb83fcb0cb3204da1504e182f32ce5d5b` on main.
+Final static release: `20260924T141451Z-e994aaab005c`. Deployment again passed all
+public byte comparisons. A separate real Chromium check on the actual configured
+HTTP origin completed a real-connectome quick probe, scrubbed paired replay,
+opened the DGX sandbox, and returned to a ready Arena. It observed zero page
+errors and zero failed HTTP responses. Main's ignored
+`test-results/deployed-counterfactual.png` records the deployed workbench.
+No backend credentials were used or exported by this smoke check.

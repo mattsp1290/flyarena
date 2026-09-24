@@ -116,3 +116,14 @@ Retain the previous image for rollback. Stop only the intended lab container and
 restart that image with the same approved token/origins. Active jobs are ephemeral;
 export before restarting. Static release rollback and backend rollback are separate.
 This integration does not replace an already-running backend automatically.
+
+## Integrated workbench release
+
+On 2026-09-24, main revision `bc10c22` was deployed as
+`20260924T141451Z-e994aaab005c`. Public HTML/assets matched the build, and an actual
+Chromium visit completed a real-connectome probe, scrubbed replay, opened the
+optional sandbox and returned to a ready Arena without HTTP or page errors.
+The configured HTTP host requires portable graph hashing; integrity checks remain
+mandatory. Packaging now creates its archive outside `dist` to avoid tar observing
+its own output-directory mutation. Detailed tests and independent/live Cursor
+thermonuclear reviews are recorded in `docs/counterfactual-validation.md`.

@@ -1,6 +1,6 @@
 # Execution and merge readiness
 
-Implementation is complete; current validation is recorded in docs/counterfactual-validation.md. Independent code reviews and the live Cursor thermonuclear review passed after fixes. Final merge follows the gates below.
+Implementation is complete; current validation is recorded in docs/counterfactual-validation.md. Independent code reviews and the live Cursor thermonuclear review passed after fixes. The integration and reviewed follow-up fixes are merged and pushed to main; the deployed browser journey is verified. The gates below record the completed execution contract.
 
 ## Ordered packages
 1. Complete two independent plan reviews and one fresh adversarial review. Reconcile findings in these files. Preserve the user's application context and scope. Then freeze the plan as ready. Main ignores `.agents/plans`; force-add only this plan directory, without changing the ignore rule or including another agent's plans.
