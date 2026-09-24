@@ -10,8 +10,8 @@
     "neuronCount": 1008,
     "selfLoopCount": 0
   },
-  "compiledFromGitRevision": "15dd004008f87f5e056e5bd0162d79377ccda36e",
-  "compilerSourceSha256": "c9ce17e1034f459960926dca15d6ba8b72727c157852bc00fa96c5a0e8737d6a",
+  "compiledFromGitRevision": "19ae25f793c1fed8dde3b8492566e4b5b46b8c55",
+  "compilerSourceSha256": "73c1ac1cfdf06b69d9a75ed4e69033fb464a1ae3094a993c81f33e62f39b9828",
   "dynamics": {
     "globalGain": 0.00019837727389950208,
     "globalGainCalibration": {

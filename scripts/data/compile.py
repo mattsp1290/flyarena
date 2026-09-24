@@ -198,7 +198,10 @@ COMPILER_SOURCE_DIR = Path(__file__).resolve().parent
 #: `compile_graph`'s aggregation/CSR logic or the emitted `.bin.gz` bytes,
 #: and must not change this hash or force an unrelated recompile when it is
 #: added or edited. See docs/data-provenance.md's "Soma positions sidecar"
-#: section.
+#: section. `scripts/data/rewire_batch.py` is the same kind of sidecar: a
+#: batch driver over `rewire.py`'s `rewire_graph` that writes to a
+#: gitignored training-run directory, never to this compiler's own
+#: `.bin.gz`/manifest/ledger output, so it must not change this hash either.
 COMPILER_SOURCE_FILENAMES: tuple[str, ...] = ("binfmt.py", "compile.py", "download.py", "rewire.py")
 
 #: Every `scripts/data/*.py` file that is *not* part of "the compiler" --
@@ -209,7 +212,7 @@ COMPILER_SOURCE_FILENAMES: tuple[str, ...] = ("binfmt.py", "compile.py", "downlo
 #: dropped into `scripts/data/` (compiler or sidecar) can never be silently
 #: left out of both -- unlike the old `*.py` glob, an allowlist fails open
 #: by default; this test is what makes it fail closed instead.
-NON_COMPILER_SIDECAR_FILENAMES: tuple[str, ...] = ("positions.py",)
+NON_COMPILER_SIDECAR_FILENAMES: tuple[str, ...] = ("positions.py", "rewire_batch.py")
 
 
 def compiler_source_sha256(source_dir: Path = COMPILER_SOURCE_DIR) -> str:
