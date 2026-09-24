@@ -192,6 +192,21 @@ test.describe('asset load and readiness', () => {
     // (not spanning under the sidebar too).
     expect(activityBox.y).toBeGreaterThan(arenaBox.y + arenaBox.height - 1);
     expect(activityBox.x).toBeCloseTo(arenaBox.x, 0);
+
+    // Round-2 review finding: pinning the sidebar to `grid-row: 1 / span 2`
+    // (above) fixed *position* but, without `main { grid-template-rows:
+    // auto 1fr }` and `.activity { align-self: start }`, CSS grid spread
+    // the tall sidebar's height evenly across both rows and stretched the
+    // arena and the *collapsed* activity panel to fill it — confirmed in a
+    // browser: the empty collapsed panel measured ~700px tall around ~73px
+    // of actual content, pushing the Expand toggle below the fold. These
+    // height/gap assertions catch that class of regression, which the
+    // position-only assertions above cannot.
+    expect(activityBox.height).toBeLessThan(200);
+    const canvasRegionBox = await page.locator('section.arena .canvas-region').boundingBox();
+    if (!canvasRegionBox) throw new Error('Expected the arena canvas region to have a bounding box');
+    expect(activityBox.y - (canvasRegionBox.y + canvasRegionBox.height)).toBeLessThan(120);
+    expect(activityBox.y).toBeLessThan(1000);
   });
 });
 
