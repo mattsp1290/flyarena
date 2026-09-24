@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -11,8 +11,8 @@ import {
   type ReadoutWeights
 } from '../../src/lib/connectome/readout';
 import type { ConnectomeGraph } from '../../src/lib/connectome/format';
-import { mulberry32 } from '../../src/lib/random/mulberry32';
 import {
+  ARM_NAMES,
   computeArmBundleSha256,
   computeGraphIdentity,
   deserializeArmBundle,
@@ -23,10 +23,18 @@ import {
   type SerializedArmBundle
 } from './export-arms';
 import { runEpisode } from './episode';
-import { readNpyFloat32Array } from './npy';
 import { TRACE_SUBSTEPS } from './export-traces';
-
-const ARM_NAMES: readonly ArmName[] = ['biological', 'rewired', 'disconnected'];
+import { requireNonNegativeInt, requirePositiveInt, requireValue } from './cli';
+import { readRunDir, type LoadedRun, type RunConfig } from './run-dir';
+import { conditionRng, conditionStats, pairedStats } from './stats';
+import {
+  renderReportMarkdown,
+  type ArmPairReport,
+  type ArmReplicaReport,
+  type ArmReport,
+  type EvaluationReport,
+  type SideBySideReport
+} from './report';
 
 /**
  * The authoritative TypeScript rescorer: the Node code the browser's own
@@ -37,51 +45,16 @@ const ARM_NAMES: readonly ArmName[] = ['biological', 'rewired', 'disconnected'];
  * decision is enforced: whatever `training/`'s (WP2/WP3, GPU-side) fitness
  * says, only this script's numbers are ever published.
  *
- * ## Run-directory contract (defined here; WP3 is not built yet)
- *
- * `training/src/flyarena_training/cem.py` (WP3,
- * `.agents/plans/trained-readout/03-cem-training.md`) does not exist on
- * `main` yet. This is the contract this evaluator defines and consumes;
- * WP3 must honor it. `tests/fixtures/trained-readout-run.ts` builds a tiny
- * synthetic run directory satisfying it, for this file's own tests.
- *
- * `<run-dir>/`:
- *   - `config.json` (required): a `RunConfig` (below), one arm/replica's
- *     training configuration.
- *   - `theta_final.npy` (required): a 1-D little-endian float32 (`<f4`) or
- *     float64 (`<f8`) NumPy array (`scripts/training/npy.ts`) of length
- *     `config.parameterCount`, the flat concatenation, in this exact
- *     order, `[w1 (H×D, row-major), b1 (H), w2 (3×H, row-major), b2 (3)]`
- *     — the same order `readoutParameterCount` sums and `ReadoutWeights`
- *     (`src/lib/connectome/readout.ts`) declares its fields in. This is
- *     "the published candidate: the final CEM mean"
- *     (`03-cem-training.md`), not `theta_best.npy` (best-ever candidate;
- *     not read by this evaluator).
- *   - `env.json` (optional): torch/CUDA/device provenance. When present for
- *     the shipped replica (trainerSeed 101), it is copied into
- *     `trained-readout-v1.manifest.json`'s `env` map, keyed by arm; a
- *     missing `env.json` for a shipped replica is recorded as a report
- *     warning, not an error (see `runEvaluate`'s shipped-artifact section).
- *   - `generations.csv` (optional): not read by this evaluator.
- *
- * `substeps` must equal the evaluation's own `--substeps` (`args.substeps`,
- * default `TRACE_SUBSTEPS`): `runEvaluate` throws if any run was trained at
- * a different `K`, rather than silently rescoring under different dynamics
- * than it was trained on. `armBundleSha256`, when present, is cross-checked
- * against the (verified) arm bundle actually loaded, so a WP3 driver can
- * pin exactly which exported bundle it trained against.
+ * The run-directory contract this evaluator consumes (`config.json` +
+ * `theta_final.npy`) is defined and documented in `./run-dir.ts`; the
+ * statistics (mean/median/std, seeded bootstrap CIs, paired differences,
+ * `conditionRng`) live in `./stats.ts`; `docs/trained-readout-report.md`
+ * generation lives in `./report.ts`. This file is the orchestrator: CLI
+ * parsing, arm-bundle loading/verification, the per-arm/per-pair/side-by-side
+ * evaluation loops, and writing the four artifacts.
  */
-export interface RunConfig {
-  readonly arm: ArmName;
-  /** Replica identity: one of 101, 202, 303 per WP3's default trainer-seed set. */
-  readonly trainerSeed: number;
-  readonly D: number;
-  readonly H: number;
-  readonly parameterCount: number;
-  readonly substeps: number;
-  /** Optional: the `export-arms.ts` bundle sha256 this run was trained against. */
-  readonly armBundleSha256?: string;
-}
+
+export type { RunConfig };
 
 /** Replica 0 (`03-cem-training.md`: "Replica 0 is the one shipped to the browser"). */
 const SHIPPED_TRAINER_SEED = 101;
@@ -104,73 +77,6 @@ const evaluatorGitRev = (): string | null => {
   } catch {
     return null;
   }
-};
-
-interface LoadedRun {
-  readonly dir: string;
-  readonly config: RunConfig;
-  readonly weights: ReadoutWeights;
-  readonly weightsSha256: string;
-  readonly env: unknown | null;
-}
-
-const POSITIVE_INT_RUN_CONFIG_FIELDS = ['trainerSeed', 'D', 'H', 'parameterCount', 'substeps'] as const;
-
-const readRunDir = (dir: string): LoadedRun => {
-  const configPath = resolve(dir, 'config.json');
-  const config = JSON.parse(readFileSync(configPath, 'utf8')) as Record<string, unknown>;
-
-  if (typeof config.arm !== 'string' || !ARM_NAMES.includes(config.arm as ArmName)) {
-    throw new Error(`evaluate: ${configPath}'s "arm" must be one of ${ARM_NAMES.join(', ')}, got ${JSON.stringify(config.arm)}`);
-  }
-  for (const field of POSITIVE_INT_RUN_CONFIG_FIELDS) {
-    const value = config[field];
-    if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
-      throw new Error(`evaluate: ${configPath}'s "${field}" must be a positive integer, got ${JSON.stringify(value)}`);
-    }
-  }
-  if (config.armBundleSha256 !== undefined && typeof config.armBundleSha256 !== 'string') {
-    throw new Error(`evaluate: ${configPath}'s "armBundleSha256" must be a string when present`);
-  }
-  const runConfig = config as unknown as RunConfig;
-  const { D, H, parameterCount } = runConfig;
-  const expectedLength = readoutParameterCount(D, H);
-  if (parameterCount !== expectedLength) {
-    throw new Error(
-      `evaluate: ${configPath}'s parameterCount ${parameterCount} does not equal ` +
-        `readoutParameterCount(D=${D}, H=${H}) = ${expectedLength}`
-    );
-  }
-
-  const thetaPath = resolve(dir, 'theta_final.npy');
-  const theta = readNpyFloat32Array(thetaPath);
-  if (theta.length !== parameterCount) {
-    throw new Error(
-      `evaluate: ${thetaPath} has ${theta.length} values, expected ${parameterCount} ` +
-        `(config.json's parameterCount) for run "${dir}"`
-    );
-  }
-  const weightsSha256 = sha256Hex(Buffer.from(theta.buffer, theta.byteOffset, theta.byteLength));
-
-  let cursor = 0;
-  const take = (count: number): Float32Array => {
-    const slice = Float32Array.from(theta.subarray(cursor, cursor + count));
-    cursor += count;
-    return slice;
-  };
-  const weights: ReadoutWeights = {
-    inputSize: D,
-    hiddenSize: H,
-    w1: take(H * D),
-    b1: take(H),
-    w2: take(3 * H),
-    b2: take(3)
-  };
-
-  const envPath = resolve(dir, 'env.json');
-  const env = existsSync(envPath) ? (JSON.parse(readFileSync(envPath, 'utf8')) as unknown) : null;
-
-  return { dir, config: runConfig, weights, weightsSha256, env };
 };
 
 interface ArmGraphs {
@@ -252,92 +158,6 @@ const loadArmGraphs = (
 };
 
 // ---------------------------------------------------------------------------
-// Statistics: mean/median/std, seeded bootstrap CIs, paired differences.
-// ---------------------------------------------------------------------------
-
-interface ConditionStats {
-  readonly n: number;
-  readonly mean: number;
-  readonly median: number;
-  /** Population standard deviation (divide-by-n): descriptive, not inferential (the CI is). */
-  readonly std: number;
-  readonly ci95: readonly [number, number];
-}
-
-interface PairedStats {
-  readonly n: number;
-  readonly meanDifference: number;
-  readonly ci95: readonly [number, number];
-}
-
-const mean = (values: readonly number[]): number => values.reduce((sum, value) => sum + value, 0) / values.length;
-
-const median = (values: readonly number[]): number => {
-  const sorted = [...values].sort((a, b) => a - b);
-  const n = sorted.length;
-  return n % 2 === 1 ? sorted[(n - 1) / 2] : (sorted[n / 2 - 1] + sorted[n / 2]) / 2;
-};
-
-const std = (values: readonly number[]): number => {
-  const m = mean(values);
-  const variance = values.reduce((sum, value) => sum + (value - m) ** 2, 0) / values.length;
-  return Math.sqrt(variance);
-};
-
-/** Bootstrap the 95% CI of `statistic(resample)` over `resamples` seeded, with-replacement resamples. */
-const bootstrapCI = (
-  n: number,
-  resamples: number,
-  rng: () => number,
-  statistic: (pickIndex: () => number) => number
-): readonly [number, number] => {
-  const draws = new Array<number>(resamples);
-  for (let r = 0; r < resamples; r += 1) {
-    draws[r] = statistic(() => Math.floor(rng() * n));
-  }
-  draws.sort((a, b) => a - b);
-  const lowIndex = Math.floor(0.025 * resamples);
-  const highIndex = Math.min(resamples - 1, Math.ceil(0.975 * resamples) - 1);
-  return [draws[lowIndex], draws[highIndex]];
-};
-
-const conditionStats = (
-  values: readonly number[],
-  resamples: number,
-  rng: () => number
-): ConditionStats => ({
-  n: values.length,
-  mean: mean(values),
-  median: median(values),
-  std: std(values),
-  ci95: bootstrapCI(values.length, resamples, rng, (pickIndex) => {
-    let sum = 0;
-    for (let i = 0; i < values.length; i += 1) sum += values[pickIndex()];
-    return sum / values.length;
-  })
-});
-
-/** Paired difference `a[i] - b[i]` for same-seed pairs, with a seeded bootstrap CI on the mean difference. */
-const pairedStats = (
-  a: readonly number[],
-  b: readonly number[],
-  resamples: number,
-  rng: () => number
-): PairedStats => {
-  if (a.length !== b.length) throw new Error('evaluate: paired series must have equal length');
-  const diffs = a.map((value, index) => value - b[index]);
-  return {
-    n: diffs.length,
-    meanDifference: mean(diffs),
-    ci95: bootstrapCI(diffs.length, resamples, rng, (pickIndex) => {
-      let sum = 0;
-      for (let i = 0; i < diffs.length; i += 1) sum += diffs[pickIndex()];
-      return sum / diffs.length;
-    })
-  };
-};
-
-// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
@@ -348,6 +168,8 @@ export interface EvaluateArgs {
   readonly outDir: string;
   /** True only when `--out` was actually passed, not merely defaulted (see `runEvaluate`'s public/data guard). */
   readonly outDirExplicit: boolean;
+  /** Explicit override for `docs/trained-readout-report.md`'s path; see `resolveReportMdPath`. */
+  readonly reportMdPath?: string;
   readonly ticks: number;
   readonly substeps: number;
   readonly heldOutStart: number;
@@ -357,6 +179,7 @@ export interface EvaluateArgs {
 }
 
 const DEFAULT_OUT_DIR = 'public/data';
+const DEFAULT_REPORT_MD_PATH = 'docs/trained-readout-report.md';
 
 /** 'E','V','A','L' as a fixed default seed; arbitrary but stable across runs. */
 const DEFAULT_BOOTSTRAP_SEED = 0x4556_414c;
@@ -365,38 +188,13 @@ const DEFAULT_HELD_OUT_START = 30001;
 const DEFAULT_HELD_OUT_COUNT = 100;
 const DEFAULT_BOOTSTRAP_RESAMPLES = 10000;
 
-const requireValue = (flag: string, value: string | undefined): string => {
-  if (value === undefined || value.startsWith('--')) {
-    throw new Error(`${flag} requires a value`);
-  }
-  return value;
-};
-
-const requirePositiveInt = (flag: string, value: string | undefined): number => {
-  const raw = requireValue(flag, value);
-  const parsed = Number(raw);
-  if (!Number.isInteger(parsed) || parsed <= 0) {
-    throw new Error(`${flag} must be a positive integer, got "${raw}"`);
-  }
-  return parsed;
-};
-
-/** Like `requirePositiveInt`, but accepts 0 — for seed-like flags, where 0 is a meaningful seed. */
-const requireNonNegativeInt = (flag: string, value: string | undefined): number => {
-  const raw = requireValue(flag, value);
-  const parsed = Number(raw);
-  if (!Number.isInteger(parsed) || parsed < 0) {
-    throw new Error(`${flag} must be a non-negative integer, got "${raw}"`);
-  }
-  return parsed;
-};
-
 export const parseEvaluateArgs = (argv: readonly string[]): EvaluateArgs => {
   let graphPath: string | undefined;
   let armsDir: string | undefined;
   const runDirs: string[] = [];
   let outDir = DEFAULT_OUT_DIR;
   let outDirExplicit = false;
+  let reportMdPath: string | undefined;
   let ticks = DEFAULT_TICKS;
   let substeps = TRACE_SUBSTEPS;
   let heldOutStart = DEFAULT_HELD_OUT_START;
@@ -425,6 +223,9 @@ export const parseEvaluateArgs = (argv: readonly string[]): EvaluateArgs => {
     } else if (flag === '--out') {
       outDir = requireValue(flag, argv[index + 1]);
       outDirExplicit = true;
+      index += 2;
+    } else if (flag === '--report-md') {
+      reportMdPath = requireValue(flag, argv[index + 1]);
       index += 2;
     } else if (flag === '--ticks') {
       ticks = requirePositiveInt(flag, argv[index + 1]);
@@ -457,6 +258,7 @@ export const parseEvaluateArgs = (argv: readonly string[]): EvaluateArgs => {
     runDirs,
     outDir,
     outDirExplicit,
+    reportMdPath,
     ticks,
     substeps,
     heldOutStart,
@@ -466,6 +268,26 @@ export const parseEvaluateArgs = (argv: readonly string[]): EvaluateArgs => {
   };
 };
 
+/**
+ * `docs/trained-readout-report.md`'s path, per WP4's plan text (it names
+ * that exact path for the real, shipped evaluation). `--report-md`
+ * overrides unconditionally. Otherwise: default to `docs/` only when `--out`
+ * itself resolves to the real shipped `public/data` — i.e. only for a real
+ * evaluation run, mirroring the trace-graph-mode `--out` guard above. Every
+ * other invocation (trace-graph dev mode, and every test) writes the report
+ * markdown alongside `--out`'s own report.json/artifact, so tests never
+ * touch `docs/`.
+ */
+export const resolveReportMdPath = (args: Readonly<EvaluateArgs>): string => {
+  if (args.reportMdPath) return resolve(process.cwd(), args.reportMdPath);
+  const resolvedOutDir = resolve(process.cwd(), args.outDir);
+  const resolvedDefaultOutDir = resolve(process.cwd(), DEFAULT_OUT_DIR);
+  if (resolvedOutDir === resolvedDefaultOutDir) {
+    return resolve(process.cwd(), DEFAULT_REPORT_MD_PATH);
+  }
+  return resolve(resolvedOutDir, 'trained-readout-report.md');
+};
+
 // ---------------------------------------------------------------------------
 // Core evaluation
 // ---------------------------------------------------------------------------
@@ -473,6 +295,7 @@ export const parseEvaluateArgs = (argv: readonly string[]): EvaluateArgs => {
 export interface RunEvaluateResult {
   readonly warnings: readonly string[];
   readonly reportPath: string;
+  readonly reportMdPath: string;
   readonly artifactWritten: boolean;
 }
 
@@ -542,25 +365,8 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
   }
 
   const heldOutSeeds = Array.from({ length: args.heldOutCount }, (_, i) => args.heldOutStart + i);
-  /**
-   * A fresh, independently-seeded bootstrap RNG for one statistic, keyed by
-   * a stable label (e.g. `"biological|trained|101"`). Each `conditionStats`/
-   * `pairedStats` call gets its own stream derived from `--bootstrap-seed`
-   * + its label (sha256, first 4 bytes as a uint32) rather than all of them
-   * sharing one sequentially-consumed `mulberry32` stream: with a shared
-   * stream, a statistic's resample draws — and therefore its CI bounds —
-   * depended on how many other statistics happened to be computed before
-   * it, so adding or removing an unrelated arm/replica from `--runs` would
-   * silently shift every later CI even though that arm/replica's own data
-   * never changed. Per-label seeding makes every statistic's CI a pure
-   * function of (`--bootstrap-seed`, its own label, its own data) —
-   * independent of what else this invocation evaluated, not merely
-   * independent of `--runs` argument order.
-   */
-  const conditionRng = (label: string): (() => number) => {
-    const digest = createHash('sha256').update(`${args.bootstrapSeed}|${label}`).digest();
-    return mulberry32(digest.readUInt32LE(0));
-  };
+  /** Statistic-scoped bootstrap RNG; see `stats.ts`'s `conditionRng` doc comment. */
+  const rngFor = (label: string): (() => number) => conditionRng(args.bootstrapSeed, label);
 
   const scoreCache = new Map<string, number>();
   const computeLeftScore = (
@@ -586,6 +392,14 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
     return result.left.movementScore;
   };
 
+  /** `computeLeftScore` over every held-out seed, for one (arm, decoder, trainerSeed, weights) condition. */
+  const scoresFor = (
+    arm: ArmName,
+    decoder: 'trained' | 'authored' | 'silenced',
+    trainerSeed: number | null,
+    weights: ReadoutWeights | null
+  ): number[] => heldOutSeeds.map((seed) => computeLeftScore(arm, decoder, trainerSeed, weights, seed));
+
   const armReplicas = new Map<ArmName, Map<number, LoadedRun>>();
   for (const run of runs) {
     if (!armReplicas.has(run.config.arm)) armReplicas.set(run.config.arm, new Map());
@@ -599,44 +413,45 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
    * always produces the same `report.json` bytes, not just the same argv.
    * (Each statistic's bootstrap CI is independently seeded via
    * `conditionRng`, so it no longer depends on iteration order or on what
-   * else this invocation evaluated — see `conditionRng`'s doc comment.)
+   * else this invocation evaluated — see `stats.ts`'s `conditionRng` doc
+   * comment.)
    */
   const sortedReplicas = (arm: ArmName): Array<[number, LoadedRun]> =>
     [...(armReplicas.get(arm) ?? new Map<number, LoadedRun>())].sort(([a], [b]) => a - b);
 
   const warnings: string[] = [];
 
-  const armsReport: Record<string, unknown> = {};
+  const armsReport: Record<string, ArmReport> = {};
   for (const arm of armNames) {
     const graph = armGraphs[arm]!;
     const D = armD.get(arm)!;
 
-    const authoredScores = heldOutSeeds.map((seed) => computeLeftScore(arm, 'authored', null, null, seed));
-    const authoredStats = conditionStats(authoredScores, args.bootstrapResamples, conditionRng(`${arm}|authored`));
+    const authoredScores = scoresFor(arm, 'authored', null, null);
+    const authoredStats = conditionStats(authoredScores, args.bootstrapResamples, rngFor(`${arm}|authored`));
 
-    const replicasReport: Record<string, unknown> = {};
+    const replicasReport: Record<string, ArmReplicaReport> = {};
     for (const [trainerSeed, run] of sortedReplicas(arm)) {
       validateReadoutWeights(run.weights, graph);
-      const trainedScores = heldOutSeeds.map((seed) => computeLeftScore(arm, 'trained', trainerSeed, run.weights, seed));
-      const silencedScores = heldOutSeeds.map((seed) => computeLeftScore(arm, 'silenced', trainerSeed, run.weights, seed));
+      const trainedScores = scoresFor(arm, 'trained', trainerSeed, run.weights);
+      const silencedScores = scoresFor(arm, 'silenced', trainerSeed, run.weights);
       replicasReport[String(trainerSeed)] = {
         H: run.config.H,
         parameterCount: run.config.parameterCount,
         weightsSha256: run.weightsSha256,
         env: run.env,
-        trained: conditionStats(trainedScores, args.bootstrapResamples, conditionRng(`${arm}|trained|${trainerSeed}`)),
-        silenced: conditionStats(silencedScores, args.bootstrapResamples, conditionRng(`${arm}|silenced|${trainerSeed}`)),
+        trained: conditionStats(trainedScores, args.bootstrapResamples, rngFor(`${arm}|trained|${trainerSeed}`)),
+        silenced: conditionStats(silencedScores, args.bootstrapResamples, rngFor(`${arm}|silenced|${trainerSeed}`)),
         pairedTrainedVsAuthored: pairedStats(
           trainedScores,
           authoredScores,
           args.bootstrapResamples,
-          conditionRng(`${arm}|paired-trained-vs-authored|${trainerSeed}`)
+          rngFor(`${arm}|paired-trained-vs-authored|${trainerSeed}`)
         ),
         pairedTrainedVsSilenced: pairedStats(
           trainedScores,
           silencedScores,
           args.bootstrapResamples,
-          conditionRng(`${arm}|paired-trained-vs-silenced|${trainerSeed}`)
+          rngFor(`${arm}|paired-trained-vs-silenced|${trainerSeed}`)
         )
       };
     }
@@ -650,14 +465,14 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
     };
   }
 
-  const armPairs: unknown[] = [];
+  const armPairs: ArmPairReport[] = [];
   for (let i = 0; i < armNames.length; i += 1) {
     for (let j = i + 1; j < armNames.length; j += 1) {
       const armA = armNames[i];
       const armB = armNames[j];
 
-      const authoredA = heldOutSeeds.map((seed) => computeLeftScore(armA, 'authored', null, null, seed));
-      const authoredB = heldOutSeeds.map((seed) => computeLeftScore(armB, 'authored', null, null, seed));
+      const authoredA = scoresFor(armA, 'authored', null, null);
+      const authoredB = scoresFor(armB, 'authored', null, null);
       armPairs.push({
         condition: 'authored',
         trainerSeed: null,
@@ -667,7 +482,7 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
           authoredA,
           authoredB,
           args.bootstrapResamples,
-          conditionRng(`armpair|authored|${armA}|${armB}`)
+          rngFor(`armpair|authored|${armA}|${armB}`)
         )
       });
 
@@ -676,8 +491,8 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
         const runB = replicasB.get(trainerSeed);
         if (!runB) continue;
         for (const condition of ['trained', 'silenced'] as const) {
-          const scoresA = heldOutSeeds.map((seed) => computeLeftScore(armA, condition, trainerSeed, runA.weights, seed));
-          const scoresB = heldOutSeeds.map((seed) => computeLeftScore(armB, condition, trainerSeed, runB.weights, seed));
+          const scoresA = scoresFor(armA, condition, trainerSeed, runA.weights);
+          const scoresB = scoresFor(armB, condition, trainerSeed, runB.weights);
           armPairs.push({
             condition,
             trainerSeed,
@@ -687,7 +502,7 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
               scoresA,
               scoresB,
               args.bootstrapResamples,
-              conditionRng(`armpair|${condition}|${armA}|${armB}|${trainerSeed}`)
+              rngFor(`armpair|${condition}|${armA}|${armB}|${trainerSeed}`)
             )
           });
         }
@@ -695,7 +510,7 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
     }
   }
 
-  const sideBySide: unknown[] = [];
+  const sideBySide: SideBySideReport[] = [];
   if (armGraphs.biological && armGraphs.rewired) {
     const leftAuthored: number[] = [];
     const rightAuthored: number[] = [];
@@ -715,13 +530,13 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
       leftArm: 'biological',
       rightArm: 'rewired',
       replica: null,
-      left: conditionStats(leftAuthored, args.bootstrapResamples, conditionRng('sidebyside|authored|left')),
-      right: conditionStats(rightAuthored, args.bootstrapResamples, conditionRng('sidebyside|authored|right')),
+      left: conditionStats(leftAuthored, args.bootstrapResamples, rngFor('sidebyside|authored|left')),
+      right: conditionStats(rightAuthored, args.bootstrapResamples, rngFor('sidebyside|authored|right')),
       pairedLeftMinusRight: pairedStats(
         leftAuthored,
         rightAuthored,
         args.bootstrapResamples,
-        conditionRng('sidebyside|authored|paired')
+        rngFor('sidebyside|authored|paired')
       )
     });
 
@@ -747,17 +562,17 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
         leftArm: 'biological',
         rightArm: 'rewired',
         replica: trainerSeed,
-        left: conditionStats(leftTrained, args.bootstrapResamples, conditionRng(`sidebyside|trained|${trainerSeed}|left`)),
+        left: conditionStats(leftTrained, args.bootstrapResamples, rngFor(`sidebyside|trained|${trainerSeed}|left`)),
         right: conditionStats(
           rightTrained,
           args.bootstrapResamples,
-          conditionRng(`sidebyside|trained|${trainerSeed}|right`)
+          rngFor(`sidebyside|trained|${trainerSeed}|right`)
         ),
         pairedLeftMinusRight: pairedStats(
           leftTrained,
           rightTrained,
           args.bootstrapResamples,
-          conditionRng(`sidebyside|trained|${trainerSeed}|paired`)
+          rngFor(`sidebyside|trained|${trainerSeed}|paired`)
         )
       });
     }
@@ -809,7 +624,7 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
     shippedH ??= run.config.H;
   }
 
-  const report = {
+  const report: EvaluationReport = {
     formatVersion: 1,
     graph: {
       source: graphIdentity.graphSource,
@@ -833,6 +648,10 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
   mkdirSync(outDir, { recursive: true });
   const reportPath = resolve(outDir, 'trained-readout-v1.report.json');
   writeFileSync(reportPath, JSON.stringify(report));
+
+  const reportMdPath = resolveReportMdPath(args);
+  mkdirSync(dirname(reportMdPath), { recursive: true });
+  writeFileSync(reportMdPath, renderReportMarkdown(report));
 
   let artifactWritten = false;
   if (complete && shippedD !== null && shippedH !== null) {
@@ -883,7 +702,7 @@ export const runEvaluate = (args: Readonly<EvaluateArgs>): RunEvaluateResult => 
     artifactWritten = true;
   }
 
-  return { warnings, reportPath, artifactWritten };
+  return { warnings, reportPath, reportMdPath, artifactWritten };
 };
 
 const main = (): void => {
@@ -892,7 +711,8 @@ const main = (): void => {
     const result = runEvaluate(args);
     // eslint-disable-next-line no-console -- CLI tool: this is its user-facing output.
     console.log(
-      `evaluate: wrote ${result.reportPath}${result.artifactWritten ? ' and trained-readout-v1.{json,manifest.json}' : ''}` +
+      `evaluate: wrote ${result.reportPath} and ${result.reportMdPath}` +
+        `${result.artifactWritten ? ', and trained-readout-v1.{json,manifest.json}' : ''}` +
         (result.warnings.length > 0 ? `\nwarnings:\n  ${result.warnings.join('\n  ')}` : '')
     );
   } catch (error) {

@@ -1,6 +1,7 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { gzipSync } from 'node:zlib';
 import { describe, expect, it } from 'vitest';
 
 import { encodeGraphBinary, validateGraph } from '../../src/lib/connectome/format';
@@ -30,6 +31,35 @@ describe('parseExportArmsArgs', () => {
     expect(args.rewiredPath).toBeUndefined();
     expect(args.fixtureRewire).toBe(false);
     expect(args.outDir).toBe('training/runs/arms');
+  });
+});
+
+describe('computeGraphIdentity: graphId derivation', () => {
+  // Same fix as export-traces.ts's graphIdFromPath (round-3 review S3):
+  // computeGraphIdentity shares the same "strip .bin.gz, not just .gz"
+  // requirement, via the shared graphIdFromPath helper.
+  it('strips both .bin and a trailing .gz for a gzip artifact', () => {
+    const outDir = mkdtempSync(join(tmpdir(), 'export-arms-'));
+    try {
+      const graphPath = resolve(outDir, 'malecns-arena-v1.bin.gz');
+      writeFileSync(graphPath, gzipSync(Buffer.from(encodeGraphBinary(createTraceGraph()))));
+      const identity = computeGraphIdentity(graphPath);
+      expect(identity.graphId).toBe('malecns-arena-v1');
+    } finally {
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+
+  it('strips just .bin for a non-gzip artifact', () => {
+    const outDir = mkdtempSync(join(tmpdir(), 'export-arms-'));
+    try {
+      const graphPath = resolve(outDir, 'malecns-arena-v1.bin');
+      writeFileSync(graphPath, Buffer.from(encodeGraphBinary(createTraceGraph())));
+      const identity = computeGraphIdentity(graphPath);
+      expect(identity.graphId).toBe('malecns-arena-v1');
+    } finally {
+      rmSync(outDir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -148,6 +178,132 @@ describe('runExportArms (trace-graph mode)', () => {
       expect(second.outDir).toBe(first.outDir);
       expect([...second.written].sort()).toEqual(['biological', 'disconnected']);
       expect(existsSync(rewiredPath)).toBe(false);
+    } finally {
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('runExportArms: assertMatchingNodeSet gate (round-2 R2-I1 regression coverage)', () => {
+  // R2-I1 (round-2 action item, `reviews/feat-l127-arm-export-evaluator-round2-.../04-action-items.md`)
+  // asked for a `leakRate`-changed and an `inputWeight`-scaled `--rewired`
+  // artifact, each asserted to throw `ExportArmsGateError`; the thermo-nuclear
+  // round-3 review (`thermo-architecture`, I2) found the underlying gate fix
+  // (`export-arms.ts:328-355`) correct but these regression tests still
+  // missing. This block covers every non-`edgeCount` branch
+  // `assertMatchingNodeSet` checks: metadata (via `leakRate`), `inputWeight`,
+  // `presynapticSigns`, and `outputWeight` — not just the pre-existing
+  // "different graph, shifted `biologicalIds`" case above, which exercises a
+  // different comparison (`biologicalIds`, not these four).
+  const writeGraphBin = (outDir: string, fileName: string, graph: ReturnType<typeof createTraceGraph>): string => {
+    const path = resolve(outDir, fileName);
+    writeFileSync(path, Buffer.from(encodeGraphBinary(graph)));
+    return path;
+  };
+
+  it('throws when the "rewired" artifact has a different leakRate (metadata mismatch)', () => {
+    const outDir = mkdtempSync(join(tmpdir(), 'export-arms-'));
+    try {
+      const biological = createTraceGraph();
+      const mutated = { ...biological, metadata: { ...biological.metadata, leakRate: biological.metadata.leakRate + 0.1 } };
+      expect(() => validateGraph(mutated)).not.toThrow(); // the mutation alone must stay a valid graph
+
+      const bioPath = writeGraphBin(outDir, 'biological.bin', biological);
+      const rewiredPath = writeGraphBin(outDir, 'leak-rate-mutated.bin', mutated);
+
+      expect(() =>
+        runExportArms({ graphPath: bioPath, rewiredPath, fixtureRewire: false, fixtureRewireSeed: 0, outDir })
+      ).toThrow(ExportArmsGateError);
+      expect(() =>
+        runExportArms({ graphPath: bioPath, rewiredPath, fixtureRewire: false, fixtureRewireSeed: 0, outDir })
+      ).toThrow(/metadata/);
+    } finally {
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+
+  it('throws when the "rewired" artifact\'s inputWeight is scaled', () => {
+    const outDir = mkdtempSync(join(tmpdir(), 'export-arms-'));
+    try {
+      const biological = createTraceGraph();
+      const mutated = { ...biological, inputWeight: Float32Array.from(biological.inputWeight, (w) => w * 2) };
+      expect(() => validateGraph(mutated)).not.toThrow();
+      // Sanity: the fixture actually has nonzero input weights, so scaling
+      // by 2 is a real, detectable change, not a no-op on all-zero data.
+      expect(Array.from(mutated.inputWeight).some((w) => w !== 0)).toBe(true);
+
+      const bioPath = writeGraphBin(outDir, 'biological.bin', biological);
+      const rewiredPath = writeGraphBin(outDir, 'input-weight-scaled.bin', mutated);
+
+      expect(() =>
+        runExportArms({ graphPath: bioPath, rewiredPath, fixtureRewire: false, fixtureRewireSeed: 0, outDir })
+      ).toThrow(ExportArmsGateError);
+      expect(() =>
+        runExportArms({ graphPath: bioPath, rewiredPath, fixtureRewire: false, fixtureRewireSeed: 0, outDir })
+      ).toThrow(/inputWeight/);
+    } finally {
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+
+  it('throws when the "rewired" artifact has one flipped presynapticSign', () => {
+    const outDir = mkdtempSync(join(tmpdir(), 'export-arms-'));
+    try {
+      const biological = createTraceGraph();
+      const flippedSigns = Int8Array.from(biological.presynapticSigns);
+      flippedSigns[0] = flippedSigns[0] === 1 ? -1 : 1;
+      const mutated = { ...biological, presynapticSigns: flippedSigns };
+      expect(() => validateGraph(mutated)).not.toThrow(); // -1/1 stays a valid sign
+
+      const bioPath = writeGraphBin(outDir, 'biological.bin', biological);
+      const rewiredPath = writeGraphBin(outDir, 'sign-flipped.bin', mutated);
+
+      expect(() =>
+        runExportArms({ graphPath: bioPath, rewiredPath, fixtureRewire: false, fixtureRewireSeed: 0, outDir })
+      ).toThrow(ExportArmsGateError);
+      expect(() =>
+        runExportArms({ graphPath: bioPath, rewiredPath, fixtureRewire: false, fixtureRewireSeed: 0, outDir })
+      ).toThrow(/presynapticSigns/);
+    } finally {
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+
+  it('throws when the "rewired" artifact\'s outputWeight is changed', () => {
+    const outDir = mkdtempSync(join(tmpdir(), 'export-arms-'));
+    try {
+      const biological = createTraceGraph();
+      const mutatedOutputWeight = Float32Array.from(biological.outputWeight);
+      mutatedOutputWeight[18] += 0.5; // neuron 18 is an output neuron in this fixture (see trace-graph.ts)
+      const mutated = { ...biological, outputWeight: mutatedOutputWeight };
+      expect(() => validateGraph(mutated)).not.toThrow();
+
+      const bioPath = writeGraphBin(outDir, 'biological.bin', biological);
+      const rewiredPath = writeGraphBin(outDir, 'output-weight-mutated.bin', mutated);
+
+      expect(() =>
+        runExportArms({ graphPath: bioPath, rewiredPath, fixtureRewire: false, fixtureRewireSeed: 0, outDir })
+      ).toThrow(ExportArmsGateError);
+      expect(() =>
+        runExportArms({ graphPath: bioPath, rewiredPath, fixtureRewire: false, fixtureRewireSeed: 0, outDir })
+      ).toThrow(/outputWeight/);
+    } finally {
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not throw for an unmutated pair (same graph as both --graph and --rewired)', () => {
+    const outDir = mkdtempSync(join(tmpdir(), 'export-arms-'));
+    try {
+      const biological = createTraceGraph();
+      const bioPath = writeGraphBin(outDir, 'biological.bin', biological);
+      // A fresh, independently-encoded copy of the exact same graph as the
+      // "rewired" artifact: every field this gate checks is equal, so the
+      // gate must not throw a false positive.
+      const rewiredPath = writeGraphBin(outDir, 'unmutated-copy.bin', createTraceGraph());
+
+      const result = runExportArms({ graphPath: bioPath, rewiredPath, fixtureRewire: false, fixtureRewireSeed: 0, outDir });
+      expect([...result.written].sort()).toEqual(['biological', 'disconnected', 'rewired']);
     } finally {
       rmSync(outDir, { recursive: true, force: true });
     }

@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
-import { basename, extname, resolve } from 'node:path';
+import { extname, resolve } from 'node:path';
 
 import {
   parseGraphBinary,
@@ -12,7 +12,8 @@ import {
 import { outputNeuronIndices } from '../../src/lib/connectome/readout';
 import { createTraceGraph } from '../../tests/fixtures/trace-graph';
 import { createFixtureRewiredTraceGraph } from '../../tests/fixtures/trace-graph-rewire';
-import { DEFAULT_GRAPH_ID, loadGraphArtifact } from './export-traces';
+import { requireValue } from './cli';
+import { DEFAULT_GRAPH_ID, graphIdFromPath, loadGraphArtifact } from './export-traces';
 
 /**
  * Exports each experimental arm's exact graph arrays from TypeScript, using
@@ -60,6 +61,9 @@ import { DEFAULT_GRAPH_ID, loadGraphArtifact } from './export-traces';
 const sha256Hex = (data: Uint8Array | string): string => createHash('sha256').update(data).digest('hex');
 
 export type ArmName = 'biological' | 'rewired' | 'disconnected';
+
+/** Every valid `ArmName`, in the fixed order used by every report/artifact table. */
+export const ARM_NAMES: readonly ArmName[] = ['biological', 'rewired', 'disconnected'];
 
 export type ArmProvenance =
   | { readonly kind: 'biological-artifact'; readonly artifactPath: string; readonly artifactSha256: string }
@@ -220,7 +224,7 @@ export const computeGraphIdentity = (graphPath?: string): GraphIdentity => {
     const graph = loadGraphArtifact(graphPath);
     validateGraph(graph);
     return {
-      graphId: basename(graphPath, extname(graphPath)),
+      graphId: graphIdFromPath(graphPath),
       graphSource: 'artifact',
       graphArtifactPath: graphPath,
       graphArtifactSha256: sha256Hex(raw),
@@ -363,13 +367,6 @@ export interface ExportArmsArgs {
   readonly fixtureRewireSeed: number;
   readonly outDir: string;
 }
-
-const requireValue = (flag: string, value: string | undefined): string => {
-  if (value === undefined || value.startsWith('--')) {
-    throw new Error(`${flag} requires a value`);
-  }
-  return value;
-};
 
 export const parseExportArmsArgs = (argv: readonly string[]): ExportArmsArgs => {
   let graphPath: string | undefined;

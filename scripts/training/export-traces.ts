@@ -29,6 +29,7 @@ import {
 import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import { mulberry32 } from '../../src/lib/random/mulberry32';
 import { createTraceGraph } from '../../tests/fixtures/trace-graph';
+import { requireValue } from './cli';
 
 /**
  * Exports deterministic golden traces from the existing TypeScript arena +
@@ -119,14 +120,6 @@ export interface CliArgs {
   outDirExplicit: boolean;
   includeWorld: boolean;
 }
-
-/** A missing option value must not silently consume the next flag instead. */
-const requireValue = (flag: string, value: string | undefined): string => {
-  if (value === undefined || value.startsWith('--')) {
-    throw new Error(`${flag} requires a value`);
-  }
-  return value;
-};
 
 /**
  * Canonicalize a path for the overwrite-guard comparison below: `resolve()`
@@ -219,6 +212,23 @@ export const loadGraphArtifact = (path: string): ConnectomeGraph => {
   const buffer = isGzip(raw) ? gunzipSync(raw) : raw;
   const arrayBuffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
   return parseGraphBinary(arrayBuffer);
+};
+
+/**
+ * Derive a `graphId` from a graph artifact path. `basename(path,
+ * extname(path))` alone strips only the last extension, so
+ * `malecns-arena-v1.bin.gz` would mangle to `graphId = "malecns-arena-v1.bin"`
+ * — the stray `.bin` then propagates into every `SerializedArmBundle.graphId`
+ * (`export-arms.ts`) and every trace file's `graphId` field. Strip a
+ * trailing `.gz` first, then the remaining extension (`.bin`, or whatever
+ * else a non-gzip artifact uses), so `foo.bin.gz` and `foo.bin` both yield
+ * `graphId = "foo"`. Not a correctness gate — nothing compares `graphId` for
+ * equality; `graphArtifactSha256` is the real identity — but it is recorded
+ * provenance and should not be silently wrong.
+ */
+export const graphIdFromPath = (path: string): string => {
+  const withoutGz = path.endsWith('.gz') ? path.slice(0, -'.gz'.length) : path;
+  return basename(withoutGz, extname(withoutGz));
 };
 
 interface SerializedGraph {
@@ -581,9 +591,7 @@ const main = (): void => {
 
   const graph = args.graphPath ? loadGraphArtifact(args.graphPath) : createTraceGraph();
   validateGraph(graph);
-  const graphId = args.graphPath
-    ? basename(args.graphPath, extname(args.graphPath))
-    : DEFAULT_GRAPH_ID;
+  const graphId = args.graphPath ? graphIdFromPath(args.graphPath) : DEFAULT_GRAPH_ID;
 
   const outDir = resolve(process.cwd(), args.outDir);
   const files = buildGoldenFiles(graph, graphId, args.substeps, { includeWorld: args.includeWorld });

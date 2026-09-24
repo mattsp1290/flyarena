@@ -30,6 +30,18 @@ const GOLDEN_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '../fixtures
  * the final recorded tick": it uses only `stepWorld` directly on the
  * committed action record, never `episode.ts`'s own observe/model/decode
  * computation.
+ *
+ * "The final recorded tick" is `TRACE_TICKS` = 60, not the 300 named in
+ * `.agents/plans/trained-readout/04-authoritative-evaluation-and-artifacts.md`'s
+ * acceptance text ("reproduces the golden trace's score at tick 300
+ * exactly"). That plan text is stale, not this test: `export-traces.ts`'s
+ * `TRACE_TICKS` doc comment explains the reduction from the plan's stated
+ * 300-tick default to 60 (inherited from WP1, predates this branch) —
+ * dropping to 60 ticks was the byte-budget-driven, plan-authorized
+ * reduction that keeps all four golden seeds within the ≤ 200 KB committed
+ * fixture budget. Do not read this file and assume `episode.ts` needs to
+ * run 300 ticks against a 60-tick golden fixture; 60 is deliberate and
+ * matches every currently committed fixture.
  */
 const goldenFinalLeftScore = (seed: number): AgentScore => {
   const trace = JSON.parse(

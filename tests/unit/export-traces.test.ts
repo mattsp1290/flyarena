@@ -8,6 +8,7 @@ import { createWorld, stepWorld } from '../../src/lib/arena/world';
 import {
   buildSeedTrace,
   DEFAULT_GRAPH_ID,
+  graphIdFromPath,
   loadGraphArtifact,
   parseArgs,
   TRACE_SUBSTEPS
@@ -25,6 +26,29 @@ import { createTraceGraph } from '../fixtures/trace-graph';
 const here = dirname(fileURLToPath(import.meta.url));
 const publicDataDir = resolve(here, '../../public/data');
 const REAL_ARTIFACT = resolve(publicDataDir, 'malecns-arena-v1.bin.gz');
+
+describe('graphIdFromPath', () => {
+  // Round-3 thermo review (`thermo-maintainability` S3 / `thermo-architecture`
+  // S3): `basename(path, extname(path))` alone strips only the last
+  // extension, so `malecns-arena-v1.bin.gz` mangled to `graphId =
+  // "malecns-arena-v1.bin"`. `graphIdFromPath` strips a trailing `.gz`
+  // first, then the remaining extension.
+  it('strips both .bin and a trailing .gz from a gzip artifact path', () => {
+    expect(graphIdFromPath('public/data/malecns-arena-v1.bin.gz')).toBe('malecns-arena-v1');
+  });
+
+  it('strips just .bin from a non-gzip artifact path (no mangling regression)', () => {
+    expect(graphIdFromPath('public/data/malecns-arena-v1.bin')).toBe('malecns-arena-v1');
+  });
+
+  it('matches on the real committed gzip artifact', () => {
+    expect(graphIdFromPath(REAL_ARTIFACT)).toBe('malecns-arena-v1');
+  });
+
+  it('leaves a path with no recognized extension untouched (basename only)', () => {
+    expect(graphIdFromPath('some/dir/plain-name')).toBe('plain-name');
+  });
+});
 
 describe('loadGraphArtifact', () => {
   it('detects gzip by magic bytes (not filename) and parses/validates the real committed artifact', () => {
