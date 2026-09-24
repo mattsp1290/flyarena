@@ -21,6 +21,7 @@
     "experiment:counterfactual": "tsx scripts/experiments/counterfactual.ts",
     "null:evaluate": "tsx scripts/null/null-evaluate.ts",
     "null:report": "tsx scripts/null/null-report.ts",
+    "null:lookup-rewired-artifact": "tsx scripts/null/lookup-rewired-artifact.ts",
     "test:subpath": "playwright test --config playwright.subpath.config.ts"
   },
   "dependencies": {

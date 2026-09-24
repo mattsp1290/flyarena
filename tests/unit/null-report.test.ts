@@ -385,6 +385,31 @@ describe('runNullReport', () => {
       expect(() => runNullReport(trainedArgs)).toThrow(/substeps \(999\) do not match/);
     });
 
+    it('falls back to the "no CEM config recorded" prose when cemConfig is null', () => {
+      writeFileSync(args.trained, JSON.stringify(buildTrainedRaw({ cemConfig: null })));
+      runNullReport(trainedArgs);
+      const reportMd = readFileSync(reportMdPath, 'utf8');
+      expect(reportMd).toContain('no CEM config was recorded on any scored run directory');
+    });
+
+    it('falls back to the "no CEM config recorded" prose when cemConfig is only partially populated', () => {
+      // `toCemConfigSummary` (null-report-trained.ts) is all-or-nothing: a
+      // real trained.json never has a partial cemConfig (reconcileCemConfig
+      // in null-trained-evaluate.ts throws instead of publishing one), but
+      // this pins the fallback behavior for a hand-edited/older fixture --
+      // the old code (reading fields straight off a Record<string, unknown>)
+      // would have silently interpolated "undefined" for the missing fields
+      // instead (a thermo-maintainability review finding).
+      writeFileSync(
+        args.trained,
+        JSON.stringify(buildTrainedRaw({ cemConfig: { population: 128, elites: 32 } }))
+      );
+      runNullReport(trainedArgs);
+      const reportMd = readFileSync(reportMdPath, 'utf8');
+      expect(reportMd).toContain('no CEM config was recorded on any scored run directory');
+      expect(reportMd).not.toContain('undefined');
+    });
+
     it('throws when trained.json has no biological entry at raw.replicaSeed (the shipped replica)', () => {
       writeFileSync(
         args.trained,

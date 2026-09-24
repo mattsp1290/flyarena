@@ -490,7 +490,16 @@ export interface NullEvaluationRaw {
   readonly host: { readonly arch: string; readonly node: string };
 }
 
-const toGraphRaw = (results: readonly NullSeedResult[]): NullGraphRaw => ({
+/**
+ * Reshape one task's raw per-seed worker results into its `NullGraphRaw`
+ * output shape. Shared with `null-trained-evaluate.ts` (WP3), whose own
+ * `NullTrainedGraphRaw` is a type alias for `NullGraphRaw` (the two scripts'
+ * per-graph output shape is identical — `heldOutSeeds`/`movementScore`/
+ * `foodPickups`/`hazardContacts` — only the *enclosing* raw-evaluation shape
+ * differs), rather than each redeclaring an identical function (a
+ * thermo-maintainability review finding).
+ */
+export const toGraphRaw = (results: readonly NullSeedResult[]): NullGraphRaw => ({
   heldOutSeeds: results.map((r) => r.seed),
   movementScore: results.map((r) => r.movementScore),
   foodPickups: results.map((r) => r.foodPickups),
@@ -545,13 +554,19 @@ export const assembleRaw = (
  * finding), which would make this function return `outPath` itself —
  * so the very next `atomicWriteFileSync` below would silently overwrite the
  * multi-hour `authored.json` this function just wrote with the tiny
- * run-meta sidecar. `--out` is validated to end in `.json` at parse time
- * (`parseNullEvaluateArgs`), but this function stays self-checking for any
- * other caller (a test, a future script) that might not go through the CLI.
+ * run-meta sidecar. `--out` (both scripts' own, identically-named, flag) is
+ * validated to end in `.json` at parse time (`parseNullEvaluateArgs`/
+ * `parseNullTrainedEvaluateArgs`), but this function stays self-checking
+ * for any other caller (a test, a future
+ * script) that might not go through either CLI. `source` names the calling
+ * script (`"null-evaluate"`/`"null-trained-evaluate"`) so the thrown message
+ * still identifies which one raised it -- shared between the two rather
+ * than each redeclaring an identical function (a thermo-maintainability
+ * review finding).
  */
-const runMetaPathFor = (outPath: string): string => {
+export const runMetaPathFor = (source: string, outPath: string): string => {
   if (!outPath.endsWith('.json')) {
-    throw new Error(`null-evaluate: expected a ".json" output path, got "${outPath}"`);
+    throw new Error(`${source}: expected a ".json" output path, got "${outPath}"`);
   }
   return `${outPath.slice(0, -'.json'.length)}.run.json`;
 };
@@ -594,30 +609,59 @@ export const runNullEvaluate = async (
   // treatment: a torn sidecar would otherwise look like "run never
   // finished" even though the (correctly, atomically written) multi-hour
   // `authored.json` right next to it is fine.
-  const runMetaOut = runMetaPathFor(args.out);
+  const runMetaOut = runMetaPathFor('null-evaluate', args.out);
   atomicWriteFileSync(runMetaOut, `${JSON.stringify({ shards: args.shards, elapsedMs, perEpisodeMs }, null, 2)}\n`);
 
   return { out: args.out, runMetaOut, taskCount: tasks.length, elapsedMs };
 };
 
-const main = async (): Promise<void> => {
-  try {
-    const args = parseNullEvaluateArgs(process.argv.slice(2));
-    const { out, runMetaOut, taskCount, elapsedMs } = await runNullEvaluate(args);
-    const totalEpisodes = taskCount * args.heldOutCount;
-    const perEpisodeMs = elapsedMs / totalEpisodes;
-    // eslint-disable-next-line no-console -- CLI tool: this is its user-facing output.
-    console.log(
-      `null-evaluate: wrote ${out} and ${runMetaOut} (${taskCount} graphs x ${args.heldOutCount} seeds = ` +
-        `${totalEpisodes} episodes) in ${(elapsedMs / 1000).toFixed(1)}s (${perEpisodeMs.toFixed(1)} ms/episode, ` +
-        `${args.shards} shards)`
-    );
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    // eslint-disable-next-line no-console -- CLI tool: this is its user-facing error output.
-    console.error(`null-evaluate failed: ${message}`);
-    process.exit(1);
-  }
+/** Every `runNullEvaluate`/`runNullTrainedEvaluate`-shaped CLI driver's return value: what `runCliMain` needs to log its summary line. */
+export interface CliRunResult {
+  readonly out: string;
+  readonly runMetaOut: string;
+  readonly taskCount: number;
+  readonly elapsedMs: number;
+}
+
+/**
+ * `main()`'s shared shape: parse argv, await `run`, log a one-line summary
+ * (`console.log`) on success, or log the error and `process.exit(1)` on
+ * failure — never throwing back out to the caller. `null-evaluate.ts` and
+ * `null-trained-evaluate.ts` previously hand-wrote near-identical copies of
+ * this (same try/catch/console.log/console.error/`process.exit(1)` shape,
+ * differing only in which functions they called and the log wording -- a
+ * thermo-maintainability review finding); both now build their own `main`
+ * from this generic instead. `taskNoun` fills in the one wording difference
+ * ("graphs" for the authored null, "runs" for the trained sample) so the
+ * summary line still reads naturally for each script.
+ */
+export const runCliMain = <Args extends { readonly heldOutCount: number; readonly shards: number }>(
+  scriptName: string,
+  taskNoun: string,
+  parseArgs: (argv: readonly string[]) => Args,
+  run: (args: Readonly<Args>) => Promise<CliRunResult>
+): (() => Promise<void>) => {
+  return async () => {
+    try {
+      const args = parseArgs(process.argv.slice(2));
+      const { out, runMetaOut, taskCount, elapsedMs } = await run(args);
+      const totalEpisodes = taskCount * args.heldOutCount;
+      const perEpisodeMs = elapsedMs / totalEpisodes;
+      // eslint-disable-next-line no-console -- CLI tool: this is its user-facing output.
+      console.log(
+        `${scriptName}: wrote ${out} and ${runMetaOut} (${taskCount} ${taskNoun} x ${args.heldOutCount} seeds = ` +
+          `${totalEpisodes} episodes) in ${(elapsedMs / 1000).toFixed(1)}s (${perEpisodeMs.toFixed(1)} ms/episode, ` +
+          `${args.shards} shards)`
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // eslint-disable-next-line no-console -- CLI tool: this is its user-facing error output.
+      console.error(`${scriptName} failed: ${message}`);
+      process.exit(1);
+    }
+  };
 };
+
+const main = runCliMain('null-evaluate', 'graphs', parseNullEvaluateArgs, runNullEvaluate);
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) void main();

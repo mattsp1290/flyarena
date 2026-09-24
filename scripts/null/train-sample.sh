@@ -7,11 +7,25 @@
 # initStd 0.5, E (training seeds/generation) 16, H (hidden size) 16, ticks
 # 1800 -- so the null's 20 rewired scores and bigq's 3 biological replicas
 # differ only in graph topology / replica seed, never in hyperparameters.
-# The merged source of truth for this config is
-# public/data/trained-readout-v1.manifest.json's "training" block
-# (re-grounded against training/runs/production/biological-{101,202,303}/config.json
-# in this worktree, which was verified byte-for-byte against that manifest
-# block before this script was written).
+#
+# population/elites/generations/train-seeds-per-generation/alpha/std-floor/
+# init-std/hidden-size are READ DIRECTLY from
+# public/data/trained-readout-v1.manifest.json's "training" block (+ its
+# top-level "H") at every invocation, below -- never hard-coded literals a
+# future manifest regeneration (or a copy-paste of this script for a similar
+# future study) could silently drift from. This runs before any GPU time is
+# spent (before the seed loop, before the first export-arms/flyarena-train
+# call) and fails fast with a clear error if the manifest is missing or
+# malformed (a thermo-architecture review finding: an earlier version
+# hard-coded these as literals with a comment claiming they were "verified
+# byte-for-byte against that manifest block before this script was written"
+# -- a one-time, manual, unenforced claim with no repeatable check). An
+# explicit `--population`/`--elites`/etc. flag still overrides its
+# manifest-derived default, exactly as before (see the `--dry-run-fixture`
+# fast-smoke-test example below, which overrides the population/generations/
+# etc. flags that affect run time). `ticks` is NOT part of the manifest's
+# "training" block (it is recorded per-run-directory, not per-study) and
+# stays this script's own literal default, unaffected by the above.
 #
 # For each rewiring seed s:
 #   1. `npm run training:export-arms` exports the rewired graph's CSR arrays
@@ -65,6 +79,12 @@
 # own doc comment) -- so a fixture run can never be mistaken for, or
 # accidentally overwrite, the real study's output: its --arms-out/--trained-out
 # default to a distinct "-dry-run-fixture" suffixed directory.
+#
+# TRAIN_SAMPLE_MANIFEST_PATH (env var, not a flag): overrides which manifest
+# the CEM-config preflight below reads. Only meant for this script's own
+# tests (pointing at a fixture manifest to prove the preflight fails fast on
+# a missing/malformed one) -- a real invocation should never set it, so it
+# always reads the real, shipped public/data/trained-readout-v1.manifest.json.
 
 set -euo pipefail
 
@@ -76,14 +96,20 @@ dry_run_fixture=0
 seed_start=0
 seed_count=20
 replica_seed=101
-population=128
-elites=32
-generations=150
-train_seeds_per_generation=16
-alpha=0.7
-std_floor=0.02
-init_std=0.5
-hidden_size=16
+# population/elites/generations/train_seeds_per_generation/alpha/std_floor/
+# init_std/hidden_size are intentionally left UNSET here -- read_manifest_cem_config
+# (below) fills each one that is still unset after CLI parsing from
+# public/data/trained-readout-v1.manifest.json, so there is no hard-coded
+# literal here to silently drift from it. An explicit --population/--elites/
+# etc. flag (parsed below) still overrides its manifest-derived default.
+population=""
+elites=""
+generations=""
+train_seeds_per_generation=""
+alpha=""
+std_floor=""
+init_std=""
+hidden_size=""
 ticks=1800
 graph_path="public/data/malecns-arena-v1.bin.gz"
 graphs_dir="training/runs/null/graphs"
@@ -151,6 +177,100 @@ if [[ ! "$seed_count" =~ ^[0-9]+$ ]] || [[ "$seed_count" -eq 0 ]]; then
   exit 1
 fi
 
+# Reads public/data/trained-readout-v1.manifest.json's "training" block
+# (population/elites/generations/trainingSeedsPerGeneration/alpha/stdFloor/
+# initStd) plus its top-level "H", validating every field's presence/type,
+# and prints each value on its own stdout line, in that fixed order. Exits 1
+# with a clear stderr message (never a silent `KeyError`/`None`) on a
+# missing/unreadable/malformed manifest or a missing/wrong-typed field --
+# this is the CEM-config pre-flight itself: it runs (below) before any
+# export-arms/flyarena-train call, so a bad manifest fails in milliseconds,
+# not after however much of a real run has already completed. `ticks` is
+# deliberately not read here -- see this script's module doc comment.
+read_manifest_cem_config() {
+  local manifest_path="$1"
+  python3 - "$manifest_path" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        text = f.read()
+except OSError as exc:
+    sys.stderr.write(f"train-sample.sh: cannot read manifest {path}: {exc}\n")
+    sys.exit(1)
+
+try:
+    manifest = json.loads(text)
+except json.JSONDecodeError as exc:
+    sys.stderr.write(f"train-sample.sh: {path} is not valid JSON: {exc}\n")
+    sys.exit(1)
+
+if not isinstance(manifest, dict):
+    sys.stderr.write(f"train-sample.sh: {path} does not contain a JSON object\n")
+    sys.exit(1)
+
+training = manifest.get("training")
+if not isinstance(training, dict):
+    sys.stderr.write(f"train-sample.sh: {path} has no \"training\" object\n")
+    sys.exit(1)
+
+
+def require_number(container, key, label, integer=False):
+    value = container.get(key)
+    is_number = isinstance(value, (int, float)) and not isinstance(value, bool)
+    if not is_number or (integer and float(value) != int(value)):
+        kind = "an integer" if integer else "a number"
+        sys.stderr.write(f"train-sample.sh: {path}'s {label} is missing or not {kind} (got {value!r})\n")
+        sys.exit(1)
+    # Cast to `int` (not just validated as mathematically integral) before
+    # this is ever printed below: a manifest that happens to serialize an
+    # integral value as a JSON float (e.g. "150.0") would otherwise flow
+    # through as the literal string "150.0" into `--generations`/etc., which
+    # `flyarena_training.cli`'s `type=int` argparse flags reject -- exactly
+    # the kind of manifest drift this pre-flight exists to catch cleanly,
+    # not turn into an unrelated argparse traceback (a review finding).
+    return int(value) if integer else value
+
+
+population = require_number(training, "population", "training.population", integer=True)
+elites = require_number(training, "elites", "training.elites", integer=True)
+generations = require_number(training, "generations", "training.generations", integer=True)
+train_seeds_per_generation = require_number(
+    training, "trainingSeedsPerGeneration", "training.trainingSeedsPerGeneration", integer=True
+)
+alpha = require_number(training, "alpha", "training.alpha")
+std_floor = require_number(training, "stdFloor", "training.stdFloor")
+init_std = require_number(training, "initStd", "training.initStd")
+hidden_size = require_number(manifest, "H", "H", integer=True)
+
+for value in (population, elites, generations, train_seeds_per_generation, alpha, std_floor, init_std, hidden_size):
+    print(value)
+PY
+}
+
+manifest_path="${TRAIN_SAMPLE_MANIFEST_PATH:-${repo_root}/public/data/trained-readout-v1.manifest.json}"
+manifest_output="$(read_manifest_cem_config "$manifest_path")"
+mapfile -t manifest_cem_values <<< "$manifest_output"
+if [[ "${#manifest_cem_values[@]}" -ne 8 ]]; then
+  echo "train-sample.sh: expected 8 values from read_manifest_cem_config, got ${#manifest_cem_values[@]}" >&2
+  exit 1
+fi
+
+# Only fills a field CLI parsing above left unset -- an explicit --population/
+# --elites/etc. flag always wins (see this script's module doc comment and
+# the --dry-run-fixture fast-smoke-test usage example, which overrides
+# several of these for speed).
+population="${population:-${manifest_cem_values[0]}}"
+elites="${elites:-${manifest_cem_values[1]}}"
+generations="${generations:-${manifest_cem_values[2]}}"
+train_seeds_per_generation="${train_seeds_per_generation:-${manifest_cem_values[3]}}"
+alpha="${alpha:-${manifest_cem_values[4]}}"
+std_floor="${std_floor:-${manifest_cem_values[5]}}"
+init_std="${init_std:-${manifest_cem_values[6]}}"
+hidden_size="${hidden_size:-${manifest_cem_values[7]}}"
+
 if [[ "$dry_run_fixture" -eq 1 ]]; then
   # Never share a directory with the real study's output -- see this
   # script's module doc comment.
@@ -198,21 +318,17 @@ export PATH="${HOME}/.nvm/versions/node/v22.22.3/bin:${PATH}"
 # reads) -- data-driven rather than assuming a fixed
 # "malecns-arena-v1-rewired-seed<N>.bin.gz" naming convention, since that
 # name is derived from --graph's own graphId, not fixed by this script.
+#
+# Shells out to scripts/null/lookup-rewired-artifact.ts, which reuses
+# null-evaluate.ts's already-validated `readRewireIndex`/`RewireIndex`
+# schema, instead of a second, disconnected `index.json` parser hand-written
+# in Python here (a thermo-maintainability review finding: the previous
+# inline python3 heredoc only did unvalidated `entry["seed"]`/
+# `entry["artifact"]` dict lookups, so a renamed/malformed field would raise
+# a generic `KeyError` here instead of a specific, actionable error).
 rewired_artifact_for_seed() {
   local index_path="$1" seed="$2"
-  python3 - "$index_path" "$seed" <<'PY'
-import json
-import sys
-
-index = json.load(open(sys.argv[1]))
-seed = int(sys.argv[2])
-for entry in index["seeds"]:
-    if entry["seed"] == seed:
-        print(entry["artifact"])
-        sys.exit(0)
-sys.stderr.write(f"train-sample.sh: seed {seed} not found in {sys.argv[1]}\n")
-sys.exit(1)
-PY
+  node --import tsx scripts/null/lookup-rewired-artifact.ts "$index_path" "$seed"
 }
 
 mkdir -p "$trained_out"

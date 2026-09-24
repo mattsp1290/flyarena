@@ -5,6 +5,7 @@ import { buildGraphBufferForMode } from '../../src/lib/experiment/bindings';
 import { parseGraphBinary, type GraphMode } from '../../src/lib/connectome/format';
 import { runEpisode } from '../training/episode';
 import { sha256Hex } from '../training/fsio';
+import { assertFiniteScores, runWorkerMain } from './null-worker-shared';
 
 /**
  * `null-evaluate.ts`'s child process: `node:child_process.fork`s this file
@@ -110,34 +111,9 @@ const runTask = (task: NullWorkerTask): readonly NullSeedResult[] => {
       right: { decoder: 'parked' }
     });
     const { movementScore, foodPickups, hazardContacts } = result.left;
-    // A NaN/Infinity score would silently become `null` under
-    // `JSON.stringify` and then `0` wherever `authored.json` is later
-    // summed (`conditionStats`'s sums, the bootstrap resample sums, even
-    // `Array.prototype.sort`'s comparator) — shifting a graph's mean, CI,
-    // and null rank with no error anywhere downstream. Fail here instead,
-    // where the graph and seed that produced it are still known (a
-    // dual-review finding).
-    if (![movementScore, foodPickups, hazardContacts].every(Number.isFinite)) {
-      throw new Error(
-        `null-worker: ${task.graphId} seed ${seed} produced a non-finite score ` +
-          `(movementScore=${movementScore}, foodPickups=${foodPickups}, hazardContacts=${hazardContacts})`
-      );
-    }
+    assertFiniteScores('null-worker', task.graphId, seed, { movementScore, foodPickups, hazardContacts });
     return { seed, movementScore, foodPickups, hazardContacts };
   });
 };
 
-process.on('message', (task: NullWorkerTask) => {
-  try {
-    const results = runTask(task);
-    const message: NullWorkerMessage = { type: 'result', graphId: task.graphId, results };
-    process.send?.(message);
-  } catch (error) {
-    const message: NullWorkerMessage = {
-      type: 'error',
-      graphId: task.graphId,
-      message: error instanceof Error ? error.message : String(error)
-    };
-    process.send?.(message);
-  }
-});
+runWorkerMain(runTask);

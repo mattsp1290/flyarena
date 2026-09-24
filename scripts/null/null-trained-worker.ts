@@ -4,7 +4,8 @@ import type { ArmName } from '../training/arms';
 import { computeArmBundleSha256, deserializeArmBundle, type SerializedArmBundle } from '../training/export-arms';
 import { runEpisode } from '../training/episode';
 import { readRunDir, type LoadedRun } from '../training/run-dir';
-import type { NullSeedResult, NullWorkerMessage } from './null-worker';
+import type { NullSeedResult } from './null-worker';
+import { assertFiniteScores, runWorkerMain } from './null-worker-shared';
 
 /**
  * `.agents/plans/rewiring-null/03-trained-sample.md`'s WP3 child process:
@@ -13,15 +14,19 @@ import type { NullSeedResult, NullWorkerMessage } from './null-worker';
  * `theta_final.npy`, loaded against its own `export-arms.ts` bundle graph —
  * with decoder `trained`, opponent parked, over every held-out seed.
  *
- * Deliberately reuses `null-worker.ts`'s `NullSeedResult`/`NullWorkerMessage`
- * types directly rather than redeclaring near-identical ones: both workers
- * report the same per-seed shape (`seed`/`movementScore`/`foodPickups`/
+ * Deliberately reuses `null-worker.ts`'s `NullSeedResult` type directly
+ * rather than redeclaring a near-identical one: both workers report the
+ * same per-seed shape (`seed`/`movementScore`/`foodPickups`/
  * `hazardContacts`) over the same `{type: 'result'|'error', graphId, ...}`
  * wire protocol, so `null-evaluate.ts`'s generic `runShardedEvaluation` can
  * drive this worker with the exact same sharding/fork/failure-handling
  * mechanism it already uses for `null-worker.ts` (see that function's doc
  * comment) — only the *task* shape below differs (a run directory + arm
- * bundle path, not a gzip graph path + sha256).
+ * bundle path, not a gzip graph path + sha256). The finite-score guard and
+ * the `process.on('message', ...)`/`process.send` IPC wrapper are shared
+ * with `null-worker.ts` via `null-worker-shared.ts` (`assertFiniteScores`/
+ * `runWorkerMain`) rather than hand-duplicated (a thermo-maintainability
+ * review finding).
  */
 
 export interface NullTrainedWorkerTask {
@@ -142,29 +147,9 @@ export const runTask = (task: NullTrainedWorkerTask): readonly NullSeedResult[] 
       right: { decoder: 'parked' }
     });
     const { movementScore, foodPickups, hazardContacts } = result.left;
-    // See null-worker.ts's identical check: a NaN/Infinity score would
-    // silently round-trip through JSON as null/be summed as 0 downstream.
-    if (![movementScore, foodPickups, hazardContacts].every(Number.isFinite)) {
-      throw new Error(
-        `null-trained-worker: ${task.graphId} seed ${seed} produced a non-finite score ` +
-          `(movementScore=${movementScore}, foodPickups=${foodPickups}, hazardContacts=${hazardContacts})`
-      );
-    }
+    assertFiniteScores('null-trained-worker', task.graphId, seed, { movementScore, foodPickups, hazardContacts });
     return { seed, movementScore, foodPickups, hazardContacts };
   });
 };
 
-process.on('message', (task: NullTrainedWorkerTask) => {
-  try {
-    const results = runTask(task);
-    const message: NullWorkerMessage = { type: 'result', graphId: task.graphId, results };
-    process.send?.(message);
-  } catch (error) {
-    const message: NullWorkerMessage = {
-      type: 'error',
-      graphId: task.graphId,
-      message: error instanceof Error ? error.message : String(error)
-    };
-    process.send?.(message);
-  }
-});
+runWorkerMain(runTask);

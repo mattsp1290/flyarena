@@ -7,7 +7,7 @@ import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import { requireNonNegativeInt, requirePositiveInt, requireValue } from '../training/cli';
 import { atomicWriteFileSync } from '../training/fsio';
 import { CEM_CONFIG_FIELDS, isEmptyCemConfig, readRunDir } from '../training/run-dir';
-import { runShardedEvaluation } from './null-evaluate';
+import { runCliMain, runMetaPathFor, runShardedEvaluation, toGraphRaw, type NullGraphRaw } from './null-evaluate';
 import type { NullSeedResult, NullWorkerMessage } from './null-worker';
 import type { NullTrainedWorkerTask } from './null-trained-worker';
 
@@ -312,12 +312,14 @@ export const buildTasks = (args: Readonly<NullTrainedEvaluateArgs>): NullTrained
 // Output
 // ---------------------------------------------------------------------------
 
-export interface NullTrainedGraphRaw {
-  readonly heldOutSeeds: readonly number[];
-  readonly movementScore: readonly number[];
-  readonly foodPickups: readonly number[];
-  readonly hazardContacts: readonly number[];
-}
+/**
+ * Identical shape to `null-evaluate.ts`'s `NullGraphRaw` (both scripts
+ * report the same per-graph `heldOutSeeds`/`movementScore`/`foodPickups`/
+ * `hazardContacts` array set); aliased rather than redeclared so the two
+ * scripts share one type and `toGraphRaw` (a thermo-maintainability review
+ * finding).
+ */
+export type NullTrainedGraphRaw = NullGraphRaw;
 
 export interface NullTrainedRewiredGraphRaw extends NullTrainedGraphRaw {
   readonly seed: number;
@@ -372,13 +374,6 @@ export interface NullTrainedEvaluationRaw {
    */
   readonly cemConfigWarnings: readonly string[];
 }
-
-const toGraphRaw = (results: readonly NullSeedResult[]): NullTrainedGraphRaw => ({
-  heldOutSeeds: results.map((r) => r.seed),
-  movementScore: results.map((r) => r.movementScore),
-  foodPickups: results.map((r) => r.foodPickups),
-  hazardContacts: results.map((r) => r.hazardContacts)
-});
 
 /** `git rev-parse HEAD`, `null` on any failure (not a git checkout, `git` missing) -- informational, matches `training/src/flyarena_training/cli.py`'s `_git_rev` convention. */
 const gitRev = (): string | null => {
@@ -521,14 +516,6 @@ export const assembleRaw = (
 // main
 // ---------------------------------------------------------------------------
 
-/** Same convention as `null-evaluate.ts`'s identically-named function: `<out>.run.json` for operational metadata `trained.json` itself deliberately excludes. */
-const runMetaPathFor = (outPath: string): string => {
-  if (!outPath.endsWith('.json')) {
-    throw new Error(`null-trained-evaluate: expected a ".json" output path, got "${outPath}"`);
-  }
-  return `${outPath.slice(0, -'.json'.length)}.run.json`;
-};
-
 export const runNullTrainedEvaluate = async (
   args: Readonly<NullTrainedEvaluateArgs>
 ): Promise<{ out: string; runMetaOut: string; taskCount: number; elapsedMs: number }> => {
@@ -548,30 +535,12 @@ export const runNullTrainedEvaluate = async (
   mkdirSync(dirname(args.out), { recursive: true });
   atomicWriteFileSync(args.out, JSON.stringify(raw));
 
-  const runMetaOut = runMetaPathFor(args.out);
+  const runMetaOut = runMetaPathFor('null-trained-evaluate', args.out);
   atomicWriteFileSync(runMetaOut, `${JSON.stringify({ shards: args.shards, elapsedMs, perEpisodeMs }, null, 2)}\n`);
 
   return { out: args.out, runMetaOut, taskCount: tasks.length, elapsedMs };
 };
 
-const main = async (): Promise<void> => {
-  try {
-    const args = parseNullTrainedEvaluateArgs(process.argv.slice(2));
-    const { out, runMetaOut, taskCount, elapsedMs } = await runNullTrainedEvaluate(args);
-    const totalEpisodes = taskCount * args.heldOutCount;
-    const perEpisodeMs = elapsedMs / totalEpisodes;
-    // eslint-disable-next-line no-console -- CLI tool: this is its user-facing output.
-    console.log(
-      `null-trained-evaluate: wrote ${out} and ${runMetaOut} (${taskCount} runs x ${args.heldOutCount} seeds = ` +
-        `${totalEpisodes} episodes) in ${(elapsedMs / 1000).toFixed(1)}s (${perEpisodeMs.toFixed(1)} ms/episode, ` +
-        `${args.shards} shards)`
-    );
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    // eslint-disable-next-line no-console -- CLI tool: this is its user-facing error output.
-    console.error(`null-trained-evaluate failed: ${message}`);
-    process.exit(1);
-  }
-};
+const main = runCliMain('null-trained-evaluate', 'runs', parseNullTrainedEvaluateArgs, runNullTrainedEvaluate);
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) void main();
