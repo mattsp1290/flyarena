@@ -41,18 +41,25 @@ const waitForReady = (page: Page): Promise<void> =>
  *
  * `vite preview --base /fly/` (this spec's own dev/test server) happens to
  * 302-redirect a bare `GET /` to `/fly/` — confirmed directly by curling it
- * — so `page.goto('/')` would still *land* on the right page here even
- * after that URL-resolution mistake, silently hiding the bug from this
- * test. Production's Apache config (`.agents/deployment.md`) has no such
- * redirect: it only redirects the exact path `/fly` (no trailing slash) to
- * `/fly/`, never `/` to `/fly/`. `page.goto('')` avoids relying on this
- * server's redirect at all, and the `toHaveURL` assertion right after every
- * call below pins the actual landing URL so a future regression here fails
- * loudly instead of silently passing via that redirect.
+ * — so `page.goto('/')` would still *land* on the right final URL here even
+ * after that URL-resolution mistake: the browser follows the redirect, and
+ * a `toHaveURL(baseURL)` check alone can't tell a direct hit from a
+ * followed redirect. Production's Apache config (`.agents/deployment.md`)
+ * has no such redirect: it only redirects the exact path `/fly` (no
+ * trailing slash) to `/fly/`, never `/` to `/fly/`. `page.goto('')` avoids
+ * relying on this server's redirect at all, and the `redirectedFrom()`
+ * check below (a round-2 review pass caught that `toHaveURL` alone doesn't
+ * actually distinguish the two cases against this specific server) makes
+ * that explicit and testable: it fails if navigation ever went through a
+ * redirect to get here, not just if it landed somewhere else.
  */
 const gotoFlyBase = async (page: Page, baseURL: string): Promise<void> => {
-  await page.goto('');
+  const response = await page.goto('');
   await expect(page).toHaveURL(baseURL);
+  expect(
+    response?.request().redirectedFrom(),
+    'navigation must land on baseURL directly, not via a server redirect (see this function\'s doc comment)'
+  ).toBeNull();
 };
 
 test.describe('non-root deployment base (/fly/)', () => {
@@ -109,11 +116,27 @@ test.describe('non-root deployment base (/fly/)', () => {
 
     // The `href` string alone doesn't prove the file is actually served
     // there — neither the app nor any other test in this spec ever fetches
-    // the ledger JSON. Follow both links for real.
-    for (const link of [manifestLink, ledgerLink]) {
-      const href = await link.getAttribute('href');
-      const response = await page.request.get(new URL(href!, baseURL).href);
-      expect(response.status(), href!).toBe(200);
-    }
+    // the ledger JSON. Follow both links for real. A round-2 review pass
+    // caught that `vite preview` answers *any* missing path under `/fly/`
+    // with its SPA fallback (`index.html`, status 200, `text/html`) rather
+    // than a 404 — confirmed directly by requesting a nonexistent path — so
+    // asserting `status() === 200` alone would still pass if either file
+    // were missing entirely. Asserting the JSON content type plus an actual
+    // field from each file's real shape (`public/data/malecns-arena-v1.
+    // {manifest,ledger}.json`) rules that out.
+    // Requested via the same `basePath` already asserted above (not a fresh
+    // `getAttribute` round-trip), so these two checks stay tied to the
+    // exact hrefs just verified rather than independently re-deriving them.
+    const manifestResponse = await page.request.get(new URL(`${basePath}data/malecns-arena-v1.manifest.json`, baseURL).href);
+    expect(manifestResponse.status()).toBe(200);
+    expect(manifestResponse.headers()['content-type']).toContain('application/json');
+    const manifestBody = (await manifestResponse.json()) as { sourceDataset?: unknown };
+    expect(typeof manifestBody.sourceDataset).toBe('string');
+
+    const ledgerResponse = await page.request.get(new URL(`${basePath}data/malecns-arena-v1.ledger.json`, baseURL).href);
+    expect(ledgerResponse.status()).toBe(200);
+    expect(ledgerResponse.headers()['content-type']).toContain('application/json');
+    const ledgerBody = (await ledgerResponse.json()) as { compileStats?: unknown };
+    expect(typeof ledgerBody.compileStats).toBe('object');
   });
 });
