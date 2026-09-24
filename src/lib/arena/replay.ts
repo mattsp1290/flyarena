@@ -1,4 +1,5 @@
 import type { GraphMode } from '../connectome/format';
+import type { DecoderKind } from '../worker/protocol';
 import {
   ARENA_CONFIG,
   retainArenaConfig,
@@ -198,6 +199,27 @@ export interface ExperimentReplayExport {
    * `public/data/*`) without embedding the connectome itself.
    */
   graphBinarySha256: Partial<Record<AgentId, string>>;
+  /**
+   * Which decoding path produced this run (`'authored'` | `'trained'`, the
+   * same `DecoderKind` the Worker protocol and `ExperimentController#getDecoder()`
+   * use) — always present, so a downloaded replay always states which
+   * decoder it was recorded under, never leaving a reader to assume the
+   * default.
+   */
+  decoder: DecoderKind;
+  /**
+   * sha256 of `trained-readout-v1.json`'s exact bytes (`TrainedReadoutManifest.artifactSha256`,
+   * `./experiment/assets.ts`), present only when `decoder === 'trained'`.
+   * This single hash already pins *every* arm's trained-readout weights at
+   * once (`decoder`), since `w1`/`b1`/`w2`/`b2` for all three arms are
+   * base64-encoded sections of that one committed JSON file — a per-arm
+   * weights hash would only restate a fact this one hash already proves,
+   * so this is the cheap, complete version of "weights identity" rather
+   * than an additional field. Absent (not `null`/`""`) in Authored mode,
+   * matching `graphBinarySha256`'s own "absent, not a placeholder"
+   * convention just above.
+   */
+  trainedReadoutArtifactSha256?: string;
   substepsPerTick: number;
   totalTicks: number;
   finalSummary: ReplaySummary;
@@ -210,12 +232,17 @@ export const createExperimentReplayExport = (
   options: {
     topology: Record<AgentId, GraphMode>;
     graphBinarySha256?: Partial<Record<AgentId, string>>;
+    /** Defaults to `'authored'` (matching the product's own authored-by-default decision) when omitted, e.g. by a caller with no decoder concept of its own. */
+    decoder?: DecoderKind;
+    /** See `ExperimentReplayExport.trainedReadoutArtifactSha256`'s doc comment; ignored when `decoder !== 'trained'`. */
+    trainedReadoutArtifactSha256?: string;
     substepsPerTick: number;
     totalTicks: number;
     trace: readonly ExperimentTraceEntry[];
   }
 ): ExperimentReplayExport => {
   const finalSummary = createReplaySummary(world);
+  const decoder: DecoderKind = options.decoder ?? 'authored';
   return {
     schemaVersion: 1,
     seed: world.seed,
@@ -226,6 +253,14 @@ export const createExperimentReplayExport = (
     // never carries a misleading "graphBinarySha256": null/"" for an arm
     // that simply has none.
     graphBinarySha256: { left: options.graphBinarySha256?.left, right: options.graphBinarySha256?.right },
+    decoder,
+    // Same "absent, not a placeholder" convention as `graphBinarySha256`
+    // above: `JSON.stringify` drops an `undefined`-valued key entirely, so
+    // an Authored-mode export never carries a misleading
+    // "trainedReadoutArtifactSha256": null/"".
+    ...(decoder === 'trained' && options.trainedReadoutArtifactSha256
+      ? { trainedReadoutArtifactSha256: options.trainedReadoutArtifactSha256 }
+      : {}),
     substepsPerTick: options.substepsPerTick,
     totalTicks: options.totalTicks,
     finalSummary,

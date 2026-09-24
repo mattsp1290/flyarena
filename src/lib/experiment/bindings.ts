@@ -12,6 +12,7 @@ import {
   resetModelState,
   runSubsteps
 } from '../connectome/model';
+import type { ReadoutWeights } from '../connectome/readout';
 import { computeTelemetry } from '../connectome/telemetry';
 import type { WorkerClient } from '../worker/client';
 import type { AgentBinding, AgentStepInput, AgentStepResult } from './runner';
@@ -125,16 +126,25 @@ export const createOracleAgentBinding = (options: CreateOracleBindingOptions): A
 /**
  * Build an `AgentBinding` backed by a `WorkerClient` (`../worker/client.ts`).
  * Initializes the Worker with `graphBuffer` (transferred, not cloned) before
- * returning, so the binding is immediately usable.
+ * returning, so the binding is immediately usable. `readout`, when given, is
+ * this arm's trained-readout weights (already `validateReadoutWeights`-
+ * checked by the caller against the graph being loaded here — see
+ * `ExperimentController`'s trained-readout loading) — passed straight
+ * through to `client.init` so the Worker can serve `set-decoder: 'trained'`
+ * later without a re-`init`. Always passed at `init` regardless of which
+ * decoder is initially active (authored-by-default): this is what lets a
+ * later `set-decoder` switch flip decoders on an already-running Worker
+ * instead of requiring a fresh dispose/init round trip.
  */
 export const createWorkerAgentBinding = async (
   client: WorkerClient,
   graphBuffer: ArrayBuffer,
   mode: GraphMode,
   /** See `AgentRunnerInfo.graphBinarySha256` (`./runner.ts`) — passed straight through into the resulting binding's `info`. */
-  graphBinarySha256?: string
+  graphBinarySha256?: string,
+  readout?: Readonly<ReadoutWeights>
 ): Promise<AgentBinding> => {
-  const initResult = await client.init(graphBuffer, mode);
+  const initResult = await client.init(graphBuffer, mode, readout);
 
   const step: AgentBinding['step'] = async (input) => {
     const result = await client.step(input.channelValues, input.substeps);

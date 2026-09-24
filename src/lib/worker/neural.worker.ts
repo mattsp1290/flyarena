@@ -8,9 +8,17 @@ import {
   type NeuralModelState,
   type StepScratch
 } from '../connectome/model';
+import {
+  createReadoutOutput,
+  createReadoutScratch,
+  outputNeuronIndices,
+  readoutForward,
+  validateReadoutWeights,
+  type ReadoutWeights
+} from '../connectome/readout';
 import { computeTelemetry } from '../connectome/telemetry';
 import { MAX_SUBSTEPS_PER_TICK, WORKER_PROTOCOL_VERSION } from './protocol';
-import type { WorkerErrorCode, WorkerFailure, WorkerRequest, WorkerResponse } from './protocol';
+import type { DecoderKind, WorkerErrorCode, WorkerFailure, WorkerRequest, WorkerResponse } from './protocol';
 
 /**
  * The dedicated Web Worker for stepping the sparse connectome oracle off the
@@ -24,15 +32,34 @@ import type { WorkerErrorCode, WorkerFailure, WorkerRequest, WorkerResponse } fr
  */
 
 /**
+ * The trained-readout config for one initialized arm, built once at `init`
+ * from `InitWorkerRequest.readout` (already `validateReadoutWeights`-checked
+ * against this exact graph by that point — see the `init` case below).
+ * `scratch`/`out` are this arm's allocation-free `readoutForward` buffers,
+ * matching the "created once at init, never per tick" contract
+ * (`.agents/plans/trained-readout/06-browser-integration.md`'s change-surface
+ * table); `indices` is this graph's `outputNeuronIndices`, computed once
+ * here rather than recomputed every `step`.
+ */
+interface ReadoutRuntime {
+  weights: Readonly<ReadoutWeights>;
+  indices: Int32Array;
+  scratch: Float32Array;
+  out: Float32Array;
+}
+
+/**
  * The Worker's own state, as a tagged union: either not yet initialized
  * (`idle`) or holding a fully-initialized graph/state/scratch/outputs/
- * activity quintet (`ready`). The five `ready` fields are never
- * independently present — `init` produces all five together (`activity`
- * always starting `false`), `dispose` clears all five together, and every
- * other handler only ever needs to know "is the runtime ready," not which
- * of five fields happen to be set. A tagged union makes that atomicity a
- * type-level fact instead of a convention enforced only by a five-way
- * `&&`/`||` check that a future added field could be left out of.
+ * activity/decoder/readout bundle (`ready`). The `ready` fields are never
+ * independently present — `init` produces all of them together (`activity`
+ * always starting `false`, `decoder` always starting `'authored'`, `readout`
+ * present only when `InitWorkerRequest.readout` was supplied and validated),
+ * `dispose` clears all of them together, and every other handler only ever
+ * needs to know "is the runtime ready," not which fields happen to be set. A
+ * tagged union makes that atomicity a type-level fact instead of a
+ * convention enforced only by a multi-way `&&`/`||` check that a future
+ * added field could be left out of.
  */
 type RuntimeState =
   | { status: 'idle' }
@@ -54,6 +81,14 @@ type RuntimeState =
        * `dispose`).
        */
       activity: boolean;
+      /**
+       * Which decoding path `step` currently runs. Always `'authored'`
+       * immediately after `init` (authored-by-default), regardless of
+       * whether `readout` below is present; only `set-decoder` changes it.
+       */
+      decoder: DecoderKind;
+      /** Present only when `InitWorkerRequest.readout` was supplied and passed validation at `init`; `set-decoder: 'trained'` is rejected without this. */
+      readout?: ReadoutRuntime;
     };
 
 /**
@@ -136,6 +171,36 @@ export const handleWorkerRequest = (
           );
         }
         const graph = parseGraphBinary(request.graphBuffer);
+
+        let readout: ReadoutRuntime | undefined;
+        if (request.readout) {
+          // Validated here, against this exact parsed graph, before `init`
+          // is allowed to succeed — not deferred to the first `set-decoder:
+          // 'trained'` or `step` call. A validation failure fails `init`
+          // itself with `invalid-request` (not `invalid-graph`: the graph
+          // buffer itself may be perfectly fine) so a caller can tell a
+          // corrupt/mismatched readout artifact apart from a corrupt graph
+          // one — see `InitWorkerRequest.readout`'s doc comment.
+          try {
+            validateReadoutWeights(request.readout, graph);
+          } catch (error) {
+            return respond(
+              failure(
+                'init',
+                request.requestId,
+                'invalid-request',
+                error instanceof Error ? error.message : String(error)
+              )
+            );
+          }
+          readout = {
+            weights: request.readout,
+            indices: outputNeuronIndices(graph),
+            scratch: createReadoutScratch(request.readout.hiddenSize),
+            out: createReadoutOutput()
+          };
+        }
+
         runtime.current = {
           status: 'ready',
           graph,
@@ -143,7 +208,9 @@ export const handleWorkerRequest = (
           scratch: createStepScratch(graph),
           outputs: createOutputBuffer(graph),
           mode: request.mode,
-          activity: false
+          activity: false,
+          decoder: 'authored',
+          readout
         };
         return respond({
           type: 'init',
@@ -175,7 +242,7 @@ export const handleWorkerRequest = (
         if (runtime.current.status !== 'ready') {
           return respond(stepFailure('not-initialized', 'Neural worker has not been initialized'));
         }
-        const { graph, state, scratch, outputs, activity } = runtime.current;
+        const { graph, state, scratch, outputs, activity, decoder, readout } = runtime.current;
 
         if (!Number.isInteger(request.substeps) || request.substeps <= 0) {
           return respond(stepFailure('invalid-request', 'substeps must be a positive integer'));
@@ -210,6 +277,25 @@ export const handleWorkerRequest = (
           }
         }
         runSubsteps(graph, state, scratch, request.channelValues, request.substeps, outputs);
+        // 'trained': `readoutForward` on the per-neuron output rates just
+        // produced by the substeps above, gathered through this arm's own
+        // `outputNeuronIndices` (`readout.indices`) and written into its
+        // preallocated `scratch`/`out` buffers (created once at `init` — see
+        // `ReadoutRuntime`'s doc comment) — no allocation per step. `readout`
+        // is always defined here: `set-decoder` rejects `'trained'` at
+        // selection time when it is absent (see that case below), so this
+        // branch can never be reached with `decoder === 'trained'` and no
+        // `readout`. `outputs` (the authored `aggregateOutputs` result) is
+        // still computed above by `runSubsteps` either way — matching the
+        // plan's "authored: unchanged aggregateOutputs" note — just not used
+        // for `actionFeatures` in this branch.
+        let actionFeatures: number[];
+        if (decoder === 'trained' && readout) {
+          readoutForward(readout.weights, state.rate, readout.indices, readout.scratch, readout.out);
+          actionFeatures = Array.from(readout.out);
+        } else {
+          actionFeatures = Array.from(outputs);
+        }
         // A fresh copy, not a view onto `state.rate`: `state.rate` is the
         // Worker's own long-lived, reused-every-substep buffer (see
         // `connectome/model.ts`'s allocation-free-substep-loop contract), so
@@ -224,7 +310,7 @@ export const handleWorkerRequest = (
           type: 'step',
           requestId: request.requestId,
           ok: true,
-          actionFeatures: Array.from(outputs),
+          actionFeatures,
           telemetry: computeTelemetry(state),
           ...(rates ? { rates } : {})
         };
@@ -253,6 +339,41 @@ export const handleWorkerRequest = (
           requestId: request.requestId,
           ok: true,
           enabled: request.enabled
+        });
+      }
+
+      case 'set-decoder': {
+        if (runtime.current.status !== 'ready') {
+          return respond(
+            failure('set-decoder', request.requestId, 'not-initialized', 'Neural worker has not been initialized')
+          );
+        }
+        if (request.decoder !== 'authored' && request.decoder !== 'trained') {
+          return respond(
+            failure(
+              'set-decoder',
+              request.requestId,
+              'invalid-request',
+              `decoder must be "authored" or "trained", received ${String(request.decoder)}`
+            )
+          );
+        }
+        if (request.decoder === 'trained' && !runtime.current.readout) {
+          return respond(
+            failure(
+              'set-decoder',
+              request.requestId,
+              'invalid-request',
+              'Cannot select the trained decoder: this Worker was initialized without readout weights'
+            )
+          );
+        }
+        runtime.current = { ...runtime.current, decoder: request.decoder };
+        return respond({
+          type: 'set-decoder',
+          requestId: request.requestId,
+          ok: true,
+          decoder: request.decoder
         });
       }
 

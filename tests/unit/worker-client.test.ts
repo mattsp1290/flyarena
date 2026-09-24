@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { encodeGraphBinary } from '../../src/lib/connectome/format';
+import { outputNeuronIndices, type ReadoutWeights } from '../../src/lib/connectome/readout';
 import { createWorkerClient, WorkerClientError } from '../../src/lib/worker/client';
 import { WORKER_PROTOCOL_VERSION } from '../../src/lib/worker/protocol';
 import { createRandomGraph } from '../fixtures/tiny-graph';
@@ -7,6 +8,19 @@ import { FakeNeuralWorker } from '../helpers/fake-worker';
 
 const graph = createRandomGraph(0x9, { neuronCount: 6, inputChannelCount: 2, outputPopulationCount: 1 });
 const buffer = encodeGraphBinary(graph);
+
+const readoutWeights = (): ReadoutWeights => {
+  const inputSize = outputNeuronIndices(graph).length;
+  const hiddenSize = 2;
+  return {
+    inputSize,
+    hiddenSize,
+    w1: new Float32Array(hiddenSize * inputSize).fill(0.1),
+    b1: new Float32Array(hiddenSize),
+    w2: new Float32Array(3 * hiddenSize).fill(0.2),
+    b2: new Float32Array(3)
+  };
+};
 
 describe('createWorkerClient', () => {
   it('round-trips init/step/reset/dispose against a live worker-shaped target, matching responses by requestId', async () => {
@@ -122,6 +136,37 @@ describe('createWorkerClient', () => {
     const worker = new FakeNeuralWorker();
     const client = createWorkerClient(worker);
     await expect(client.setActivity(true)).rejects.toThrow(/not-initialized/);
+  });
+
+  it('setDecoder round-trips authored <-> trained when init was given matching readout weights, and rejects "trained" without them', async () => {
+    const worker = new FakeNeuralWorker();
+    const client = createWorkerClient(worker);
+    await client.init(buffer.slice(0), undefined, readoutWeights());
+
+    const toTrained = await client.setDecoder('trained');
+    expect(toTrained.ok).toBe(true);
+    expect(toTrained.decoder).toBe('trained');
+
+    const toAuthored = await client.setDecoder('authored');
+    expect(toAuthored.ok).toBe(true);
+    expect(toAuthored.decoder).toBe('authored');
+
+    const noReadoutClient = createWorkerClient(new FakeNeuralWorker());
+    await noReadoutClient.init(buffer.slice(0));
+    await expect(noReadoutClient.setDecoder('trained')).rejects.toThrow(/readout/i);
+  });
+
+  it('setDecoder rejects before init with not-initialized', async () => {
+    const worker = new FakeNeuralWorker();
+    const client = createWorkerClient(worker);
+    await expect(client.setDecoder('authored')).rejects.toThrow(/not-initialized/);
+  });
+
+  it('init rejects with invalid-request when the passed readout does not match the graph', async () => {
+    const worker = new FakeNeuralWorker();
+    const client = createWorkerClient(worker);
+    const mismatched: ReadoutWeights = { ...readoutWeights(), inputSize: readoutWeights().inputSize + 1 };
+    await expect(client.init(buffer.slice(0), undefined, mismatched)).rejects.toMatchObject({ code: 'invalid-request' });
   });
 
   it('rejects the returned promise with the structured error message on a Worker failure response', async () => {

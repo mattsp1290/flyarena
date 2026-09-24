@@ -10,7 +10,13 @@
  * `public/data/` files (read via `node:fs`) without a server.
  */
 
-import { parseGraphBinary, type ConnectomeGraph } from '../connectome/format';
+import { parseGraphBinary, type ConnectomeGraph, type GraphMode } from '../connectome/format';
+import {
+  decodeReadoutArtifact,
+  readoutParameterCount,
+  type ReadoutWeights,
+  type TrainedReadoutArtifactJson
+} from '../connectome/readout';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
 
@@ -557,4 +563,141 @@ export const loadPositions = async (
     rateMin: biologicalGraph.metadata.rateMin,
     rateMax: biologicalGraph.metadata.rateMax
   };
+};
+
+/**
+ * The subset of `public/data/trained-readout-v1.manifest.json` the app
+ * actually reads: enough to verify the artifact JSON's own bytes and to
+ * label its provenance in the ledger panel (WP6). The manifest also carries
+ * training/evaluator/env provenance the ledger does not surface — those
+ * fields simply pass through untyped here rather than being restated field
+ * by field.
+ */
+export interface TrainedReadoutManifest {
+  version: number;
+  /** sha256 of `trained-readout-v1.json`'s exact bytes — checked against the fetched artifact below before it is trusted. */
+  artifactSha256: string;
+  /** Output-neuron count (readout input size), identical across arms by construction (`export-arms.ts`'s node-set gate). */
+  D: number;
+  /** Hidden layer width, identical across arms (one shared training config). */
+  H: number;
+  /** Total trainable scalars per arm (`readoutParameterCount(D, H)`), identical across arms. */
+  parameterCount: number;
+}
+
+/**
+ * WP6's trained-readout counterpart to `PositionsLoadResult`: never throws,
+ * and every failure is a returned `status` so `ExperimentController` can
+ * keep the Authored path working and disable just the Trained decoder with
+ * an honest reason (the "artifact failed verification" ledger message) —
+ * never fail the whole experiment over a missing/corrupt trained-readout
+ * artifact, which is optional relative to the required arena graph
+ * artifacts `loadArenaArtifacts` gates Start on.
+ */
+export type TrainedReadoutLoadResult =
+  | { status: 'ok'; manifest: TrainedReadoutManifest; weightsByMode: Readonly<Record<GraphMode, ReadoutWeights>> }
+  | { status: 'unavailable'; reason: string };
+
+/**
+ * Every `GraphMode` the trained-readout artifact carries a per-arm entry
+ * for (`TrainedReadoutArtifactJson.arms`'s required keys). Built from an
+ * exhaustiveness-checked map, not a bare array literal: `READOUT_ARMS_MAP`'s
+ * type (`Record<GraphMode, true>`) has no structural link a plain
+ * `readonly GraphMode[]` array would — a future `GraphMode` variant added
+ * to `format.ts` without a matching entry here fails to compile on this
+ * object literal, instead of silently type-checking while
+ * `readoutWeightsForMode()` (`controller.ts`) would return `undefined` for
+ * the new arm at runtime with no error anywhere (round-1 dual review,
+ * carried over as an open suggestion into the thermo-maintainability
+ * review's S2).
+ */
+const READOUT_ARMS_MAP: Record<GraphMode, true> = { biological: true, rewired: true, disconnected: true };
+const READOUT_ARMS: readonly GraphMode[] = Object.keys(READOUT_ARMS_MAP) as GraphMode[];
+
+/**
+ * Fetch, sha256-verify, and base64-decode `trained-readout-v1.{json,manifest.json}`
+ * (WP6 item 2's trained-readout counterpart to `loadArenaArtifacts`). Unlike
+ * that function, this one never throws — see `TrainedReadoutLoadResult`'s doc
+ * comment — and does not itself call `validateReadoutWeights` against a
+ * graph: the caller (`ExperimentController`, which has the per-arm parsed
+ * graphs) does that once it has something to validate each arm's weights
+ * against.
+ */
+export const loadTrainedReadoutArtifact = async (dataBaseUrl = '/data'): Promise<TrainedReadoutLoadResult> => {
+  try {
+    const manifest = await fetchJson<TrainedReadoutManifest>(`${dataBaseUrl}/trained-readout-v1.manifest.json`);
+    const artifactBytes = await fetchArrayBuffer(`${dataBaseUrl}/trained-readout-v1.json`);
+
+    const artifactHash = await sha256Hex(artifactBytes);
+    if (artifactHash !== manifest.artifactSha256) {
+      return {
+        status: 'unavailable',
+        reason: `trained-readout-v1.json sha256 ${artifactHash} does not match its manifest (${manifest.artifactSha256})`
+      };
+    }
+
+    let json: TrainedReadoutArtifactJson;
+    try {
+      json = JSON.parse(new TextDecoder().decode(artifactBytes)) as TrainedReadoutArtifactJson;
+    } catch (error) {
+      return {
+        status: 'unavailable',
+        reason: `trained-readout-v1.json is not valid JSON: ${error instanceof Error ? error.message : String(error)}`
+      };
+    }
+
+    // Dual review (round 1, Important): the sha256 check above only proves
+    // the artifact's own bytes are untampered — it says nothing about
+    // whether the manifest's separately-authored `D`/`H`/`parameterCount`
+    // fields (what the ledger panel displays verbatim, `LedgerPanel.svelte`)
+    // still describe *this* artifact. A manifest that is internally
+    // consistent (its own hash check passes) but was hand-edited or left
+    // stale after a forgotten regeneration would otherwise pass every check
+    // above and only surface as a silently wrong architecture/parameter-count
+    // claim in the UI — the same risk class `loadArenaArtifacts` above
+    // already guards against for the arena manifest's `neuronCount`/
+    // `edgeCount`. The MLP itself is unaffected either way (it always uses
+    // `json.inputSize`/`json.hiddenSize` directly, separately checked by
+    // `validateReadoutWeights` against the loaded graph); this is a
+    // display-honesty gate, not a numerical-correctness one.
+    const expectedParameterCount = readoutParameterCount(json.inputSize, json.hiddenSize);
+    // Named per-field, not just a blanket mismatch (thermo-maintainability
+    // review S3): the manifest and the artifact can diverge on any subset
+    // of D/H/parameterCount independently (e.g. only `parameterCount` stale
+    // after a hand-edit, with `D`/`H` both still correct) — naming exactly
+    // which field(s) diverged makes the ledger's failure reason faster to
+    // diagnose from a bug report than always restating every field.
+    const divergingFields: string[] = [];
+    if (manifest.D !== json.inputSize) divergingFields.push('D');
+    if (manifest.H !== json.hiddenSize) divergingFields.push('H');
+    if (manifest.parameterCount !== expectedParameterCount) divergingFields.push('parameterCount');
+    if (divergingFields.length > 0) {
+      return {
+        status: 'unavailable',
+        reason:
+          `trained-readout-v1.manifest.json diverges from the artifact on ${divergingFields.join(', ')}: ` +
+          `manifest (D=${manifest.D}, H=${manifest.H}, parameterCount=${manifest.parameterCount}) ` +
+          `does not match the artifact's own inputSize=${json.inputSize}/hiddenSize=${json.hiddenSize} ` +
+          `(expected parameterCount ${expectedParameterCount})`
+      };
+    }
+
+    const weightsByMode: Partial<Record<GraphMode, ReadoutWeights>> = {};
+    for (const arm of READOUT_ARMS) {
+      weightsByMode[arm] = decodeReadoutArtifact(json, arm);
+    }
+
+    return {
+      status: 'ok',
+      manifest,
+      weightsByMode: weightsByMode as Record<GraphMode, ReadoutWeights>
+    };
+  } catch (error) {
+    // Fetch failure (e.g. a 404 because WP5's production artifact has not
+    // shipped yet), a malformed manifest, or a `decodeReadoutArtifact`
+    // failure (a missing arm key or a non-multiple-of-4 base64 payload) all
+    // land here as the same honest "unavailable" outcome — the Trained
+    // decoder is simply not offered, and Authored keeps working.
+    return { status: 'unavailable', reason: error instanceof Error ? error.message : String(error) };
+  }
 };

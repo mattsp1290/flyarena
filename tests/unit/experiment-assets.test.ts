@@ -7,10 +7,12 @@ import {
   DecompressionUnsupportedError,
   decompressGzip,
   loadArenaArtifacts,
+  loadTrainedReadoutArtifact,
   sha256Hex,
   verifyAndDecompressArtifact
 } from '../../src/lib/experiment/assets';
-import { parseGraphBinary, validateGraph } from '../../src/lib/connectome/format';
+import { parseGraphBinary, validateGraph, createDisconnectedGraph } from '../../src/lib/connectome/format';
+import { validateReadoutWeights } from '../../src/lib/connectome/readout';
 import { createPublicDataFetch } from '../helpers/fake-worker';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -229,5 +231,103 @@ describe('loadArenaArtifacts (fetch -> gunzip -> hash-verify, against real commi
       return createPublicDataFetch()(input);
     });
     await expect(loadArenaArtifacts('/data', 'malecns-arena-v1.manifest.json')).rejects.toThrow(/seed0/);
+  });
+});
+
+describe('loadTrainedReadoutArtifact (against the real committed WP5 production artifact)', () => {
+  it('loads, hash-verifies, and decodes all three arms, each validating against its own parsed graph', async () => {
+    vi.stubGlobal('fetch', createPublicDataFetch());
+    const result = await loadTrainedReadoutArtifact('/data');
+    expect(result.status).toBe('ok');
+    if (result.status !== 'ok') return;
+
+    expect(result.manifest.D).toBe(48);
+    expect(result.manifest.H).toBe(16);
+    expect(result.manifest.parameterCount).toBe(835);
+    expect(Object.keys(result.weightsByMode).sort()).toEqual(['biological', 'disconnected', 'rewired']);
+
+    const biologicalGraphBuffer = await decompressGzip(
+      toArrayBuffer(readFileSync(resolve(publicDataDir, 'malecns-arena-v1.bin.gz')))
+    );
+    const rewiredGraphBuffer = await decompressGzip(
+      toArrayBuffer(readFileSync(resolve(publicDataDir, 'malecns-arena-v1-rewired-seed0.bin.gz')))
+    );
+    const biologicalGraph = parseGraphBinary(biologicalGraphBuffer);
+    const rewiredGraph = parseGraphBinary(rewiredGraphBuffer);
+    const disconnectedGraph = createDisconnectedGraph(biologicalGraph);
+
+    expect(() => validateReadoutWeights(result.weightsByMode.biological, biologicalGraph)).not.toThrow();
+    expect(() => validateReadoutWeights(result.weightsByMode.rewired, rewiredGraph)).not.toThrow();
+    expect(() => validateReadoutWeights(result.weightsByMode.disconnected, disconnectedGraph)).not.toThrow();
+  });
+
+  it('is "unavailable" with an honest sha256 reason when trained-readout-v1.json is corrupted, and never throws', async () => {
+    vi.stubGlobal('fetch', createPublicDataFetch({ corrupt: 'trained-readout-v1.json' }));
+    const result = await loadTrainedReadoutArtifact('/data');
+    expect(result.status).toBe('unavailable');
+    if (result.status === 'unavailable') expect(result.reason).toMatch(/sha256/i);
+  });
+
+  it('is "unavailable" (never throws) when the artifact is missing entirely', async () => {
+    vi.stubGlobal('fetch', async () => new Response(null, { status: 404, statusText: 'Not Found' }));
+    const result = await loadTrainedReadoutArtifact('/data');
+    expect(result.status).toBe('unavailable');
+  });
+
+  /**
+   * Dual review (round 1, Important): the sha256 check above only proves
+   * `trained-readout-v1.json`'s own bytes are untampered — it says nothing
+   * about whether the manifest's separately-authored `D`/`H`/`parameterCount`
+   * fields (what `LedgerPanel.svelte` displays verbatim) still describe
+   * *this* artifact. Mirrors `loadArenaArtifacts`'s existing "stale manifest"
+   * test above for the same risk class.
+   */
+  it('is "unavailable" when the manifest\'s D/H/parameterCount does not match the artifact\'s own inputSize/hiddenSize (stale/hand-edited manifest)', async () => {
+    const realManifest = JSON.parse(
+      readFileSync(resolve(publicDataDir, 'trained-readout-v1.manifest.json'), 'utf8')
+    ) as Record<string, unknown>;
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('trained-readout-v1.manifest.json')) {
+        return new Response(JSON.stringify({ ...realManifest, D: (realManifest.D as number) + 1 }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        });
+      }
+      return createPublicDataFetch()(input);
+    });
+    const result = await loadTrainedReadoutArtifact('/data');
+    expect(result.status).toBe('unavailable');
+    if (result.status === 'unavailable') {
+      expect(result.reason).toMatch(/does not match the artifact/);
+      // Thermo-maintainability review S3: name the diverging field(s), not
+      // just a blanket "doesn't match" — this mutation only touches `D`, so
+      // only `D` should be named as diverging, not `H`/`parameterCount` too.
+      expect(result.reason).toMatch(/diverges from the artifact on D\b/);
+      expect(result.reason).not.toMatch(/diverges from the artifact on [^:]*H/);
+    }
+  });
+
+  it('names only parameterCount when D/H both still match but parameterCount alone is stale (thermo-maintainability review S3)', async () => {
+    const realManifest = JSON.parse(
+      readFileSync(resolve(publicDataDir, 'trained-readout-v1.manifest.json'), 'utf8')
+    ) as Record<string, unknown>;
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('trained-readout-v1.manifest.json')) {
+        return new Response(
+          JSON.stringify({ ...realManifest, parameterCount: (realManifest.parameterCount as number) + 1 }),
+          { status: 200, headers: { 'content-type': 'application/json' } }
+        );
+      }
+      return createPublicDataFetch()(input);
+    });
+    const result = await loadTrainedReadoutArtifact('/data');
+    expect(result.status).toBe('unavailable');
+    if (result.status === 'unavailable') {
+      expect(result.reason).toMatch(/diverges from the artifact on parameterCount/);
+      expect(result.reason).not.toMatch(/diverges from the artifact on [^:]*D/);
+      expect(result.reason).not.toMatch(/diverges from the artifact on [^:]*H\b/);
+    }
   });
 });

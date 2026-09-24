@@ -1,11 +1,10 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ExperimentController, type ExperimentControllerCallbacks } from '../../src/lib/experiment/controller';
-import type { AgentId } from '../../src/lib/arena/types';
+import { describe, expect, it, vi } from 'vitest';
+import { ExperimentController } from '../../src/lib/experiment/controller';
 import type { ConnectomeGraph, GraphMode } from '../../src/lib/connectome/format';
 import type { ArenaManifest } from '../../src/lib/experiment/assets';
-import type { ExperimentStatus } from '../../src/lib/experiment/state';
 import type { WorkerRequest, WorkerResponse } from '../../src/lib/worker/protocol';
 import { createPublicDataFetch, FakeNeuralWorker } from '../helpers/fake-worker';
+import { createCallbacks, createWorker, SEED, TOTAL_TICKS, useControllerTestLifecycle } from './experiment-controller-test-helpers';
 
 /**
  * `ExperimentController` (WP6's thermo review I1/maintainability I1 fix)
@@ -17,69 +16,19 @@ import { createPublicDataFetch, FakeNeuralWorker } from '../helpers/fake-worker'
  * directly against the plain class instead: no component, no jsdom DOM
  * mount, no render-module mock — only `fetch`/`Worker` stand-ins, the same
  * ones `tests/App.lifecycle.test.ts` uses.
+ *
+ * Decoder-toggle coverage (`ExperimentController trained-readout /
+ * setDecoder`) lives in its own file,
+ * `tests/unit/experiment-controller-decoder.test.ts` — split out when this
+ * file crossed the thermo review's 1000-line threshold (see
+ * `reviews/feat-nom6-trained-toggle-thermo-2026-09-24-766f09c/thermo-architecture/01-critical-and-important.md`).
+ * Both files share their fixture/lifecycle setup via
+ * `./experiment-controller-test-helpers.ts` (callback recorder, the fake
+ * `fetch`/`Worker` stub wiring, and the per-test controller cleanup
+ * registry — see that module's doc comment for why the cleanup matters).
  */
 
-const TOTAL_TICKS = 30;
-const SEED = 12345;
-
-const createCallbacks = (): ExperimentControllerCallbacks & {
-  statuses: ExperimentStatus[];
-  errors: string[];
-  topologyApplied: Array<[AgentId, GraphMode]>;
-  switchCounts: Array<Readonly<Record<AgentId, number>>>;
-} => {
-  const statuses: ExperimentStatus[] = [];
-  const errors: string[] = [];
-  const topologyApplied: Array<[AgentId, GraphMode]> = [];
-  const switchCounts: Array<Readonly<Record<AgentId, number>>> = [];
-  return {
-    statuses,
-    errors,
-    topologyApplied,
-    switchCounts,
-    onStatusChange: (status) => statuses.push(status),
-    onTelemetry: vi.fn(),
-    onError: (message) => errors.push(message),
-    onManifest: vi.fn(),
-    onTopologyApplied: (agentId, mode) => topologyApplied.push([agentId, mode]),
-    onTopologySwitchCountChange: (counts) => switchCounts.push({ ...counts })
-  };
-};
-
-/**
- * Cleanup registry (thermo-architecture I1 fix, applied here too on audit):
- * every `ExperimentController` constructed by a test is registered via
- * `trackController` immediately after construction (including inside the
- * two `setUp()` helpers below, so every test that goes through one is
- * covered without its own explicit cleanup call). The `afterEach` below
- * disposes every tracked controller — which in turn disposes its
- * `ExperimentRunner` and terminates both arms' `WorkerClient`s — before
- * unstubbing the `fetch`/`Worker` globals, so a runner a test started via
- * `runner.start()`/`changeTopology()` and never explicitly paused/disposed
- * cannot keep ticking in the background past its own test (see
- * `experiment-runner.test.ts`'s identical registry for the reproduced
- * flake this pattern closes). `ExperimentController#dispose()` is
- * documented as idempotent, so calling it here is harmless even for a test
- * that already disposed its own controller.
- */
-const activeControllers: ExperimentController[] = [];
-const trackController = (controller: ExperimentController): ExperimentController => {
-  activeControllers.push(controller);
-  return controller;
-};
-
-beforeEach(() => {
-  vi.stubGlobal('fetch', createPublicDataFetch());
-  vi.stubGlobal('Worker', FakeNeuralWorker as unknown as typeof Worker);
-});
-
-afterEach(() => {
-  for (const controller of activeControllers) controller.dispose();
-  activeControllers.length = 0;
-  vi.unstubAllGlobals();
-});
-
-const createWorker = (): Worker => new FakeNeuralWorker() as unknown as Worker;
+const { trackController } = useControllerTestLifecycle();
 
 describe('ExperimentController#initialize', () => {
   it('fetches/verifies both artifacts, constructs a runner, and reports the default topology to both arms', async () => {

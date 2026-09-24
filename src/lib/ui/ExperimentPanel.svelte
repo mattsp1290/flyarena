@@ -2,6 +2,7 @@
   import type { AgentId } from '../arena/types';
   import type { GraphMode } from '../connectome/format';
   import type { ExperimentStatus } from '../experiment/state';
+  import type { DecoderKind } from '../worker/protocol';
 
   /**
    * Start/Pause/Reset, seed input, per-agent topology selectors, and the
@@ -30,13 +31,45 @@
     controlsLocked: boolean;
     /** True while any topology switch is in flight. Locks Pause/Reset (a switch always implies a reset already in progress; a fresh explicit reset/pause request would race it) in addition to their own status-based rule; see `topologyControlsLocked` for the selectors' own, stricter lock. */
     topologySwitchPending: boolean;
+    /**
+     * True while a decoder switch is in flight. Locks Reset alongside
+     * `topologySwitchPending` (round-2 dual review): `ExperimentController#setDecoder`
+     * always ends with its own `runner.reset()` once both arms' Workers ack
+     * — a manual Reset click during that window doesn't desync anything
+     * (both are idempotent, FIFO-ordered per Worker), but it does get
+     * silently redone a moment later by the pending switch's own reset,
+     * which is a confusing, unexplained double reset from the user's
+     * perspective. Pause needs no equivalent guard: `ExperimentController#setDecoder`
+     * only proceeds while `status !== 'running'`, so a decoder switch can
+     * never be in flight while Pause's own `canPauseNow` (`status ===
+     * 'running'`) is true in the first place.
+     */
+    decoderSwitchPending: boolean;
     /** `controlsLocked`, plus true whenever the run isn't idle at `ready`/`finished` — a topology switch is never allowed mid-run, including merely `paused`. */
     topologyControlsLocked: boolean;
+    /** Which decoder both agents currently share (`ExperimentController#getDecoder()`); authored by default. */
+    decoder: DecoderKind;
+    /**
+     * True while the decoder radio group must be disabled entirely: while
+     * `running` or `loading` (`controlsLocked`'s own two status-based
+     * conditions — `ExperimentController#setDecoder` is a no-op before a
+     * runner exists, so there is nothing for it to act on during
+     * `loading`), a topology switch is in flight, or a decoder switch is
+     * itself in flight. Currently identical to `controlsLocked` — see that
+     * prop's own doc comment and `App.svelte`'s `decoderControlsLocked`
+     * derivation for why a formula this narrow already covers every case
+     * `ExperimentController#setDecoder`'s own gate (`status !== 'running'`)
+     * needs.
+     */
+    decoderControlsLocked: boolean;
+    /** Non-empty exactly when the Trained option must be shown disabled with this reason (a missing/hash-mismatched/graph-mismatched trained-readout artifact); `undefined` when Trained is selectable. */
+    trainedDecoderUnavailableReason?: string;
     onStart: () => void;
     onPause: () => void;
     onReset: () => void;
     onSeedInput: (seed: number) => void;
     onTopologyChange: (agentId: AgentId, mode: GraphMode) => void;
+    onDecoderChange: (decoder: DecoderKind) => void;
     onDownloadReplay: () => void;
   }
 
@@ -47,12 +80,17 @@
     topology,
     controlsLocked,
     topologySwitchPending,
+    decoderSwitchPending,
     topologyControlsLocked,
+    decoder,
+    decoderControlsLocked,
+    trainedDecoderUnavailableReason,
     onStart,
     onPause,
     onReset,
     onSeedInput,
     onTopologyChange,
+    onDecoderChange,
     onDownloadReplay
   }: Props = $props();
 
@@ -97,6 +135,8 @@
   const handleTopologyChange = (agentId: AgentId) => (event: Event): void => {
     onTopologyChange(agentId, (event.currentTarget as HTMLSelectElement).value as GraphMode);
   };
+
+  const handleDecoderChange = (value: DecoderKind) => (): void => onDecoderChange(value);
 </script>
 
 <section class="panel" aria-labelledby="controls-heading">
@@ -114,7 +154,7 @@
       {startLabel}
     </button>
     <button type="button" onclick={onPause} disabled={!canPauseNow || topologySwitchPending}>Pause</button>
-    <button type="button" onclick={onReset} disabled={!canResetNow || topologySwitchPending}>Reset</button>
+    <button type="button" onclick={onReset} disabled={!canResetNow || topologySwitchPending || decoderSwitchPending}>Reset</button>
   </div>
 
   <div class="field">
@@ -160,6 +200,61 @@
     </select>
   </div>
 
+  <fieldset class="field decoder-field" disabled={decoderControlsLocked}>
+    <legend>Decoder</legend>
+    <label class="radio-option">
+      <input
+        type="radio"
+        name="decoder"
+        value="authored"
+        checked={decoder === 'authored'}
+        onchange={handleDecoderChange('authored')}
+      />
+      Authored
+    </label>
+    <label class="radio-option">
+      <input
+        type="radio"
+        name="decoder"
+        value="trained"
+        checked={decoder === 'trained'}
+        disabled={trainedDecoderUnavailableReason !== undefined}
+        onchange={handleDecoderChange('trained')}
+      />
+      Trained (offline)
+    </label>
+    {#if decoderSwitchPending}
+      <!--
+        Thermo-maintainability review (a11y, Important): the fieldset itself
+        disables during a decoder switch (`decoderControlsLocked`, which
+        includes `decoderSwitchPending`), which a sighted mouse user sees as
+        the dimmed `button:disabled`/`input:disabled` styling below, but
+        nothing was previously announced to assistive tech, and nothing
+        textual explained the pause to a sighted keyboard user either — a
+        screen-reader user who activates the Trained radio heard nothing
+        further until the fieldset re-enabled a moment later,
+        indistinguishable from the click having silently failed.
+        `aria-live="polite"` announces this transient status without
+        interrupting whatever the user is doing.
+      -->
+      <p class="hint" aria-live="polite">Switching decoder…</p>
+    {/if}
+    {#if trainedDecoderUnavailableReason}
+      <!--
+        `aria-live="polite"` (thermo-maintainability review, a11y,
+        Important): announces when Trained becomes unavailable (e.g. after
+        `initialize()`'s trained-readout load/validate step resolves) to
+        assistive tech, not just sighted users reading the fieldset's
+        visible hint text. Distinct from `App.svelte`'s header
+        `role="status"` region, which reports the run's `status`
+        (loading/ready/running/…), not trained-readout artifact
+        availability — a screen-reader user relying on that region alone
+        would never hear this.
+      -->
+      <p class="hint" aria-live="polite">Trained unavailable: {trainedDecoderUnavailableReason}</p>
+    {/if}
+  </fieldset>
+
   <button type="button" class="replay-download" onclick={onDownloadReplay} disabled={!canDownload}>
     Download replay (config + score traces, no connectome)
   </button>
@@ -185,6 +280,35 @@
     border-radius: 0.4rem;
     color: #edf4ff;
     background: #0e1826;
+  }
+
+  .decoder-field {
+    border: 1px solid #304355;
+    border-radius: 0.4rem;
+    padding: 0.5rem 0.6rem 0.65rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+
+  .decoder-field legend {
+    padding: 0 0.3rem;
+    color: #cbd8e7;
+    font-size: 0.82rem;
+  }
+
+  .radio-option {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    color: #edf4ff;
+    font-size: 0.85rem;
+  }
+
+  .hint {
+    margin: 0.2rem 0 0;
+    color: #ffd7de;
+    font-size: 0.75rem;
   }
 
   .replay-download {

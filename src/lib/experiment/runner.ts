@@ -7,7 +7,7 @@ import { createSnapshot, createWorld, stepWorld } from '../arena/world';
 import { NEURAL_SUBSTEPS_PER_TICK } from '../connectome/constants';
 import type { GraphMode } from '../connectome/format';
 import type { NeuralTelemetry } from '../connectome/telemetry';
-import { MAX_SUBSTEPS_PER_TICK } from '../worker/protocol';
+import { MAX_SUBSTEPS_PER_TICK, type DecoderKind } from '../worker/protocol';
 import { canPause, canReset, canResume, canStart, transition, type ExperimentStatus } from './state';
 
 /** Re-exported so existing call sites (this module, its tests) keep working; see `connectome/constants.ts` for why the value itself lives there. */
@@ -312,13 +312,27 @@ export class ExperimentRunner {
     };
   }
 
-  getReplayExport(): ExperimentReplayExport {
+  /**
+   * `ExperimentRunner` itself has no notion of "decoder" — both arms'
+   * `AgentBinding`s look identical to it whether they are running the
+   * authored or trained decoding path internally — so the caller (
+   * `ExperimentController`, via `App.svelte`'s `handleDownloadReplay`)
+   * supplies the decoder identity and, for Trained, the trained-readout
+   * artifact's sha256 (`ExperimentController#getDecoder()`/
+   * `getTrainedReadoutStatus()`). Defaults to `'authored'` with no hash so
+   * every pre-existing call site (e.g. `tests/unit/experiment-runner.test.ts`,
+   * which has no controller in the loop at all) keeps compiling and
+   * reporting an honest default rather than a fabricated `'trained'` claim.
+   */
+  getReplayExport(options?: { decoder?: DecoderKind; trainedReadoutArtifactSha256?: string }): ExperimentReplayExport {
     return createExperimentReplayExport(this.world, {
       topology: { left: this.agents.left.info.topology, right: this.agents.right.info.topology },
       graphBinarySha256: {
         left: this.agents.left.info.graphBinarySha256,
         right: this.agents.right.info.graphBinarySha256
       },
+      decoder: options?.decoder ?? 'authored',
+      trainedReadoutArtifactSha256: options?.trainedReadoutArtifactSha256,
       substepsPerTick: this.substepsPerTick,
       totalTicks: this.options.totalTicks,
       trace: this.trace

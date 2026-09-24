@@ -1,4 +1,5 @@
 import type { GraphMode } from '../connectome/format';
+import type { ReadoutWeights } from '../connectome/readout';
 import type { NeuralTelemetry } from '../connectome/telemetry';
 
 /**
@@ -37,10 +38,25 @@ export const MAX_SUBSTEPS_PER_TICK = 64;
  * build-skew bug (e.g. a stale cached Worker script surviving a deploy) into
  * an immediate, diagnosable rejection instead of the Worker and main thread
  * silently disagreeing about a response shape — see
- * `docs/architecture.md`'s "versioned message protocol" note. `1` marks the
- * shape as of `set-activity`/`StepWorkerSuccess.rates` (this addition).
+ * `docs/architecture.md`'s "versioned message protocol" note. `1` marked the
+ * shape as of `set-activity`/`StepWorkerSuccess.rates`. `2` marks the shape
+ * as of the trained-readout toggle
+ * (`.agents/plans/trained-readout/06-browser-integration.md`):
+ * `InitWorkerRequest.readout`, `SetDecoderWorkerRequest`/`SetDecoderWorkerSuccess`.
  */
-export const WORKER_PROTOCOL_VERSION = 1;
+export const WORKER_PROTOCOL_VERSION = 2;
+
+/**
+ * Which action-decoding path the Worker runs after each `step`'s neural
+ * substeps: `'authored'` (`aggregateOutputs`, the pre-existing 3-population-sum
+ * path) or `'trained'` (`readoutForward` over the per-neuron output rates —
+ * requires `InitWorkerRequest.readout` to have been supplied at `init`).
+ * Every Worker starts `'authored'` immediately after `init`, matching the
+ * product's authored-by-default decision
+ * (`.agents/plans/trained-readout/00-overview.md`); `set-decoder` is the only
+ * way to change it.
+ */
+export type DecoderKind = 'authored' | 'trained';
 
 export interface WorkerError {
   code: WorkerErrorCode;
@@ -54,6 +70,20 @@ export interface InitWorkerRequest {
   graphBuffer: ArrayBuffer;
   /** Descriptive-only topology label; does not affect parsing or dynamics. */
   mode?: GraphMode;
+  /**
+   * This arm's trained readout weights, when the trained decoder is
+   * available for it. Optional: a Worker initialized without `readout` can
+   * still run `'authored'` (the default) but rejects `set-decoder: 'trained'`
+   * with `invalid-request`. Validated against the parsed graph
+   * (`validateReadoutWeights`) before `init` succeeds; a mismatch (wrong
+   * `inputSize`/`hiddenSize`/array lengths, or a non-finite weight) fails the
+   * whole `init` call with `invalid-request` — not `invalid-graph`, since the
+   * graph buffer itself may be perfectly valid — so a caller can tell a
+   * corrupt/mismatched trained-readout artifact apart from a corrupt graph
+   * artifact. Never re-validated per step: `handleWorkerRequest`'s `init`
+   * case is the one place this runs.
+   */
+  readout?: Readonly<ReadoutWeights>;
 }
 
 /** Zeroes network state without re-parsing the graph. */
@@ -102,12 +132,31 @@ export interface SetActivityWorkerRequest {
   enabled: boolean;
 }
 
+/**
+ * Switches which decoding path subsequent `step` responses use, without
+ * re-`init`ing the Worker (and therefore without touching neural state —
+ * `ExperimentController#setDecoder`, the one production caller, always
+ * pairs this with an explicit `ExperimentRunner#reset()` at the orchestration
+ * layer, per `.agents/plans/trained-readout/06-browser-integration.md`'s
+ * "resets the experiment to tick 0" invariant; the Worker itself does not
+ * reset anything here). Allowed in any runtime state except `idle` (returns
+ * `not-initialized`, matching `reset`/`step`). Rejected with `invalid-request`
+ * when `decoder: 'trained'` is requested but this Worker's `init` was never
+ * given `readout`.
+ */
+export interface SetDecoderWorkerRequest {
+  type: 'set-decoder';
+  requestId: string;
+  decoder: DecoderKind;
+}
+
 export type WorkerRequest =
   | InitWorkerRequest
   | ResetWorkerRequest
   | StepWorkerRequest
   | DisposeWorkerRequest
-  | SetActivityWorkerRequest;
+  | SetActivityWorkerRequest
+  | SetDecoderWorkerRequest;
 
 export interface InitWorkerSuccess {
   type: 'init';
@@ -166,6 +215,14 @@ export interface SetActivityWorkerSuccess {
   enabled: boolean;
 }
 
+export interface SetDecoderWorkerSuccess {
+  type: 'set-decoder';
+  requestId: string;
+  ok: true;
+  /** Echoes `SetDecoderWorkerRequest.decoder`. */
+  decoder: DecoderKind;
+}
+
 /**
  * A failed response for any request type, carrying a structured error.
  * `type` is `'unknown'` when the inbound message itself was too malformed
@@ -185,4 +242,5 @@ export type WorkerResponse =
   | StepWorkerSuccess
   | DisposeWorkerSuccess
   | SetActivityWorkerSuccess
+  | SetDecoderWorkerSuccess
   | WorkerFailure;

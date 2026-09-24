@@ -29,7 +29,13 @@ Each fixed world tick follows one conceptual order:
 
 `observe → encode` is `src/lib/arena/sensors.ts#observeAgent`: it returns the already-normalized 8-channel `Observation` directly usable as a Worker `step` request's `channelValues`, so there is no separate encode function. `K neural substeps → aggregate` is one `step` request per arm, run concurrently, each performing `NEURAL_SUBSTEPS_PER_TICK` (`src/lib/experiment/runner.ts`, currently 4, bounded by `MAX_SUBSTEPS_PER_TICK`) calls to `connectome/model.ts#stepModel` against the same held-constant observation before aggregating into action features. `decode` is `arena/actions.ts#decodeAction`. `world step` is exactly one `stepWorld` call per tick, using both arms' decoded actions together. `telemetry` is `ExperimentRunner#getTelemetry()`.
 
-The sensory encoder and action decoder are shared by all experimental arms. No renderer, camera, animation state, hidden pathfinder, or privileged map coordinate may bypass the observation contract. Rendering is decoupled from the fixed simulation timestep: `src/App.svelte`'s `requestAnimationFrame` loop only calls `ExperimentRunner#getSnapshot(nowMs)`, which interpolates between the world's last two completed ticks (`arena/world.ts#createSnapshot`) — it never steps the simulation itself.
+The sensory encoder and `decodeAction` are shared by all experimental arms in both decoder modes. In **Authored mode** (the default) the whole encode → decode path, including `aggregateOutputs`' three population sums, is identical across arms. In **Trained mode** each arm's readout weights are its own — trained independently per arm on the DGX Spark — while every arm shares one architecture, parameter count, and training procedure; see `docs/model-ledger.md`'s "Trained readout" row for the exact scoping and `docs/trained-readout-report.md` for the held-out evaluation.
+
+### Trained decoder branch
+
+Selecting the Trained decoder (`SetDecoderWorkerRequest`, `src/lib/worker/protocol.ts`) changes the "aggregate → decode" step of the loop above: instead of `aggregateOutputs`' three population sums, the Worker gathers the per-neuron rates of every output-assigned neuron (`connectome/readout.ts#outputNeuronIndices`, length `D`) and runs them through that arm's trained readout (`readoutForward`, `D → H → 3`, tanh/tanh/sigmoid) before the same shared `decodeAction`. A Worker's readout weights are set once, at `init` (`InitWorkerRequest.readout`, validated against that Worker's own parsed graph — a shape/`NaN` mismatch fails `init` itself with `invalid-request`, not a corrupt-graph error), and never touched again per step; `set-decoder` only flips which precomputed path a later `step` call takes, so a decoder switch never requires re-initializing (dispose/`init`) the Worker. `ExperimentController#setDecoder` always switches both arms' Workers together and is only accepted between runs (mirroring the topology-switch contract two paragraphs below), and it always resets the run to tick 0 with the current seed. If the trained-readout artifact is missing, fails its sha256 check, or fails `validateReadoutWeights` against the loaded graph, the Trained option is simply unavailable (surfaced honestly in the ledger panel and the decoder control) and the experiment keeps running in Authored mode — this mirrors the existing arena-artifact hash-verification contract (`assets.ts#loadArenaArtifacts`) rather than introducing a new failure mode.
+
+No renderer, camera, animation state, hidden pathfinder, or privileged map coordinate may bypass the observation contract. Rendering is decoupled from the fixed simulation timestep: `src/App.svelte`'s `requestAnimationFrame` loop only calls `ExperimentRunner#getSnapshot(nowMs)`, which interpolates between the world's last two completed ticks (`arena/world.ts#createSnapshot`) — it never steps the simulation itself.
 
 ### One neural control interval per tick, with backpressure instead of catch-up
 
@@ -48,6 +54,24 @@ The authoritative golden-trace fixtures (`tests/fixtures/golden/`) and evaluator
 ## Current scope
 
 Work packages 1–7 of the 3D Connectome Arena POC plan are implemented: the static shell, the deterministic arena simulation core, the sparse neural oracle and Worker runtime, the pinned MaleCNS artifact and rewired control, the read-only Three.js renderer, the closed-loop experiment described above, and browser/CI/performance gates (`tests/e2e/arena.spec.ts`, `.github/workflows/ci.yml`, `scripts/experiments/seed-sweep.ts`, `docs/seed-sweep.md`). `App.svelte`'s previous scripted placeholder motion loop has been removed; the closed-loop `ExperimentRunner` now drives every run. Vercel deployment (work package 8) belongs to a later Beans work package.
+
+## Offline trained-readout pipeline
+
+A separate offline pipeline trains and evaluates the trained readout described
+above: a PyTorch `uv` project at `training/` (run on a DGX Spark, batched
+cross-entropy method (CEM), never authoritative for published numbers) and
+Node `tsx` scripts at `scripts/training/` (`export-arms.ts`, `episode.ts`,
+`evaluate.ts`, …) that run the same TypeScript arena/sensor/rate-model/readout
+code the browser ships and are the *authoritative* scorer. This pipeline
+publishes the pinned, hashed static artifacts the browser loads
+(`public/data/trained-readout-v1.{json,manifest.json,report.json}`) and the
+human-readable `docs/trained-readout-report.md`. Nothing in this pipeline runs
+from the browser or in response to a user action: the shipped product remains
+a static, client-only build with no live or product-facing training service,
+the same as before this feature — this is a build-time/offline concern only,
+distinct from the DGX sandbox's own separate, live PyTorch backend for the
+counterfactual workbench described next. See
+`.agents/plans/trained-readout/` for the full pipeline design.
 
 ## Counterfactual workbench and DGX sandbox
 

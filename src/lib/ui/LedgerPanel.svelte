@@ -1,31 +1,70 @@
 <script lang="ts">
-  import type { ArenaManifest } from '../experiment/assets';
+  import type { ArenaManifest, TrainedReadoutLoadResult } from '../experiment/assets';
+  import type { DecoderKind } from '../worker/protocol';
 
   /**
    * The model ledger vocabulary (`docs/model-ledger.md`) plus provenance
    * links (WP6 item 7). Never says "brain emulation," and never attributes
    * the authored encoder/decoder to biology — see `docs/data-provenance.md`
    * for the full sourcing detail this panel links out to.
+   *
+   * The trained-readout row/detail block (WP6) is visible regardless of
+   * `decoder` — it documents what the artifact *is*, not merely what is
+   * currently selected — matching
+   * `.agents/plans/trained-readout/06-browser-integration.md`'s "Visible in
+   * both modes" requirement.
    */
   interface Props {
     manifest: ArenaManifest | undefined;
+    /** Which decoder both agents currently share; scopes the "Sensory encoder and action decoder" row's label to the active mode. */
+    decoder: DecoderKind;
+    /** `undefined` while `ExperimentController#initialize()`'s trained-readout step has not yet resolved. */
+    trainedReadout: TrainedReadoutLoadResult | undefined;
   }
 
-  let { manifest }: Props = $props();
+  let { manifest, decoder, trainedReadout }: Props = $props();
 
-  const LEDGER_ROWS: readonly { term: string; label: string }[] = [
+  const LEDGER_ROWS = $derived<readonly { term: string; label: string }[]>([
     { term: 'Graph topology', label: 'Measured' },
     { term: 'Biological annotations', label: 'Annotated' },
     { term: 'Network dynamics', label: 'Authored / literature-derived' },
     { term: 'Global parameters', label: 'Calibrated' },
-    { term: 'Sensory encoder and action decoder', label: 'Authored' },
+    // Scoped to the current mode (docs/model-ledger.md's Trained-mode
+    // scoping): in Authored mode the decoder is identical across arms; in
+    // Trained mode each arm's readout is its own trained weights (matched
+    // architecture/parameter count — see the Readout row below), while the
+    // encoder and decodeAction stay Authored and identical either way.
+    {
+      term: 'Sensory encoder and action decoder',
+      label: decoder === 'trained' ? 'Authored (encoder) + Trained (readout, per-arm)' : 'Authored'
+    },
     { term: '3D presentation', label: 'Synthetic' },
     // WP3 (anatomical activity view): neuron positions come from the MaleCNS
     // soma annotation sidecar (`docs/data-provenance.md`); the colors drawn
     // from them are the authored dynamics' live output, not a measurement.
     { term: 'Neuron positions', label: 'Measured' },
-    { term: 'Displayed neural activity', label: 'Computed' }
-  ];
+    { term: 'Displayed neural activity', label: 'Computed' },
+    {
+      term: 'Readout (trained mode)',
+      label:
+        trainedReadout === undefined
+          ? 'Loading…'
+          : trainedReadout.status === 'ok'
+            ? 'Trained (offline)'
+            : 'Trained (offline) — unavailable'
+    }
+  ]);
+
+  const reportUrl = $derived(`${import.meta.env.BASE_URL}data/trained-readout-v1.report.json`);
+  const readoutManifestUrl = $derived(`${import.meta.env.BASE_URL}data/trained-readout-v1.manifest.json`);
+  /**
+   * A plain GitHub blob link to the human-readable report, since `docs/` is
+   * not part of the deployed static site (only `public/` is served) — a
+   * relative `docs/trained-readout-report.md` link would 404 under any base
+   * path. The JSON links above are the base-path-safe, always-resolvable
+   * links; this is offered alongside them for the prose version.
+   */
+  const GITHUB_REPORT_URL = 'https://github.com/mattsp1290/flyarena/blob/main/docs/trained-readout-report.md';
 </script>
 
 <section class="panel ledger" aria-labelledby="ledger-heading">
@@ -42,10 +81,49 @@
   <p class="disclaimer">
     This is a small, descriptive proof-of-concept experiment. The graph
     topology below comes from a real connectome reconstruction; the
-    dynamics, sensory encoder, and action decoder are authored engineering
-    choices applied identically to every arm, not measurements of biological
-    behavior.
+    dynamics and sensory encoder are authored engineering choices applied
+    identically to every arm, not measurements of biological behavior. In
+    Authored mode the action decoder is identical across arms too; in
+    Trained mode each arm uses its own trained readout weights, with a
+    matched architecture, parameter count, and training procedure (see
+    "Readout (trained mode)" below) — the decoder is never a measurement of
+    biological behavior in either mode.
   </p>
+
+  {#if trainedReadout?.status === 'ok'}
+    {@const readout = trainedReadout}
+    <div class="trained-readout-detail">
+      <p>
+        Weights optimized offline by the cross-entropy method (CEM) against
+        the arena score — an engineering artifact, not biology, with
+        identical architecture and parameter count across arms. GPU training
+        reruns are not bit-identical to the shipped weights (informational
+        only; the shipped, hash-pinned artifact below is the authoritative
+        result the browser always loads).
+      </p>
+      <dl>
+        <div><dt>Artifact sha256</dt><dd>{readout.manifest.artifactSha256.slice(0, 12)}…</dd></div>
+        <div><dt>Parameter count (per arm)</dt><dd>{readout.manifest.parameterCount}</dd></div>
+        <div><dt>Architecture</dt><dd>{readout.manifest.D} → {readout.manifest.H} → 3</dd></div>
+      </dl>
+      <p class="disclaimer">
+        Headline results measured single-agent (opponent parked); side-by-side
+        results in report.
+      </p>
+      <ul class="links">
+        <li><a href={reportUrl} target="_blank" rel="noreferrer">Trained-readout report (JSON)</a></li>
+        <li><a href={readoutManifestUrl} target="_blank" rel="noreferrer">Trained-readout artifact manifest (JSON)</a></li>
+        <li><a href={GITHUB_REPORT_URL} target="_blank" rel="noreferrer">Trained-readout report (Markdown, GitHub)</a></li>
+      </ul>
+    </div>
+  {:else if trainedReadout?.status === 'unavailable'}
+    <!-- No `role="status"`: the app header's own status span already owns
+         that role page-wide (see `ExperimentPanel.svelte`'s matching hint
+         for the same reasoning). -->
+    <p class="error-message">
+      Trained readout artifact failed verification: {trainedReadout.reason}
+    </p>
+  {/if}
 
   {#if manifest}
     <dl>
@@ -101,5 +179,46 @@
 
   .links a {
     color: #79d8d0;
+  }
+
+  .trained-readout-detail {
+    margin: 0.9rem 0;
+    padding: 0.65rem 0.75rem;
+    border: 1px solid #304355;
+    border-radius: 0.4rem;
+    background: rgb(121 216 208 / 6%);
+  }
+
+  .trained-readout-detail dl {
+    margin: 0.5rem 0;
+    display: grid;
+    gap: 0.25rem;
+  }
+
+  .trained-readout-detail dl div {
+    display: flex;
+    justify-content: space-between;
+    gap: 0.6rem;
+    font-size: 0.8rem;
+  }
+
+  .trained-readout-detail dt {
+    color: #9aacc2;
+  }
+
+  .trained-readout-detail dd {
+    margin: 0;
+    color: #edf4ff;
+    text-align: right;
+  }
+
+  .error-message {
+    margin: 0.9rem 0;
+    padding: 0.6rem 0.75rem;
+    border: 1px solid #ef476f;
+    border-radius: 0.4rem;
+    color: #ffd7de;
+    background: rgb(239 71 111 / 12%);
+    font-size: 0.8rem;
   }
 </style>
