@@ -8,4 +8,15 @@ Deliberately outside `scripts/data/`: nothing here influences a compiled
 `compiler_source_sha256()` allowlist (`scripts/data/compile.py`'s
 `COMPILER_SOURCE_FILENAMES`/`NON_COMPILER_SIDECAR_FILENAMES`) and never needs
 classification there.
+
+Run these modules as scripts (`uv run python scripts/analysis/transfer.py
+...`), not as `-m` modules: `transfer.py`/`features.py` resolve `env_guard`/
+`graph_io`/`binfmt`/`rewire`/`fsutil` via a `sys.path.insert` at the top of
+the file (matching `scripts/data/`'s own established convention), which only
+runs when the file is executed directly or imported with `scripts/analysis/`
+already on `sys.path` (as `tests_python/conftest.py` arranges for the test
+suite) -- `python -m scripts.analysis.transfer` does not go through either
+path and fails. This `__init__.py` exists so `scripts.analysis` is a valid
+package name for tooling that inspects the directory tree, not to invite
+`-m`-style invocation.
 """

@@ -162,8 +162,14 @@ def canonical_json_text(payload: object) -> str:
     `list`/`dict` -- callers must convert numpy scalars (`float(x)`,
     `int(x)`, `bool(x)`) before calling this, since `json` does not know how
     to serialize `numpy.float64`/`numpy.bool_` on its own.
+
+    `allow_nan=False`: a singular or overflowing computation (an `inf`
+    condition number, a `nan` transfer entry) must fail loudly here, at
+    write time, rather than silently emitting `Infinity`/`NaN` -- not valid
+    JSON, and a downstream `JSON.parse` would fail far from the actual
+    cause. A review finding (dual review, WP2).
     """
-    return json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    return json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
 
 
 def write_canonical_json(path: Path, payload: object) -> None:

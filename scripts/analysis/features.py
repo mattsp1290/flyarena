@@ -51,9 +51,13 @@ other 26 -- 24 transfer entries + 2 derived predictors -- come from
 `transfer.py`).
 
 Run with `OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
-DD_IAST_ENABLED=false` and `PYTHONPATH` unset; refuses to run otherwise
-(`env_guard.assert_single_threaded_blas`, checked before `numpy` does any
-work).
+DD_IAST_ENABLED=false` and `PYTHONPATH` unset (`.agents/plans/
+null-explanation/05-execution-handoff.md`'s required run environment). This
+module refuses to run unless the three thread-count variables above are all
+`"1"` (`env_guard.assert_single_threaded_blas`, checked before `numpy` does
+any work) -- `DD_IAST_ENABLED`/`PYTHONPATH` are not independently enforced
+here (a dual-review finding: an earlier version of this docstring implied
+they were).
 """
 
 from __future__ import annotations
@@ -74,6 +78,8 @@ assert_single_threaded_blas()
 import numpy as np  # noqa: E402
 
 from graph_io import (  # noqa: E402
+    GraphVerificationError,
+    PUBLIC_DATA_DIR,
     build_dense_matrices,
     disconnected_graph_arrays,
     load_verified_graph,
@@ -161,21 +167,35 @@ def _signed_path_counts(edge_pos: np.ndarray, edge_neg: np.ndarray, graph: "binf
     respectively. Counts directed walks of length 1..3 from any input
     neuron to any neuron in each output population, split by the sign
     product of every traversed presynaptic neuron (see this module's doc
-    comment)."""
-    n = edge_pos.shape[0]
+    comment).
+
+    Only the `n_inputs` source columns (8 in production, never more than
+    `neuronCount`) are ever read from `c_pos`/`c_neg` -- propagating the
+    full `n x n` matrix at every step wasted almost all of the work (a
+    dual-review finding: on the real biological graph, n=1008, this made
+    `graph_features` ~6.4s/graph, dominated by 8 `int64` `n x n` matmuls;
+    NumPy's integer matmul does not use BLAS, unlike the float64 solves in
+    `transfer.py`). Propagating only the input columns turns those into
+    `n x n_inputs` matmuls -- the same walk counts, in a fraction of the
+    time. The earlier `@ identity` for the length-1 step was also a no-op
+    full `n x n` matmul that just returned its input unchanged.
+    """
     input_mask = graph.input_channel_index >= 0
     population_index = graph.output_population_index
 
+    edge_pos_int = edge_pos.astype(np.int64)
+    edge_neg_int = edge_neg.astype(np.int64)
+
     # c_pos_k[post, source]: # length-k walks source -> ... -> post whose
-    # sign product (over every traversed presynaptic neuron) is +1.
-    # c_neg_k: sign product -1. Recursion extends by one more hop: a
-    # positive-so-far walk extended by a `+` edge stays positive; extended
-    # by a `-` edge becomes negative (and symmetrically for a
-    # negative-so-far walk) -- this is exactly matrix multiplication by the
-    # signed *unweighted* adjacency, split into its positive/negative parts.
-    identity = np.eye(n, dtype=np.int64)
-    c_pos = edge_pos.astype(np.int64) @ identity  # length-1: c_pos_1 = edge_pos
-    c_neg = edge_neg.astype(np.int64) @ identity  # length-1: c_neg_1 = edge_neg
+    # sign product (over every traversed presynaptic neuron) is +1, for
+    # `source` ranging only over input neurons. c_neg_k: sign product -1.
+    # Recursion extends by one more hop: a positive-so-far walk extended by
+    # a `+` edge stays positive; extended by a `-` edge becomes negative
+    # (and symmetrically for a negative-so-far walk) -- this is exactly
+    # matrix multiplication by the signed *unweighted* adjacency, split into
+    # its positive/negative parts.
+    c_pos = edge_pos_int[:, input_mask]  # length-1: c_pos_1 = edge_pos restricted to input columns
+    c_neg = edge_neg_int[:, input_mask]
 
     totals_pos = {name: 0 for name in OUTPUT_POPULATIONS}
     totals_neg = {name: 0 for name in OUTPUT_POPULATIONS}
@@ -183,13 +203,13 @@ def _signed_path_counts(edge_pos: np.ndarray, edge_neg: np.ndarray, graph: "binf
     def accumulate(c_pos_k: np.ndarray, c_neg_k: np.ndarray) -> None:
         for p, population_name in enumerate(OUTPUT_POPULATIONS):
             target_mask = population_index == p
-            totals_pos[population_name] += int(np.sum(c_pos_k[np.ix_(target_mask, input_mask)]))
-            totals_neg[population_name] += int(np.sum(c_neg_k[np.ix_(target_mask, input_mask)]))
+            totals_pos[population_name] += int(np.sum(c_pos_k[target_mask, :]))
+            totals_neg[population_name] += int(np.sum(c_neg_k[target_mask, :]))
 
     accumulate(c_pos, c_neg)
     for _ in range(2):  # extend to length 2, then length 3
-        next_pos = edge_pos.astype(np.int64) @ c_pos + edge_neg.astype(np.int64) @ c_neg
-        next_neg = edge_pos.astype(np.int64) @ c_neg + edge_neg.astype(np.int64) @ c_pos
+        next_pos = edge_pos_int @ c_pos + edge_neg_int @ c_neg
+        next_neg = edge_pos_int @ c_neg + edge_neg_int @ c_pos
         c_pos, c_neg = next_pos, next_neg
         accumulate(c_pos, c_neg)
 
@@ -207,10 +227,15 @@ def _reciprocity(edge_bool: np.ndarray, edge_count: int) -> float:
 
 
 def _weight_balance(adjacency: np.ndarray, population_index: np.ndarray) -> dict:
-    balance = {}
+    """`None` (not `0.0`) for a population with no neurons: `0.0` is a
+    plausible real measurement ("perfectly balanced"), so it must not also
+    mean "not applicable" -- matches `_weighted_in_degree`'s convention
+    below (a dual-review finding; every production graph has all three
+    populations, so this was not a live bug, but a trap for reuse)."""
+    balance: dict[str, float | None] = {}
     for p, population_name in enumerate(OUTPUT_POPULATIONS):
         rows = population_index == p
-        balance[population_name] = float(np.sum(adjacency[rows, :])) if np.any(rows) else 0.0
+        balance[population_name] = float(np.sum(adjacency[rows, :])) if np.any(rows) else None
     return balance
 
 
@@ -230,7 +255,19 @@ def motif_counts(edge_bool: np.ndarray) -> dict:
     two_cycle_count = int(np.sum(np.triu(reciprocal, k=1)))
 
     edges_int = edges.astype(np.int64)
-    two_step = edges_int @ edges_int  # [a, c] = # of distinct b with a->b->c
+    # `edges_int` is `[post, pre]` (matching `edge_bool`'s own convention
+    # throughout this module), so `(edges_int @ edges_int)[x, z] = sum_y
+    # edges_int[x, y] * edges_int[y, z]` counts walks `z -> y -> x`, not
+    # `x -> y -> z` -- a dual-review finding: an earlier version of this
+    # comment mislabeled the direction. The feed-forward-triangle count
+    # itself is unaffected (correct either way): summing `two_step *
+    # edges_int` over all `(x, z)` is the same total whether each term is
+    # read as counting `z->y->x` (with the direct edge `edges_int[x,z]`,
+    # i.e. `z->x`) or, equivalently, as counting `x->y->z` with a direct
+    # edge `x->z` under the transposed reading -- the two readings visit
+    # the same multiset of (source, mid, sink) triples, just labeled
+    # oppositely, so the sum is transpose-invariant.
+    two_step = edges_int @ edges_int
     feed_forward_triangle_count = int(np.sum(two_step * edges_int))
 
     return {"twoCycleCount": two_cycle_count, "feedForwardTriangleCount": feed_forward_triangle_count}
@@ -305,6 +342,26 @@ def _one_disconnected(graph_id: str, path: Path, expected_sha256: str) -> tuple[
     return graph_id, graph_features(disconnected_graph_arrays(graph))
 
 
+def _verify_jobs(jobs: list[tuple[str, Path, str, bool]]) -> None:
+    """Pre-flight decompressed-sha256 verification for every job, before any
+    pool worker is submitted -- see `transfer.py`'s identical helper's doc
+    comment (a dual-review finding, applied to both CLIs)."""
+    mismatches: list[str] = []
+    checked: set[Path] = set()
+    for graph_id, path, expected_sha256, _is_disconnected in jobs:
+        if path in checked:
+            continue
+        checked.add(path)
+        try:
+            load_verified_graph(path, expected_sha256)
+        except (OSError, GraphVerificationError, binfmt.InvalidGraphError) as error:
+            mismatches.append(f"{graph_id}: {error}")
+    if mismatches:
+        raise GraphVerificationError(
+            f"features: {len(mismatches)} graph file(s) failed pre-flight verification:\n" + "\n".join(mismatches)
+        )
+
+
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--index", type=Path, required=True, help="rewire_batch.py index.json")
@@ -313,7 +370,13 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--biological",
         type=Path,
         default=None,
-        help="biological source .bin.gz (default: skip biological/disconnected)",
+        help="biological source .bin.gz (default: public/data/<index.sourceArtifact>); "
+        "also computes the disconnected control",
+    )
+    parser.add_argument(
+        "--skip-biological",
+        action="store_true",
+        help="omit biological/disconnected entirely (rewired graphs only)",
     )
     parser.add_argument("--out", type=Path, required=True, help="combined features.json output path")
     parser.add_argument(
@@ -327,18 +390,23 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
+    if args.biological is not None and args.skip_biological:
+        raise SystemExit("features: --biological and --skip-biological are mutually exclusive")
     index = _read_rewire_index(args.index)
 
     jobs: list[tuple[str, Path, str, bool]] = []  # (graphId, path, expectedSha256, isDisconnected)
-    if args.biological is not None:
-        if not args.biological.exists():
-            raise SystemExit(f"features: --biological path {args.biological} does not exist")
-        jobs.append(("biological", args.biological, index["sourceSha256"], False))
-        jobs.append(("disconnected", args.biological, index["sourceSha256"], True))
+    if not args.skip_biological:
+        biological_path = args.biological if args.biological is not None else PUBLIC_DATA_DIR / index["sourceArtifact"]
+        if not biological_path.exists():
+            raise SystemExit(f"features: biological source {biological_path} does not exist")
+        jobs.append(("biological", biological_path, index["sourceSha256"], False))
+        jobs.append(("disconnected", biological_path, index["sourceSha256"], True))
 
     seeds = sorted(index["seeds"], key=lambda entry: entry["seed"])
     for entry in seeds:
         jobs.append((f"rewired-{entry['seed']}", args.graphs_dir / entry["artifact"], entry["binarySha256"], False))
+
+    _verify_jobs(jobs)
 
     results: dict[str, dict] = {}
     with ProcessPoolExecutor(max_workers=max(1, args.workers)) as pool:
@@ -346,9 +414,16 @@ def main(argv: list[str] | None = None) -> None:
             pool.submit(_one_disconnected if is_disconnected else _one_graph, graph_id, path, sha)
             for graph_id, path, sha, is_disconnected in jobs
         ]
-        for future in futures:
-            graph_id, result = future.result()
-            results[graph_id] = result
+        try:
+            for future in futures:
+                graph_id, result = future.result()
+                results[graph_id] = result
+        except BaseException:
+            # See transfer.py's identical guard's doc comment: without this,
+            # every already-queued graph still runs to completion before the
+            # error is raised (a dual-review finding).
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
 
     out_payload = {
         "version": 1,

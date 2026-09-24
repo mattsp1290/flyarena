@@ -43,9 +43,13 @@ metric per tick without repeating this module's `O(n^3)` dense solve in
 TypeScript.
 
 Run with `OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
-DD_IAST_ENABLED=false` and `PYTHONPATH` unset; refuses to run otherwise
-(`env_guard.assert_single_threaded_blas`, checked before `numpy` does any
-work).
+DD_IAST_ENABLED=false` and `PYTHONPATH` unset (`.agents/plans/
+null-explanation/05-execution-handoff.md`'s required run environment). This
+module refuses to run unless the three thread-count variables above are all
+`"1"` (`env_guard.assert_single_threaded_blas`, checked before `numpy` does
+any work) -- `DD_IAST_ENABLED`/`PYTHONPATH` are not independently enforced
+here (a dual-review finding: an earlier version of this docstring implied
+they were).
 """
 
 from __future__ import annotations
@@ -67,8 +71,11 @@ import numpy as np  # noqa: E402
 
 from graph_io import (  # noqa: E402
     DenseGraphMatrices,
+    GraphVerificationError,
+    PUBLIC_DATA_DIR,
     build_dense_matrices,
     load_verified_graph,
+    sha256_hex,
     write_canonical_json,
 )
 
@@ -101,7 +108,22 @@ class TransferComputation:
     steady_state_map: np.ndarray  # (neuronCount, inputChannelCount), float64
 
 
-def _compute_transfer(matrices: DenseGraphMatrices, leak_rate: float, global_gain: float, timestep_seconds: float) -> TransferComputation:
+#: `T`'s shape every real graph (biological/disconnected/rewired) has --
+#: `_compute_transfer`'s `strict_shape=True` callers (the CLI) raise rather
+#: than silently reporting `None` derived predictors when a graph doesn't
+#: match it (a dual-review finding: a silent `None` on a future metadata
+#: change, e.g. an added observation channel, would make `explain.py` test a
+#: predictor that is null for every graph with no error anywhere).
+PRODUCTION_T_SHAPE = (len(OUTPUT_POPULATION_INDEX), len(OBSERVATION_CHANNEL_INDEX))
+
+
+def _compute_transfer(
+    matrices: DenseGraphMatrices,
+    leak_rate: float,
+    global_gain: float,
+    timestep_seconds: float,
+    strict_shape: bool = False,
+) -> TransferComputation:
     A = matrices.adjacency
     B = matrices.input_matrix
     O = matrices.output_matrix
@@ -110,20 +132,34 @@ def _compute_transfer(matrices: DenseGraphMatrices, leak_rate: float, global_gai
     system_matrix = leak_rate * np.eye(neuron_count, dtype=np.float64) - global_gain * A
 
     if neuron_count == 0:
-        condition_number = 0.0
+        condition_number = None
+        singular = False
         steady_state_map = np.zeros((0, B.shape[1]), dtype=np.float64)
         eig_A = np.zeros((0,), dtype=np.complex128)
     else:
         condition_number = float(np.linalg.cond(system_matrix))
-        steady_state_map = np.linalg.solve(system_matrix, B)
+        try:
+            steady_state_map = np.linalg.solve(system_matrix, B)
+            singular = False
+        except np.linalg.LinAlgError:
+            # The plan's policy for a bad graph is to flag and exclude it,
+            # not to abort the whole batch (`illConditioned` already does
+            # this for a merely ill-conditioned matrix); an *exactly*
+            # singular one is the limiting case of the same policy, and
+            # extremely unlikely at this study's `leakRate` (the real
+            # biological graph's condition number is ~4.8) -- but a `main()`
+            # that crashes on it would otherwise lose every other graph's
+            # multi-hour work in the same batch (a dual-review finding).
+            steady_state_map = np.full((neuron_count, B.shape[1]), np.nan, dtype=np.float64)
+            singular = True
         eig_A = np.linalg.eigvals(A)
 
     T = O @ steady_state_map  # (outputPopulationCount, inputChannelCount)
 
-    ill_conditioned = condition_number > ILL_CONDITIONED_THRESHOLD
+    ill_conditioned = singular or (condition_number is not None and condition_number > ILL_CONDITIONED_THRESHOLD)
 
     spectral_abscissa = float(global_gain * np.max(eig_A.real)) if eig_A.size > 0 else 0.0
-    stable = spectral_abscissa < leak_rate
+    stable = (not singular) and spectral_abscissa < leak_rate
     time_constant_seconds = (1.0 / (leak_rate - spectral_abscissa)) if stable else None
 
     discretized_eig = 1.0 - timestep_seconds * leak_rate + timestep_seconds * global_gain * eig_A
@@ -134,36 +170,43 @@ def _compute_transfer(matrices: DenseGraphMatrices, leak_rate: float, global_gai
     )
 
     # The derived predictors index specific rows/columns of `T` by the
-    # production `OUTPUT_POPULATION`/`OBSERVATION_CHANNELS` convention (3
-    # populations, 8 channels) -- every real graph (biological/disconnected/
-    # rewired) has exactly that shape, but a hand-built test fixture
-    # (`tests_python/test_transfer.py`'s 3-neuron graph) may not. Report
-    # `None` rather than raising `IndexError` for a smaller `T`, so this
-    # function stays usable on any well-formed graph, not only
-    # production-shaped ones.
-    fits_production_shape = T.shape[0] > max(OUTPUT_POPULATION_INDEX.values()) and T.shape[1] > max(
-        OBSERVATION_CHANNEL_INDEX.values()
-    )
-    if fits_production_shape:
+    # production `OUTPUT_POPULATION`/`OBSERVATION_CHANNELS` convention
+    # (`PRODUCTION_T_SHAPE`) -- every real graph has exactly that shape, but
+    # a hand-built test fixture (`tests_python/test_transfer.py`'s 3-neuron
+    # graph) may not. `strict_shape=True` (the CLI path) raises on a
+    # mismatch instead of silently reporting `None`; `strict_shape=False`
+    # (the public `transfer_matrix()` used by tests/tooling on
+    # non-production-shaped graphs) reports `None`.
+    if T.shape == PRODUCTION_T_SHAPE and not singular:
         turn_gain = float(
             T[OUTPUT_POPULATION_INDEX["yaw"], OBSERVATION_CHANNEL_INDEX["foodBearing"]]
             - T[OUTPUT_POPULATION_INDEX["yaw"], OBSERVATION_CHANNEL_INDEX["hazardBearing"]]
         )
         approach_gain = float(T[OUTPUT_POPULATION_INDEX["thrust"], OBSERVATION_CHANNEL_INDEX["foodDistance"]])
+        output_population_order: list[str] | None = list(OUTPUT_POPULATION_INDEX.keys())
+        input_channel_order: list[str] | None = list(OBSERVATION_CHANNEL_INDEX.keys())
+    elif strict_shape and not singular:
+        raise ValueError(
+            f"transfer: T has shape {T.shape}, expected {PRODUCTION_T_SHAPE} "
+            "(OUTPUT_POPULATION/OBSERVATION_CHANNELS changed? update transfer.py's constants)"
+        )
     else:
         turn_gain = None
         approach_gain = None
+        output_population_order = None
+        input_channel_order = None
 
     result = {
-        "T": T.tolist(),
-        "outputPopulationOrder": ["thrust", "yaw", "brake"],
-        "inputChannelOrder": list(OBSERVATION_CHANNEL_INDEX.keys()),
+        "T": None if singular else T.tolist(),
+        "outputPopulationOrder": output_population_order,
+        "inputChannelOrder": input_channel_order,
         "leakRate": float(leak_rate),
         "globalGain": float(global_gain),
         "spectralAbscissa": spectral_abscissa,
         "stable": bool(stable),
         "timeConstantSeconds": time_constant_seconds,
         "conditionNumber": condition_number,
+        "singular": bool(singular),
         "illConditioned": bool(ill_conditioned),
         "discretizedSpectralRadius": discretized_spectral_radius,
         "discretizedStable": bool(discretized_spectral_radius < 1.0),
@@ -177,7 +220,9 @@ def transfer_matrix(graph: "binfmt.GraphArrays") -> dict:
     """`transfer_matrix(graph) -> dict` per the plan's change-surface table.
     Recomputes the dense solve; CLI callers that also need the steady-state
     map use `_compute_transfer`/`build_dense_matrices` directly instead, to
-    avoid a second `O(n^3)` solve for the same graph."""
+    avoid a second `O(n^3)` solve for the same graph. `strict_shape=False`:
+    a library/test entry point, usable on any well-formed graph, not only
+    production-shaped ones (see `_compute_transfer`'s doc comment)."""
     meta = graph.metadata
     matrices = build_dense_matrices(graph)
     computation = _compute_transfer(
@@ -185,6 +230,7 @@ def transfer_matrix(graph: "binfmt.GraphArrays") -> dict:
         leak_rate=float(meta["leakRate"]),
         global_gain=float(meta["globalGain"]),
         timestep_seconds=float(meta["timestepSeconds"]),
+        strict_shape=False,
     )
     return computation.result
 
@@ -234,6 +280,7 @@ def _one_graph(graph_id: str, path: Path, expected_sha256: str) -> tuple[str, di
         leak_rate=float(meta["leakRate"]),
         global_gain=float(meta["globalGain"]),
         timestep_seconds=float(meta["timestepSeconds"]),
+        strict_shape=True,
     )
     return graph_id, computation.result, computation.steady_state_map
 
@@ -247,8 +294,34 @@ def _one_disconnected(graph_id: str, path: Path, expected_sha256: str) -> tuple[
         leak_rate=float(meta["leakRate"]),
         global_gain=float(meta["globalGain"]),
         timestep_seconds=float(meta["timestepSeconds"]),
+        strict_shape=True,
     )
     return graph_id, computation.result, computation.steady_state_map
+
+
+def _verify_jobs(jobs: list[tuple[str, Path, str, bool]]) -> None:
+    """Pre-flight decompressed-sha256 verification for every job, before any
+    pool worker is submitted -- mirrors `null-evaluate.ts`'s
+    `verifyRewiredFiles`'s "fails in seconds rather than after however much
+    of a multi-hour run has already completed" up-front check (a dual-review
+    finding: neither CLI previously verified anything before starting work,
+    unlike the TS side). Aggregates every mismatch into one error, the same
+    "report everything wrong at once" convention `verifyRewiredFiles` uses.
+    """
+    mismatches: list[str] = []
+    checked: set[Path] = set()
+    for graph_id, path, expected_sha256, _is_disconnected in jobs:
+        if path in checked:
+            continue  # biological and disconnected share the same source file
+        checked.add(path)
+        try:
+            load_verified_graph(path, expected_sha256)
+        except (OSError, GraphVerificationError, binfmt.InvalidGraphError) as error:
+            mismatches.append(f"{graph_id}: {error}")
+    if mismatches:
+        raise GraphVerificationError(
+            f"transfer: {len(mismatches)} graph file(s) failed pre-flight verification:\n" + "\n".join(mismatches)
+        )
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -261,6 +334,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=None,
         help="biological source .bin.gz (default: public/data/<index.sourceArtifact>); "
         "also computes the disconnected control",
+    )
+    parser.add_argument(
+        "--skip-biological",
+        action="store_true",
+        help="omit biological/disconnected entirely (rewired graphs only)",
     )
     parser.add_argument("--out", type=Path, required=True, help="combined transfer.json output path")
     parser.add_argument(
@@ -280,14 +358,20 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
+    if args.biological is not None and args.skip_biological:
+        raise SystemExit("transfer: --biological and --skip-biological are mutually exclusive")
     index = _read_rewire_index(args.index)
     steady_state_dir = args.steady_state_dir or (args.out.parent / "steady-state")
 
     jobs: list[tuple[str, Path, str, bool]] = []  # (graphId, path, expectedSha256, isDisconnected)
-    if args.biological is not None:
-        biological_path = args.biological
+    if not args.skip_biological:
+        # Default matches `regime-check.ts --biological`'s own resolution
+        # (`resolve(PUBLIC_DATA_DIR, index.sourceArtifact)`) -- previously
+        # this help text claimed the same default but the code silently
+        # skipped biological/disconnected instead (a dual-review finding).
+        biological_path = args.biological if args.biological is not None else PUBLIC_DATA_DIR / index["sourceArtifact"]
         if not biological_path.exists():
-            raise SystemExit(f"transfer: --biological path {biological_path} does not exist")
+            raise SystemExit(f"transfer: biological source {biological_path} does not exist")
         jobs.append(("biological", biological_path, index["sourceSha256"], False))
         jobs.append(("disconnected", biological_path, index["sourceSha256"], True))
 
@@ -296,16 +380,45 @@ def main(argv: list[str] | None = None) -> None:
         graph_path = args.graphs_dir / entry["artifact"]
         jobs.append((f"rewired-{entry['seed']}", graph_path, entry["binarySha256"], False))
 
+    _verify_jobs(jobs)
+
     results: dict[str, dict] = {}
+    manifest_graphs: dict[str, dict] = {}
     with ProcessPoolExecutor(max_workers=max(1, args.workers)) as pool:
         futures = {
             pool.submit(_one_disconnected if is_disconnected else _one_graph, graph_id, path, sha): graph_id
             for graph_id, path, sha, is_disconnected in jobs
         }
-        for future in futures:
-            graph_id, result, steady_state_map = future.result()
-            results[graph_id] = result
-            write_steady_state_sidecar(steady_state_dir / f"{graph_id}.steadystate.f64", steady_state_map)
+        try:
+            for future in futures:
+                graph_id, result, steady_state_map = future.result()
+                results[graph_id] = result
+                if result.get("singular"):
+                    # No sidecar, no manifest entry: `regime-check.ts`'s
+                    # manifest-based verification then refuses to run this
+                    # graph (fails loud) instead of consuming a NaN-filled
+                    # steady-state map silently.
+                    continue
+                sidecar_path = steady_state_dir / f"{graph_id}.steadystate.f64"
+                write_steady_state_sidecar(sidecar_path, steady_state_map)
+                job_sha = next(sha for gid, _p, sha, _d in jobs if gid == graph_id)
+                manifest_graphs[graph_id] = {
+                    "graphBinarySha256": job_sha,
+                    "sidecarSha256": sha256_hex(sidecar_path.read_bytes()),
+                    "neuronCount": int(steady_state_map.shape[0]),
+                    "inputChannelCount": int(steady_state_map.shape[1]),
+                }
+        except BaseException:
+            # A failed job otherwise leaves every *queued* job (everything
+            # not yet dispatched to a worker) running to completion before
+            # the error is even raised, wasting the rest of a multi-hour
+            # batch (a dual-review finding: `ProcessPoolExecutor.__exit__`
+            # calls `shutdown(wait=True)` by default). `_verify_jobs` above
+            # already rules out the common cause (a bad graph file); this
+            # guards against everything else (a `LinAlgError` `_compute_transfer`
+            # doesn't itself catch, an `OSError` writing a sidecar, `Ctrl-C`).
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
 
     out_payload = {
         "version": 1,
@@ -314,6 +427,22 @@ def main(argv: list[str] | None = None) -> None:
         "graphs": results,
     }
     write_canonical_json(args.out, out_payload)
+
+    # Written only after every job has succeeded (see the `try`/`except`
+    # above): ties each steady-state sidecar to the exact graph bytes it was
+    # solved from, so `regime-check.ts` can detect a stale or partial
+    # sidecar directory left over from an earlier run instead of silently
+    # computing `steadyStateDistance` against the wrong graph (a dual-review
+    # finding -- the one input in this pipeline that previously had no
+    # sha256 verification tying it to its source).
+    manifest_payload = {
+        "version": 1,
+        "sourceGraphSha256": index["sourceSha256"],
+        "rewireSourceSha256": index["rewireSourceSha256"],
+        "graphs": manifest_graphs,
+    }
+    write_canonical_json(steady_state_dir / "manifest.json", manifest_payload)
+
     # eslint-equivalent user-facing summary line for a CLI tool.
     print(f"transfer: wrote {args.out} ({len(results)} graphs) and steady-state sidecars under {steady_state_dir}")
 

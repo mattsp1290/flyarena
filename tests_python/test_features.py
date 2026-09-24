@@ -112,10 +112,13 @@ def test_reciprocity(features):
 
 def test_weight_balance(features):
     # Neuron 3 (thrust) receives (1,3, mag 5, sign +1) -> +5 and
-    # (2,3, mag 1, sign -1) -> -1: signed sum = 4.
+    # (2,3, mag 1, sign -1) -> -1: signed sum = 4. yaw/brake have no
+    # neurons in this fixture, so they report `None` ("not applicable"),
+    # not `0.0` ("measured, perfectly balanced") -- a dual-review finding,
+    # matching `weightedInDegree`'s existing convention below.
     assert features["weightBalance"]["thrust"] == pytest.approx(4.0)
-    assert features["weightBalance"]["yaw"] == pytest.approx(0.0)
-    assert features["weightBalance"]["brake"] == pytest.approx(0.0)
+    assert features["weightBalance"]["yaw"] is None
+    assert features["weightBalance"]["brake"] is None
 
 
 def test_motif_counts(features):
@@ -143,6 +146,59 @@ def test_edge_and_neuron_counts(features):
 # ---------------------------------------------------------------------------
 # motif_counts: self-loops must not be double-counted or fabricate a triangle
 # ---------------------------------------------------------------------------
+
+
+def _make_signed_walk_discriminating_graph() -> "binfmt.GraphArrays":
+    """A separate 4-neuron graph, edges `0->1, 1->2, 1->3, 2->3, 3->1` (the
+    main fixture's edges) plus `0->3`, signs `[-1, +1, -1, +1]`. Chosen so
+    `sign[pre]` (correct) and `sign[post]` (a plausible transposition bug)
+    give different excitatory/inhibitory totals for the walks 0 -> 3 of
+    length <= 3 -- unlike the main fixture (whose sign pattern happens not
+    to discriminate the two conventions on its own edges), this one does (a
+    dual-review finding). Walks (pre-neurons traversed, i.e. every node but
+    the final target, per this module's own doc comment on sign products):
+
+        L1  0->3                sign[0]                      = -1
+        L2  0->1->3              sign[0]*sign[1]              = -1
+        L3  0->1->2->3           sign[0]*sign[1]*sign[2]      = +1
+        L3  0->3->1->3           sign[0]*sign[3]*sign[1]      = -1
+
+    Correct: excitatory 1, inhibitory 3."""
+    metadata = {
+        "formatVersion": 1,
+        "neuronCount": 4,
+        "edgeCount": 6,
+        "inputChannelCount": len(OBSERVATION_CHANNELS),
+        "outputPopulationCount": len(OUTPUT_POPULATIONS),
+        "timestepSeconds": 1.0 / 30.0,
+        "leakRate": 0.35,
+        "rateMin": -2.0,
+        "rateMax": 2.0,
+        "inputClampMin": -1.0,
+        "inputClampMax": 1.0,
+        "globalGain": 0.5,
+    }
+    # CSR rows: row0=[1,3] (0->1, 0->3); row1=[2,3] (1->2, 1->3); row2=[3]
+    # (2->3); row3=[1] (3->1). offsets = [0,2,4,5,6].
+    graph = binfmt.GraphArrays(
+        metadata=metadata,
+        biological_ids=np.array([1, 2, 3, 4], dtype=np.uint64),
+        presynaptic_offsets=np.array([0, 2, 4, 5, 6], dtype=np.uint32),
+        postsynaptic_indices=np.array([1, 3, 2, 3, 3, 1], dtype=np.uint32),
+        contact_magnitudes=np.array([1, 1, 1, 1, 1, 1], dtype=np.float32),
+        presynaptic_signs=np.array([-1, 1, -1, 1], dtype=np.int8),
+        input_channel_index=np.array([OBSERVATION_CHANNELS.index("foodBearing"), -1, -1, -1], dtype=np.int32),
+        input_weight=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        output_population_index=np.array([-1, -1, -1, OUTPUT_POPULATIONS.index("thrust")], dtype=np.int32),
+        output_weight=np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32),
+    )
+    return binfmt.validate_graph(graph)
+
+
+def test_signed_path_counts_discriminates_presynaptic_sign():
+    features = graph_features(_make_signed_walk_discriminating_graph())
+    assert features["excitatoryPathCount"]["thrust"] == 1
+    assert features["inhibitoryPathCount"]["thrust"] == 3
 
 
 def test_motif_counts_excludes_self_loops():
@@ -251,3 +307,22 @@ def test_features_cli_is_byte_identical_across_worker_counts():
         assert payload["graphs"]["disconnected"]["edgeCount"] == 0
         assert payload["graphs"]["disconnected"]["reciprocity"] == 0.0
         assert payload["graphs"]["biological"]["edgeCount"] == 5
+
+
+def test_features_cli_rejects_a_tampered_rewired_file():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        bio_path, index_path, graphs_dir = _write_cli_fixture(root)
+        victim = graphs_dir / "rewired-seed0.bin.gz"
+        # Substitute a valid but different graph -- see
+        # tests_python/test_transfer.py's identical test for why this is
+        # more deterministic than corrupting bytes.
+        substitute = _make_signed_walk_discriminating_graph()
+        victim.write_bytes(gzip.compress(binfmt.encode_graph_binary(substitute)))
+
+        out = root / "features-tampered.json"
+        result = _run_features_cli(bio_path, index_path, graphs_dir, out, workers=1)
+        assert result.returncode != 0
+        assert "GraphVerificationError" in result.stderr
+        assert "does not match expected" in result.stderr
+        assert not out.exists()

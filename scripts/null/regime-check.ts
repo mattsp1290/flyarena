@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gunzipSync } from 'node:zlib';
@@ -14,7 +14,7 @@ import {
   type CliRunResult,
   type RewireIndex
 } from './null-evaluate';
-import type { RegimeSeedResult, RegimeWorkerMessage, RegimeWorkerTask } from './regime-worker';
+import type { RegimeSeedResult, RegimeWorkerMessage, RegimeWorkerTask } from './regime-task';
 
 /**
  * `.agents/plans/null-explanation/02-transfer-and-features.md`'s WP2
@@ -36,9 +36,15 @@ import type { RegimeSeedResult, RegimeWorkerMessage, RegimeWorkerTask } from './
  *
  * Requires `scripts/analysis/transfer.py` to have already run (with the
  * same `--graphs-dir`/rewired index) and written its per-graph steady-state
- * sidecars under `--steady-state-dir`: this driver verifies every required
- * sidecar exists before forking any shard, exactly as `null-evaluate.ts`
- * verifies every rewired file's gzip sha256 up front.
+ * sidecars, plus a `steady-state/manifest.json` tying each sidecar to the
+ * exact graph bytes it was solved from, under `--steady-state-dir`: this
+ * driver verifies every required sidecar against that manifest (not merely
+ * that the file exists -- a bare existence check cannot catch a stale or
+ * partial sidecar left over from a different `transfer.py` run, since every
+ * rewiring's sidecar has the same length; a dual-review finding) before
+ * forking any shard, exactly as `null-evaluate.ts` verifies every rewired
+ * file's gzip sha256 up front. See `readSteadyStateManifest`/
+ * `verifySteadyStateManifest` below.
  */
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -141,16 +147,95 @@ export const parseRegimeCheckArgs = (argv: readonly string[]): RegimeCheckArgs =
 const steadyStatePathFor = (steadyStateDir: string, graphId: string): string =>
   resolve(steadyStateDir, `${graphId}.steadystate.f64`);
 
-/** Fail fast (before forking any shard) if a required steady-state sidecar is missing -- `transfer.py` must run first. */
-const verifySteadyStateSidecars = (steadyStateDir: string, graphIds: readonly string[]): void => {
-  const missing = graphIds.filter((graphId) => !existsSync(steadyStatePathFor(steadyStateDir, graphId)));
-  if (missing.length > 0) {
+interface SteadyStateManifestEntry {
+  readonly graphBinarySha256: string;
+  readonly sidecarSha256: string;
+}
+
+interface SteadyStateManifest {
+  readonly version: 1;
+  readonly rewireSourceSha256: string;
+  readonly graphs: Readonly<Record<string, SteadyStateManifestEntry>>;
+}
+
+/**
+ * Read and lightly validate `scripts/analysis/transfer.py`'s
+ * `steady-state/manifest.json`. Ties every steady-state sidecar to the
+ * exact graph bytes `transfer.py` solved it from -- a bare "does the file
+ * exist" check (this function's earlier form) cannot detect a sidecar left
+ * over from a different `transfer.py` run: every rewiring has the same
+ * `neuronCount * inputChannelCount` sidecar length, so a stale one from an
+ * older `index.json`/`--graphs-dir` would otherwise pass silently and
+ * corrupt `steadyStateDistance` for that graph (a dual-review finding, both
+ * reviewers independently). `transfer.py` writes this manifest only after
+ * every graph in its own run has succeeded, so its mere presence already
+ * rules out a run that crashed partway through.
+ */
+const readSteadyStateManifest = (steadyStateDir: string): SteadyStateManifest => {
+  const path = resolve(steadyStateDir, 'manifest.json');
+  let raw: string;
+  try {
+    raw = readFileSync(path, 'utf8');
+  } catch (error) {
     throw new Error(
-      `regime-check: ${missing.length} steady-state sidecar(s) missing under ${steadyStateDir} ` +
-        `(run scripts/analysis/transfer.py first): ${missing.slice(0, 10).join(', ')}` +
-        (missing.length > 10 ? ', …' : '')
+      `regime-check: cannot read ${path} (run scripts/analysis/transfer.py first): ` +
+        (error instanceof Error ? error.message : String(error))
     );
   }
+  const parsed = JSON.parse(raw) as Partial<SteadyStateManifest>;
+  if (parsed.version !== 1 || typeof parsed.rewireSourceSha256 !== 'string' || typeof parsed.graphs !== 'object' || parsed.graphs === null) {
+    throw new Error(`regime-check: ${path} is not a valid steady-state manifest`);
+  }
+  return parsed as SteadyStateManifest;
+};
+
+/**
+ * Fail fast (before forking any shard) if the steady-state manifest is
+ * missing, from a different rewire batch, or missing/mismatched for any
+ * required task -- see `readSteadyStateManifest`'s doc comment for why a
+ * bare existence check is not enough. Returns each task's `graphId ->
+ * sidecarSha256` so `buildRegimeTasks` can pass it to the worker for a
+ * second, independent verification (mirroring the graph-binary sha256
+ * check's own two-layer convention elsewhere in this pipeline).
+ */
+const verifySteadyStateManifest = (
+  steadyStateDir: string,
+  rewireSourceSha256: string,
+  tasks: ReadonlyArray<{ readonly graphId: string; readonly expectedSha256: string }>
+): ReadonlyMap<string, string> => {
+  const manifest = readSteadyStateManifest(steadyStateDir);
+  if (manifest.rewireSourceSha256 !== rewireSourceSha256) {
+    throw new Error(
+      `regime-check: ${steadyStateDir}/manifest.json is from a different rewire batch ` +
+        `(rewireSourceSha256 ${manifest.rewireSourceSha256} vs this run's ${rewireSourceSha256}) -- ` +
+        're-run scripts/analysis/transfer.py against the current --rewired-index'
+    );
+  }
+  const problems: string[] = [];
+  const sidecarShaByGraphId = new Map<string, string>();
+  for (const task of tasks) {
+    const entry = manifest.graphs[task.graphId];
+    if (!entry) {
+      problems.push(`${task.graphId}: no steady-state manifest entry (missing sidecar, or transfer.py flagged it singular)`);
+      continue;
+    }
+    if (entry.graphBinarySha256 !== task.expectedSha256) {
+      problems.push(
+        `${task.graphId}: steady-state sidecar was computed from a different graph ` +
+          `(manifest sha256 ${entry.graphBinarySha256} vs this run's ${task.expectedSha256})`
+      );
+      continue;
+    }
+    sidecarShaByGraphId.set(task.graphId, entry.sidecarSha256);
+  }
+  if (problems.length > 0) {
+    throw new Error(
+      `regime-check: ${problems.length} graph(s) failed steady-state manifest verification ` +
+        `(run scripts/analysis/transfer.py first): ${problems.slice(0, 10).join('; ')}` +
+        (problems.length > 10 ? '; …' : '')
+    );
+  }
+  return sidecarShaByGraphId;
 };
 
 const verifyBiologicalSource = (path: string, expectedSha256: string): void => {
@@ -164,6 +249,14 @@ const verifyBiologicalSource = (path: string, expectedSha256: string): void => {
   }
 };
 
+/**
+ * Builds every task with `steadyStateSha256: ''` -- a placeholder, not yet
+ * verified. `runRegimeCheck` passes this list straight to
+ * `verifySteadyStateManifest` (which only reads `graphId`/`expectedSha256`)
+ * and then maps the verified `sidecarSha256` back onto each task before any
+ * shard is forked; no task with a real sidecar sha unset ever reaches
+ * `runShardedEvaluation`.
+ */
 export const buildRegimeTasks = (
   index: Readonly<RewireIndex>,
   args: Readonly<RegimeCheckArgs>,
@@ -178,12 +271,14 @@ export const buildRegimeTasks = (
       graphId: 'biological',
       mode: 'biological',
       steadyStatePath: steadyStatePathFor(args.steadyStateDir, 'biological'),
+      steadyStateSha256: '',
       ...commonBio
     });
     tasks.push({
       graphId: 'disconnected',
       mode: 'disconnected',
       steadyStatePath: steadyStatePathFor(args.steadyStateDir, 'disconnected'),
+      steadyStateSha256: '',
       ...commonBio
     });
   }
@@ -197,12 +292,26 @@ export const buildRegimeTasks = (
       path: resolve(args.graphsDir, entry.artifact),
       expectedSha256: entry.binarySha256,
       steadyStatePath: steadyStatePathFor(args.steadyStateDir, graphId),
+      steadyStateSha256: '',
       heldOutSeeds,
       ticks: args.ticks
     });
   }
   return tasks;
 };
+
+/** Attaches each task's verified `sidecarSha256` (from `verifySteadyStateManifest`) in place of the `''` placeholder `buildRegimeTasks` sets. Throws if a task's graphId is somehow missing from the map -- `verifySteadyStateManifest` already guarantees every task it was given a graphId for is present, so this is an internal-consistency check, not a user-facing one. */
+const withVerifiedSteadyStateSha = (
+  tasks: readonly RegimeWorkerTask[],
+  sidecarShaByGraphId: ReadonlyMap<string, string>
+): RegimeWorkerTask[] =>
+  tasks.map((task) => {
+    const steadyStateSha256 = sidecarShaByGraphId.get(task.graphId);
+    if (steadyStateSha256 === undefined) {
+      throw new Error(`regime-check: internal error -- no verified steady-state sha256 for "${task.graphId}"`);
+    }
+    return { ...task, steadyStateSha256 };
+  });
 
 // ---------------------------------------------------------------------------
 // Output
@@ -280,11 +389,13 @@ export const runRegimeCheck = async (args: Readonly<RegimeCheckArgs>): Promise<C
   const biologicalPath = args.biological ? args.graph ?? resolve(PUBLIC_DATA_DIR, index.sourceArtifact) : '';
   if (args.biological) verifyBiologicalSource(biologicalPath, index.sourceSha256);
 
-  const tasks = buildRegimeTasks(index, args, biologicalPath);
-  verifySteadyStateSidecars(
+  const tasksPendingSteadyStateSha = buildRegimeTasks(index, args, biologicalPath);
+  const sidecarShaByGraphId = verifySteadyStateManifest(
     args.steadyStateDir,
-    tasks.map((task) => task.graphId)
+    index.rewireSourceSha256,
+    tasksPendingSteadyStateSha
   );
+  const tasks = withVerifiedSteadyStateSha(tasksPendingSteadyStateSha, sidecarShaByGraphId);
   const workerPath = fileURLToPath(new URL('./regime-worker.ts', import.meta.url));
 
   const started = performance.now();

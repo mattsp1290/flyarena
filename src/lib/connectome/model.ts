@@ -136,10 +136,11 @@ export const aggregateOutputs = (
  * its contents are not stable across substeps) and the exact
  * `channelValues` that substep's `stepModel` call was driven with (the same
  * held-constant-per-tick array both functions already take, passed through
- * unchanged -- not copied). Optional and additive: omitting it costs
- * nothing (no branch inside the substep loop takes a different path; the
- * call site itself is the only difference), so every existing caller and
- * every parity/golden-trace test is numerically unaffected. Added for
+ * unchanged -- not copied). Optional and additive: omitting it is
+ * numerically identical to before this parameter existed -- the only cost
+ * is one `undefined` check per substep (`onSubstep?.(...)`), not a branch
+ * that changes what gets computed -- so every existing caller and every
+ * parity/golden-trace test is numerically unaffected. Added for
  * `scripts/null/regime-worker.ts` (`.agents/plans/null-explanation/
  * 02-transfer-and-features.md`'s WP2 regime check), which needs both the
  * per-substep rate (for the `±rateMax` clamp-fraction metric) and that

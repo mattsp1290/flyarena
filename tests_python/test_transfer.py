@@ -58,9 +58,22 @@ def _make_three_neuron_graph(leak_rate: float, global_gain: float, a: float, b: 
     """Neuron 0: input (channel 0), one outgoing edge 0->1 (sign +1, magnitude
     `a`). Neuron 1: two outgoing edges, 1->0 (magnitude `b`) and 1->2
     (magnitude `c`), both sign -1 (Dale's law: a neuron's sign applies to
-    every outgoing edge). Neuron 2: output (population 0), no outgoing
-    edges. CSR rows: row 0 = [1] (edge to neuron 1); row 1 = [0, 2] (edges to
-    neurons 0 and 2, ascending); row 2 = [] (empty)."""
+    every outgoing edge). Neuron 2: output (population 0), sign -1, no
+    outgoing edges. CSR rows: row 0 = [1] (edge to neuron 1); row 1 = [0, 2]
+    (edges to neurons 0 and 2, ascending); row 2 = [] (empty).
+
+    Neuron 2's own sign is deliberately *not* +1 (unlike neurons 0 and 1's
+    signs, which are meaningfully constrained by the topology): neuron 2 has
+    no outgoing edges, so its sign can never affect the correct
+    (`sign[pre]`) computation of `T` -- but it *would* affect a buggy
+    `sign[post]` implementation's result for the edge `1 -> 2`, since that
+    edge's "post" is neuron 2. Setting it to -1 (matching neuron 1's sign,
+    rather than +1) is what makes the closed-form assertion below able to
+    tell the two conventions apart -- see
+    `test_three_neuron_hand_graph_matches_closed_form`'s own comment (a
+    dual-review finding: the earlier `+1` choice happened to make `sign[pre]`
+    and `sign[post]` produce the same `T` for this exact topology, so this
+    test previously could not have caught that class of bug)."""
     metadata = {
         "formatVersion": 1,
         "neuronCount": 3,
@@ -81,7 +94,7 @@ def _make_three_neuron_graph(leak_rate: float, global_gain: float, a: float, b: 
         presynaptic_offsets=np.array([0, 1, 3, 3], dtype=np.uint32),
         postsynaptic_indices=np.array([1, 0, 2], dtype=np.uint32),
         contact_magnitudes=np.array([a, b, c], dtype=np.float32),
-        presynaptic_signs=np.array([1, -1, 1], dtype=np.int8),
+        presynaptic_signs=np.array([1, -1, -1], dtype=np.int8),
         input_channel_index=np.array([0, -1, -1], dtype=np.int32),
         input_weight=np.array([w_in, 0.0, 0.0], dtype=np.float32),
         output_population_index=np.array([-1, -1, 0], dtype=np.int32),
@@ -91,17 +104,26 @@ def _make_three_neuron_graph(leak_rate: float, global_gain: float, a: float, b: 
 
 
 def test_three_neuron_hand_graph_matches_closed_form():
-    leak_rate, global_gain, a, b, c, w_in, w_out = 0.35, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0
+    # a, b, c deliberately distinct (not all 1): with a == b == c the closed
+    # form below can't tell `a*c` apart from `b*c` or `a*b`, so a transposed-
+    # index or swapped-parameter bug could still produce the right number by
+    # coincidence (a dual-review finding).
+    leak_rate, global_gain, a, b, c, w_in, w_out = 0.35, 0.5, 1.5, 0.75, 2.0, 1.0, 1.0
     graph = _make_three_neuron_graph(leak_rate, global_gain, a, b, c, w_in, w_out)
     result = transfer_matrix(graph)
     T = np.array(result["T"])
     assert T.shape == (1, 1)
 
-    # Closed form (derived by hand, see tests_python/test_transfer.py's own
-    # module doc comment for the derivation): with S = lambda*I - g*A and
-    # A[1,0]=a, A[0,1]=-b, A[2,1]=-c (Dale's law: neuron 1's single sign
-    # applies to both its outgoing edges),
-    #   T = -(w_in * w_out * g^2 * a * c) / (lambda * (lambda^2 + g^2 * a * b))
+    # Closed form, derived by hand from S @ r = e0 * w_in * u0 where
+    # S = lambda*I - g*A and A[1,0]=a, A[0,1]=-b, A[2,1]=-c (Dale's law:
+    # neuron 1's single sign applies to both its outgoing edges; see
+    # `_make_three_neuron_graph`'s doc comment for why neuron 2's own sign
+    # is also -1, not +1):
+    #   row 1: -g*a*r0 + lambda*r1 = 0            => r1 = (g*a/lambda) * r0
+    #   row 2:  g*c*r1 + lambda*r2 = 0             => r2 = -(g*c/lambda) * r1
+    #   row 0: lambda*r0 + g*b*r1 = w_in*u0        => r0 = w_in*u0*lambda / (lambda^2 + g^2*a*b)
+    # Substituting r1 into r2, then r0:
+    #   T = w_out * r2/u0 = -(w_in * w_out * g^2 * a * c) / (lambda * (lambda^2 + g^2 * a * b))
     expected = -(w_in * w_out * global_gain**2 * a * c) / (leak_rate * (leak_rate**2 + global_gain**2 * a * b))
     assert T[0, 0] == pytest.approx(expected, rel=1e-9, abs=1e-12)
 
@@ -277,19 +299,31 @@ def test_trace_graph_reports_spectral_abscissa_and_condition_number(trace_fixtur
 
 def _write_cli_fixture(root: Path) -> tuple[Path, Path, Path]:
     """A tiny 2-graph (`biological` + one `rewired` seed) fixture on disk for
-    `transfer.py`'s CLI, independent of the trace-graph fixture above."""
+    `transfer.py`'s CLI. Uses the *trace graph* fixture (24 neurons, the
+    production `outputPopulationCount=3`/`inputChannelCount=8` shape), not
+    `_make_three_neuron_graph`: the CLI's per-graph dispatch now runs with
+    `strict_shape=True` (a dual-review finding -- `turnGain`/`approachGain`
+    must raise, not silently go `None`, for a production-shaped graph), and
+    the 3-neuron hand graph's 1x1 `T` would trip that guard. The "rewired"
+    graph reuses the exact same structure under a different artifact name --
+    this test only needs CLI-level plumbing (shard determinism, sha
+    verification), not two structurally distinct graphs."""
+    if not FIXTURE_PATH.exists():
+        pytest.skip(f"{FIXTURE_PATH} not generated (run scripts/analysis/export-trace-graph-fixture.ts)")
+    with FIXTURE_PATH.open("r") as fh:
+        fixture = json.load(fh)
+    graph = _graph_arrays_from_fixture(fixture)
+
     graphs_dir = root / "graphs"
     graphs_dir.mkdir()
 
-    bio_graph = _make_three_neuron_graph(leak_rate=0.35, global_gain=0.5, a=1.0, b=1.0, c=1.0, w_in=1.0, w_out=1.0)
-    bio_binary = binfmt.encode_graph_binary(bio_graph)
+    bio_binary = binfmt.encode_graph_binary(graph)
     bio_sha256 = binfmt.sha256_hex(bio_binary)
     bio_path = root / "biological.bin.gz"
     bio_path.write_bytes(gzip.compress(bio_binary))
 
-    rewired_graph = _make_three_neuron_graph(leak_rate=0.35, global_gain=0.5, a=2.0, b=1.0, c=1.0, w_in=1.0, w_out=1.0)
-    rewired_binary = binfmt.encode_graph_binary(rewired_graph)
-    rewired_sha256 = binfmt.sha256_hex(rewired_binary)
+    rewired_binary = bio_binary  # same structure, different artifact name -- see this function's doc comment
+    rewired_sha256 = bio_sha256
     rewired_gzip = gzip.compress(rewired_binary)
     rewired_path = graphs_dir / "rewired-seed0.bin.gz"
     rewired_path.write_bytes(rewired_gzip)
@@ -370,20 +404,23 @@ def test_transfer_cli_rejects_a_tampered_rewired_file():
         root = Path(tmp)
         bio_path, index_path, graphs_dir = _write_cli_fixture(root)
         victim = graphs_dir / "rewired-seed0.bin.gz"
-        # Flip a byte *inside* the compressed stream, not append one: gzip's
-        # own decompressor tolerates (and ignores) trailing garbage bytes
-        # after a complete, valid DEFLATE stream, so appending would decompress
-        # to byte-identical content and this test would prove nothing (the
-        # same distinction `tests/unit/null-evaluate.test.ts`'s own
-        # "flipped byte" regression test makes for the TypeScript path).
-        # Flipping a byte partway through the stream changes the decompressed
-        # payload's sha256 (or breaks decompression outright), which is what
-        # `load_verified_graph`'s post-decompression check actually guards.
-        bytes_ = bytearray(victim.read_bytes())
-        bytes_[len(bytes_) // 2] ^= 0xFF
-        victim.write_bytes(bytes_)
+        # Substitute a *valid but different* graph under the expected
+        # filename, rather than corrupting bytes: a byte flip can land
+        # anywhere in the DEFLATE stream and either break decompression
+        # outright (any "Error" in stderr, not necessarily the sha check) or
+        # -- if it lands in trailing garbage gzip tolerates -- decompress to
+        # byte-identical content and catch nothing at all. A valid
+        # substitute graph decompresses cleanly every time and is
+        # deterministically caught by exactly one thing: the decompressed
+        # sha256 not matching `index.json`'s `binarySha256` (a dual-review
+        # finding -- the previous version of this test could pass on any
+        # crash, not specifically because sha verification worked).
+        substitute = _make_three_neuron_graph(leak_rate=0.35, global_gain=0.5, a=3.0, b=1.0, c=1.0, w_in=1.0, w_out=1.0)
+        victim.write_bytes(gzip.compress(binfmt.encode_graph_binary(substitute)))
 
         out = root / "transfer-tampered.json"
         result = _run_transfer_cli(bio_path, index_path, graphs_dir, out, workers=1)
         assert result.returncode != 0
-        assert "does not match expected" in result.stderr or "Error" in result.stderr
+        assert "GraphVerificationError" in result.stderr
+        assert "does not match expected" in result.stderr
+        assert not out.exists()
