@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { encodeGraphBinary } from '../../src/lib/connectome/format';
 import { createWorkerClient, WorkerClientError } from '../../src/lib/worker/client';
+import { WORKER_PROTOCOL_VERSION } from '../../src/lib/worker/protocol';
 import { createRandomGraph } from '../fixtures/tiny-graph';
 import { FakeNeuralWorker } from '../helpers/fake-worker';
 
@@ -30,6 +31,97 @@ describe('createWorkerClient', () => {
 
     client.terminate();
     expect(worker.terminated).toBe(true);
+  });
+
+  it('init resolves with the Worker-echoed protocolVersion matching this bundle\'s WORKER_PROTOCOL_VERSION', async () => {
+    const worker = new FakeNeuralWorker();
+    const client = createWorkerClient(worker);
+    const initResult = await client.init(buffer.slice(0));
+    expect(initResult.protocolVersion).toBe(WORKER_PROTOCOL_VERSION);
+  });
+
+  it('init rejects with a structured protocol-version-mismatch error when the Worker echoes a different protocolVersion', async () => {
+    // A minimal `WorkerLike` double (not `FakeNeuralWorker`, which always
+    // echoes the real `WORKER_PROTOCOL_VERSION` via production
+    // `handleWorkerRequest`) that responds to any `init` request with a
+    // deliberately wrong `protocolVersion`, simulating a main thread and
+    // Worker built from skewed bundles — the one scenario this check exists
+    // to catch.
+    const listeners = new Map<string, Set<(event: MessageEvent) => void>>();
+    const worker = {
+      postMessage: (message: { requestId: string; type: string }) => {
+        if (message.type !== 'init') return;
+        queueMicrotask(() => {
+          const event = {
+            data: {
+              type: 'init',
+              requestId: message.requestId,
+              ok: true,
+              neuronCount: 1,
+              edgeCount: 0,
+              inputChannelCount: 1,
+              outputPopulationCount: 1,
+              protocolVersion: WORKER_PROTOCOL_VERSION + 1
+            }
+          } as unknown as MessageEvent;
+          for (const listener of listeners.get('message') ?? []) listener(event);
+        });
+      },
+      addEventListener: (type: string, listener: (event: MessageEvent) => void) => {
+        let set = listeners.get(type);
+        if (!set) {
+          set = new Set();
+          listeners.set(type, set);
+        }
+        set.add(listener);
+      },
+      removeEventListener: (type: string, listener: (event: MessageEvent) => void) => {
+        listeners.get(type)?.delete(listener);
+      }
+    };
+    const client = createWorkerClient(worker as never);
+
+    const initPromise = client.init(buffer.slice(0));
+    await expect(initPromise).rejects.toThrow(/protocol version/i);
+    await initPromise.catch((error: unknown) => {
+      expect(error).toBeInstanceOf(WorkerClientError);
+      expect((error as WorkerClientError).code).toBe('protocol-version-mismatch');
+    });
+  });
+
+  it('setActivity round-trips a set-activity request, echoing enabled and toggling whether step responses carry rates', async () => {
+    const worker = new FakeNeuralWorker();
+    const client = createWorkerClient(worker);
+    await client.init(buffer.slice(0));
+
+    const disabledStep = await client.step([0.1, -0.2], 1);
+    expect('rates' in disabledStep).toBe(false);
+
+    const enableResult = await client.setActivity(true);
+    expect(enableResult.ok).toBe(true);
+    expect(enableResult.enabled).toBe(true);
+
+    const enabledStep = await client.step([0.1, -0.2], 1);
+    // `ArrayBuffer.isView` (not `toBeInstanceOf(Float32Array)`): the value
+    // crosses `structuredClone` inside `FakeNeuralWorker`, which under
+    // jsdom's Vitest environment can construct it in a different realm than
+    // this test file's own `Float32Array` global — a real cross-realm
+    // typed-array value that `instanceof` alone cannot see as one.
+    expect(ArrayBuffer.isView(enabledStep.rates)).toBe(true);
+    expect(enabledStep.rates).toHaveLength(graph.metadata.neuronCount);
+
+    const disableResult = await client.setActivity(false);
+    expect(disableResult.ok).toBe(true);
+    expect(disableResult.enabled).toBe(false);
+
+    const redisabledStep = await client.step([0.1, -0.2], 1);
+    expect('rates' in redisabledStep).toBe(false);
+  });
+
+  it('setActivity rejects before init with not-initialized', async () => {
+    const worker = new FakeNeuralWorker();
+    const client = createWorkerClient(worker);
+    await expect(client.setActivity(true)).rejects.toThrow(/not-initialized/);
   });
 
   it('rejects the returned promise with the structured error message on a Worker failure response', async () => {

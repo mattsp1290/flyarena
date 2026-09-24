@@ -3,7 +3,7 @@ import type { GraphMode } from '../connectome/format';
 import { createWorkerClient, type WorkerClient } from '../worker/client';
 import { loadArenaArtifacts, type ArenaManifest, type LoadedArenaArtifacts } from './assets';
 import { buildGraphBufferForMode, createWorkerAgentBinding } from './bindings';
-import { ExperimentRunner, type ExperimentTelemetry } from './runner';
+import { ExperimentRunner, isNotInitializedRejection, type ExperimentTelemetry } from './runner';
 import { transition, type ExperimentStatus } from './state';
 
 /**
@@ -125,7 +125,7 @@ export class ExperimentController {
     const load = this.options.loadArtifacts ?? loadArenaArtifacts;
     let artifacts: LoadedArenaArtifacts;
     try {
-      artifacts = await load();
+      artifacts = await load(`${import.meta.env.BASE_URL}data`);
     } catch (error) {
       if (this.destroyed) return;
       this.options.callbacks.onError(error instanceof Error ? error.message : String(error));
@@ -216,6 +216,50 @@ export class ExperimentController {
           const binding = await createWorkerAgentBinding(client, buffer, mode, graphBinarySha256);
           if (this.destroyed || !this.runner) return;
           this.runner.setAgentBinding(agentId, binding);
+          // The rebuilt binding's Worker starts with activity streaming off
+          // (a fresh `init`, per `neural.worker.ts`'s "always false" note),
+          // even though this arm may have been streaming right before the
+          // switch. Re-issue it on the *new* binding directly — not via
+          // `runner.setActivityStreaming`, which would redundantly re-toggle
+          // the other, untouched arm too — so the activity view's stream
+          // never silently drops for this arm across a topology switch.
+          //
+          // Deliberately not awaited (dual review flagged the earlier
+          // awaited version): `binding.setActivity` -> `client.setActivity`
+          // -> `send` posts the `set-activity` message synchronously, inside
+          // the Promise executor (`client.ts#send`), before this line even
+          // returns — so it is already FIFO-ordered ahead of any later
+          // `step` on this Worker regardless of whether its own round trip
+          // is awaited. Awaiting it here bought no ordering guarantee, only
+          // delayed `onTelemetry`/`onTopologyApplied` and, on a rejection,
+          // routed a per-arm streaming-toggle failure into `runner.fail()`
+          // — contradicting `ExperimentRunner#setActivityStreaming`'s own
+          // documented policy that such a failure is not a run failure, and
+          // leaving `onTopologyApplied` unfired even though `setAgentBinding`
+          // above had already committed the new topology (a presentation
+          // desync: the renderer would keep the old topology label).
+          if (this.runner.isActivityStreaming()) {
+            binding.setActivity?.(true).catch((error: unknown) => {
+              if (this.destroyed) return;
+              if (isNotInitializedRejection(error)) {
+                // Expected, self-healing race (thermo review S2, applies
+                // here for the same reason as `ExperimentRunner
+                // #setActivityStreaming`'s own catch): a second switch on
+                // this same arm can begin (and dispose this arm's Worker
+                // again) before this fire-and-forget re-apply's own round
+                // trip has settled, since neither this call nor the rest of
+                // this `.then()` block awaits it. `console.debug`, not
+                // `console.error`, so this routine race doesn't drown out a
+                // genuine re-apply failure.
+                console.debug(
+                  `ExperimentController: re-applying activity streaming for ${agentId} rejected (expected: not-initialized during a topology switch)`,
+                  error
+                );
+                return;
+              }
+              console.error(`ExperimentController: re-applying activity streaming for ${agentId} failed`, error);
+            });
+          }
           this.options.callbacks.onTelemetry(this.runner.getTelemetry());
           this.options.callbacks.onTopologyApplied(agentId, mode);
         } catch (error) {

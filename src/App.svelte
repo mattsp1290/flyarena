@@ -17,6 +17,8 @@
   // inside `onMount` below instead of statically here.
   import type { ArenaScene as ArenaSceneInstance, FrameTelemetry } from './lib/render/ArenaScene';
 
+  let { onProbe }: { onProbe?: (setup: { seed: number; topology: GraphMode }) => void } = $props();
+
   let canvasEl: HTMLCanvasElement | undefined;
   let scene: ArenaSceneInstance | undefined;
   let rafId: number | undefined;
@@ -254,13 +256,7 @@
   });
 </script>
 
-<svelte:head>
-  <title>FlyArena — 3D Connectome Arena</title>
-  <meta
-    name="description"
-    content="A transparent, client-only connectome arena proof of concept."
-  />
-</svelte:head>
+
 
 <header class="masthead">
   <div>
@@ -273,6 +269,12 @@
   <span class="status" role="status" aria-label={`Experiment status: ${status}`}>{status}</span>
 </header>
 
+{#if onProbe}
+  <div class="probe-setup">
+    <button onclick={() => onProbe?.({ seed, topology: topology.left })} disabled={controlsLocked}>Probe this setup (authored decoder)</button>
+    <span>Starts matched worlds from this seed and left topology; live state is not copied.</span>
+  </div>
+{/if}
 <main>
   <section class="arena panel" aria-labelledby="arena-heading">
     <div class="section-heading">
@@ -323,3 +325,8 @@
     <LedgerPanel {manifest} />
   </aside>
 </main>
+
+<style>
+  .probe-setup { max-width:1440px; margin:0 auto 1rem; padding:0 clamp(1rem,4vw,3rem); display:flex; flex-wrap:wrap; align-items:center; gap:.8rem; }
+  .probe-setup span { color:#a2b5c8; font-size:.75rem; }
+</style>

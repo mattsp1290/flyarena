@@ -1,7 +1,15 @@
 import { decodeAction } from '../../src/lib/arena/actions';
 import { observeAgent } from '../../src/lib/arena/sensors';
 import { createWorld, stepWorld } from '../../src/lib/arena/world';
-import type { ActionsByAgent, AgentId, AgentScore, WorldState } from '../../src/lib/arena/types';
+import type {
+  ActionsByAgent,
+  AgentId,
+  AgentScore,
+  DecodedAction,
+  ReadonlyWorldState,
+  WorldState
+} from '../../src/lib/arena/types';
+import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import type { ConnectomeGraph } from '../../src/lib/connectome/format';
 import {
   createModelState,
@@ -16,7 +24,6 @@ import {
   readoutForward,
   type ReadoutWeights
 } from '../../src/lib/connectome/readout';
-import { TRACE_SUBSTEPS } from './export-traces';
 
 /**
  * Headless, single-process episode runner: the authoritative evaluation
@@ -24,17 +31,24 @@ import { TRACE_SUBSTEPS } from './export-traces';
  * Built directly on `createWorld`/`observeAgent`/`runSubsteps`/`readoutForward`/
  * `decodeAction`/`stepWorld` (the same closed-loop order documented in
  * `docs/architecture.md`'s "Closed-loop contract": observe -> encode -> K
- * neural substeps -> aggregate -> decode -> world step), because the
- * closed-loop bean (`flyarena-bb45`) and its `NEURAL_SUBSTEPS_PER_TICK` are
- * not on `main` yet.
+ * neural substeps -> aggregate -> decode -> world step). Originally written
+ * ahead of the closed-loop bean (`flyarena-bb45`) that later added
+ * `NEURAL_SUBSTEPS_PER_TICK`, which has since merged to `main` — see the
+ * TODO below for what is still outstanding.
  *
- * TODO(flyarena-bb45): once the closed-loop bean merges a reusable
- * closed-loop step function and fixes the real substep count `K`, call that
- * function here instead of re-driving `runSubsteps`/`decodeAction`/
- * `stepWorld` by hand, so this evaluator cannot drift from the shipped
- * product's per-tick order. Until then, `substeps` defaults to
- * `TRACE_SUBSTEPS` (`export-traces.ts`) for trace-graph development; a real
- * evaluation run must pass the real `K` explicitly (see `evaluate.ts`).
+ * TODO(flyarena-bb45): the closed-loop bean this evaluator was written ahead
+ * of has since merged a reusable substep count
+ * (`NEURAL_SUBSTEPS_PER_TICK`, `src/lib/connectome/constants.ts`), which
+ * `substeps` now defaults to below, but not yet a reusable closed-loop step
+ * function — this evaluator still re-drives `runSubsteps`/`decodeAction`/
+ * `stepWorld` by hand instead of calling one shared implementation with
+ * `ExperimentRunner` (`src/lib/experiment/runner.ts`). That refactor is
+ * still owed; in the interim,
+ * `tests/unit/episode-runner-parity.test.ts` guards against this file's
+ * per-tick order drifting from `ExperimentRunner`'s by asserting the two
+ * produce identical per-tick decoded actions and final scores for the
+ * authored decoder against a parked opponent, over the real biological
+ * artifact — any change to this file's tick loop must re-run that gate.
  */
 
 /**
@@ -64,10 +78,26 @@ export interface AgentEpisodeConfig {
 export interface EpisodeConfig {
   readonly seed: number;
   readonly ticks: number;
-  /** Neural substeps per world tick (K). See this file's doc comment. */
-  readonly substeps: number;
+  /**
+   * Neural substeps per world tick (K). See this file's doc comment.
+   * Defaults to `NEURAL_SUBSTEPS_PER_TICK` (`src/lib/connectome/constants.ts`,
+   * the production value `ExperimentRunner` itself defaults to) when
+   * omitted; pass it explicitly to run a non-production substep count.
+   */
+  readonly substeps?: number;
   readonly left: AgentEpisodeConfig;
   readonly right: AgentEpisodeConfig;
+  /**
+   * Diagnostic-only hook, never used by a production caller (`evaluate.ts`
+   * never passes it): invoked once per tick, immediately after `stepWorld`,
+   * with the exact decoded actions this tick fed into it and the resulting
+   * world. Exists so `tests/unit/episode-runner-parity.test.ts` can observe
+   * this file's real per-tick closed loop directly -- rather than a
+   * hand-driven re-derivation of it from the underlying primitives, which a
+   * review pass found could drift from this file's own tick loop without
+   * the parity gate noticing (see that test's module doc).
+   */
+  readonly onTick?: (tick: number, actions: Readonly<Record<AgentId, DecodedAction>>, world: ReadonlyWorldState) => void;
 }
 
 export interface AgentScoreResult {
@@ -182,12 +212,13 @@ export const runEpisode = (config: Readonly<EpisodeConfig>): EpisodeResult => {
   if (!Number.isInteger(config.ticks) || config.ticks < 0) {
     throw new Error(`episode: ticks must be a non-negative integer, got ${config.ticks}`);
   }
-  if (!Number.isInteger(config.substeps) || config.substeps <= 0) {
-    throw new Error(`episode: substeps must be a positive integer, got ${config.substeps}`);
+  const substeps = config.substeps ?? NEURAL_SUBSTEPS_PER_TICK;
+  if (!Number.isInteger(substeps) || substeps <= 0) {
+    throw new Error(`episode: substeps must be a positive integer, got ${substeps}`);
   }
 
-  const leftRunner = createAgentRunner('left', config.left, config.substeps);
-  const rightRunner = createAgentRunner('right', config.right, config.substeps);
+  const leftRunner = createAgentRunner('left', config.left, substeps);
+  const rightRunner = createAgentRunner('right', config.right, substeps);
 
   let world = createWorld(config.seed);
   for (let tick = 0; tick < config.ticks; tick += 1) {
@@ -195,6 +226,10 @@ export const runEpisode = (config: Readonly<EpisodeConfig>): EpisodeResult => {
     const rightAction = rightRunner.step(world);
     const actions: ActionsByAgent = { left: leftAction, right: rightAction };
     world = stepWorld(world, actions);
+    // decodeAction here is idempotent for these already-clamped tuples (see
+    // this function's doc comment); this is the same "actually applied this
+    // tick" action `stepWorld` decoded internally, not a re-derivation.
+    config.onTick?.(tick, { left: decodeAction(leftAction), right: decodeAction(rightAction) }, world);
   }
 
   const leftAgent = world.agents.find((agent) => agent.id === 'left');

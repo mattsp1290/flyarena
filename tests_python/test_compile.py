@@ -662,7 +662,7 @@ def test_select_subgraph_bridge_ranking_breaks_degree_ties_by_ascending_body_id(
 
 def test_compiler_source_sha256_matches_committed_ledger_and_manifest():
     """Recomputes the source hash from the actual working-tree
-    scripts/data/*.py files and asserts it equals the value already
+    COMPILER_SOURCE_FILENAMES files and asserts it equals the value already
     committed in the real, pinned artifact's ledger and manifest. A code
     change to any of those files with no accompanying `compile.py` re-run
     (and recommit of the artifact) makes this fail -- exactly the class of
@@ -676,3 +676,24 @@ def test_compiler_source_sha256_matches_committed_ledger_and_manifest():
 
     assert recomputed == ledger["compilerSourceSha256"]
     assert recomputed == manifest["compilerSourceSha256"]
+
+
+def test_every_scripts_data_module_is_classified():
+    """`COMPILER_SOURCE_FILENAMES` is an explicit allowlist, not a `*.py`
+    directory glob (see its docstring) -- which means it fails *open* by
+    default: a new file dropped into scripts/data/ is silently excluded
+    from `compilerSourceSha256` unless something notices. This test is what
+    makes that fail *closed* instead: every real `scripts/data/*.py` file
+    must be classified as either part of the compiler
+    (`COMPILER_SOURCE_FILENAMES`) or an explicitly-named non-compiler
+    sidecar (`NON_COMPILER_SIDECAR_FILENAMES`, e.g. `positions.py`), and the
+    two sets must not overlap."""
+    on_disk = {p.name for p in compiler.COMPILER_SOURCE_DIR.glob("*.py")}
+    compiler_files = set(compiler.COMPILER_SOURCE_FILENAMES)
+    sidecar_files = set(compiler.NON_COMPILER_SIDECAR_FILENAMES)
+
+    assert not (compiler_files & sidecar_files), "a filename cannot be both compiler and sidecar"
+    unclassified = on_disk - compiler_files - sidecar_files
+    assert not unclassified, f"classify {sorted(unclassified)} in compile.py as compiler or sidecar"
+    stale = (compiler_files | sidecar_files) - on_disk
+    assert not stale, f"{sorted(stale)} is listed but no longer exists in scripts/data/"

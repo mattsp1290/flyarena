@@ -25,21 +25,34 @@ Unrelated to this port's correctness; disable Datadog's Python
 instrumentation for every `uv run` invocation, one of two ways:
 
 ```bash
-DD_TRACE_ENABLED=false DD_IAST_ENABLED=false DD_APPSEC_ENABLED=false uv run pytest -v
+env -u PYTHONPATH DD_TRACE_ENABLED=false DD_IAST_ENABLED=false DD_APPSEC_ENABLED=false uv run pytest -v
 # or, equivalently, for any command (pytest, a future flyarena-train CLI, ...):
 training/scripts/run.sh pytest -v
 ```
 
-`training/scripts/run.sh` wraps the three env vars and `exec`s `uv run
-"$@"`, so WP3's automation (a script, a cron job, a CI runner) doesn't have
-to rely on the vars being copy-pasted correctly by hand every time — it's a
-one-line substitution for `uv run` everywhere in this project. (The env vars
+`training/scripts/run.sh` wraps the three `DD_*` env vars, unsets
+`PYTHONPATH`, and `exec`s `uv run "$@"`, so WP3's automation (a script, a
+cron job, a CI runner) doesn't have to rely on the vars being copy-pasted
+correctly by hand every time — it's a one-line substitution for `uv run`
+everywhere in this project. (The env vars
 can't be set from inside `training/tests/conftest.py` and have this effect:
 ddtrace's auto-injection runs via `sitecustomize`/`PYTHONPATH` before any
 user code executes, so by the time `conftest.py` runs it's too late — the
 shell invocation is the only correct fix point. `conftest.py` sets them
 anyway, defensively, in case some other code path reads `os.environ` at
 runtime; see its module doc.)
+
+Also run every `training/` command with `PYTHONPATH` unset, not just these
+three `DD_*` vars set -- an inherited `PYTHONPATH` from the shell (e.g. left
+over from another project) can reintroduce the same auto-injection this
+section disables, even with the three `DD_*` vars set, because
+`sitecustomize`/`ddtrace`'s bootstrap hooks into whatever is already on
+`sys.path`. `training/scripts/run.sh` unsets it for you; if invoking `uv
+run` directly instead, unset it yourself. Observed on this host (2026-09-24):
+`training/` pytest failed 30/119 tests under the injected IAST
+instrumentation with a bare `uv run pytest`; with `DD_IAST_ENABLED=false`
+and `PYTHONPATH` unset, all 119 passed (see
+`.agents/plans/rewiring-null/00-overview.md`'s "Risks and assumptions").
 
 If this project is ever run on a host without this injection, the env vars
 (and `run.sh`) are harmless no-ops.

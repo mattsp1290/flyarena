@@ -26,7 +26,17 @@ interface Manifest {
   gzipSha256: string;
   gzipBytes: number;
   neuronCount: number;
-  rewiredArms: Record<string, { artifact: string; binarySha256: string; binaryBytes: number; gzipSha256: string; gzipBytes: number }>;
+  rewiredArms: Record<
+    string,
+    {
+      artifact: string;
+      binarySha256: string;
+      binaryBytes: number;
+      gzipSha256: string;
+      gzipBytes: number;
+      swapStats: { edgeCount: number };
+    }
+  >;
 }
 
 const manifest = JSON.parse(
@@ -38,6 +48,13 @@ afterEach(() => {
 });
 
 describe('sha256Hex / decompressGzip (real artifact bytes)', () => {
+  it('hashes known vectors and real artifacts without secure-context Web Crypto', async () => {
+    vi.stubGlobal('crypto', {});
+    expect(await sha256Hex(new ArrayBuffer(0))).toBe('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855');
+    expect(await sha256Hex(new TextEncoder().encode('abc').buffer)).toBe('ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
+    const gzip = toArrayBuffer(readFileSync(resolve(publicDataDir, 'malecns-arena-v1.bin.gz')));
+    expect(await sha256Hex(gzip)).toBe(manifest.gzipSha256);
+  });
   it('sha256Hex matches the manifest for both the gzip and decompressed bytes', async () => {
     const gzipBytes = toArrayBuffer(readFileSync(resolve(publicDataDir, 'malecns-arena-v1.bin.gz')));
     expect(await sha256Hex(gzipBytes)).toBe(manifest.gzipSha256);
@@ -144,6 +161,60 @@ describe('loadArenaArtifacts (fetch -> gunzip -> hash-verify, against real commi
     await expect(loadArenaArtifacts('/data', 'malecns-arena-v1.manifest.json')).rejects.toBeInstanceOf(
       ArtifactIntegrityError
     );
+  });
+
+  it('rejects with ArtifactIntegrityError when the rewired arm’s manifest neuronCount/swapStats.edgeCount does not match the parsed rewired artifact (bb45 follow-up: the earlier cross-check only covered the biological arm)', async () => {
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('.manifest.json')) {
+        // Hashes/lengths for both artifacts are still correct for the real
+        // bytes — only the rewired arm's descriptive swapStats.edgeCount is
+        // now stale, exactly the scenario this check exists to catch.
+        const staleManifest = {
+          ...manifest,
+          rewiredArms: {
+            ...manifest.rewiredArms,
+            seed0: {
+              ...manifest.rewiredArms.seed0,
+              swapStats: {
+                ...manifest.rewiredArms.seed0.swapStats,
+                edgeCount: manifest.rewiredArms.seed0.swapStats.edgeCount + 1
+              }
+            }
+          }
+        };
+        return new Response(JSON.stringify(staleManifest), {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        });
+      }
+      return createPublicDataFetch()(input);
+    });
+    await expect(loadArenaArtifacts('/data', 'malecns-arena-v1.manifest.json')).rejects.toBeInstanceOf(
+      ArtifactIntegrityError
+    );
+  });
+
+  it('rejects with ArtifactIntegrityError when the rewired arm’s manifest is missing swapStats.edgeCount entirely (fails closed rather than silently skipping the check)', async () => {
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('.manifest.json')) {
+        const { swapStats: _omitted, ...seed0WithoutSwapStats } = manifest.rewiredArms.seed0;
+        const staleManifest = {
+          ...manifest,
+          rewiredArms: { ...manifest.rewiredArms, seed0: seed0WithoutSwapStats }
+        };
+        return new Response(JSON.stringify(staleManifest), {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        });
+      }
+      return createPublicDataFetch()(input);
+    });
+    await expect(loadArenaArtifacts('/data', 'malecns-arena-v1.manifest.json')).rejects.toBeInstanceOf(
+      ArtifactIntegrityError
+    );
+    await expect(loadArenaArtifacts('/data', 'malecns-arena-v1.manifest.json')).rejects.toThrow(/swapStats/);
   });
 
   it('rejects when the manifest has no seed0 rewired entry', async () => {

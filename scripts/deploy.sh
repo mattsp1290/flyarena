@@ -5,12 +5,21 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 
 die() { printf 'deploy: %s\n' "$*" >&2; exit 1; }
 mode=${1:---deploy}
+[[ $# -le 1 ]] || die 'Expected at most one option.'
 case "$mode" in
+  --package-backend)
+    mkdir -p dist
+    tar -czf dist/flyarena-backend.tar.gz \
+      backend/Dockerfile backend/pyproject.toml \
+      backend/flyarena_lab/__init__.py backend/flyarena_lab/cli.py \
+      backend/flyarena_lab/experiment.py backend/flyarena_lab/model.py \
+      backend/flyarena_lab/service.py scripts/lab.sh
+    printf 'Packaged dist/flyarena-backend.tar.gz; no remote actions performed.\n'
+    exit 0 ;;
   --deploy|--build-only) ;;
-  --help) printf 'Usage: ./scripts/deploy.sh [--deploy|--build-only]\nConfigure .env first. Default: build, upload, activate, verify.\n'; exit 0 ;;
+  --help) printf 'Usage: ./scripts/deploy.sh [--deploy|--build-only|--package-backend]\nBackend packaging is offline and needs no .env. Configure .env for static build/deploy. Default: build, upload, activate, verify.\n'; exit 0 ;;
   *) die 'Unknown option; use --help.' ;;
 esac
-[[ $# -le 1 ]] || die 'Expected at most one option.'
 [[ -f .env ]] || die 'Copy .env.example to .env and configure deployment.'
 # This is a trusted local configuration file, not input from the server.
 source .env
@@ -58,7 +67,13 @@ npm ci --no-audit --no-fund
 npm run check
 npm run build -- --base "$base"
 [[ -f dist/index.html ]] || die 'Build did not produce dist/index.html.'
-tar -czf dist/flyarena.tar.gz --exclude=flyarena.tar.gz -C dist .
+# Create outside dist: adding the archive there while tar reads '.' changes its
+# directory metadata and can make GNU tar fail before upload.
+archive=$(mktemp)
+trap 'rm -f -- "$archive"' EXIT
+tar -czf "$archive" --exclude=flyarena.tar.gz -C dist .
+mv -- "$archive" dist/flyarena.tar.gz
+trap - EXIT
 printf 'Built dist/ and dist/flyarena.tar.gz for %s\n' "$base"
 [[ "$mode" == --deploy ]] || exit 0
 
@@ -91,4 +106,4 @@ while IFS= read -r -d '' file; do
     -H 'Cache-Control: no-cache' "$url" -o "$verify_dir/response"
   cmp -s "$file" "$verify_dir/response" || die "Public content mismatch: $relative. Release is active; inspect the web-server mapping/cache. Previous releases are retained."
 done < <(find dist -type f ! -name flyarena.tar.gz -print0)
-printf 'Deployment verified. Release: %s\nNo backend services are required. Future backend placement is BACKEND_SSH in .env.\n' "$release"
+printf 'Deployment verified. Release: %s\nThe static arena/workbench require no backend. Optional DGX sandbox placement is BACKEND_SSH in .env.\n' "$release"

@@ -25,6 +25,23 @@ export type WorkerErrorCode =
  */
 export const MAX_SUBSTEPS_PER_TICK = 64;
 
+/**
+ * Integer version of this request/response shape. Bumped whenever a request
+ * or response type gains/loses/reshapes a field in a way a caller might need
+ * to branch on. Echoed back in `InitWorkerSuccess.protocolVersion` and
+ * checked by `createWorkerClient`'s `init` (`../worker/client.ts`) against
+ * this same constant, rejecting with a structured
+ * `protocol-version-mismatch` `WorkerClientError` on a mismatch — the main
+ * thread and the Worker are always built from the same bundle today, so this
+ * should never actually fire in production, but it turns a future
+ * build-skew bug (e.g. a stale cached Worker script surviving a deploy) into
+ * an immediate, diagnosable rejection instead of the Worker and main thread
+ * silently disagreeing about a response shape — see
+ * `docs/architecture.md`'s "versioned message protocol" note. `1` marks the
+ * shape as of `set-activity`/`StepWorkerSuccess.rates` (this addition).
+ */
+export const WORKER_PROTOCOL_VERSION = 1;
+
 export interface WorkerError {
   code: WorkerErrorCode;
   message: string;
@@ -71,11 +88,26 @@ export interface DisposeWorkerRequest {
   requestId: string;
 }
 
+/**
+ * Toggles whether subsequent `step` responses include the full per-neuron
+ * `rates` vector (`StepWorkerSuccess.rates`). Off by default and reset to
+ * off on every `init`, so a Worker never streams full-neuron state unless a
+ * caller explicitly opts in — see `docs/architecture.md`'s streaming note
+ * and `connectome/telemetry.ts`'s contract comment. Allowed in any runtime
+ * state except `idle` (returns `not-initialized`, matching `reset`/`step`).
+ */
+export interface SetActivityWorkerRequest {
+  type: 'set-activity';
+  requestId: string;
+  enabled: boolean;
+}
+
 export type WorkerRequest =
   | InitWorkerRequest
   | ResetWorkerRequest
   | StepWorkerRequest
-  | DisposeWorkerRequest;
+  | DisposeWorkerRequest
+  | SetActivityWorkerRequest;
 
 export interface InitWorkerSuccess {
   type: 'init';
@@ -87,6 +119,8 @@ export interface InitWorkerSuccess {
   outputPopulationCount: number;
   /** Echoes `InitWorkerRequest.mode`, so a caller can confirm which arm the Worker actually initialized. */
   mode?: GraphMode;
+  /** Echoes `WORKER_PROTOCOL_VERSION` as of this Worker build; `createWorkerClient#init` checks this against its own copy of the constant. */
+  protocolVersion: number;
 }
 
 export interface ResetWorkerSuccess {
@@ -105,12 +139,31 @@ export interface StepWorkerSuccess {
    */
   actionFeatures: readonly number[];
   telemetry: NeuralTelemetry;
+  /**
+   * Length `neuronCount`; the full per-neuron rate vector as of this step.
+   * Present only when `set-activity` most recently enabled streaming for
+   * this Worker — absent (not merely empty) otherwise, so
+   * `!('rates' in response)` is a caller's cheap on/off check. Each
+   * occurrence is a fresh `Float32Array` (`state.rate.slice()`) whose
+   * `ArrayBuffer` is transferred (not structured-cloned) in the
+   * `postMessage` call that carries this response — see
+   * `neural.worker.ts#handleWorkerRequest`'s return type.
+   */
+  rates?: Float32Array;
 }
 
 export interface DisposeWorkerSuccess {
   type: 'dispose';
   requestId: string;
   ok: true;
+}
+
+export interface SetActivityWorkerSuccess {
+  type: 'set-activity';
+  requestId: string;
+  ok: true;
+  /** Echoes `SetActivityWorkerRequest.enabled`. */
+  enabled: boolean;
 }
 
 /**
@@ -131,4 +184,5 @@ export type WorkerResponse =
   | ResetWorkerSuccess
   | StepWorkerSuccess
   | DisposeWorkerSuccess
+  | SetActivityWorkerSuccess
   | WorkerFailure;

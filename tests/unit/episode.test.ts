@@ -13,9 +13,16 @@ import {
   readoutForward,
   type ReadoutWeights
 } from '../../src/lib/connectome/readout';
+import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import { DEFAULT_GRAPH_ID, TRACE_SEEDS, TRACE_SUBSTEPS, TRACE_TICKS } from '../../scripts/training/export-traces';
 import { runEpisode } from '../../scripts/training/episode';
 import { createTraceGraph } from '../fixtures/trace-graph';
+import {
+  diffCloseEnough,
+  FLOAT_ABS_TOLERANCE,
+  FLOAT_REL_TOLERANCE,
+  GOLDEN_GENERATING_ARCH
+} from '../fixtures/cross-arch-tolerance';
 
 const GOLDEN_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '../fixtures/golden');
 
@@ -42,6 +49,48 @@ const GOLDEN_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '../fixtures
  * fixture budget. Do not read this file and assume `episode.ts` needs to
  * run 300 ticks against a 60-tick golden fixture; 60 is deliberate and
  * matches every currently committed fixture.
+ *
+ * Cross-architecture note (see `tests/fixtures/cross-arch-tolerance.ts` and
+ * `docs/architecture.md`'s "Determinism scope"): `trace.actions` was
+ * recorded on `GOLDEN_GENERATING_ARCH`, but `result.left` below comes from
+ * a fresh `runEpisode` call on whatever architecture the test runs on.
+ * Those two can differ at the float64 ULP level the same way
+ * `golden-traces.test.ts`'s byte-for-byte check can — see that file's doc
+ * comment for the measured divergence — so the comparison below is exact
+ * only on `GOLDEN_GENERATING_ARCH` and tolerance-based everywhere else.
+ *
+ * Where the actual cross-arch risk is here, precisely: both
+ * `goldenFinalLeftScore` and `runEpisode` call `stepWorld` on *this* run's
+ * own architecture — `stepWorld` itself is not being compared across
+ * machines, so its `Math.sin`/`Math.cos`/`Math.hypot` calls (`arena/world.ts`)
+ * are not a source of divergence *within this comparison* the way they are
+ * for `golden-traces.test.ts`'s cross-machine byte comparison. The only
+ * cross-arch input is `trace.actions` itself: static committed numbers,
+ * recorded on `GOLDEN_GENERATING_ARCH`, fed into `goldenFinalLeftScore`'s
+ * local `stepWorld` replay, versus `result.left`'s action values, freshly
+ * decoded from this run's own `observeAgent` -> model -> `decodeAction`
+ * pipeline. That pipeline's `observeAgent` reads the *local* world's
+ * position/heading -- which the local `createWorld`/`stepWorld` produced
+ * using this run's own `Math.sin`/`Math.cos`/`Math.hypot` results, not
+ * `GOLDEN_GENERATING_ARCH`'s -- so `world.ts` divergence in this run's own
+ * trajectory reaches `runEpisode`'s fresh observations exactly as it does
+ * for `golden-traces.test.ts`, not just `sensors.ts`'s direct calls; it
+ * only stops mattering once decoded into `outputs`, which rounds to
+ * `Float32Array` at `state.rate`/`outputs` before `decodeAction` (unlike
+ * `stepWorld`'s own float64 state). So a cross-arch flip here requires a
+ * `sensors.ts`- or `world.ts`-driven divergence in the fresh run's own
+ * trajectory large enough to cross a `Float32Array` rounding boundary in
+ * `outputs` -- narrower than `golden-traces.test.ts`'s exposure (which
+ * also directly records raw float64 `observations`, with no rounding
+ * boundary to cross), and consistent with this comparison matching
+ * exactly (0 mismatches, every committed seed) on the real x86_64 CI
+ * runner even before this file's tolerance fallback existed (measured
+ * during the `fix/golden-cross-arch` PR). Still not a structural
+ * guarantee for a future fixture refresh; see `cross-arch-tolerance.ts`'s
+ * doc comment for the caveat and the `LEAF_NOISE_FLOOR_REL`/
+ * `LEAF_NOISE_FLOOR_ABS` mechanism, which this file does not use (an
+ * `AgentScore` has only 2 float leaves, too few for a leaf-count budget to
+ * add meaningful protection over the tolerance check alone).
  */
 const goldenFinalLeftScore = (seed: number): AgentScore => {
   const trace = JSON.parse(
@@ -57,8 +106,14 @@ const goldenFinalLeftScore = (seed: number): AgentScore => {
 };
 
 describe('runEpisode: authored decoder vs golden traces', () => {
+  // `it.each` with a flat array of primitives passes exactly one value
+  // (`seed`) to the callback, so a title with two `%d` placeholders (the
+  // pre-existing version of this string) silently renders its second
+  // placeholder as "NaN" -- there is no second argument to fill it. Use one
+  // placeholder and inline TRACE_TICKS instead.
   it.each(TRACE_SEEDS)(
-    'reproduces the golden trace score at the final recorded tick (%d) exactly, seed %d',
+    `reproduces the golden trace score at tick ${TRACE_TICKS} seed %d ` +
+      `(exact on ${GOLDEN_GENERATING_ARCH}, within cross-arch tolerance elsewhere)`,
     (seed) => {
       const graph = createTraceGraph();
       const result = runEpisode({
@@ -70,7 +125,20 @@ describe('runEpisode: authored decoder vs golden traces', () => {
       });
 
       expect(result.ticks).toBe(TRACE_TICKS);
-      expect(result.left).toEqual(goldenFinalLeftScore(seed));
+
+      const expectedScore = goldenFinalLeftScore(seed);
+      if (process.arch === GOLDEN_GENERATING_ARCH) {
+        expect(result.left).toEqual(expectedScore);
+      } else {
+        const { mismatches } = diffCloseEnough(expectedScore, result.left, `seed-${seed}.left`);
+        expect(
+          mismatches,
+          `seed ${seed}: runEpisode's left score differs from the golden-actions replay beyond ` +
+            `cross-arch float tolerance (process.arch=${process.arch}, fixtures generated on ` +
+            `${GOLDEN_GENERATING_ARCH}, abs<=${FLOAT_ABS_TOLERANCE} or rel<=${FLOAT_REL_TOLERANCE}):\n` +
+            mismatches.join('\n')
+        ).toEqual([]);
+      }
     }
   );
 });
@@ -167,5 +235,25 @@ describe('runEpisode: decoder behavior', () => {
     });
 
     expect(result.left).toEqual(expectedLeft.score);
+  });
+});
+
+describe('runEpisode: substeps default', () => {
+  it('omitting substeps is exactly equivalent to passing NEURAL_SUBSTEPS_PER_TICK explicitly', () => {
+    const graph = createTraceGraph();
+    const withDefault = runEpisode({
+      seed: 3,
+      ticks: 12,
+      left: { decoder: 'authored', graph },
+      right: { decoder: 'parked' }
+    });
+    const withExplicitSubsteps = runEpisode({
+      seed: 3,
+      ticks: 12,
+      substeps: NEURAL_SUBSTEPS_PER_TICK,
+      left: { decoder: 'authored', graph },
+      right: { decoder: 'parked' }
+    });
+    expect(withDefault).toEqual(withExplicitSubsteps);
   });
 });

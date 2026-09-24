@@ -188,11 +188,43 @@ def git_revision() -> str:
 COMPILER_SOURCE_DIR = Path(__file__).resolve().parent
 
 
+#: The exact filenames "the compiler" consists of, for
+#: `compiler_source_sha256()` below: the modules whose code actually
+#: determines the compiled `.bin`/`.bin.gz` bytes. Deliberately an explicit
+#: allowlist rather than a `*.py` directory glob (which this function's
+#: first version used): `scripts/data/positions.py` is a sidecar script
+#: that joins the pinned annotations' soma columns onto the compiled
+#: graph's own `biologicalIds` after the fact -- it never influences
+#: `compile_graph`'s aggregation/CSR logic or the emitted `.bin.gz` bytes,
+#: and must not change this hash or force an unrelated recompile when it is
+#: added or edited. See docs/data-provenance.md's "Soma positions sidecar"
+#: section. `scripts/data/rewire_batch.py` is the same kind of sidecar: a
+#: batch driver over `rewire.py`'s `rewire_graph` that writes to a
+#: gitignored training-run directory, never to this compiler's own
+#: `.bin.gz`/manifest/ledger output, so it must not change this hash either.
+#: `scripts/data/fsutil.py` is a third sidecar: a filesystem helper module
+#: (the canonical atomic-text-write used by both `positions.py` and
+#: `rewire_batch.py`) with no graph-compilation logic of its own -- it is
+#: imported by sidecars, not by anything that produces `.bin.gz` bytes.
+COMPILER_SOURCE_FILENAMES: tuple[str, ...] = ("binfmt.py", "compile.py", "download.py", "rewire.py")
+
+#: Every `scripts/data/*.py` file that is *not* part of "the compiler" --
+#: i.e. every file `compiler_source_sha256()` deliberately excludes.
+#: `test_every_scripts_data_module_is_classified` in `tests_python/
+#: test_compile.py` asserts that `COMPILER_SOURCE_FILENAMES` and this tuple
+#: partition the directory's actual `*.py` files exactly, so a new module
+#: dropped into `scripts/data/` (compiler or sidecar) can never be silently
+#: left out of both -- unlike the old `*.py` glob, an allowlist fails open
+#: by default; this test is what makes it fail closed instead.
+NON_COMPILER_SIDECAR_FILENAMES: tuple[str, ...] = ("positions.py", "rewire_batch.py", "fsutil.py")
+
+
 def compiler_source_sha256(source_dir: Path = COMPILER_SOURCE_DIR) -> str:
-    """sha256 over this compiler's own Python source (`scripts/data/*.py`:
-    `binfmt.py`, `compile.py`, `download.py`, `rewire.py` -- not the
-    generated `__pycache__`), recorded as `compilerSourceSha256` in both the
-    manifest and the ledger.
+    """sha256 over this compiler's own Python source
+    (`COMPILER_SOURCE_FILENAMES`: `binfmt.py`, `compile.py`, `download.py`,
+    `rewire.py` -- not the generated `__pycache__`, and not any other
+    sidecar script that happens to also live in `scripts/data/`), recorded
+    as `compilerSourceSha256` in both the manifest and the ledger.
 
     Unlike `git_revision()`'s self-referential git SHA (see its docstring),
     this value is derived directly from the code that ran: recompiling
@@ -206,15 +238,16 @@ def compiler_source_sha256(source_dir: Path = COMPILER_SOURCE_DIR) -> str:
     class of bug a self-referential git SHA field had.
 
     Scheme (must exactly match the TypeScript recomputation in
-    `tests/unit/malecns-artifact.test.ts`): list `*.py` files directly in
-    `source_dir`, sort by filename, and for each file in that order feed
-    one sha256 hasher: the filename (UTF-8 bytes), then a single NUL byte,
-    then the file's raw bytes. Including the filename means two files
-    swapping content is not an accidental collision; the NUL byte gives an
-    unambiguous filename/content boundary.
+    `tests/unit/malecns-artifact.test.ts`): for each name in
+    `COMPILER_SOURCE_FILENAMES` sorted ascending, feed one sha256 hasher:
+    the filename (UTF-8 bytes), then a single NUL byte, then the file's raw
+    bytes. Including the filename means two files swapping content is not
+    an accidental collision; the NUL byte gives an unambiguous
+    filename/content boundary.
     """
     hasher = hashlib.sha256()
-    for path in sorted(source_dir.glob("*.py"), key=lambda p: p.name):
+    for name in sorted(COMPILER_SOURCE_FILENAMES):
+        path = source_dir / name
         hasher.update(path.name.encode("utf-8"))
         hasher.update(b"\0")
         hasher.update(path.read_bytes())
@@ -667,7 +700,7 @@ def build_manifest_and_ledger(
         "gzipBytes": binary_gzip_size,
         "license": "CC-BY-4.0",
         "sourceDataset": "male-cns:v1.0 (Janelia FlyEM Male CNS connectome)",
-        # sha256 over scripts/data/*.py at compile time -- see
+        # sha256 over COMPILER_SOURCE_FILENAMES at compile time -- see
         # compiler_source_sha256()'s docstring. Echoed into the ledger too
         # (below) so either file alone proves which compiler code produced
         # this artifact.
@@ -676,11 +709,12 @@ def build_manifest_and_ledger(
 
     ledger = {
         "artifact": f"{ARTIFACT_NAME}.bin.gz",
-        # sha256 over scripts/data/*.py (binfmt.py, compile.py, download.py,
-        # rewire.py) at compile time -- see compiler_source_sha256()'s
-        # docstring in scripts/data/compile.py. Unlike compiledFromGitRevision
-        # below, this is derived directly from the code that ran, so it
-        # cannot go stale the way a self-referential git SHA can.
+        # sha256 over COMPILER_SOURCE_FILENAMES (binfmt.py, compile.py,
+        # download.py, rewire.py) at compile time -- see
+        # compiler_source_sha256()'s docstring in scripts/data/compile.py.
+        # Unlike compiledFromGitRevision below, this is derived directly
+        # from the code that ran, so it cannot go stale the way a
+        # self-referential git SHA can.
         "compilerSourceSha256": compiler_source_sha256_value,
         # Informational only: `git rev-parse HEAD` *at compile time*. This is
         # inherently self-referential -- the commit that ships this

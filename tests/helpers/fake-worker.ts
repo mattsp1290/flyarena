@@ -26,8 +26,20 @@ export class FakeNeuralWorker {
     const cloned = structuredClone(message);
     queueMicrotask(() => {
       if (this.terminated) return;
-      const response = structuredClone(handleWorkerRequest(this.runtime, cloned));
-      this.dispatch('message', new MessageEvent('message', { data: response }));
+      const { response, transfer } = handleWorkerRequest(this.runtime, cloned);
+      // Pass `transfer` through to Node's own `structuredClone`, which
+      // (like a real `postMessage(response, transfer)`) detaches every
+      // listed buffer from *this* realm after cloning — not just a plain
+      // clone. This is deliberate, not incidental fidelity: if a future
+      // change ever made `rates` an aliased view onto the Worker's own
+      // long-lived `state.rate` buffer instead of a fresh `.slice()` copy
+      // (see `neural.worker.ts`'s `handleWorkerRequest`), detaching
+      // `rates.buffer` here would detach `state.rate`'s buffer too, and the
+      // very next `step` call would throw on a detached `ArrayBuffer`
+      // instead of silently succeeding — turning that aliasing bug into an
+      // immediate, loud test failure rather than a passing test with
+      // undefined behavior.
+      this.dispatch('message', new MessageEvent('message', { data: structuredClone(response, { transfer }) }));
     });
   }
 

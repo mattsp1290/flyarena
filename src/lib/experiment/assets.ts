@@ -11,6 +11,8 @@
  */
 
 import { parseGraphBinary } from '../connectome/format';
+import { sha256 } from '@noble/hashes/sha2.js';
+import { bytesToHex } from '@noble/hashes/utils.js';
 
 export class ArtifactIntegrityError extends Error {
   constructor(message: string) {
@@ -35,11 +37,10 @@ export class DecompressionUnsupportedError extends Error {
   }
 }
 
-const bytesToHex = (bytes: ArrayBuffer): string =>
-  Array.from(new Uint8Array(bytes), (byte) => byte.toString(16).padStart(2, '0')).join('');
-
+// Static HTTP deployments do not expose crypto.subtle. Use the same SHA-256
+// implementation in browser Workers and Node without weakening verification.
 export const sha256Hex = async (data: ArrayBuffer): Promise<string> =>
-  bytesToHex(await crypto.subtle.digest('SHA-256', data));
+  bytesToHex(sha256(new Uint8Array(data)));
 
 /** Decompress one gzip member via the streaming Web Compression API. Throws `DecompressionUnsupportedError` if unavailable. */
 export const decompressGzip = async (data: ArrayBuffer): Promise<ArrayBuffer> => {
@@ -156,6 +157,27 @@ export interface ArenaManifest {
       binarySha256: string;
       gzipBytes: number;
       gzipSha256: string;
+      /**
+       * The rewiring compiler's own accounting for this arm (see
+       * `scripts/data/rewire.py`/`compile.py`). Degree-preserving rewiring
+       * never changes the node set, so a rewired arm has no `neuronCount` of
+       * its own to cross-check — it always shares the top-level manifest's
+       * `neuronCount`. `swapStats.edgeCount` is the one rewired-arm-specific
+       * count `loadArenaArtifacts` below cross-checks the parsed rewired
+       * artifact against (bb45 follow-up: the biological cross-check below
+       * previously had no rewired-arm counterpart).
+       *
+       * Required, not optional: `rewire.py`'s compiler always writes this
+       * field in the same pass that writes this arm's hashes (see
+       * `docs/data-provenance.md`), so no real producer ever omits it. A
+       * review pass caught that an earlier, optional-typed version of this
+       * field let `loadArenaArtifacts` below silently skip the whole
+       * rewired-arm cross-check for a manifest that happened to be missing
+       * it — exactly the "stale/hand-edited manifest" case that check exists
+       * to catch. `loadArenaArtifacts` fails closed (throws
+       * `ArtifactIntegrityError`) if it is ever absent or malformed.
+       */
+      swapStats: { edgeCount: number };
     }
   >;
 }
@@ -225,6 +247,41 @@ export const loadArenaArtifacts = async (
     throw new ArtifactIntegrityError(
       `manifest neuronCount/edgeCount (${manifest.neuronCount}/${manifest.edgeCount}) does not match the ` +
         `parsed biological artifact (${parsedBiological.metadata.neuronCount}/${parsedBiological.metadata.edgeCount})`
+    );
+  }
+
+  // bb45 follow-up: the cross-check above only ever covered the biological
+  // artifact. This is defense-in-depth for manifest/artifact consistency —
+  // not, as an earlier version of this comment claimed, something that
+  // "surfaces in the UI": `swapStats.edgeCount` itself is never displayed
+  // anywhere (the ledger panel only shows the biological manifest counts;
+  // telemetry's `edgeCount` comes from the Worker's own `init` response over
+  // the parsed graph, independent of this field). What this check actually
+  // protects is the manifest/ledger JSON's own internal consistency, which
+  // Python-side tooling and any future consumer of `public/data/*.json` can
+  // rely on without re-parsing the binary artifact themselves. Degree-
+  // preserving rewiring never changes the node set, so the rewired arm has
+  // no `neuronCount` of its own; it shares the top-level manifest's
+  // `neuronCount`. Its edge count lives at `rewiredEntry.swapStats.edgeCount`
+  // (see `scripts/data/rewire.py`'s ledger output) rather than a top-level
+  // field.
+  const parsedRewired = parseGraphBinary(rewired.slice(0));
+  const rewiredEdgeCount = rewiredEntry.swapStats?.edgeCount;
+  // Fails closed: a manifest missing `swapStats.edgeCount` entirely (or
+  // with a non-numeric value) is exactly as suspect as one with a wrong
+  // value — `rewire.py` always writes this field, so its absence means the
+  // manifest itself is malformed or stale, not that there is nothing to
+  // check. An earlier, optional-typed version of this field let that case
+  // silently skip the check instead (a review-caught gap).
+  if (typeof rewiredEdgeCount !== 'number') {
+    throw new ArtifactIntegrityError(
+      "Manifest's seed0 rewired arm is missing swapStats.edgeCount (required for the rewired-artifact cross-check)"
+    );
+  }
+  if (parsedRewired.metadata.neuronCount !== manifest.neuronCount || parsedRewired.metadata.edgeCount !== rewiredEdgeCount) {
+    throw new ArtifactIntegrityError(
+      `manifest neuronCount/rewired swapStats.edgeCount (${manifest.neuronCount}/${rewiredEdgeCount}) does not ` +
+        `match the parsed rewired artifact (${parsedRewired.metadata.neuronCount}/${parsedRewired.metadata.edgeCount})`
     );
   }
 

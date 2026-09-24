@@ -72,8 +72,6 @@ const AGENT_SLOT_ACCENT: Record<AgentId, string> = {
   right: '#7fd7ff'
 };
 
-const TOPOLOGY_MODES = ['biological', 'rewired', 'disconnected'] as const satisfies readonly GraphMode[];
-
 /**
  * Text + accent for each of the three labels a slot's label sprite can
  * show. All three are preallocated per agent at construction time (see
@@ -88,6 +86,20 @@ const TOPOLOGY_LABEL: Record<GraphMode, { text: string; accent: string }> = {
   rewired: { text: 'REWIRED', accent: '#7fd7ff' },
   disconnected: { text: 'DISCONNECTED', accent: '#ef476f' }
 };
+
+/**
+ * Derived from `TOPOLOGY_LABEL`'s own keys (bb45 follow-up) rather than a
+ * separately hand-maintained literal array: `TOPOLOGY_LABEL` is a
+ * `Record<GraphMode, ...>`, so it is already a complete, exhaustive map over
+ * every `GraphMode` — a hand-written second list next to it could silently
+ * drift out of sync with a future `GraphMode` addition (TypeScript would
+ * still catch a *missing* key in `TOPOLOGY_LABEL` itself via its `Record`
+ * type, but nothing previously forced this array to stay in step with it).
+ * `Object.keys` returns `string[]`, so the cast is required; it is sound
+ * specifically because `TOPOLOGY_LABEL` is typed as `Record<GraphMode, ...>`
+ * with no index signature, meaning its keys can only ever be `GraphMode`.
+ */
+const TOPOLOGY_MODES = Object.keys(TOPOLOGY_LABEL) as readonly GraphMode[];
 
 /**
  * Pure `mode -> label` mapping, exported for direct unit testing: like

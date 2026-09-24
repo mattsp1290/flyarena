@@ -34,10 +34,36 @@ export interface AgentStepInput {
 export interface AgentStepResult {
   actionFeatures: readonly number[];
   telemetry: NeuralTelemetry;
+  /**
+   * The full per-neuron rate vector for this step, present only while
+   * activity streaming is enabled for this arm (see
+   * `ExperimentRunner#setActivityStreaming`). A `WorkerClient`-backed
+   * binding passes `StepWorkerSuccess.rates` straight through; the
+   * oracle/CPU binding has no analogous opt-in and never sets this.
+   */
+  rates?: Float32Array;
 }
 
 /** One neural control step for one arm. Must resolve with the outputs for exactly the observation it was given — never a stale/reused action. */
 export type AgentStepFn = (input: AgentStepInput) => Promise<AgentStepResult>;
+
+/**
+ * True when `error` looks like a structured `not-initialized` rejection
+ * (see `worker/client.ts#WorkerClientError`'s `code` field) — duck-typed on
+ * a `code` property rather than an `instanceof WorkerClientError` check, so
+ * this module (and `controller.ts`, which reuses this same helper) stays
+ * agnostic of which concrete `AgentBinding#setActivity` implementation
+ * issued the rejection, per this file's own "step-function-agnostic" module
+ * doc comment. `not-initialized` is the one rejection reason that is
+ * *expected* and self-healing when it fires from a `setActivity` call
+ * racing `ExperimentController#changeTopology`'s dispose -> init window for
+ * the same arm (see `ExperimentRunner#setActivityStreaming` and
+ * `controller.ts#changeTopology`'s own re-apply, which recovers it) — every
+ * other rejection reason is a genuine failure and must still be logged
+ * loudly.
+ */
+export const isNotInitializedRejection = (error: unknown): boolean =>
+  typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'not-initialized';
 
 export interface AgentRunnerInfo {
   topology: GraphMode;
@@ -71,6 +97,32 @@ export interface AgentBinding {
    */
   reset: () => Promise<void>;
   info: AgentRunnerInfo;
+  /**
+   * Toggle whether this arm's `step` results include `AgentStepResult.rates`
+   * for the anatomical activity view. Optional: the oracle/CPU binding
+   * (`bindings.ts#createOracleAgentBinding`) omits it entirely (the "not
+   * supported" contract — `ExperimentRunner#setActivityStreaming` treats a
+   * missing `setActivity` as a no-op for that arm, not an error). A
+   * `WorkerClient`-backed binding implements it with `client.setActivity`.
+   *
+   * **Ordering contract an implementation must uphold:** the underlying
+   * request must be *posted* synchronously — before this call's first
+   * `await`/microtask hop, i.e. from inside the executor of the `Promise`
+   * this method returns, not after some other awaited step — even though
+   * the returned `Promise` itself may still take a full round trip to
+   * settle. `ExperimentController#changeTopology`'s re-apply
+   * (`controller.ts`) deliberately does not `await` this call before
+   * issuing a later `step`/`dispose` on the same binding, relying entirely
+   * on this ordering guarantee (plus `Worker`'s own FIFO message delivery)
+   * to keep `set-activity` strictly ahead of anything posted after it — see
+   * that method's own doc comment. `createWorkerAgentBinding`
+   * (`bindings.ts`) satisfies this today because `WorkerClient#setActivity`
+   * -> `send` calls `worker.postMessage` synchronously inside the
+   * `Promise` executor, before returning to its own caller; a future
+   * `AgentBinding` implementation must preserve that same synchronous-post
+   * property to stay safe for a fire-and-forget re-apply.
+   */
+  setActivity?: (enabled: boolean) => Promise<void>;
 }
 
 export interface AgentTelemetry extends AgentRunnerInfo {
@@ -162,6 +214,43 @@ export class ExperimentRunner {
   private lastLatencyMs: Record<AgentId, number> = { left: 0, right: 0 };
   private trace: ExperimentTraceEntry[] = [];
   private pendingDelayFinish: (() => void) | undefined;
+  /**
+   * Whether the anatomical activity view has asked for full per-neuron
+   * rates. Not generation-scoped like `latestRates`/`lastNeuralTelemetry`
+   * below: per the plan, `reset()` keeps the current streaming setting —
+   * resetting the world/neural state is orthogonal to whether the view is
+   * currently open — so this field is untouched by `reset()`/`dispose()`.
+   */
+  private activityStreaming = false;
+  /**
+   * Bumped by every `setActivityStreaming` call (enable or disable alike),
+   * and captured by `runOneTick` at the start of each tick. A `step`
+   * request is posted to the Worker (and its round trip can straddle a
+   * later `setActivityStreaming` call, since the two are otherwise
+   * independent async operations) before this generation-style guard is
+   * consulted again when the result comes back — see `runOneTick`'s
+   * `activityEpochAtStart` check. Without this, a tick issued just before a
+   * disable but resolving just after it would still carry `rates` (the
+   * Worker computed it while activity was still on) and get written into
+   * `latestRates` even though the toggle already cleared it — a real,
+   * reproduced race: dual review both independently confirmed a paused run
+   * still showing a stale rates snapshot up to a full tick's Worker latency
+   * after `setActivityStreaming(false)` resolved. Distinct from
+   * `generation` (bumped only by `reset()`/`dispose()`/`setAgentBinding`):
+   * a streaming toggle alone must invalidate in-flight rates without also
+   * discarding the tick's `actionFeatures`/world-step effects.
+   */
+  private activityEpoch = 0;
+  /**
+   * Latest per-arm full rate vector, replaced (not accumulated) each tick.
+   * `undefined` until `setActivityStreaming(true)` has both taken effect and
+   * a subsequent tick has actually run; cleared back to `undefined` on
+   * every `setActivityStreaming` call (enable or disable — an enable must
+   * never briefly show a frame left over from before the view was closed)
+   * and on `reset()` (a stale pre-reset snapshot must never be mistaken for
+   * current state).
+   */
+  private latestRates: Record<AgentId, Float32Array | undefined> = { left: undefined, right: undefined };
 
   constructor(options: ExperimentRunnerOptions) {
     if (!Number.isInteger(options.totalTicks) || options.totalTicks <= 0) {
@@ -236,6 +325,117 @@ export class ExperimentRunner {
     });
   }
 
+  isActivityStreaming(): boolean {
+    return this.activityStreaming;
+  }
+
+  /**
+   * Whether `agentId`'s *current* binding can actually stream full-neuron
+   * rates at all — i.e. whether it implements `AgentBinding#setActivity`
+   * (`this.agents[agentId].setActivity !== undefined`) — as distinct from
+   * `isActivityStreaming()`, which reports whether streaming has been
+   * *requested* for both arms regardless of whether either one supports it
+   * (thermo-maintainability review S3). The oracle/CPU binding
+   * (`bindings.ts#createOracleAgentBinding`) omits `setActivity` entirely,
+   * so `isActivityStreaming()` can read `true` for an arm that will never
+   * actually produce `rates`; a per-arm UI indicator (e.g. WP3's activity
+   * view) should gate on this method, not `isActivityStreaming()` alone, to
+   * tell "requested but unsupported for this arm" apart from "requested and
+   * active." Reflects the arm's *current* binding, so it can change across
+   * a `setAgentBinding`/`changeTopology` call (e.g. swapping in a binding
+   * type that does support it).
+   */
+  supportsActivityStreaming(agentId: AgentId): boolean {
+    return this.agents[agentId].setActivity !== undefined;
+  }
+
+  /**
+   * Latest full per-neuron rate vector for `agentId`, or `undefined` until
+   * streaming is enabled and a tick has run since. Replaced (a new
+   * `Float32Array` reference every tick — `!==` against a previously-read
+   * value is a cheap "is this fresh" check), never accumulated or mutated
+   * in place. The caller must treat the returned array as read-only: it may
+   * be the same object a later call still returns unchanged (between
+   * ticks), so mutating it would corrupt what a subsequent read reports as
+   * "this tick's" data.
+   */
+  getLatestRates(agentId: AgentId): Float32Array | undefined {
+    return this.latestRates[agentId];
+  }
+
+  /**
+   * Enable/disable full per-neuron rate streaming for the anatomical
+   * activity view, for both arms. Allowed in any runner state (unlike
+   * `setAgentBinding`) — the view can open/close at any point in a run.
+   *
+   * Sets `this.activityStreaming` synchronously, before any `await`, so
+   * `isActivityStreaming()` reflects the caller's intent immediately —
+   * `ExperimentController#changeTopology` (`controller.ts`) reads it right
+   * after rebuilding an arm's binding to decide whether to re-issue
+   * `setActivity(true)` on the fresh binding, and must see the *requested*
+   * state even if this call's own `AgentBinding#setActivity` round trips are
+   * still in flight elsewhere. The flag is deliberately never reverted by a
+   * failed round trip below: a binding's `setActivity` can legitimately
+   * reject with `not-initialized` while its Worker is mid topology-switch
+   * (dispose -> init — see `controller.ts#changeTopology`), and the
+   * controller's own re-apply step is what recovers that arm; this method
+   * failing quietly here must not un-set what the caller asked for.
+   *
+   * Never rejects to the caller: each binding's `setActivity` is awaited and
+   * caught independently, so one arm's failure never affects the other's,
+   * and this method's own returned `Promise<void>` always resolves.
+   */
+  async setActivityStreaming(enabled: boolean): Promise<void> {
+    if (this.disposed) return;
+    const generationAtStart = this.generation;
+    this.activityStreaming = enabled;
+    // Bumped (and `latestRates` cleared) on *every* call, not just a
+    // disable: an in-flight tick issued before this call can still resolve
+    // with rates computed under the old setting — see `activityEpoch`'s doc
+    // comment and `runOneTick`'s `activityEpochAtStart` check, which is what
+    // actually keeps that stale result out of `latestRates`. Clearing on
+    // enable too means a reopened view never briefly paints a frame left
+    // over from before it was closed.
+    this.activityEpoch += 1;
+    this.latestRates = { left: undefined, right: undefined };
+    const bindings = this.agents;
+    await Promise.all(
+      (['left', 'right'] as const).map(async (agentId) => {
+        const setActivity = bindings[agentId].setActivity;
+        if (!setActivity) return;
+        try {
+          await setActivity(enabled);
+        } catch (error) {
+          // A stale generation (a reset()/topology switch raced this call)
+          // makes a rejection here expected and uninteresting — the bindings
+          // this call was issued against may already be superseded. Only
+          // log against the generation that actually issued this call, the
+          // same discipline `reset()`'s own binding-reset catch uses
+          // (`runner.ts`'s reset()); never call `this.fail()` here, since a
+          // per-arm streaming-toggle failure is not a run failure.
+          if (this.disposed || generationAtStart !== this.generation) return;
+          if (isNotInitializedRejection(error)) {
+            // Expected, self-healing race (thermo review S2): this call
+            // landed on an arm's binding while its Worker was genuinely
+            // `idle` mid `ExperimentController#changeTopology`'s dispose ->
+            // init window — the controller's own re-apply recovers it on
+            // the rebuilt binding immediately after, and this method's flag
+            // stays authoritative regardless (see this method's own doc
+            // comment). `console.debug`, not `console.error`, so this
+            // routine race doesn't drown out a genuine Worker failure in
+            // production logs.
+            console.debug(
+              `ExperimentRunner: setActivity(${enabled}) rejected for agent ${agentId} (expected: not-initialized during a topology switch)`,
+              error
+            );
+            return;
+          }
+          console.error(`ExperimentRunner: setActivity(${enabled}) failed for agent ${agentId}`, error);
+        }
+      })
+    );
+  }
+
   /**
    * Swap an arm's binding (e.g. a topology change) between runs. Only valid
    * from `ready`/`finished` — not `running` or `paused` — and always
@@ -286,6 +486,7 @@ export class ExperimentRunner {
     this.world = createWorld(this.seed, this.arenaConfig);
     this.lastTickWallClockMs = undefined;
     this.lastNeuralTelemetry = undefined;
+    this.latestRates = { left: undefined, right: undefined };
     this.latencies = { left: [], right: [] };
     this.lastLatencyMs = { left: 0, right: 0 };
     this.trace = [];
@@ -320,6 +521,10 @@ export class ExperimentRunner {
     this.generation += 1;
     this.disposed = true;
     this.pendingDelayFinish?.();
+    // Nothing reads `getLatestRates` on a disposed runner in production, but
+    // clearing it (rather than leaving a disposed runner's last-known array
+    // reachable) avoids a caller ever mistaking it for live data.
+    this.latestRates = { left: undefined, right: undefined };
   }
 
   private setStatus(next: ExperimentStatus): void {
@@ -384,6 +589,7 @@ export class ExperimentRunner {
    */
   private async runOneTick(): Promise<{ tick: number; discarded: boolean }> {
     const generationAtStart = this.generation;
+    const activityEpochAtStart = this.activityEpoch;
     const world = this.world;
     const channelValues: Record<AgentId, readonly number[]> = {
       left: observeAgent(world, 'left', this.arenaConfig),
@@ -413,6 +619,22 @@ export class ExperimentRunner {
     }
     this.recordLatency('left', left.latencyMs);
     this.recordLatency('right', right.latencyMs);
+    // Replaced, not accumulated, and only when a result actually carries
+    // rates. Also gated on `activityEpochAtStart === this.activityEpoch`
+    // (dual review, confirmed by reproduction): this tick's `step` requests
+    // were posted while streaming was on, but `setActivityStreaming` can
+    // toggle (and clear `latestRates`) while this same tick's round trip is
+    // still in flight — the Worker already computed `rates` for this result
+    // under the *old* setting, so writing it back here would resurrect a
+    // snapshot the toggle just cleared (or, on a fast disable-then-enable,
+    // one the current enable never asked for). A binding with streaming
+    // disabled the whole tick, or mid topology-switch before the
+    // controller's re-apply lands, simply carries no `rates` at all, so
+    // there is nothing to (incorrectly) skip.
+    if (activityEpochAtStart === this.activityEpoch) {
+      if (left.result.rates) this.latestRates.left = left.result.rates;
+      if (right.result.rates) this.latestRates.right = right.result.rates;
+    }
 
     const actions: ActionsByAgent = {
       left: decodeAction(left.result.actionFeatures),

@@ -12,8 +12,8 @@ deployment URL, SSH destination, and confirmed dedicated app directory. `.env`
 is trusted shell configuration and is ignored by Git. Never put actual hostnames,
 IP addresses, or SSH destinations in tracked documentation, scripts, or `VITE_*`
 variables. The backend placement requested by the owner is recorded as
-`BACKEND_SSH` in `.env`. This app currently has no backend, database, or daemon;
-deploy any future backend services on that designated machine.
+`BACKEND_SSH` in `.env`. The default arena and counterfactual workbench have no backend. The optional
+synthetic sandbox has a separate service; place it on that designated machine.
 
 ## Hosting contract
 
@@ -89,3 +89,41 @@ HTML/asset verification. A Chromium smoke check confirmed the `/fly` redirect,
 rendered application, and absence of failed resources or JavaScript errors.
 The existing homepage continued to return HTTP 200. Svelte/TypeScript checks
 and all 58 unit tests passed. Sensitive connection details remain in `.env`.
+
+## Optional DGX sandbox packaging
+
+The arena and counterfactual workbench remain static and require no backend.
+The separate synthetic sandbox can use a local ARM64 GB10 backend.
+`./scripts/deploy.sh --package-backend` creates `dist/flyarena-backend.tar.gz`
+without reading `.env`, contacting a server, or starting a service. The bundle
+contains only the Dockerfile, Python metadata/source, and `scripts/lab.sh`.
+
+Extract a reviewed bundle into a dedicated release directory. Build with
+`./scripts/lab.sh --build`; supply a fresh `LAB_TOKEN` of at least 16 characters
+and start `./scripts/lab.sh --cuda` (`--cpu` omits GPU access). It binds to
+loopback port 8765 by default. Health is `/api/v1/health`; job routes require a
+bearer token. Use `LAB_CONTAINER_NAME` and `LAB_PORT` for a temporary test instance.
+`LAB_ORIGINS` must list exact approved frontend origins; wildcard CORS is rejected.
+Never embed tokens in Vite variables, URLs or static artifacts.
+
+Remote use requires an operator-managed authenticated HTTPS proxy or private
+tunnel. The pinned ARM64 NVIDIA image is large, and the 6 GiB container RAM limit
+and 2 GiB PyTorch tensor allocator cap do not fully isolate unified GPU memory.
+Only one ASGI worker is supported. Verify authenticated completion, cancellation
+and export before treating a backend release as operational.
+
+Retain the previous image for rollback. Stop only the intended lab container and
+restart that image with the same approved token/origins. Active jobs are ephemeral;
+export before restarting. Static release rollback and backend rollback are separate.
+This integration does not replace an already-running backend automatically.
+
+## Integrated workbench release
+
+On 2026-09-24, main revision `bc10c22` was deployed as
+`20260924T141451Z-e994aaab005c`. Public HTML/assets matched the build, and an actual
+Chromium visit completed a real-connectome probe, scrubbed replay, opened the
+optional sandbox and returned to a ready Arena without HTTP or page errors.
+The configured HTTP host requires portable graph hashing; integrity checks remain
+mandatory. Packaging now creates its archive outside `dist` to avoid tar observing
+its own output-directory mutation. Detailed tests and independent/live Cursor
+thermonuclear reviews are recorded in `docs/counterfactual-validation.md`.

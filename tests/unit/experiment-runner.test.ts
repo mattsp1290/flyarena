@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gunzipSync } from 'node:zlib';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createReplaySummary, hashReplaySummary } from '../../src/lib/arena/replay';
 import {
   createDisconnectedGraph,
@@ -10,14 +10,16 @@ import {
   parseGraphBinary,
   type GraphMode
 } from '../../src/lib/connectome/format';
-import { createOracleAgentBinding } from '../../src/lib/experiment/bindings';
+import { createOracleAgentBinding, createWorkerAgentBinding } from '../../src/lib/experiment/bindings';
 import {
   computeMedian,
   ExperimentRunner,
   NEURAL_SUBSTEPS_PER_TICK,
   type AgentBinding
 } from '../../src/lib/experiment/runner';
+import { createWorkerClient } from '../../src/lib/worker/client';
 import { createRandomGraph } from '../fixtures/tiny-graph';
+import { FakeNeuralWorker } from '../helpers/fake-worker';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const publicDataDir = resolve(here, '../../public/data');
@@ -51,6 +53,33 @@ const runToFinished = (runner: ExperimentRunner): Promise<void> =>
   });
 
 /**
+ * Cleanup registry (thermo-architecture I1 fix): every `ExperimentRunner`
+ * constructed by a test is registered here via `trackRunner` immediately
+ * after construction, and the `afterEach` below disposes every tracked
+ * runner unconditionally once the test finishes. Without this, a runner
+ * left `running` (e.g. a test that calls `start()` and returns without an
+ * explicit `pause()`/`dispose()`) keeps its `runLoop` issuing real
+ * Worker/timer-driven ticks in the background past its own test's
+ * completion — reproduced as an intermittent uncaught `DataCloneError`
+ * attributed to whichever test last touched a still-ticking runner, only
+ * visible when the *full* `npm run test:unit` suite runs all 44 files
+ * together (a file-scoped loop of just the changed file does not reproduce
+ * it). `ExperimentRunner#dispose()` is documented as idempotent and safe to
+ * call regardless of current status (`runner.ts`), so calling it here even
+ * for a runner a test already paused/disposed itself is harmless.
+ */
+const activeRunners: ExperimentRunner[] = [];
+const trackRunner = (runner: ExperimentRunner): ExperimentRunner => {
+  activeRunners.push(runner);
+  return runner;
+};
+
+afterEach(() => {
+  for (const runner of activeRunners) runner.dispose();
+  activeRunners.length = 0;
+});
+
+/**
  * An externally-resolvable/rejectable promise, used below to control
  * exactly when a binding's `step`/`reset` call settles — instead of racing
  * a real `setTimeout` margin against another real timer (see the doc
@@ -75,9 +104,30 @@ const createDeferred = <T = void>(): { promise: Promise<T>; resolve: (value: T) 
  * silently turning a currently-passing test flaky; a poll that only
  * resolves once the condition is actually observed true has no such
  * failure mode — it simply takes as long as it takes.
+ *
+ * `timeoutMs` (bb45 follow-up: this helper previously had no timeout of its
+ * own) bounds that "as long as it takes" promise: a genuinely stuck
+ * predicate — e.g. a real regression that leaves the runner parked in
+ * `running` forever — must fail this specific `waitUntil` call with a clear
+ * timeout error inside its own test's timeout window, rather than silently
+ * riding on Vitest's own per-test timeout (which would report a generic
+ * "test timed out" against whichever assertion happened to be pending, with
+ * no indication *which* condition never became true).
+ *
+ * The default must stay clearly below Vitest's own default per-test timeout
+ * (5000ms; `vite.config.ts` does not override `test.testTimeout`) — both
+ * dual-review passes independently caught an earlier version of this default
+ * (5000ms, matching Vitest's own default exactly) as unable to ever win that
+ * race: `waitUntil`'s internal timer and the outer test timer both start
+ * close together, so the outer one — reporting a generic "Test timed out",
+ * not this function's named error — would always fire first or tie. 2000ms
+ * leaves the outer timeout a comfortable multi-second margin to still apply
+ * to whatever the test does *after* a `waitUntil` call resolves.
  */
-const waitUntil = (predicate: () => boolean): Promise<void> =>
-  new Promise((resolve) => {
+const WAIT_UNTIL_DEFAULT_TIMEOUT_MS = 2000;
+
+const waitUntil = (predicate: () => boolean, timeoutMs = WAIT_UNTIL_DEFAULT_TIMEOUT_MS): Promise<void> =>
+  new Promise((resolve, reject) => {
     if (predicate()) {
       resolve();
       return;
@@ -85,9 +135,14 @@ const waitUntil = (predicate: () => boolean): Promise<void> =>
     const poll = setInterval(() => {
       if (predicate()) {
         clearInterval(poll);
+        clearTimeout(timeout);
         resolve();
       }
     }, 1);
+    const timeout = setTimeout(() => {
+      clearInterval(poll);
+      reject(new Error(`waitUntil: predicate did not become true within ${timeoutMs}ms`));
+    }, timeoutMs);
   });
 
 describe('NEURAL_SUBSTEPS_PER_TICK', () => {
@@ -118,6 +173,7 @@ describe('ExperimentRunner determinism', () => {
         agents: buildFixtureAgents(0x55),
         targetTickIntervalMs: 0
       });
+      trackRunner(runner);
       await runToFinished(runner);
       // Reuse the real production summary-construction path rather than a
       // hand-maintained parallel copy of its field mapping: this also means
@@ -146,6 +202,7 @@ describe('ExperimentRunner determinism', () => {
         agents: buildFixtureAgents(0x66, nextJitterMs),
         targetTickIntervalMs: 0
       });
+      trackRunner(runner);
       await runToFinished(runner);
       const world = runner.getWorld();
       return { hash: hashReplaySummary(createReplaySummary(world)), tick: world.tick };
@@ -155,6 +212,168 @@ describe('ExperimentRunner determinism', () => {
     expect(slow.tick).toBe(totalTicks);
     expect(fast.tick).toBe(totalTicks);
     expect(slow.hash).toBe(fast.hash);
+  });
+
+  /**
+   * WP7 item 2: an irregular render-frame cadence must not change the final
+   * simulation state. `getSnapshot(nowMs)` is `ExperimentRunner`'s one
+   * concession to the renderer — see `docs/architecture.md`'s closed-loop
+   * contract, "Rendering is decoupled from the fixed simulation timestep" —
+   * and is documented as read-only/interpolation-only. This is a direct
+   * regression test for that contract: calling it at an unpredictable
+   * cadence (simulating a browser tab whose `requestAnimationFrame` rate is
+   * jittering, throttled, or backgrounded) *genuinely concurrently* with the
+   * real tick loop must produce a byte-identical replay hash to a run where
+   * it is never called at all.
+   *
+   * Both dual-review passes independently caught a real bug in an earlier
+   * version of this test: with `targetTickIntervalMs: 0` and no per-step
+   * latency, `ExperimentRunner#runLoop` never awaits a real timer (`delay()`
+   * — see `runner.ts` — is only called when `targetTickIntervalMs > 0`), so
+   * all `totalTicks` ticks resolve as one uninterrupted microtask chain.
+   * Since JS always drains the entire microtask queue before running any
+   * macrotask (`setTimeout`), a frame sampler built on `setTimeout` — as an
+   * earlier version of this test was — could not fire even once until
+   * *after* the run had already reached `finished`, making the whole test
+   * vacuous (independently confirmed by both reviewers with a throwaway
+   * probe: exactly one frame, at the final tick). The fix here is the same
+   * one both reviews suggested: give both runs a tiny deterministic
+   * per-step latency (`simulatedLatencyMs`, already `bindings.ts`'s
+   * supported test-only hook — see the randomized-Worker-latency test
+   * above), which forces a real macrotask yield every tick so the
+   * `setTimeout`-based frame sampler can genuinely interleave. The test then
+   * *asserts* that interleaving actually happened (`midRunFrameCount`) —
+   * the whole point of the fix — so this test cannot silently regress back
+   * to vacuous again without failing on its own guard.
+   */
+  it('an irregular (deterministic) render-frame sampling cadence — genuinely concurrent getSnapshot() calls — does not change the final tick, score, or replay hash', async () => {
+    const seed = 0x9911;
+    const totalTicks = 100;
+    /**
+     * Small, fixed 0-2ms per-step latency: forces one macrotask yield per
+     * tick (see the doc comment above) without meaningfully slowing the test
+     * down. A *factory* rather than one shared closure: `runWithFrameSampling`
+     * calls this once per run, and the two runs execute concurrently
+     * (`Promise.all` below) — a single shared mutable counter would let the
+     * two runs race for draws from the same sequence, silently making each
+     * run's own per-tick latency non-deterministic relative to the other run
+     * (still bounded 0-2ms either way, but no longer "identical for both
+     * runs" as intended). Two independent generators, each seeded the same,
+     * give each run its own deterministic 0-2ms sequence regardless of how
+     * the two runs happen to interleave.
+     */
+    const createStepLatencyMs = (): (() => number) => {
+      let stepLatencySeed = 0x5eed;
+      return () => {
+        stepLatencySeed = (stepLatencySeed * 1103515245 + 12345) >>> 0;
+        // `% 3` (not `% 2`): once `stepLatencySeed` grows past ~2^26, this
+        // LCG's multiply exceeds `Number.MAX_SAFE_INTEGER`, so JS's float64
+        // arithmetic silently loses precision in the *lowest* bits — `% 2`
+        // (probing only the single lowest bit) empirically locked to a
+        // constant 0 for this seed/multiplier pair, which produced zero
+        // real delays and made the whole test vacuous again (caught while
+        // implementing this exact fix). `% 3` draws on more of the value's
+        // remaining entropy and reliably still varies; the existing
+        // randomized-Worker-latency test above uses the same modulus
+        // pattern for the same reason.
+        return stepLatencySeed % 3;
+      };
+    };
+
+    const runWithFrameSampling = async (
+      sampleFrames: boolean
+    ): Promise<{ hash: string; tick: number; midRunFrameCount: number }> => {
+      const runner = new ExperimentRunner({
+        seed,
+        totalTicks,
+        agents: buildFixtureAgents(0x51, createStepLatencyMs()),
+        targetTickIntervalMs: 0
+      });
+      trackRunner(runner);
+      let frameCount = 0;
+      const ticksAtFrame: number[] = [];
+      let frameTimer: ReturnType<typeof setTimeout> | undefined;
+      if (sampleFrames) {
+        // An irregular, non-periodic cadence — not a fixed rAF-like interval
+        // — is the point: a real backgrounded/throttled tab's frame timing
+        // is not periodic either. Still fully deterministic (a fixed
+        // arithmetic sequence), which is what makes the hash comparison
+        // below meaningful across repeated test runs.
+        const scheduleNextFrame = (): void => {
+          frameTimer = setTimeout(() => {
+            frameCount += 1;
+            ticksAtFrame.push(runner.getWorld().tick);
+            // Read-only per this class's contract; the return value is
+            // deliberately discarded — only the *call* (and its potential
+            // side effects, if the contract were ever violated) matters here.
+            void runner.getSnapshot(performance.now() + ((frameCount * 37) % 23));
+            if (runner.getStatus() !== 'finished' && runner.getStatus() !== 'error') scheduleNextFrame();
+          }, frameCount % 3);
+        };
+        scheduleNextFrame();
+      }
+      try {
+        await runToFinished(runner);
+      } finally {
+        if (frameTimer) clearTimeout(frameTimer);
+      }
+      const world = runner.getWorld();
+      const midRunFrameCount = ticksAtFrame.filter((tick) => tick > 0 && tick < totalTicks).length;
+      return { hash: hashReplaySummary(createReplaySummary(world)), tick: world.tick, midRunFrameCount };
+    };
+
+    const [withFrames, withoutFrames] = await Promise.all([
+      runWithFrameSampling(true),
+      runWithFrameSampling(false)
+    ]);
+    expect(withFrames.tick).toBe(totalTicks);
+    expect(withoutFrames.tick).toBe(totalTicks);
+    // The guard against this test silently going vacuous again: frames must
+    // have genuinely landed *during* the run, not only once at/after the end.
+    expect(withFrames.midRunFrameCount).toBeGreaterThan(10);
+    expect(withFrames.hash).toBe(withoutFrames.hash);
+  });
+
+  /**
+   * WP2 stop/go gate: with the activity view closed, the closed-loop
+   * simulation must be byte-for-byte unaffected by whether the anatomical
+   * activity view happens to be open. `rates` only ever augments
+   * `AgentStepResult`/`StepWorkerSuccess` (it plays no role in `decodeAction`
+   * or `stepWorld`), so this only needs `WorkerClient`-backed bindings (the
+   * oracle binding has no `setActivity` at all, and its dynamics are already
+   * covered by the determinism tests above) to prove streaming toggling
+   * never perturbs the deterministic replay hash.
+   */
+  it('replay hash is identical with activity streaming enabled vs disabled', async () => {
+    const seed = 0x8899;
+    const totalTicks = 80;
+    const graph = createRandomGraph(0x88, { neuronCount: 20, inputChannelCount: 8, outputPopulationCount: 3 });
+    const buffer = encodeGraphBinary(graph);
+
+    const buildWorkerAgents = async (): Promise<Record<'left' | 'right', AgentBinding>> => {
+      const leftClient = createWorkerClient(new FakeNeuralWorker());
+      const rightClient = createWorkerClient(new FakeNeuralWorker());
+      const [left, right] = await Promise.all([
+        createWorkerAgentBinding(leftClient, buffer.slice(0), 'biological'),
+        createWorkerAgentBinding(rightClient, buffer.slice(0), 'biological')
+      ]);
+      return { left, right };
+    };
+
+    const runWithStreaming = async (streaming: boolean): Promise<string> => {
+      const agents = await buildWorkerAgents();
+      const runner = new ExperimentRunner({ seed, totalTicks, agents, targetTickIntervalMs: 0 });
+      trackRunner(runner);
+      if (streaming) await runner.setActivityStreaming(true);
+      await runToFinished(runner);
+      return hashReplaySummary(createReplaySummary(runner.getWorld()));
+    };
+
+    const [withStreaming, withoutStreaming] = await Promise.all([
+      runWithStreaming(true),
+      runWithStreaming(false)
+    ]);
+    expect(withStreaming).toBe(withoutStreaming);
   });
 });
 
@@ -185,6 +404,7 @@ describe('ExperimentRunner backpressure', () => {
       agents: { left: trackedLeft, right: buildFixtureAgents(0x1).right },
       targetTickIntervalMs: 0
     });
+    trackRunner(runner);
     await runToFinished(runner);
     expect(maxInFlight).toBe(1);
   });
@@ -201,6 +421,7 @@ describe('ExperimentRunner backpressure', () => {
       agents: { left: slowLeft, right },
       targetTickIntervalMs: 5 // deliberately below the 20ms simulated latency
     });
+    trackRunner(runner);
     await runToFinished(runner);
     expect(runner.getTelemetry().behindRealtime).toBe(true);
     // Every tick must still have actually run to completion (1..totalTicks reached, not skipped).
@@ -219,6 +440,7 @@ describe('ExperimentRunner backpressure', () => {
       agents: { left: slowLeft, right: fastRight },
       targetTickIntervalMs: 0
     });
+    trackRunner(runner);
     await runToFinished(runner);
 
     const telemetry = runner.getTelemetry();
@@ -245,6 +467,7 @@ describe('ExperimentRunner setAgentBinding', () => {
       agents: { left: makeBinding(), right: makeBinding() },
       targetTickIntervalMs: 0
     });
+    trackRunner(runner);
 
     // ready: allowed.
     expect(() => runner.setAgentBinding('left', makeBinding())).not.toThrow();
@@ -280,6 +503,7 @@ describe('ExperimentRunner setAgentBinding', () => {
       agents: { left: makeBinding(), right: makeBinding() },
       targetTickIntervalMs: 0
     });
+    trackRunner(runner);
     await runToFinished(runner);
     expect(runner.getWorld().tick).toBe(10);
 
@@ -326,6 +550,7 @@ describe('ExperimentRunner disconnected vs biological (real MaleCNS artifact)', 
       },
       targetTickIntervalMs: 0
     });
+    trackRunner(runner);
     await runToFinished(runner);
 
     expect(seenNonZero.biological).toBe(true);
@@ -345,6 +570,7 @@ describe('ExperimentRunner full-length run', () => {
       agents: buildFixtureAgents(0x2a),
       targetTickIntervalMs: 0
     });
+    trackRunner(runner);
     await runToFinished(runner);
     expect(runner.getStatus()).toBe('finished');
     expect(runner.getWorld().tick).toBe(2700);
@@ -378,6 +604,7 @@ describe('ExperimentRunner pause/resume/reset', () => {
         }
       }
     });
+    trackRunner(runner);
 
     runner.start();
     await waitUntil(() => runner.getStatus() === 'paused');
@@ -424,6 +651,7 @@ describe('ExperimentRunner pause/resume/reset', () => {
       agents: { left: slow, right: fast },
       targetTickIntervalMs: 0
     });
+    trackRunner(runner);
     runner.start();
     // `ExperimentRunner#start()` runs synchronously through `runLoop` ->
     // `runOneTick` -> `AgentBinding#step` up to their first real `await` —
@@ -464,6 +692,7 @@ describe('ExperimentRunner pause/resume/reset', () => {
         agents: { left, right },
         targetTickIntervalMs: 0
       });
+      trackRunner(runner);
       runner.start();
       // No wall-clock "interrupt mid-flight" wait: `ExperimentRunner#start()`
       // synchronously drives `runLoop` -> `runOneTick` -> `Promise.all` ->
@@ -490,6 +719,7 @@ describe('ExperimentRunner pause/resume/reset', () => {
       const left = createOracleAgentBinding({ graphBuffer: buffer.slice(0), mode: 'biological' });
       const right = createOracleAgentBinding({ graphBuffer: buffer.slice(0), mode: 'biological' });
       const runner = new ExperimentRunner({ seed, totalTicks: 60, agents: { left, right }, targetTickIntervalMs: 0 });
+      trackRunner(runner);
       await runToFinished(runner);
       return runner.getReplayExport().finalHash;
     };
@@ -530,6 +760,7 @@ describe('ExperimentRunner pause/resume/reset', () => {
       targetTickIntervalMs: 0,
       onStatusChange: (next) => statuses.push(next)
     });
+    trackRunner(runner);
     runner.start();
     // `flaky.step()`'s first call is already synchronously in flight by
     // this point (see the mid-flight-reset test above for the full trace),
@@ -555,5 +786,306 @@ describe('ExperimentRunner pause/resume/reset', () => {
     runner.start();
     await runToFinished(runner);
     expect(runner.getStatus()).toBe('finished');
+  });
+});
+
+describe('ExperimentRunner activity streaming', () => {
+  const buildWorkerAgents = async (
+    buffer: ArrayBuffer
+  ): Promise<Record<'left' | 'right', AgentBinding>> => {
+    const leftClient = createWorkerClient(new FakeNeuralWorker());
+    const rightClient = createWorkerClient(new FakeNeuralWorker());
+    const [left, right] = await Promise.all([
+      createWorkerAgentBinding(leftClient, buffer.slice(0), 'biological'),
+      createWorkerAgentBinding(rightClient, buffer.slice(0), 'biological')
+    ]);
+    return { left, right };
+  };
+
+  /**
+   * Wraps `binding.step` with a small real (`setTimeout`-based) per-call
+   * delay. With `targetTickIntervalMs: 0` and no delay at all, a
+   * `FakeNeuralWorker`-backed run's entire microtask chain (every tick's
+   * `postMessage` round trip is `queueMicrotask`-based, not a real timer)
+   * drains to completion *before* any macrotask — including a polling
+   * `setInterval`, per this file's own `waitUntil`/`runToFinished` — ever
+   * gets a chance to run (see the randomized-Worker-latency determinism test
+   * above for the same underlying mechanism, there used deliberately; here
+   * it would make a "catch the run mid-flight" assertion vacuous instead,
+   * since by the time any poll fires the run has already reached
+   * `finished`). A tiny fixed delay forces a real macrotask yield every
+   * tick, so a test can actually observe an in-progress run.
+   */
+  const withStepDelay = (binding: AgentBinding, delayMs: number): AgentBinding => ({
+    ...binding,
+    step: async (input) => {
+      await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+      return binding.step(input);
+    }
+  });
+
+  it('isActivityStreaming/getLatestRates start off, and reflect setActivityStreaming(true) once ticks run', async () => {
+    const graph = createRandomGraph(0x9a, { neuronCount: 20, inputChannelCount: 8, outputPopulationCount: 3 });
+    const buffer = encodeGraphBinary(graph);
+    const built = await buildWorkerAgents(buffer);
+    const agents: Record<'left' | 'right', AgentBinding> = {
+      left: withStepDelay(built.left, 5),
+      right: withStepDelay(built.right, 5)
+    };
+    const runner = new ExperimentRunner({ seed: 1, totalTicks: 200, agents, targetTickIntervalMs: 0 });
+    trackRunner(runner);
+
+    expect(runner.isActivityStreaming()).toBe(false);
+    expect(runner.getLatestRates('left')).toBeUndefined();
+    expect(runner.getLatestRates('right')).toBeUndefined();
+
+    await runner.setActivityStreaming(true);
+    expect(runner.isActivityStreaming()).toBe(true);
+    // Setting the flag does not itself run a tick; no rates exist yet.
+    expect(runner.getLatestRates('left')).toBeUndefined();
+
+    runner.start();
+    await waitUntil(() => runner.getLatestRates('left') !== undefined && runner.getLatestRates('right') !== undefined);
+    const firstLeft = runner.getLatestRates('left');
+    expect(firstLeft).toHaveLength(graph.metadata.neuronCount);
+    expect(runner.getLatestRates('right')).toHaveLength(graph.metadata.neuronCount);
+    // The run must still genuinely be in flight (not already `finished`) at
+    // this point — otherwise the next assertion (the reference changing
+    // tick to tick) would pass vacuously because no further tick will ever
+    // run. `totalTicks: 200` at 5ms/step/arm gives ample headroom over
+    // `waitUntil`'s 2s default budget for this to hold reliably.
+    expect(runner.getStatus()).toBe('running');
+
+    // Replaced, not accumulated: the array reference (and contents, for a
+    // biological arm whose recurrent drive keeps evolving) changes tick to
+    // tick rather than being mutated in place or reused stale.
+    await waitUntil(() => {
+      const next = runner.getLatestRates('left');
+      return next !== undefined && next !== firstLeft;
+    });
+
+    runner.pause();
+    await runner.setActivityStreaming(false);
+    expect(runner.isActivityStreaming()).toBe(false);
+    // Disabling clears the stored snapshot — a closed view must never render
+    // stale pre-disable data if it briefly re-reads state before unmounting.
+    expect(runner.getLatestRates('left')).toBeUndefined();
+    expect(runner.getLatestRates('right')).toBeUndefined();
+  });
+
+  it('reset() keeps the current streaming setting but clears the stale pre-reset rates snapshot', async () => {
+    const graph = createRandomGraph(0x9b, { neuronCount: 16, inputChannelCount: 8, outputPopulationCount: 3 });
+    const buffer = encodeGraphBinary(graph);
+    const agents = await buildWorkerAgents(buffer);
+    const runner = new ExperimentRunner({ seed: 2, totalTicks: 500, agents, targetTickIntervalMs: 0 });
+    trackRunner(runner);
+
+    await runner.setActivityStreaming(true);
+    runner.start();
+    await waitUntil(() => runner.getLatestRates('left') !== undefined);
+
+    runner.reset();
+    expect(runner.getStatus()).toBe('ready');
+    // The streaming *setting* survives a reset (only the world/neural state
+    // resets) — this is what lets a topology switch (which always implies a
+    // reset) be recovered by the controller re-issuing set-activity, rather
+    // than silently dropping the user's choice.
+    expect(runner.isActivityStreaming()).toBe(true);
+    // But the stale snapshot from before the reset must not linger.
+    expect(runner.getLatestRates('left')).toBeUndefined();
+
+    runner.start();
+    await waitUntil(() => runner.getLatestRates('left') !== undefined);
+    expect(runner.getLatestRates('left')).toHaveLength(graph.metadata.neuronCount);
+  });
+
+  it('setActivityStreaming never rejects even when a binding has no setActivity (the oracle binding)', async () => {
+    const graph = createRandomGraph(0x9c, { neuronCount: 12, inputChannelCount: 8, outputPopulationCount: 3 });
+    const buffer = encodeGraphBinary(graph);
+    const agents: Record<'left' | 'right', AgentBinding> = {
+      left: createOracleAgentBinding({ graphBuffer: buffer.slice(0), mode: 'biological' }),
+      right: createOracleAgentBinding({ graphBuffer: buffer.slice(0), mode: 'biological' })
+    };
+    const runner = new ExperimentRunner({ seed: 3, totalTicks: 10, agents, targetTickIntervalMs: 0 });
+    trackRunner(runner);
+
+    await expect(runner.setActivityStreaming(true)).resolves.toBeUndefined();
+    expect(runner.isActivityStreaming()).toBe(true);
+    // No binding ever produces rates (the oracle binding has no `setActivity`
+    // to enable it), so `getLatestRates` stays `undefined` — not an error.
+    runner.start();
+    await runToFinished(runner);
+    expect(runner.getLatestRates('left')).toBeUndefined();
+    expect(runner.getLatestRates('right')).toBeUndefined();
+  });
+
+  /**
+   * Regression test for a bug dual review independently found and
+   * reproduced: `runOneTick` used to record `left.result.rates` /
+   * `right.result.rates` into `latestRates` whenever a result carried them,
+   * with no check of whether streaming was *still* on by the time the tick
+   * actually resolved. A tick whose `step` request the Worker had already
+   * computed (with activity on) before `setActivityStreaming(false)` was
+   * called could still resolve afterward and write its rates back in,
+   * resurrecting exactly the "stale pre-disable snapshot" this class's own
+   * doc comments say can never happen. The fix is `activityEpoch`: bumped by
+   * every `setActivityStreaming` call and checked against the value
+   * `runOneTick` captured at its own start.
+   */
+  it('a tick already in flight when streaming is disabled does not resurrect a stale rates snapshot', async () => {
+    const graph = createRandomGraph(0x9d, { neuronCount: 16, inputChannelCount: 8, outputPopulationCount: 3 });
+    const buffer = encodeGraphBinary(graph);
+    const built = await buildWorkerAgents(buffer);
+    // A small delay on both arms (see `withStepDelay`'s doc comment above):
+    // without it this worker-backed, `targetTickIntervalMs: 0` run finishes
+    // its whole microtask chain before any of this test's macrotask-based
+    // polling (`waitUntil`) or `holdNextStep`-arming ever gets a turn to run.
+    const delayed = { left: withStepDelay(built.left, 5), right: withStepDelay(built.right, 5) };
+
+    const releaseStep = createDeferred<void>();
+    let holdNextStep = false;
+    const left: AgentBinding = {
+      ...delayed.left,
+      step: async (input) => {
+        // The real Worker round trip completes first — with activity still
+        // on — so `result` genuinely carries `rates`, exactly like the
+        // reproduced bug. Only *this* JS-side resolution is held back.
+        const result = await delayed.left.step(input);
+        if (holdNextStep) {
+          holdNextStep = false;
+          await releaseStep.promise;
+        }
+        return result;
+      }
+    };
+    const agents: Record<'left' | 'right', AgentBinding> = { left, right: delayed.right };
+    const runner = new ExperimentRunner({ seed: 4, totalTicks: 300, agents, targetTickIntervalMs: 0 });
+    trackRunner(runner);
+
+    await runner.setActivityStreaming(true);
+    runner.start();
+    await waitUntil(() => runner.getLatestRates('left') !== undefined);
+
+    holdNextStep = true;
+    // Resolves once a tick's `left.step()` has finished its real round trip
+    // and is now parked on `releaseStep` — i.e. the in-flight-when-disabled
+    // window has genuinely opened, not a guessed number of ticks.
+    await waitUntil(() => !holdNextStep);
+
+    const disablePromise = runner.setActivityStreaming(false);
+    // Cleared synchronously, before the held tick's stale result can land.
+    expect(runner.getLatestRates('left')).toBeUndefined();
+
+    releaseStep.resolve();
+    await disablePromise;
+    // Let the now-unblocked `Promise.all`/`runOneTick` chain for the held
+    // tick actually finish processing its (stale-generation-of-activity)
+    // result.
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(runner.isActivityStreaming()).toBe(false);
+    expect(runner.getLatestRates('left')).toBeUndefined();
+    expect(runner.getLatestRates('right')).toBeUndefined();
+  });
+
+  /** A minimal always-succeeding binding, used below as the "other arm" so `setActivityStreaming` has exactly one genuinely failing arm to isolate. */
+  const makeQuietBinding = (setActivity: AgentBinding['setActivity']): AgentBinding => ({
+    step: async () => ({ actionFeatures: [0], telemetry: { meanRate: 0, minRate: 0, maxRate: 0, activeFraction: 0 } }),
+    reset: async () => {},
+    info: { topology: 'biological', neuronCount: 1, edgeCount: 0 },
+    setActivity
+  });
+
+  it('supportsActivityStreaming reports per-arm capability, distinct from isActivityStreaming\'s requested-intent flag (thermo maintainability review S3)', async () => {
+    const graph = createRandomGraph(0x9b, { neuronCount: 10, inputChannelCount: 4, outputPopulationCount: 2 });
+    const buffer = encodeGraphBinary(graph);
+    // `left` is a `WorkerClient`-backed binding (implements `setActivity`);
+    // `right` is the oracle/CPU binding, which omits it entirely (see
+    // `bindings.ts#createOracleAgentBinding`'s "not supported" contract).
+    const workerAgents = await buildWorkerAgents(buffer);
+    const oracleRight = createOracleAgentBinding({ graphBuffer: buffer.slice(0), mode: 'biological' });
+    const runner = new ExperimentRunner({
+      seed: 1,
+      totalTicks: 10,
+      agents: { left: workerAgents.left, right: oracleRight },
+      targetTickIntervalMs: 0
+    });
+    trackRunner(runner);
+
+    // Capability is per-arm and independent of whether streaming has been
+    // requested at all.
+    expect(runner.supportsActivityStreaming('left')).toBe(true);
+    expect(runner.supportsActivityStreaming('right')).toBe(false);
+    expect(runner.isActivityStreaming()).toBe(false);
+
+    // Requesting streaming makes `isActivityStreaming()` true for *both*
+    // arms (it reports intent, not per-arm effect — this is the exact
+    // ambiguity `supportsActivityStreaming` exists to disambiguate), even
+    // though `right` can never actually produce `rates`.
+    await runner.setActivityStreaming(true);
+    expect(runner.isActivityStreaming()).toBe(true);
+    expect(runner.supportsActivityStreaming('left')).toBe(true);
+    expect(runner.supportsActivityStreaming('right')).toBe(false);
+  });
+
+  it('setActivityStreaming logs a genuine (non-not-initialized) setActivity failure at console.error, not console.debug (thermo review S2)', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const debugSpy = vi.spyOn(console, 'debug').mockImplementation(() => {});
+    try {
+      const failing = makeQuietBinding(async () => {
+        throw new Error('internal-error: simulated genuine Worker failure');
+      });
+      const ok = makeQuietBinding(async () => {});
+      const runner = new ExperimentRunner({
+        seed: 1,
+        totalTicks: 10,
+        agents: { left: failing, right: ok },
+        targetTickIntervalMs: 0
+      });
+      trackRunner(runner);
+
+      await runner.setActivityStreaming(true);
+
+      expect(errorSpy).toHaveBeenCalled();
+      expect(debugSpy).not.toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
+      debugSpy.mockRestore();
+    }
+  });
+
+  it('setActivityStreaming logs an expected not-initialized rejection at console.debug, not console.error (thermo review S2)', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const debugSpy = vi.spyOn(console, 'debug').mockImplementation(() => {});
+    try {
+      // Duck-typed to match `WorkerClientError`'s `code` field
+      // (`worker/client.ts`) — what a real `WorkerClient`-backed binding
+      // actually rejects with when its Worker is genuinely `idle` mid
+      // `ExperimentController#changeTopology`'s dispose -> init window; see
+      // `runner.ts#isNotInitializedRejection`.
+      const notInitialized = makeQuietBinding(async () => {
+        const error = new Error('not-initialized: Neural worker has not been initialized') as Error & {
+          code: string;
+        };
+        error.code = 'not-initialized';
+        throw error;
+      });
+      const ok = makeQuietBinding(async () => {});
+      const runner = new ExperimentRunner({
+        seed: 1,
+        totalTicks: 10,
+        agents: { left: notInitialized, right: ok },
+        targetTickIntervalMs: 0
+      });
+      trackRunner(runner);
+
+      await runner.setActivityStreaming(true);
+
+      expect(debugSpy).toHaveBeenCalled();
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
+      debugSpy.mockRestore();
+    }
   });
 });

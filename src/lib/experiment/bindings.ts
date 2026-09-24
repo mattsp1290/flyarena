@@ -138,16 +138,42 @@ export const createWorkerAgentBinding = async (
 
   const step: AgentBinding['step'] = async (input) => {
     const result = await client.step(input.channelValues, input.substeps);
-    return { actionFeatures: result.actionFeatures, telemetry: result.telemetry };
+    return {
+      actionFeatures: result.actionFeatures,
+      telemetry: result.telemetry,
+      // Conditional spread (not `rates: result.rates`): a disabled response
+      // has no `rates` key on the wire at all (see `StepWorkerSuccess.rates`'s
+      // doc comment), and this keeps `AgentStepResult` matching that exactly
+      // — `'rates' in result` is `false` rather than `true` with an
+      // `undefined` value, so a downstream `!('rates' in result)` check
+      // (the closed-view contract's own assertion) behaves the same at this
+      // layer as it does directly against the Worker response.
+      ...(result.rates ? { rates: result.rates } : {})
+    };
   };
 
   const reset: AgentBinding['reset'] = async () => {
     await client.reset();
   };
 
+  // Satisfies `AgentBinding#setActivity`'s synchronous-post ordering
+  // contract (`runner.ts`'s doc comment): `client.setActivity` ->
+  // `WorkerClient`'s internal `send` calls `worker.postMessage` inside the
+  // `Promise` executor it returns, before `send` itself returns — so the
+  // `set-activity` message is already posted by the time this `async`
+  // function reaches its own first (and only) `await`, regardless of how
+  // long the returned Promise then takes to settle. This is what lets
+  // `ExperimentController#changeTopology` call this without awaiting it and
+  // still trust FIFO ordering against whatever it posts next on the same
+  // Worker.
+  const setActivity: AgentBinding['setActivity'] = async (enabled) => {
+    await client.setActivity(enabled);
+  };
+
   return {
     step,
     reset,
+    setActivity,
     info: {
       topology: mode,
       neuronCount: initResult.neuronCount,
