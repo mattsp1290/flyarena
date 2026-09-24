@@ -6,16 +6,13 @@ import { gunzipSync } from 'node:zlib';
 import { describe, expect, it } from 'vitest';
 
 import { decodeAction } from '../../src/lib/arena/actions';
-import { observeAgent } from '../../src/lib/arena/sensors';
-import { createWorld, stepWorld } from '../../src/lib/arena/world';
 import type { AgentId, DecodedAction, WorldState } from '../../src/lib/arena/types';
 import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import { parseGraphBinary, type ConnectomeGraph } from '../../src/lib/connectome/format';
 import type { NeuralTelemetry } from '../../src/lib/connectome/telemetry';
-import { createModelState, createOutputBuffer, createStepScratch, runSubsteps } from '../../src/lib/connectome/model';
 import { createOracleAgentBinding } from '../../src/lib/experiment/bindings';
 import { ExperimentRunner, type AgentBinding, type AgentStepInput, type AgentStepResult } from '../../src/lib/experiment/runner';
-import { runEpisode } from '../../scripts/training/episode';
+import { runEpisode, type AgentScoreResult } from '../../scripts/training/episode';
 
 /**
  * WP1 episode re-grounding gate
@@ -29,22 +26,21 @@ import { runEpisode } from '../../scripts/training/episode';
  * the left, and a parked opponent on the right, for seeds `30001..30003`
  * (the held-out range this plan reserves) at 300 ticks each.
  *
- * **Why the left side is replayed by hand as well as called through
- * `runEpisode`.** `runEpisode` only returns the *final* per-agent score
- * (`EpisodeResult`), not a per-tick trace, so there is no product API to
- * pull per-tick decoded actions from that call directly. The 'authored'
- * decoder path it runs internally
- * (`createNeuralRunner`'s `decoder === 'authored'` branch) is exactly three
- * calls in a fixed order -- `observeAgent` -> `runSubsteps` -> `decodeAction`
- * -- using the same exported primitives this test file also imports; this
- * test drives those same three primitives itself, once per tick, purely to
- * capture what `runEpisode` cannot expose. That replay is not trusted on
- * its own: each seed's block first asserts the replay's own final score
- * (computed the same way `runEpisode` computes it, by feeding its decoded
- * actions into `stepWorld`) equals `runEpisode`'s actual returned
- * `EpisodeResult.left` -- so a divergence between this file's replay and
- * `runEpisode` would fail *that* assertion, not silently pass the per-tick
- * comparison below by comparing two independently-wrong sequences.
+ * **Per-tick capture comes from `runEpisode` itself, via `onTick`.**
+ * `runEpisode` only returns the *final* per-agent score (`EpisodeResult`),
+ * with no built-in way to observe its per-tick actions. An earlier version
+ * of this test worked around that by hand-replaying episode.ts's authored
+ * decoder logic (`observeAgent` -> `runSubsteps` -> `decodeAction`) and
+ * comparing *that replica* against `ExperimentRunner`, linking it back to
+ * the real `runEpisode` only through a final-score equality check. A
+ * review pass (with a mutation test: feeding the left arm a stale
+ * observation) confirmed that setup could report a passing per-tick
+ * comparison while the actual `runEpisode` tick loop had drifted, only
+ * surfacing as an opaque final-score mismatch with no tick index. `onTick`
+ * (`EpisodeConfig`, `episode.ts`) removes the need for a replica entirely:
+ * it fires once per tick, right after `stepWorld`, with the exact decoded
+ * actions that tick fed into it -- so `episodeLeftActions` below is
+ * `runEpisode`'s own per-tick record, not a second implementation of it.
  *
  * **The parked opponent.** `ExperimentRunner` has no "parked" concept --
  * `runOneTick` always steps both arms through their `AgentBinding`. A
@@ -54,14 +50,19 @@ import { runEpisode } from '../../scripts/training/episode';
  * `createZeroAgentBinding` below is a test-only `AgentBinding` whose `step`
  * always resolves the zero action -- no product code changes. Since
  * `decodeAction([0, 0, 0])` equals episode.ts's own `ZERO_ACTION`, this is
- * exactly `createParkedRunner`'s behavior. `rightPositions` (tracked via
- * `onTelemetry`) confirms the right agent's position never moves under it,
- * i.e. that this test-only binding really is parked-equivalent.
+ * exactly `createParkedRunner`'s behavior. Both paths' right-arm results are
+ * checked: `rightPositions` (via `ExperimentRunner`'s `onTelemetry`) and
+ * `episodeRightPositions` (via `onTick`) each confirm the right agent's
+ * position never moves, and `episodeResult.right` is compared against
+ * `ExperimentRunner`'s own right-arm telemetry and asserted to have
+ * travelled zero distance -- a review pass found the first version of this
+ * test never checked `runEpisode`'s own parked arm at all (a mutated
+ * `createParkedRunner` returning a nonzero action still passed).
  *
- * Stop-if-fails: if any seed's left-agent decoded actions or final score
- * diverge between the two paths, the failing `it` throws naming the exact
- * first divergent tick -- see `firstDivergentTickIndex` below -- rather than
- * only reporting an opaque array diff.
+ * Stop-if-fails: if any seed's left-agent decoded actions or either arm's
+ * final score diverge between the two paths, the failing `it` throws
+ * naming the exact first divergent tick -- see `firstDivergentTickIndex`
+ * below -- rather than only reporting an opaque array diff.
  */
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -106,16 +107,25 @@ const recordingBinding = (binding: AgentBinding, sink: DecodedAction[]): AgentBi
   }
 });
 
-const runToFinished = (runner: ExperimentRunner): Promise<void> =>
+/**
+ * Rejects with the runner's real error (captured via `errorSink`, populated
+ * by an `onError` callback passed at construction) instead of a generic
+ * message, if the runner never reaches `finished`.
+ */
+const runToFinished = (runner: ExperimentRunner, errorSink: { current?: Error }): Promise<void> =>
   new Promise((resolveRun, rejectRun) => {
+    let settled = false;
     const poll = setInterval(() => {
+      if (settled) return;
       const status = runner.getStatus();
       if (status === 'finished') {
+        settled = true;
         clearInterval(poll);
         resolveRun();
       } else if (status === 'error') {
+        settled = true;
         clearInterval(poll);
-        rejectRun(new Error('ExperimentRunner entered the error state during the parity gate'));
+        rejectRun(errorSink.current ?? new Error('ExperimentRunner entered the error state during the parity gate'));
       }
     }, 1);
     runner.start();
@@ -132,6 +142,18 @@ const capturePosition = (world: Readonly<WorldState>, agentId: AgentId): Positio
   return { x: agent.position.x, z: agent.position.z };
 };
 
+const toScoreResult = (telemetry: {
+  foodPickups: number;
+  hazardContacts: number;
+  distanceTravelled: number;
+  movementScore: number;
+}): AgentScoreResult => ({
+  foodPickups: telemetry.foodPickups,
+  hazardContacts: telemetry.hazardContacts,
+  distanceTravelled: telemetry.distanceTravelled,
+  movementScore: telemetry.movementScore
+});
+
 /** Index of the first tick at which `a`/`b` disagree on any decoded field, or -1 if they agree over their full shared length and are the same length. */
 const firstDivergentTickIndex = (a: readonly DecodedAction[], b: readonly DecodedAction[]): number => {
   const length = Math.min(a.length, b.length);
@@ -144,96 +166,101 @@ const firstDivergentTickIndex = (a: readonly DecodedAction[], b: readonly Decode
 };
 
 describe('episode.ts runEpisode vs ExperimentRunner: per-tick closed-loop parity', () => {
+  // Loaded once and shared across every seed's `it` below. Safe: `graph` is
+  // read-only static structure (`runEpisode`/`createOracleAgentBinding`
+  // each allocate their own fresh, per-call mutable neural state from it),
+  // and `buffer` is only ever read via a fresh `buffer.slice(0)` defensive
+  // copy per `createOracleAgentBinding` call below, never transferred or
+  // mutated in place.
   const { graph, buffer } = loadBiologicalGraph();
 
   for (const seed of SEEDS) {
-    it(`seed ${seed}: left (authored) per-tick decoded actions and final score match, right (parked) never moves`, async () => {
-      // --- Path A: the real product `runEpisode` call. ---
-      const episodeResult = runEpisode({
-        seed,
-        ticks: TICKS,
-        substeps: NEURAL_SUBSTEPS_PER_TICK,
-        left: { decoder: 'authored', graph },
-        right: { decoder: 'parked' }
-      });
-
-      // --- Path A': per-tick instrumented replay of the exact same primitives
-      // episode.ts's authored path composes -- see this file's module doc for
-      // why, and note the self-check against `episodeResult.left` below.
-      const state = createModelState(graph);
-      const scratch = createStepScratch(graph);
-      const outputs = createOutputBuffer(graph);
-      let replayWorld = createWorld(seed);
-      const episodeLeftActions: DecodedAction[] = [];
-      const episodeRightPositions: Position[] = [];
-      for (let tick = 0; tick < TICKS; tick += 1) {
-        const observation = observeAgent(replayWorld, 'left');
-        runSubsteps(graph, state, scratch, observation, NEURAL_SUBSTEPS_PER_TICK, outputs);
-        const decoded = decodeAction(Array.from(outputs));
-        episodeLeftActions.push(decoded);
-        replayWorld = stepWorld(replayWorld, {
-          left: [decoded.thrust, decoded.yaw, decoded.brake],
-          right: [0, 0, 0]
+    it(
+      `seed ${seed}: left (authored) per-tick decoded actions and both arms' final scores match, right (parked) never moves`,
+      async () => {
+        // --- Path A: the real product `runEpisode` call, instrumented via
+        // `onTick` (see this file's module doc for why this replaced an
+        // earlier hand-replay approach). ---
+        const episodeLeftActions: DecodedAction[] = [];
+        const episodeRightPositions: Position[] = [];
+        const episodeResult = runEpisode({
+          seed,
+          ticks: TICKS,
+          substeps: NEURAL_SUBSTEPS_PER_TICK,
+          left: { decoder: 'authored', graph },
+          right: { decoder: 'parked' },
+          onTick: (_tick, actions, world) => {
+            episodeLeftActions.push(actions.left);
+            episodeRightPositions.push(capturePosition(world, 'right'));
+          }
         });
-        episodeRightPositions.push(capturePosition(replayWorld, 'right'));
-      }
-      const replayLeftAgent = replayWorld.agents.find((agent) => agent.id === 'left');
-      if (!replayLeftAgent) throw new Error('parity gate: replay world is missing the left agent');
-      // Self-check: the hand-driven replay must reach the exact same final
-      // score `runEpisode` itself returned, or the per-tick capture above
-      // cannot be trusted as representative of `runEpisode`'s real behavior.
-      expect(replayLeftAgent.score).toEqual(episodeResult.left);
+        expect(episodeLeftActions).toHaveLength(TICKS);
+        // Nontriviality guard: the authored decoder over the real graph must
+        // actually move the left agent, or a passing comparison below could
+        // just mean both paths independently produced an all-zero run.
+        expect(episodeResult.left.distanceTravelled).toBeGreaterThan(0);
+        expect(episodeResult.right.distanceTravelled).toBe(0);
 
-      // --- Path B: the product closed-loop orchestrator, ExperimentRunner +
-      // createOracleAgentBinding, with a test-only zero binding for "parked".
-      const leftActions: DecodedAction[] = [];
-      const leftBinding = recordingBinding(
-        createOracleAgentBinding({ graphBuffer: buffer.slice(0), mode: 'biological' }),
-        leftActions
-      );
-      const rightBinding = createZeroAgentBinding(graph.metadata.neuronCount);
-      const rightPositions: Position[] = [];
-      const runner = new ExperimentRunner({
-        seed,
-        totalTicks: TICKS,
-        agents: { left: leftBinding, right: rightBinding },
-        substepsPerTick: NEURAL_SUBSTEPS_PER_TICK,
-        targetTickIntervalMs: 0,
-        onTelemetry: () => {
-          rightPositions.push(capturePosition(runner.getWorld(), 'right'));
-        }
-      });
-      const initialRightPosition = capturePosition(runner.getWorld(), 'right');
-      await runToFinished(runner);
-
-      // --- Comparison 1: per-tick left decoded actions. ---
-      const divergentTick = firstDivergentTickIndex(episodeLeftActions, leftActions);
-      if (divergentTick !== -1) {
-        throw new Error(
-          `seed ${seed}: episode.ts and ExperimentRunner left-agent decoded actions first diverge at tick ` +
-            `${divergentTick} of ${TICKS}: runEpisode=${JSON.stringify(episodeLeftActions[divergentTick])}, ` +
-            `ExperimentRunner=${JSON.stringify(leftActions[divergentTick])}`
+        // --- Path B: the product closed-loop orchestrator, ExperimentRunner
+        // + createOracleAgentBinding, with a test-only zero binding for
+        // "parked".
+        const leftActions: DecodedAction[] = [];
+        const leftBinding = recordingBinding(
+          createOracleAgentBinding({ graphBuffer: buffer.slice(0), mode: 'biological' }),
+          leftActions
         );
-      }
-      expect(leftActions).toHaveLength(TICKS);
+        const rightBinding = createZeroAgentBinding(graph.metadata.neuronCount);
+        const rightPositions: Position[] = [];
+        const errorSink: { current?: Error } = {};
+        const runner = new ExperimentRunner({
+          seed,
+          totalTicks: TICKS,
+          agents: { left: leftBinding, right: rightBinding },
+          substepsPerTick: NEURAL_SUBSTEPS_PER_TICK,
+          targetTickIntervalMs: 0,
+          onError: (error) => {
+            errorSink.current = error;
+          },
+          // `runOneTick` (runner.ts) calls this after `stepWorld` has
+          // already applied that tick, and only for a tick that was not
+          // discarded by a concurrent reset/dispose (neither happens in
+          // this test) -- so one call per applied tick, world already
+          // advanced, is exactly what `rightPositions.length` below relies
+          // on equaling `TICKS`.
+          onTelemetry: () => {
+            rightPositions.push(capturePosition(runner.getWorld(), 'right'));
+          }
+        });
+        const initialRightPosition = capturePosition(runner.getWorld(), 'right');
+        await runToFinished(runner, errorSink);
+        expect(runner.getWorld().tick).toBe(TICKS);
 
-      // --- Comparison 2: final score. ---
-      const runnerLeftTelemetry = runner.getTelemetry().agents.left;
-      expect({
-        foodPickups: runnerLeftTelemetry.foodPickups,
-        hazardContacts: runnerLeftTelemetry.hazardContacts,
-        distanceTravelled: runnerLeftTelemetry.distanceTravelled,
-        movementScore: runnerLeftTelemetry.movementScore
-      }).toEqual(episodeResult.left);
+        // --- Comparison 1: per-tick left decoded actions. ---
+        const divergentTick = firstDivergentTickIndex(episodeLeftActions, leftActions);
+        if (divergentTick !== -1) {
+          throw new Error(
+            `seed ${seed}: episode.ts and ExperimentRunner left-agent decoded actions first diverge at tick ` +
+              `${divergentTick} of ${TICKS}: runEpisode=${JSON.stringify(episodeLeftActions[divergentTick])}, ` +
+              `ExperimentRunner=${JSON.stringify(leftActions[divergentTick])}`
+          );
+        }
+        expect(leftActions).toHaveLength(TICKS);
 
-      // --- Comparison 3: the right (parked) agent never moves, on either path. ---
-      expect(rightPositions).toHaveLength(TICKS);
-      for (const position of rightPositions) {
-        expect(position).toEqual(initialRightPosition);
-      }
-      for (const position of episodeRightPositions) {
-        expect(position).toEqual(initialRightPosition);
-      }
-    });
+        // --- Comparison 2: final score, both arms. ---
+        const telemetry = runner.getTelemetry();
+        expect(toScoreResult(telemetry.agents.left)).toEqual(episodeResult.left);
+        expect(toScoreResult(telemetry.agents.right)).toEqual(episodeResult.right);
+
+        // --- Comparison 3: the right (parked) agent never moves, on either path. ---
+        expect(rightPositions).toHaveLength(TICKS);
+        for (const position of rightPositions) {
+          expect(position).toEqual(initialRightPosition);
+        }
+        for (const position of episodeRightPositions) {
+          expect(position).toEqual(initialRightPosition);
+        }
+      },
+      15_000
+    );
   }
 });

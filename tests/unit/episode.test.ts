@@ -13,6 +13,7 @@ import {
   readoutForward,
   type ReadoutWeights
 } from '../../src/lib/connectome/readout';
+import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import { DEFAULT_GRAPH_ID, TRACE_SEEDS, TRACE_SUBSTEPS, TRACE_TICKS } from '../../scripts/training/export-traces';
 import { runEpisode } from '../../scripts/training/episode';
 import { createTraceGraph } from '../fixtures/trace-graph';
@@ -234,5 +235,25 @@ describe('runEpisode: decoder behavior', () => {
     });
 
     expect(result.left).toEqual(expectedLeft.score);
+  });
+});
+
+describe('runEpisode: substeps default', () => {
+  it('omitting substeps is exactly equivalent to passing NEURAL_SUBSTEPS_PER_TICK explicitly', () => {
+    const graph = createTraceGraph();
+    const withDefault = runEpisode({
+      seed: 3,
+      ticks: 12,
+      left: { decoder: 'authored', graph },
+      right: { decoder: 'parked' }
+    });
+    const withExplicitSubsteps = runEpisode({
+      seed: 3,
+      ticks: 12,
+      substeps: NEURAL_SUBSTEPS_PER_TICK,
+      left: { decoder: 'authored', graph },
+      right: { decoder: 'parked' }
+    });
+    expect(withDefault).toEqual(withExplicitSubsteps);
   });
 });

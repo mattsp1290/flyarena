@@ -30,16 +30,6 @@ DD_TRACE_ENABLED=false DD_IAST_ENABLED=false DD_APPSEC_ENABLED=false uv run pyte
 training/scripts/run.sh pytest -v
 ```
 
-Run every `training/` command (not just `pytest`) with these three env vars
-set, and with `PYTHONPATH` unset -- an inherited `PYTHONPATH` from the
-shell (e.g. left over from another project) can reintroduce the same
-auto-injection this section disables, even with the three `DD_*` vars set,
-because `sitecustomize`/`ddtrace`'s bootstrap hooks into whatever is already
-on `sys.path`. On this host, `training/` pytest fails 30/119 tests under the
-injected IAST instrumentation with a bare `uv run pytest`; with
-`DD_IAST_ENABLED=false` and `PYTHONPATH` unset, all 119 pass (see
-`.agents/plans/rewiring-null/00-overview.md`'s "Risks and assumptions").
-
 `training/scripts/run.sh` wraps the three env vars and `exec`s `uv run
 "$@"`, so WP3's automation (a script, a cron job, a CI runner) doesn't have
 to rely on the vars being copy-pasted correctly by hand every time — it's a
@@ -50,6 +40,18 @@ user code executes, so by the time `conftest.py` runs it's too late — the
 shell invocation is the only correct fix point. `conftest.py` sets them
 anyway, defensively, in case some other code path reads `os.environ` at
 runtime; see its module doc.)
+
+Also run every `training/` command with `PYTHONPATH` unset, not just these
+three `DD_*` vars set -- an inherited `PYTHONPATH` from the shell (e.g. left
+over from another project) can reintroduce the same auto-injection this
+section disables, even with the three `DD_*` vars set, because
+`sitecustomize`/`ddtrace`'s bootstrap hooks into whatever is already on
+`sys.path`. `training/scripts/run.sh` unsets it for you; if invoking `uv
+run` directly instead, unset it yourself. Observed on this host (2026-09-24):
+`training/` pytest failed 30/119 tests under the injected IAST
+instrumentation with a bare `uv run pytest`; with `DD_IAST_ENABLED=false`
+and `PYTHONPATH` unset, all 119 passed (see
+`.agents/plans/rewiring-null/00-overview.md`'s "Risks and assumptions").
 
 If this project is ever run on a host without this injection, the env vars
 (and `run.sh`) are harmless no-ops.

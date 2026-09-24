@@ -97,6 +97,12 @@ def test_two_runs_over_the_same_seed_range_give_identical_index_json(tmp_path):
 
 
 def test_main_cli_writes_the_requested_seed_range_and_index_json(tmp_path):
+    # Snapshotted *before* the CLI runs -- read after, this assertion would
+    # trivially compare the file with itself and could never fail even if
+    # the CLI rewrote the manifest.
+    manifest_path = PUBLIC_DATA_DIR / "malecns-arena-v1.manifest.json"
+    manifest_bytes_before = manifest_path.read_bytes()
+
     out_dir = tmp_path / "cli-graphs"
     exit_code = rewire_batch.main(
         [
@@ -123,11 +129,13 @@ def test_main_cli_writes_the_requested_seed_range_and_index_json(tmp_path):
     assert [entry["seed"] for entry in index["seeds"]] == [0, 1, 2]
     assert index["sourceArtifact"] == SOURCE_ARTIFACT.name
     assert index["rewireSourceSha256"] == binfmt.sha256_hex(Path(rewire.__file__).read_bytes())
+    assert index["binfmtSourceSha256"] == binfmt.sha256_hex(Path(binfmt.__file__).read_bytes())
+    assert index["numpyVersion"] == np.__version__
+    assert index["params"] == {"allowSelfLoops": False, "swapAttemptsMultiplier": rewire.DEFAULT_SWAP_ATTEMPTS_MULTIPLIER}
 
     # The CLI must never touch the shipped product manifest.
-    manifest_before = (PUBLIC_DATA_DIR / "malecns-arena-v1.manifest.json").read_text()
     assert "malecns-arena-v1.manifest.json" not in {p.name for p in out_dir.iterdir()}
-    assert manifest_before == (PUBLIC_DATA_DIR / "malecns-arena-v1.manifest.json").read_text()
+    assert manifest_path.read_bytes() == manifest_bytes_before
 
 
 def test_custom_index_out_path_is_honored(tmp_path):
@@ -150,7 +158,7 @@ def test_custom_index_out_path_is_honored(tmp_path):
     assert not (out_dir / "index.json").exists()
 
 
-@pytest.mark.parametrize("spec", ["0", "0:", ":5", "abc:5", "0:abc"])
+@pytest.mark.parametrize("spec", ["0", "0:", ":5", "abc:5", "0:abc", "-1:3"])
 def test_parse_seed_range_rejects_malformed_specs(spec):
     with pytest.raises(ValueError):
         rewire_batch.parse_seed_range(spec)
@@ -194,6 +202,20 @@ def test_batch_output_preserves_rewiring_invariants_for_every_seed(tmp_path):
         assert int(rewired_graph.metadata["edgeCount"]) == int(source_graph.metadata["edgeCount"])
         assert np.array_equal(rewired_graph.presynaptic_signs, source_graph.presynaptic_signs)
         assert np.array_equal(rewired_graph.biological_ids, source_graph.biological_ids)
+        # Edge-weight multiset: a swap only ever changes an edge's target,
+        # never its contactMagnitudes value, so the full set of weights
+        # (irrespective of which row each now sorts into) is preserved --
+        # the per-presynaptic-neuron version of this same invariant is
+        # already exhaustively covered by
+        # tests_python/test_compile.py::test_rewire_preserves_edge_weight_multiset_per_presynaptic_neuron.
+        assert np.array_equal(
+            np.sort(rewired_graph.contact_magnitudes), np.sort(source_graph.contact_magnitudes)
+        )
+        # Per-node I/O maps are copied through unmodified by rewire_graph.
+        assert np.array_equal(rewired_graph.input_channel_index, source_graph.input_channel_index)
+        assert np.array_equal(rewired_graph.input_weight, source_graph.input_weight)
+        assert np.array_equal(rewired_graph.output_population_index, source_graph.output_population_index)
+        assert np.array_equal(rewired_graph.output_weight, source_graph.output_weight)
 
         assert entry["stats"]["acceptedSwaps"] <= entry["stats"]["attempts"]
         # Any seed with acceptedSwaps < edgeCount is still included (never

@@ -1,7 +1,7 @@
 import { decodeAction } from '../../src/lib/arena/actions';
 import { observeAgent } from '../../src/lib/arena/sensors';
 import { createWorld, stepWorld } from '../../src/lib/arena/world';
-import type { ActionsByAgent, AgentId, AgentScore, WorldState } from '../../src/lib/arena/types';
+import type { ActionsByAgent, AgentId, AgentScore, DecodedAction, WorldState } from '../../src/lib/arena/types';
 import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import type { ConnectomeGraph } from '../../src/lib/connectome/format';
 import {
@@ -80,6 +80,17 @@ export interface EpisodeConfig {
   readonly substeps?: number;
   readonly left: AgentEpisodeConfig;
   readonly right: AgentEpisodeConfig;
+  /**
+   * Diagnostic-only hook, never used by a production caller (`evaluate.ts`
+   * never passes it): invoked once per tick, immediately after `stepWorld`,
+   * with the exact decoded actions this tick fed into it and the resulting
+   * world. Exists so `tests/unit/episode-runner-parity.test.ts` can observe
+   * this file's real per-tick closed loop directly -- rather than a
+   * hand-driven re-derivation of it from the underlying primitives, which a
+   * review pass found could drift from this file's own tick loop without
+   * the parity gate noticing (see that test's module doc).
+   */
+  readonly onTick?: (tick: number, actions: Readonly<Record<AgentId, DecodedAction>>, world: Readonly<WorldState>) => void;
 }
 
 export interface AgentScoreResult {
@@ -208,6 +219,10 @@ export const runEpisode = (config: Readonly<EpisodeConfig>): EpisodeResult => {
     const rightAction = rightRunner.step(world);
     const actions: ActionsByAgent = { left: leftAction, right: rightAction };
     world = stepWorld(world, actions);
+    // decodeAction here is idempotent for these already-clamped tuples (see
+    // this function's doc comment); this is the same "actually applied this
+    // tick" action `stepWorld` decoded internally, not a re-derivation.
+    config.onTick?.(tick, { left: decodeAction(leftAction), right: decodeAction(rightAction) }, world);
   }
 
   const leftAgent = world.agents.find((agent) => agent.id === 'left');
