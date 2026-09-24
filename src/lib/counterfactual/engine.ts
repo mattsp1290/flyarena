@@ -1,22 +1,23 @@
+import { AUTHORED, createDecoder, type Decoder } from './decoder';
 import { ARENA_CONFIG, createArenaConfigFingerprint } from '../arena/config';
 import { observeAgent } from '../arena/sensors';
 import { decodeAction } from '../arena/actions';
 import { createWorld, createSnapshot, stepWorld } from '../arena/world';
-import type { AgentScore, WorldState } from '../arena/types';
+import type { AgentScore, WorldState, ReadonlyWorldState } from '../arena/types';
 import { NEURAL_SUBSTEPS_PER_TICK } from '../connectome/constants';
 import { aggregateOutputs, createModelState, createOutputBuffer, createStepScratch, stepModel } from '../connectome/model';
 import type { ConnectomeGraph } from '../connectome/format';
 import type { PreparedGraph } from './targets';
 import {
   MODEL_VERSION, SCORE_KEYS, seedsFor, validateRequest,
-  type Evidence, type Frame, type Interval, type Request, type SeedResult, type BranchResult
+  type Evidence, type EvidenceHeader, type Frame, type Interval, type Request, type SeedResult, type BranchResult
 } from './types';
 
 /** Every branch owns a full world, neural state and reusable scratch. */
-export function createBranch(graph: ConnectomeGraph, world: WorldState, rates?: Float32Array) {
+export function createBranch(graph: ConnectomeGraph, world: WorldState, rates?: Float32Array, decoder: Decoder = AUTHORED) {
   const state = createModelState(graph);
   if (rates) state.rate.set(rates);
-  return { world: structuredClone(world), state, scratch: createStepScratch(graph), outputs: createOutputBuffer(graph) };
+  return { world: structuredClone(world), state, scratch: createStepScratch(graph), outputs: createOutputBuffer(graph), decode: createDecoder(graph, decoder) };
 }
 export type SimulationBranch = ReturnType<typeof createBranch>;
 
@@ -29,11 +30,11 @@ export function stepBranch(graph: ConnectomeGraph, branch: SimulationBranch, tar
     for (const i of target) branch.state.rate[i] = 0;
   }
   aggregateOutputs(graph, branch.state, branch.outputs);
-  const action = decodeAction(Array.from(branch.outputs));
+  const action = decodeAction(branch.decode(branch.state.rate, branch.outputs));
   branch.world = stepWorld(branch.world, { left: [action.thrust, action.yaw, action.brake], right: [0, 0, 0] });
 }
 
-export function captureFrame(world: WorldState): Frame {
+export function captureFrame(world: ReadonlyWorldState): Frame {
   return {
     snapshot: createSnapshot(world, 1),
     scores: { left: { ...world.agents.find(a => a.id === 'left')!.score }, right: { ...world.agents.find(a => a.id === 'right')!.score } }
@@ -56,16 +57,16 @@ const meanScore = (values: AgentScore[]): AgentScore => {
   return mean;
 };
 
-export function runSeed(prepared: PreparedGraph, request: Request, seed: number): SeedResult {
+export function runSeed(prepared: PreparedGraph, request: Request, seed: number, decoder: Decoder = AUTHORED): SeedResult {
   const target = prepared.targets.find(t => t.id === request.target);
   if (!target?.indices.length) throw new Error('Selected target has no neurons');
-  const warm = createBranch(prepared.graph, createWorld(seed));
+  const warm = createBranch(prepared.graph, createWorld(seed), undefined, decoder);
   for (let i = 0; i < request.warmup; i++) stepBranch(prepared.graph, warm);
   const fork = captureFrame(warm.world);
   const count = Math.min(60, request.horizon);
   const sampleTicks = new Set(Array.from({ length: count + 1 }, (_, i) => Math.round(i * request.horizon / count)));
   function future(indices: readonly number[]): BranchResult {
-    const branch = createBranch(prepared.graph, warm.world, warm.state.rate);
+    const branch = createBranch(prepared.graph, warm.world, warm.state.rate, decoder);
     const frames = [captureFrame(branch.world)];
     for (let tick = 1; tick <= request.horizon; tick++) {
       stepBranch(prepared.graph, branch, indices);
@@ -84,7 +85,7 @@ export function runSeed(prepared: PreparedGraph, request: Request, seed: number)
   };
 }
 
-export function evidenceHeader(prepared: PreparedGraph, input: unknown): Omit<Evidence, 'results' | 'summary'> {
+export function evidenceHeader(prepared: PreparedGraph, input: unknown, decoder: Decoder = AUTHORED): EvidenceHeader {
   const request = validateRequest(input);
   if (request.topology !== prepared.identity.topology) throw new Error('Prepared topology does not match request');
   const target = prepared.targets.find(t => t.id === request.target);
@@ -93,7 +94,7 @@ export function evidenceHeader(prepared: PreparedGraph, input: unknown): Omit<Ev
   return {
     schemaVersion: 1, modelVersion: MODEL_VERSION, request, seeds, graph: { ...prepared.identity },
     config: { ...ARENA_CONFIG }, configFingerprint: createArenaConfigFingerprint(ARENA_CONFIG),
-    substeps: NEURAL_SUBSTEPS_PER_TICK, decoder: 'authored', opponent: 'zero-action', target: structuredClone(target),
+    substeps: NEURAL_SUBSTEPS_PER_TICK, ...structuredClone(decoder), opponent: 'zero-action', target: structuredClone(target),
     provenance: {
       topology: request.topology === 'biological' ? 'Measured connectivity' : 'Authored control derived from measured connectivity',
       grouping: 'Authored input/output mappings, not anatomical regions',
@@ -104,11 +105,11 @@ export function evidenceHeader(prepared: PreparedGraph, input: unknown): Omit<Ev
 }
 
 /** Generator allows Worker progress between seeds without browser dependencies. */
-export function* experiment(prepared: PreparedGraph, input: unknown): Generator<number, Evidence> {
-  const header = evidenceHeader(prepared, input);
+export function* experiment(prepared: PreparedGraph, input: unknown, decoder: Decoder = AUTHORED): Generator<number, Evidence> {
+  const header = evidenceHeader(prepared, input, decoder);
   const results: SeedResult[] = [];
   for (const seed of header.seeds) {
-    results.push(runSeed(prepared, header.request, seed));
+    results.push(runSeed(prepared, header.request, seed, decoder));
     yield results.length;
   }
   return {
@@ -121,8 +122,8 @@ export function* experiment(prepared: PreparedGraph, input: unknown): Generator<
     }
   };
 }
-export function runExperiment(prepared: PreparedGraph, request: unknown): Evidence {
-  const iterator = experiment(prepared, request);
+export function runExperiment(prepared: PreparedGraph, request: unknown, decoder: Decoder = AUTHORED): Evidence {
+  const iterator = experiment(prepared, request, decoder);
   let next = iterator.next();
   while (!next.done) next = iterator.next();
   return next.value;

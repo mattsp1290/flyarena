@@ -17,7 +17,12 @@ test('all views work beneath /fly/ with root asset routes deliberately unavailab
   await page.getByRole('button',{name:'Use quick probe settings'}).click();
   await page.getByRole('button',{name:'Fork & compare →'}).click();
   await expect(page.getByRole('status')).toHaveText('completed');
-  await page.getByRole('link',{name:/03 DGX sandbox/}).click();
+  await page.getByRole('link',{name:'03 Behavior atlas',exact:true}).click();
+  await expect(page.getByRole('group',{name:'Select a discovered behavior'})).toBeVisible();
+  await page.getByRole('button',{name:'Use quick probe settings'}).click();
+  await page.getByRole('button',{name:'Fork & compare →'}).click();
+  await expect(page.getByRole('status')).toHaveText('completed');
+  await page.getByRole('link',{name:/04 DGX sandbox/}).click();
   await expect(page.getByLabel('Access token')).toBeVisible();
   await page.setViewportSize({width:390,height:844});
   expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);

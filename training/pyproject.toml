@@ -20,6 +20,7 @@ dependencies = [
 
 [project.scripts]
 flyarena-train = "flyarena_training.cli:main"
+flyarena-atlas = "flyarena_training.atlas_cli:main"
 
 [dependency-groups]
 dev = [

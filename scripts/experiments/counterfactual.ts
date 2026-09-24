@@ -1,22 +1,24 @@
+import { loadLocalAtlas } from '../atlas/files';
+import { resolveController } from '../../src/lib/atlas/controller';
+import { AUTHORED, type Decoder } from '../../src/lib/counterfactual/decoder';
 import { readFile, stat, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { parseArgs } from 'node:util';
-import { verifyAndDecompressArtifact, type ArenaManifest } from '../../src/lib/experiment/assets';
-import { parseGraphBinary } from '../../src/lib/connectome/format';
+import { loadLocalAssets } from './local-assets';
 import { prepareGraph } from '../../src/lib/counterfactual/targets';
 import { evidenceHeader, runExperiment } from '../../src/lib/counterfactual/engine';
 import { compareEvidence, readEvidenceRequest, serializeEvidence } from '../../src/lib/counterfactual/evidence';
 import { DEFAULT_REQUEST, validateRequest, type ExportDocument } from '../../src/lib/counterfactual/types';
 
 const { values } = parseArgs({ options: {
-  verify: { type: 'string' }, 'compare-numerical': { type: 'string' }, output: { type: 'string' },
+  controller: { type: 'string' }, verify: { type: 'string' }, 'compare-numerical': { type: 'string' }, output: { type: 'string' },
   data: { type: 'string', default: 'public/data' }, seed: { type: 'string' }, seeds: { type: 'string' },
   warmup: { type: 'string' }, horizon: { type: 'string' }, topology: { type: 'string' }, target: { type: 'string' }
 } });
 if (values.verify && values['compare-numerical']) throw new Error('Choose exact verification or numerical comparison');
 const inputPath = values.verify ?? values['compare-numerical'];
 if (!inputPath && !values.output) throw new Error('Use --output FILE to retain the evidence, or --verify FILE');
-if (inputPath && ['seed', 'seeds', 'warmup', 'horizon', 'topology', 'target'].some(k => values[k as keyof typeof values] !== undefined)) {
+if (inputPath && ['controller', 'seed', 'seeds', 'warmup', 'horizon', 'topology', 'target'].some(k => values[k as keyof typeof values] !== undefined)) {
   throw new Error('Verification settings come only from the export');
 }
 let input: ReturnType<typeof readEvidenceRequest> | undefined;
@@ -33,26 +35,27 @@ const request = input?.request ?? validateRequest({
   topology: values.topology ?? DEFAULT_REQUEST.topology, target: values.target ?? DEFAULT_REQUEST.target
 });
 const data = resolve(values.data);
-const manifest: ArenaManifest = JSON.parse(await readFile(resolve(data, 'malecns-arena-v1.manifest.json'), 'utf8'));
-async function artifact(name: string) {
-  if (!/^[a-zA-Z0-9._-]+$/.test(name)) throw new Error('Invalid artifact filename');
-  const buffer = await readFile(resolve(data, name));
-  return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+const assets = await loadLocalAssets(data);
+const prepared = await prepareGraph(assets, request.topology);
+let decoder: Decoder = AUTHORED;
+const exportedController = input?.evidence.decoder === 'atlas-trained' ? input.evidence.controller : undefined;
+if (exportedController !== undefined || values.controller !== undefined) {
+  if (exportedController !== undefined && (!exportedController || typeof exportedController !== 'object')) throw new Error('Invalid exported controller');
+  const identity = exportedController as Record<string, unknown> | undefined;
+  const id = identity ? identity.id : Number(values.controller);
+  if (typeof id !== 'number' || !Number.isInteger(id)) throw new Error('Invalid controller ID');
+  const loaded = await loadLocalAtlas(data);
+  decoder = { decoder: 'atlas-trained', controller: await resolveController(loaded, prepared, id) };
 }
-const [biological, rewired] = await Promise.all([
-  artifact(manifest.artifact).then(b => verifyAndDecompressArtifact(b, manifest)),
-  artifact(manifest.rewiredArms.seed0.artifact).then(b => verifyAndDecompressArtifact(b, manifest.rewiredArms.seed0))
-]);
-const parsedBiological = parseGraphBinary(biological.slice(0));
-const prepared = await prepareGraph({ manifest, biological, rewired, parsedBiological }, request.topology);
+
 if (input) {
   // Fail before simulation on mismatched model identity, targets, or seeds as well as after it on outcomes.
-  const header = evidenceHeader(prepared, request);
+  const header = evidenceHeader(prepared, request, decoder);
   const actual = Object.fromEntries(Object.keys(header).map(key => [key, input!.evidence[key]]));
   if (!compareEvidence(header, actual).matches) throw new Error('Export model, graph, target or seed identity mismatch');
 }
 const started = performance.now();
-const evidence = runExperiment(prepared, request);
+const evidence = runExperiment(prepared, request, decoder);
 if (input) {
   const comparison = compareEvidence(evidence, input.evidence, Boolean(values['compare-numerical']));
   console.log(JSON.stringify({ status: comparison.matches ? comparison.exact ? 'exact reproduction' : 'numerically close; not exact reproduction' : 'not reproduced', ...comparison }, null, 2));

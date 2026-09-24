@@ -1,3 +1,4 @@
+import type { Decoder } from './decoder';
 import type { AgentId, AgentScore, ArenaSnapshot } from '../arena/types';
 import type { ArenaConfig } from '../arena/config';
 import type { GraphMode } from '../connectome/format';
@@ -60,7 +61,7 @@ export interface SeedResult {
   shamDifference: AgentScore;
 }
 export interface Interval { mean: number; low: number; high: number }
-export interface Evidence {
+interface EvidenceBase {
   schemaVersion: 1;
   modelVersion: typeof MODEL_VERSION;
   request: Request;
@@ -69,7 +70,6 @@ export interface Evidence {
   config: Readonly<ArenaConfig>;
   configFingerprint: string;
   substeps: number;
-  decoder: 'authored';
   opponent: 'zero-action';
   target: Target;
   provenance: { topology: string; grouping: string; dynamics: string; interpretation: string };
@@ -80,6 +80,8 @@ export interface Evidence {
     shamEffect: Interval;
   };
 }
+export type EvidenceHeader = Omit<EvidenceBase, 'results' | 'summary'> & Decoder;
+export type Evidence = EvidenceBase & Decoder;
 export interface ExportDocument {
   evidence: Evidence;
   runtime: { producer: string; platform: string; elapsedMs: number };

@@ -16,6 +16,19 @@ npm run dev
 
 Vite prints the local development URL. The arena and counterfactual workbench require no backend or credentials. The optional DGX sandbox uses a separate local Python service.
 
+## Behavior atlas
+
+Open **Behavior atlas** to explore 30 GPU-discovered controllers on the measured
+connectome, replay held-out behavior, inspect disconnected/zero-input controls,
+and run fresh circuit-silencing probes with the selected controller. The atlas
+and probes run without a backend. [Experiment and reproduction contract](docs/behavior-atlas.md).
+
+```bash
+npm run atlas:verify
+npm run experiment:counterfactual -- --controller 1316 --output /tmp/atlas-probe.json
+npm run experiment:counterfactual -- --verify /tmp/atlas-probe.json
+```
+
 ## Counterfactual workbench
 
 Open **Counterfactual workbench** in the navigation, or choose **Probe this setup**

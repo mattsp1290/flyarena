@@ -1,3 +1,4 @@
+import type { AtlasSelection } from '../atlas/types';
 import type { GraphMode } from '../connectome/format';
 import type { ExportDocument, Preparation, Request } from './types';
 import type { WorkerCommand, WorkerEvent } from './protocol';
@@ -21,6 +22,12 @@ export class CounterfactualClient {
   }
   run(request: Request, progress: (completed: number, total: number) => void): Promise<ExportDocument> {
     return this.request({ type: 'run', baseUrl: this.baseUrl, request }, event => {
+      if (event.type === 'progress') progress(event.completed, event.total);
+      return event.type === 'complete' ? event.document : undefined;
+    });
+  }
+  runAtlas(selection: AtlasSelection, request: Request, progress: (completed: number, total: number) => void): Promise<ExportDocument> {
+    return this.request({ type: 'run-atlas', baseUrl: this.baseUrl, selection, request }, event => {
       if (event.type === 'progress') progress(event.completed, event.total);
       return event.type === 'complete' ? event.document : undefined;
     });

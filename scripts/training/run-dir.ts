@@ -5,6 +5,7 @@ import { resolve } from 'node:path';
 import { readoutParameterCount, type ReadoutWeights } from '../../src/lib/connectome/readout';
 import { ARM_NAMES, type ArmName } from './arms';
 import { readNpyFloat32Array } from './npy';
+import { readoutFromFlat } from '../../src/lib/connectome/readout-serialization';
 
 /**
  * The run-directory contract `scripts/training/evaluate.ts` defines and
@@ -125,20 +126,7 @@ export const readRunDir = (dir: string): LoadedRun => {
   }
   const weightsSha256 = sha256Hex(Buffer.from(theta.buffer, theta.byteOffset, theta.byteLength));
 
-  let cursor = 0;
-  const take = (count: number): Float32Array => {
-    const slice = Float32Array.from(theta.subarray(cursor, cursor + count));
-    cursor += count;
-    return slice;
-  };
-  const weights: ReadoutWeights = {
-    inputSize: D,
-    hiddenSize: H,
-    w1: take(H * D),
-    b1: take(H),
-    w2: take(3 * H),
-    b2: take(3)
-  };
+  const weights = readoutFromFlat(theta, D, H);
 
   const envPath = resolve(dir, 'env.json');
   const env = existsSync(envPath) ? (JSON.parse(readFileSync(envPath, 'utf8')) as unknown) : null;

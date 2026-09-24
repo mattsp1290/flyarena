@@ -2,14 +2,15 @@
   import { onMount } from 'svelte';
   import Arena from './App.svelte';
   import type { GraphMode } from './lib/connectome/format';
-  type View = 'arena' | 'counterfactual' | 'dgx';
+  type View = 'arena' | 'counterfactual' | 'dgx' | 'atlas';
   const readView = (): View => {
     const hash = window.location.hash.slice(1);
-    return hash === 'counterfactual' || hash === 'dgx' ? hash : 'arena';
+    return hash === 'counterfactual' || hash === 'dgx' || hash === 'atlas' ? hash : 'arena';
   };
   let view = $state<View>(readView());
   let Workbench = $state<typeof import('./lib/counterfactual/Workbench.svelte').default>();
   let Lab = $state<typeof import('./lib/lab/Lab.svelte').default>();
+  let Atlas = $state<typeof import('./lib/atlas/Atlas.svelte').default>();
   let error = $state('');
   let setup = $state<{seed:number; topology:GraphMode} | undefined>();
   let destroyed = false;
@@ -22,6 +23,10 @@
       if (view === 'counterfactual' && !Workbench) {
         const component = (await import('./lib/counterfactual/Workbench.svelte')).default;
         if (!destroyed) Workbench = component;
+      }
+      if (view === 'atlas' && !Atlas) {
+        const component = (await import('./lib/atlas/Atlas.svelte')).default;
+        if (!destroyed) Atlas = component;
       }
       if (view === 'dgx' && !Lab) {
         const component = (await import('./lib/lab/Lab.svelte')).default;
@@ -39,16 +44,19 @@
     return () => { destroyed = true; window.removeEventListener('hashchange', route); };
   });
 </script>
-<svelte:head><title>FlyArena — {view === 'arena' ? '3D Connectome Arena' : view === 'counterfactual' ? 'Counterfactual workbench' : 'DGX synthetic sandbox'}</title><meta name="description" content="Explore measured connectome topology, paired model interventions, and a separate GPU synthetic circuit sandbox." /></svelte:head>
+<svelte:head><title>FlyArena — {view === 'arena' ? '3D Connectome Arena' : view === 'counterfactual' ? 'Counterfactual workbench' : view === 'atlas' ? 'Behavior atlas' : 'DGX synthetic sandbox'}</title><meta name="description" content="Explore measured connectome topology, paired model interventions, and a separate GPU synthetic circuit sandbox." /></svelte:head>
 <nav aria-label="Experiment views">
   <a href="#arena" aria-current={view === 'arena' ? 'page' : undefined}><span>01</span> Arena</a>
   <a href="#counterfactual" aria-current={view === 'counterfactual' ? 'page' : undefined}><span>02</span> Counterfactual workbench</a>
-  <a href="#dgx" aria-current={view === 'dgx' ? 'page' : undefined}><span>03</span> DGX sandbox <small>optional backend</small></a>
+  <a href="#atlas" aria-current={view === 'atlas' ? 'page' : undefined}><span>03</span> Behavior atlas</a>
+  <a href="#dgx" aria-current={view === 'dgx' ? 'page' : undefined}><span>04</span> DGX sandbox <small>optional backend</small></a>
 </nav>
 {#if error}<div class="load-error" role="alert">{error} <button onclick={route}>Retry loading view</button></div>{/if}
 {#if view === 'arena'}<Arena onProbe={probe} />
 {:else if view === 'counterfactual'}
   {#if Workbench}<Workbench {setup} />{:else if !error}<p class="loading" role="status">Loading workbench…</p>{/if}
+{:else if view === 'atlas'}
+  {#if Atlas}<Atlas />{:else if !error}<p class="loading" role="status">Loading behavior atlas…</p>{/if}
 {:else if !Lab && !error}<p class="loading" role="status">Loading DGX sandbox…</p>{/if}
 {#if Lab}
   <!-- Keep job identity and serial polling alive across navigation, including completion while hidden. -->

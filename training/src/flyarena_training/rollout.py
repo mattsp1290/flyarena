@@ -25,11 +25,11 @@ import torch
 
 from .config import ARENA_CONFIG, ArenaConfig
 from .graph import ConnectomeGraph, output_neuron_indices
-from .model import PreparedGraph, create_model_state, run_substeps
+from .model import PreparedGraph, ModelState, create_model_state, run_substeps
 from .readout import ReadoutWeights, gather_output_rates, readout_forward, readout_parameter_count
 from .seeds import HELD_OUT_SEED_COUNT, HELD_OUT_SEED_START, assert_no_held_out_seeds
 from .sensors import observe_batch
-from .world import create_world_batch, step_world_batched
+from .world import WorldBatch, create_world_batch, step_world_batched
 
 
 def theta_batch_to_readout_weights(theta: torch.Tensor, input_size: int, hidden_size: int) -> ReadoutWeights:
@@ -64,7 +64,7 @@ def theta_batch_to_readout_weights(theta: torch.Tensor, input_size: int, hidden_
     return ReadoutWeights(input_size=input_size, hidden_size=hidden_size, w1=w1, b1=b1, w2=w2, b2=b2)
 
 
-def _expand_weights(weights: ReadoutWeights, e: int) -> ReadoutWeights:
+def expand_readout_weights(weights: ReadoutWeights, e: int) -> ReadoutWeights:
     """Repeats each of `P` candidates' weights `e` times consecutively (row
     `i` of the result is candidate `i // e`), matching the row order
     `evaluate_fitness` tiles seeds against (see its doc comment)."""
@@ -97,10 +97,21 @@ class RolloutEnv:
 def build_rollout_env(graph: ConnectomeGraph, device: str | torch.device, config: ArenaConfig = ARENA_CONFIG) -> RolloutEnv:
     device = torch.device(device)
     prepared = PreparedGraph(graph, device)
-    indices = output_neuron_indices(graph)
+    indices = output_neuron_indices(graph).to(device)
     return RolloutEnv(
         graph=graph, prepared=prepared, output_indices=indices, input_size=int(indices.numel()), device=device, config=config
     )
+
+
+def step_readout_world(env: RolloutEnv, model_state: ModelState, weights: ReadoutWeights,
+                       world: WorldBatch, substeps: int) -> tuple[WorldBatch, torch.Tensor]:
+    """Canonical trained closed-loop tick, shared by CEM and atlas discovery."""
+    observation = observe_batch(world, "left", env.config).to(torch.float32)
+    run_substeps(env.prepared, model_state, observation, substeps)
+    gathered = gather_output_rates(env.graph, model_state.rate, env.output_indices)
+    action = readout_forward(weights, gathered)
+    # Omitted right action means a parked opponent in both experiments.
+    return step_world_batched(world, {"left": action}, env.config, validate=False), action
 
 
 def evaluate_fitness(
@@ -118,7 +129,7 @@ def evaluate_fitness(
     `left`'s final `movementScore`.
 
     Row order: candidate `p`'s `E` seeds occupy consecutive rows
-    `[p*E, (p+1)*E)` of the `B = P*E` batch (`_expand_weights`'s
+    `[p*E, (p+1)*E)` of the `B = P*E` batch (`expand_readout_weights`'s
     `repeat_interleave` order), so `seeds` is tiled `P` times (`list(seeds) *
     p`) to line up with it — reshaping the final `[B]` movement-score vector
     to `[P, E]` and averaging over dim 1 then recovers each candidate's own
@@ -139,20 +150,14 @@ def evaluate_fitness(
     weights = theta_batch_to_readout_weights(
         theta_batch.to(device=env.device, dtype=torch.float32), env.input_size, hidden_size
     )
-    expanded_weights = _expand_weights(weights, e)
+    expanded_weights = expand_readout_weights(weights, e)
 
     tiled_seeds = list(seeds) * p
     state = create_world_batch(tiled_seeds, device=env.device, config=env.config)
     model_state = create_model_state(env.graph, batch_size=p * e, device=env.device)
 
     for _ in range(ticks):
-        observation = observe_batch(state, "left", env.config).to(torch.float32)
-        run_substeps(env.prepared, model_state, observation, substeps)
-        gathered = gather_output_rates(env.graph, model_state.rate, env.output_indices)
-        left_action = readout_forward(expanded_weights, gathered)
-        # `right` omitted -> the zero action every tick (decode_action_batch's
-        # None convention, `actions.py`), matching the plan's parked opponent.
-        state = step_world_batched(state, {"left": left_action}, env.config, validate=False)
+        state, _ = step_readout_world(env, model_state, expanded_weights, state, substeps)
 
     movement_score = state.agent_movement_score[:, 0]  # [B], left agent, AGENT_IDS index 0
     return movement_score.reshape(p, e).mean(dim=1)

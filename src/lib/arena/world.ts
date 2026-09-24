@@ -15,7 +15,8 @@ import type {
   FoodState,
   HazardState,
   Vec2,
-  WorldState
+  WorldState,
+  ReadonlyWorldState
 } from './types';
 
 const normalizeSeed = (seed: number): number => {
@@ -395,7 +396,7 @@ const interpolate = (previous: number, current: number, alpha: number): number =
  * Calling this at any frequency has no side effects on simulation or replay.
  */
 export const createSnapshot = (
-  world: Readonly<WorldState>,
+  world: ReadonlyWorldState,
   alpha: number,
   suppliedConfig?: Readonly<ArenaConfig>
 ): ArenaSnapshot => {

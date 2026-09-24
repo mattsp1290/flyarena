@@ -84,7 +84,7 @@ test('sandbox navigation retains the same GPU job and exports a result completed
   await expect(page.getByRole('button',{name:'Cancel experiment'})).toBeVisible();
   await page.getByRole('link',{name:'01 Arena',exact:true}).click();
   await expect(page.getByRole('status')).toHaveText('ready');
-  await page.getByRole('link',{name:/03 DGX sandbox/}).click();
+  await page.getByRole('link',{name:/04 DGX sandbox/}).click();
   await expect(page.getByTestId('lab-job-id')).toHaveText(identifier);
   expect(submissions).toBe(1);
   await page.getByRole('button',{name:'Cancel experiment'}).click();
@@ -97,7 +97,7 @@ test('sandbox navigation retains the same GPU job and exports a result completed
   await expect(page.getByRole('status')).toHaveText('ready');
   // The hidden instance keeps serial polling, so completion does not discard evidence.
   await expect(page.locator('.dgx-sandbox [role="status"]')).toContainText('completed',{timeout:60_000});
-  await page.getByRole('link',{name:/03 DGX sandbox/}).click();
+  await page.getByRole('link',{name:/04 DGX sandbox/}).click();
   await expect(page.getByTestId('lab-job-id')).toHaveText(second);
   expect(submissions).toBe(2);
   const event=page.waitForEvent('download');await page.getByRole('button',{name:/Export evidence/}).click();

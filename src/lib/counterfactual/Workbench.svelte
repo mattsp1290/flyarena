@@ -1,12 +1,13 @@
 <script lang="ts">
   import { onDestroy, untrack } from 'svelte';
+  import type { AtlasSelection } from '../atlas/types';
   import type { GraphMode } from '../connectome/format';
   import { CounterfactualClient, ExperimentCancelled } from './client';
   import { DEFAULT_REQUEST, BRANCHES, type ExportDocument, type Preparation, type Request } from './types';
   import { serializeEvidence } from './evidence';
   import PairedReplay from './PairedReplay.svelte';
 
-  let { setup }: { setup?: { seed: number; topology: GraphMode } } = $props();
+  let { setup, selection }: { setup?: { seed: number; topology: GraphMode }; selection?: AtlasSelection } = $props();
   let options = $state<Request>(untrack(() => ({ ...DEFAULT_REQUEST, ...setup })));
   let preparation = $state<Preparation | null>(null);
   let document = $state<ExportDocument | null>(null);
@@ -38,7 +39,8 @@
     const current = ++epoch;
     error = ''; document = null; completed = 0; selectedSeed = 0; status = 'running';
     try {
-      const next = await client.run({ ...options }, n => { if (current === epoch) completed = n; });
+      const progress = (n: number) => { if (current === epoch) completed = n; };
+      const next = await (selection ? client.runAtlas(selection, { ...options }, progress) : client.run({ ...options }, progress));
       if (current !== epoch) return;
       document = next; status = 'completed';
     } catch (e) {
@@ -59,17 +61,17 @@
 <div class="counterfactual">
   <header class="intro">
     <p class="eyebrow">FlyArena / counterfactual workbench</p>
-    <h1>One past.<br /><em>Different futures.</em></h1>
+    <h1>{#if selection}Controller #{selection.id}.<br /><em>Different futures.</em>{:else}One past.<br /><em>Different futures.</em>{/if}</h1>
     <p>Fork the same world and neural state. Silence a circuit group. Follow what changes.</p>
-    <div class="badges"><span>Real connectome artifact</span><span>Authored dynamics & decoder</span><span>Runs in your browser</span></div>
+    <div class="badges"><span>Real connectome artifact</span><span>Authored dynamics · {selection ? 'optimized decoder' : 'authored decoder'}</span><span>Runs in your browser</span></div>
   </header>
   <main class="workbench">
     <aside class="controls panel" aria-label="Counterfactual settings">
       <p class="eyebrow">01 / Set the intervention</p><h2>A controlled fork</h2>
-      <p class="muted">The left agent uses the authored decoder. The right agent receives zero action. This restarts a seeded setup; it does not capture the live arena.</p>
+      <p class="muted">The left agent uses {selection ? `atlas controller #${selection.id}` : 'the authored decoder'}. The right agent receives zero action. This restarts a seeded setup; it does not capture the live arena.</p>
       <form onsubmit={event => { event.preventDefault(); void run(); }}>
         <fieldset disabled={status === 'running'}>
-          <label>Graph topology<select bind:value={options.topology}><option value="biological">Measured biological topology</option><option value="rewired">Rewired seed 0 control</option><option value="disconnected">Disconnected control</option></select></label>
+          <label>Graph topology<select bind:value={options.topology}><option value="biological">Measured biological topology</option>{#if !selection}<option value="rewired">Rewired seed 0 control</option>{/if}<option value="disconnected">Disconnected control</option></select></label>
           <label>Silence group<select bind:value={options.target} disabled={!preparation}>
             {#each preparation?.targets ?? [] as item}<option value={item.id} disabled={!item.indices.length}>{item.label} · {item.indices.length} neurons</option>{/each}
           </select></label>
