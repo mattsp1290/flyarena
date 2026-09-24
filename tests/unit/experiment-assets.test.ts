@@ -273,4 +273,33 @@ describe('loadTrainedReadoutArtifact (against the real committed WP5 production 
     const result = await loadTrainedReadoutArtifact('/data');
     expect(result.status).toBe('unavailable');
   });
+
+  /**
+   * Dual review (round 1, Important): the sha256 check above only proves
+   * `trained-readout-v1.json`'s own bytes are untampered — it says nothing
+   * about whether the manifest's separately-authored `D`/`H`/`parameterCount`
+   * fields (what `LedgerPanel.svelte` displays verbatim) still describe
+   * *this* artifact. Mirrors `loadArenaArtifacts`'s existing "stale manifest"
+   * test above for the same risk class.
+   */
+  it('is "unavailable" when the manifest\'s D/H/parameterCount does not match the artifact\'s own inputSize/hiddenSize (stale/hand-edited manifest)', async () => {
+    const realManifest = JSON.parse(
+      readFileSync(resolve(publicDataDir, 'trained-readout-v1.manifest.json'), 'utf8')
+    ) as Record<string, unknown>;
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('trained-readout-v1.manifest.json')) {
+        return new Response(JSON.stringify({ ...realManifest, D: (realManifest.D as number) + 1 }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        });
+      }
+      return createPublicDataFetch()(input);
+    });
+    const result = await loadTrainedReadoutArtifact('/data');
+    expect(result.status).toBe('unavailable');
+    if (result.status === 'unavailable') {
+      expect(result.reason).toMatch(/does not match the artifact/);
+    }
+  });
 });

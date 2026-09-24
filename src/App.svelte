@@ -71,9 +71,35 @@
   /** True for the duration of an in-flight `controller.setDecoder()` call — set/cleared locally around that call (there is only ever one decoder shared by both arms, unlike per-arm topology switches, so a single flag suffices). */
   let decoderSwitchPending = $state(false);
 
-  /** True while running/loading — locks Start and Seed. Pause/Reset are governed by `topologySwitchPending` directly instead (see `ExperimentPanel`): they must stay clickable for the entire duration of a run, which is most of what this flag being true actually means. */
-  const controlsLocked = $derived(status === 'running' || status === 'loading' || topologySwitchPending);
-  /** Topology selectors additionally require `ready`/`finished` — a switch is never allowed mid-run (see `ExperimentRunner#setAgentBinding`), including while merely `paused`. */
+  /**
+   * True while running/loading — locks Start and Seed. Pause/Reset are
+   * governed by `topologySwitchPending` directly instead (see
+   * `ExperimentPanel`): they must stay clickable for the entire duration of
+   * a run, which is most of what this flag being true actually means.
+   *
+   * Also locks on `decoderSwitchPending` (dual review, round 1): without
+   * this, `status` stays whatever it was (typically `ready`/`paused`) for
+   * the whole duration of `controller.setDecoder()`'s own Worker round trip
+   * — `ExperimentController` only calls `runner.reset()` *after* both arms'
+   * `set-decoder` Workers have acked — so Start stayed clickable during that
+   * window. `ExperimentRunner#reset()` allows resetting from `running`
+   * (`state.ts`'s `canReset`), so a run started in that window would get
+   * silently snapped back to tick 0 the moment the pending decoder switch
+   * finished, with no error and no explanation to the user.
+   */
+  const controlsLocked = $derived(
+    status === 'running' || status === 'loading' || topologySwitchPending || decoderSwitchPending
+  );
+  /**
+   * Topology selectors additionally require `ready`/`finished` — a switch
+   * is never allowed mid-run (see `ExperimentRunner#setAgentBinding`),
+   * including while merely `paused`. Locking on `controlsLocked` (which now
+   * includes `decoderSwitchPending`) also closes the matching race on this
+   * side: `ExperimentController#changeTopology` itself now bails out while
+   * a decoder switch is in flight (`decoderSwitchInFlight`, `controller.ts`)
+   * — this UI lock keeps a same-tick topology click from being a confusing,
+   * unexplained no-op rather than a disabled control during that window.
+   */
   const topologyControlsLocked = $derived(controlsLocked || (status !== 'ready' && status !== 'finished'));
   /**
    * The decoder radio group's own lock, distinct from `controlsLocked`:

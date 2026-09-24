@@ -136,6 +136,26 @@ export class ExperimentController {
   private trainedReadout: TrainedReadoutLoadResult | undefined;
   /** The decoder currently shared by both arms' Workers; always `'authored'` until a successful `setDecoder('trained')` call. */
   private decoder: DecoderKind = 'authored';
+  /**
+   * True for the synchronous-to-Promise-resolution duration of a `setDecoder`
+   * call (dual review, round 1: without this, `changeTopology` could start
+   * — and post `dispose()` to a Worker `setDecoder` had just posted
+   * `set-decoder` to — while `setDecoder`'s own `Promise.all` was still in
+   * flight; `changeTopology`'s re-apply branch reads `this.decoder` to
+   * decide whether to re-issue `set-decoder: 'trained'` on the rebuilt
+   * binding, but `setDecoder` only writes `this.decoder` *after* its await
+   * resolves, so the rebuilt binding could silently stay on `'authored'`
+   * while the controller went on to report `'trained'` for both arms — no
+   * error surfaced anywhere). `changeTopology` bails out while this is
+   * `true` (mirroring `setDecoder`'s own `topologySwitchCount` guard in the
+   * other direction), and `setDecoder` sets it `true` synchronously — before
+   * its own first `await` — so the two guards can never observe a moment
+   * where both would proceed: whichever of `setDecoder`/`changeTopology` a
+   * caller invokes first synchronously claims its guard before the other
+   * can run at all (this module has no `await` between either method's own
+   * entry and the point it sets its own flag).
+   */
+  private decoderSwitchInFlight = false;
 
   constructor(options: ExperimentControllerOptions) {
     this.options = options;
@@ -313,6 +333,9 @@ export class ExperimentController {
     if (!this.runner || !this.workerClients || !this.biologicalGraphBuffer || !this.rewiredGraphBuffer || !this.manifest) {
       return;
     }
+    // A no-op while a decoder switch is in flight — see `decoderSwitchInFlight`'s
+    // doc comment for the race this closes (dual review, round 1).
+    if (this.decoderSwitchInFlight) return;
     const currentStatus = this.runner.getStatus();
     if (currentStatus !== 'ready' && currentStatus !== 'finished') return;
 
@@ -444,6 +467,12 @@ export class ExperimentController {
     if (this.topologySwitchCount.left > 0 || this.topologySwitchCount.right > 0) return;
     if (decoder === 'trained' && this.trainedReadout?.status !== 'ok') return;
 
+    // Set synchronously, before the first `await` below — this is what lets
+    // `changeTopology`'s own `decoderSwitchInFlight` guard actually exclude
+    // a topology switch starting anywhere during this call's Worker round
+    // trip, not just after `this.decoder` is written at the end. See that
+    // field's doc comment for the race this closes.
+    this.decoderSwitchInFlight = true;
     try {
       await Promise.all([this.workerClients.left.setDecoder(decoder), this.workerClients.right.setDecoder(decoder)]);
       if (this.destroyed || !this.runner) return;
@@ -456,6 +485,8 @@ export class ExperimentController {
       // Route through the runner so the host and the runner's own status can
       // never disagree, matching `changeTopology`'s own failure handling.
       this.runner?.fail(error);
+    } finally {
+      this.decoderSwitchInFlight = false;
     }
   }
 
