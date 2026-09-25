@@ -280,3 +280,44 @@ export const writeEffectColors = (
     }
   }
 };
+
+/**
+ * Selects the positions (from `basePositions`, a shared/arm-agnostic
+ * centered/scaled `[x, y, z]` array, length `neuronCount * 3`) of every
+ * neuron whose `emphasize[i]` is `false` — the lesion-effect color mode's
+ * "not FDR-significant" outline-ring overlay (`ActivityScene.ts#paintOutline`)
+ * draws one ring at each of these positions, never at an FDR-significant
+ * one. Pure, allocation-free, and Three.js-independent — the position-
+ * selection half of what was previously inlined directly in `paintOutline`,
+ * pulled out so a reversed `emphasize` check (putting outlines on every
+ * *significant* neuron instead) is directly unit-testable without a real
+ * WebGL/jsdom canvas (thermo-maintainability review I2: `paintOutline` had
+ * zero test coverage, and every component-level test mocks `ActivityScene`
+ * wholesale, so a reversed check there would pass the entire suite).
+ *
+ * Writes into `out`, a caller-owned buffer that must be at least
+ * `neuronCount * 3` long (the worst case: every neuron is non-significant).
+ * `ActivityScene.ts` allocates that scratch buffer once per call — outside
+ * its "no allocation" per-frame hot path, since this only runs on lesion-mode
+ * entry or a topology switch while lesion mode is active — and slices it down
+ * to the returned count afterward. Positions are packed contiguously starting
+ * at offset 0, in ascending neuron-index order, matching the packing the
+ * original inline implementation produced.
+ *
+ * Returns the number of neurons written (`count`); the caller's own
+ * positions are `out.subarray(0, count * 3)`.
+ */
+export const writeOutlinePositions = (basePositions: Float32Array, emphasize: ArrayLike<boolean>, out: Float32Array): number => {
+  const neuronCount = basePositions.length / 3;
+  let writeIndex = 0;
+  for (let neuron = 0; neuron < neuronCount; neuron += 1) {
+    if (emphasize[neuron]) continue;
+    const source = neuron * 3;
+    const destination = writeIndex * 3;
+    out[destination] = basePositions[source];
+    out[destination + 1] = basePositions[source + 1];
+    out[destination + 2] = basePositions[source + 2];
+    writeIndex += 1;
+  }
+  return writeIndex;
+};

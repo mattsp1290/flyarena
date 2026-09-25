@@ -3,7 +3,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import type { AgentId } from '../arena/types';
 import type { PositionsArtifact } from '../experiment/assets';
 import { createCanvasResizeObserver, createContextLossHandler, resizeRendererAndCamera, teardownWebglScene } from './lifecycle';
-import { layoutPositions, partitionByRole, writeColors, writeEffectColors, type NeuronRole } from './activity-layout';
+import { layoutPositions, partitionByRole, writeColors, writeEffectColors, writeOutlinePositions, type NeuronRole } from './activity-layout';
 import { DIVERGING_LUT, VIRIDIS_LUT } from './colormap';
 import { POINT_SIZE } from './activity-constants';
 
@@ -442,19 +442,15 @@ export class ActivityScene {
   private paintOutline(agentId: AgentId, emphasize: ArrayLike<boolean>): void {
     const arm = this.arms[agentId];
     const neuronCount = this.basePositions.length / 3;
-    let count = 0;
-    for (let neuron = 0; neuron < neuronCount; neuron += 1) if (!emphasize[neuron]) count += 1;
-    const positions = new Float32Array(count * 3);
-    let writeIndex = 0;
-    for (let neuron = 0; neuron < neuronCount; neuron += 1) {
-      if (emphasize[neuron]) continue;
-      const source = neuron * 3;
-      const destination = writeIndex * 3;
-      positions[destination] = this.basePositions[source];
-      positions[destination + 1] = this.basePositions[source + 1];
-      positions[destination + 2] = this.basePositions[source + 2];
-      writeIndex += 1;
-    }
+    // Worst-case-sized scratch buffer (every neuron non-significant) handed
+    // to the pure `writeOutlinePositions` helper (`activity-layout.ts`,
+    // thermo-maintainability I2) — outside this scene's per-frame hot path
+    // (see that function's own doc comment), so one allocation per call is
+    // fine. `subarray` below is a view, not a copy, so trimming to the
+    // actual written count costs nothing extra.
+    const scratch = new Float32Array(neuronCount * 3);
+    const count = writeOutlinePositions(this.basePositions, emphasize, scratch);
+    const positions = scratch.subarray(0, count * 3);
     // Round-2 dual review (Suggestion, latent-bug class): `setAttribute`
     // alone only reassigns `geometry.attributes.position` — it neither frees
     // the *previous* attribute's underlying GL buffer (three's

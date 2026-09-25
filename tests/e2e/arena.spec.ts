@@ -599,6 +599,11 @@ test.describe('lesion-effect color mode (WP3)', () => {
     // Honest, in-product labels (the plan's non-negotiables).
     await expect(activitySection.getByText(/Computed \(offline\)/)).toBeVisible();
     await expect(activitySection.getByText(/effect on this model's score when this neuron's rate is/i)).toBeVisible();
+    // Sign convention, stated in words (thermo-suggestion S1) — not just
+    // inferable from the legend's spatial blue/vermillion positioning.
+    await expect(
+      activitySection.getByText(/negative = this model's score drops when the neuron is silenced, positive = it rises/i)
+    ).toBeVisible();
     await expect(activitySection.getByText(/FDR q\s*=\s*0\.05/)).toBeVisible();
     await expect(activitySection.getByText(/not a claim about the real fly/i)).toBeVisible();
     await expect(activitySection.getByText(/hand-wired encoder inputs/i)).toBeVisible();
@@ -607,8 +612,15 @@ test.describe('lesion-effect color mode (WP3)', () => {
       'https://github.com/mattsp1290/flyarena/blob/main/docs/lesion-atlas-report.md'
     );
     // Diverging legend with a non-color-only FDR-significance marker.
-    await expect(activitySection.locator('.legend-bar.diverging')).toBeVisible();
+    await expect(activitySection.locator('.legend-bar')).toBeVisible();
     await expect(activitySection.getByText(/not FDR-significant/i)).toBeVisible();
+    // Shared-scale honesty caption (thermo-architecture I2): states the
+    // scale is shared across both graphs, with live per-graph max |effect|
+    // values — a uniformly pale arm must not read as "no effect here."
+    await expect(activitySection.getByText(/one scale, shared across both graphs/i)).toBeVisible();
+    await expect(
+      activitySection.getByText(/a mostly pale arm means its effects are small on this shared scale, not necessarily zero/i)
+    ).toBeVisible();
 
     // Streaming stopped: the tick debug attributes must not advance further,
     // even though the run is still going (the simulation keeps ticking —

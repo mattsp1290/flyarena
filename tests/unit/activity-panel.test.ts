@@ -8,6 +8,7 @@ import type { ArenaManifest, PositionsArtifact, PositionsLoadResult } from '../.
 import type { ExperimentRunner } from '../../src/lib/experiment/runner';
 import type { ConnectomeGraph } from '../../src/lib/connectome/format';
 import { loadLesionAtlas, type LesionAtlasLoadResult } from '../../src/lib/experiment/lesionAtlas';
+import { buildActivitySceneMockModule, type MockActivitySceneInstance } from '../helpers/mock-activity-scene';
 
 // Only `loadLesionAtlas` (the async fetch/verify path) is mocked — the real
 // `lesionAtlasGraphKeyForTopology` pure function is kept, so the panel's own
@@ -18,43 +19,13 @@ vi.mock('../../src/lib/experiment/lesionAtlas', async (importOriginal) => {
   return { ...actual, loadLesionAtlas: vi.fn() };
 });
 
-interface MockActivitySceneOptions {
-  onContextLost?: (info: { reason: string }) => void;
-}
-
-interface MockActivitySceneInstance {
-  options: MockActivitySceneOptions;
-  update: ReturnType<typeof vi.fn>;
-  clear: ReturnType<typeof vi.fn>;
-  dispose: ReturnType<typeof vi.fn>;
-  render: ReturnType<typeof vi.fn>;
-  setReducedMotion: ReturnType<typeof vi.fn>;
-  setMode: ReturnType<typeof vi.fn>;
-  setStaticColors: ReturnType<typeof vi.fn>;
-  setNoLesionData: ReturnType<typeof vi.fn>;
-}
-
 const instances: MockActivitySceneInstance[] = [];
 
-vi.mock('../../src/lib/render/ActivityScene', () => {
-  class ActivitySceneUnavailableError extends Error {}
-  class ActivityScene {
-    options: MockActivitySceneOptions;
-    update = vi.fn();
-    clear = vi.fn();
-    dispose = vi.fn();
-    render = vi.fn();
-    setReducedMotion = vi.fn();
-    setMode = vi.fn();
-    setStaticColors = vi.fn();
-    setNoLesionData = vi.fn();
-    constructor(options: MockActivitySceneOptions) {
-      this.options = options;
-      instances.push(this);
-    }
-  }
-  return { ActivityScene, ActivitySceneUnavailableError };
-});
+// Thermo-maintainability review S4: the mock `ActivityScene` class itself now
+// lives in one shared place (`tests/helpers/mock-activity-scene.ts`), used
+// here and by `activity-panel-race.test.ts` — previously hand-duplicated in
+// both files.
+vi.mock('../../src/lib/render/ActivityScene', () => buildActivitySceneMockModule(instances));
 
 const fakePositions = (neuronCount = 3): PositionsArtifact => ({
   version: 1,
@@ -645,6 +616,44 @@ describe('ActivityPanel lesion-effect color mode (WP3)', () => {
     expect(loadLesionAtlas).toHaveBeenCalledTimes(1);
   });
 
+  it('the label states the sign convention, and the legend states the shared scale with live per-graph max values (thermo-architecture I2, thermo-suggestion S1)', async () => {
+    vi.mocked(loadLesionAtlas).mockResolvedValue(fakeLesionAtlasOk());
+    const runner = makeRunner();
+    render(ActivityPanel, {
+      runner,
+      positionsStatus: okPositionsStatus,
+      telemetry: undefined,
+      topologySwitchPending: false,
+      manifest: fakeManifest(),
+      biologicalGraph: fakeBiologicalGraph,
+      topology: { left: 'biological', right: 'rewired' }
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    await waitFor(() => expect(instances).toHaveLength(1));
+    await fireEvent.click(screen.getByRole('radio', { name: /lesion effect \(offline\)/i }));
+    await waitFor(() => expect(instances[0].setStaticColors).toHaveBeenCalled());
+
+    // Sign convention, stated in words (thermo-suggestion S1) — screen-reader
+    // users get this from the label text, not just the legend's spatial
+    // blue/vermillion positioning (`aria-hidden` on the color bar itself).
+    expect(
+      screen.getByText(/negative = this model's score drops when the neuron is silenced, positive = it rises/i)
+    ).toBeInTheDocument();
+
+    // Shared-scale honesty caption (thermo-architecture I2), computed live
+    // from the loaded atlas data — `fakeLesionAtlasOk`'s biological graph has
+    // max |effect| 0.3 (from [0.1, -0.2, 0.3]) and rewiredSeed0 has 0.5 (from
+    // [-0.4, 0.5, 0.0]), deliberately different so this test would fail if
+    // the wrong graph's data (or the absMax fixture value, 1) were shown
+    // instead.
+    expect(screen.getByText(/one scale, shared across both graphs/i)).toBeInTheDocument();
+    expect(screen.getByText(/biological: 0\.300, rewired seed 0: 0\.500/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(/a mostly pale arm means its effects are small on this shared scale, not necessarily zero/i)
+    ).toBeInTheDocument();
+  });
+
   it("frame() never calls update()/clear() while lesion mode is active, even with fresh rates available", async () => {
     vi.mocked(loadLesionAtlas).mockResolvedValue(fakeLesionAtlasOk());
     const runner = makeRunner();
@@ -901,5 +910,70 @@ describe('ActivityPanel lesion-effect color mode (WP3)', () => {
     // must never flip the mode to lesion behind their back.
     expect(instances[0].setMode).not.toHaveBeenCalledWith('lesion');
     expect(screen.getByRole('radio', { name: /^live rate$/i })).toBeChecked();
+  });
+
+  it('the hint paragraph is an always-present aria-live region, not one only mounted once populated (thermo-maintainability I3)', async () => {
+    vi.mocked(loadLesionAtlas).mockResolvedValueOnce({ status: 'unavailable', reason: 'network hiccup (test)' });
+    const runner = makeRunner();
+    const { container } = render(ActivityPanel, {
+      runner,
+      positionsStatus: okPositionsStatus,
+      telemetry: undefined,
+      topologySwitchPending: false,
+      manifest: fakeManifest(),
+      biologicalGraph: fakeBiologicalGraph,
+      topology: { left: 'biological', right: 'rewired' }
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    await waitFor(() => expect(instances).toHaveLength(1));
+
+    // The live-region node exists from first paint, before any hint text has
+    // ever been set — a screen reader must already have this node in the
+    // accessibility tree to reliably announce a later *mutation* to it. The
+    // earlier version only mounted this element via its own nested `{#if}`,
+    // once text existed, which several screen readers (notably VoiceOver/
+    // Safari) do not reliably announce on first insertion.
+    const hint = container.querySelector('p.hint[aria-live="polite"]');
+    expect(hint).not.toBeNull();
+    expect(hint?.textContent).toBe('');
+
+    await fireEvent.click(screen.getByRole('radio', { name: /lesion effect \(offline\)/i }));
+    await waitFor(() => expect(screen.getByText(/could not be loaded \(retrying is available\)/i)).toBeInTheDocument());
+
+    // Same node (reference equality), now carrying the transient-failure
+    // text — a mutation to an already-present live region, not a freshly-
+    // inserted one.
+    const hintAfter = container.querySelector('p.hint[aria-live="polite"]');
+    expect(hintAfter).toBe(hint);
+    expect(hintAfter?.textContent).toMatch(/network hiccup \(test\)/i);
+  });
+
+  it('the sr-only FDR-significance summary is an always-present aria-live region (thermo-maintainability I3)', async () => {
+    vi.mocked(loadLesionAtlas).mockResolvedValue(fakeLesionAtlasOk());
+    const runner = makeRunner();
+    const { container } = render(ActivityPanel, {
+      runner,
+      positionsStatus: okPositionsStatus,
+      telemetry: undefined,
+      topologySwitchPending: false,
+      manifest: fakeManifest(),
+      biologicalGraph: fakeBiologicalGraph,
+      topology: { left: 'biological', right: 'rewired' }
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    await waitFor(() => expect(instances).toHaveLength(1));
+
+    const summary = container.querySelector('p.sr-only[aria-live="polite"]');
+    expect(summary).not.toBeNull();
+    expect(summary?.textContent).toBe('');
+
+    await fireEvent.click(screen.getByRole('radio', { name: /lesion effect \(offline\)/i }));
+    await waitFor(() => expect(instances[0].setStaticColors).toHaveBeenCalled());
+
+    const summaryAfter = container.querySelector('p.sr-only[aria-live="polite"]');
+    expect(summaryAfter).toBe(summary);
+    expect(summaryAfter?.textContent).toMatch(/lesion effect mode/i);
   });
 });

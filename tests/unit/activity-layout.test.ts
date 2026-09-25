@@ -4,6 +4,7 @@ import {
   partitionByRole,
   writeColors,
   writeEffectColors,
+  writeOutlinePositions,
   type NeuronRole,
   type PositionSource
 } from '../../src/lib/render/activity-layout';
@@ -297,5 +298,66 @@ describe('writeEffectColors (WP3 lesion-effect color mode)', () => {
     writeEffectColors(effect, emphasize, indices, 10, DIVERGING_LUT, out);
 
     expect(out[0]).not.toBeCloseTo(out[3], 5);
+  });
+});
+
+describe('writeOutlinePositions (WP3 lesion-effect mode outline-ring overlay — thermo-maintainability I2)', () => {
+  // A reversed `emphasize` check here — outlining significant neurons
+  // instead of non-significant ones — was mutation-checked by hand: flipping
+  // `if (emphasize[neuron]) continue;` to `if (!emphasize[neuron]) continue;`
+  // in `activity-layout.ts` and re-running this describe block fails every
+  // test below (confirmed during review; reverted afterward).
+
+  it('selects only non-FDR-significant neurons\' positions, packed contiguously in ascending neuron order', () => {
+    const basePositions = Float32Array.from([
+      0, 0, 0, // neuron 0 (significant)
+      1, 1, 1, // neuron 1 (NOT significant)
+      2, 2, 2, // neuron 2 (significant)
+      3, 3, 3 // neuron 3 (NOT significant)
+    ]);
+    const emphasize = [true, false, true, false];
+    const out = new Float32Array(basePositions.length);
+
+    const count = writeOutlinePositions(basePositions, emphasize, out);
+
+    expect(count).toBe(2);
+    expect(Array.from(out.subarray(0, 3))).toEqual([1, 1, 1]);
+    expect(Array.from(out.subarray(3, 6))).toEqual([3, 3, 3]);
+  });
+
+  it('writes nothing (count 0) when every neuron is FDR-significant', () => {
+    const basePositions = Float32Array.from([0, 0, 0, 1, 1, 1]);
+    const emphasize = [true, true];
+    const out = new Float32Array(basePositions.length);
+
+    expect(writeOutlinePositions(basePositions, emphasize, out)).toBe(0);
+  });
+
+  it('writes every neuron, in order, when none are FDR-significant', () => {
+    const basePositions = Float32Array.from([0, 0, 0, 1, 1, 1]);
+    const emphasize = [false, false];
+    const out = new Float32Array(basePositions.length);
+
+    const count = writeOutlinePositions(basePositions, emphasize, out);
+
+    expect(count).toBe(2);
+    expect(Array.from(out.subarray(0, 6))).toEqual([0, 0, 0, 1, 1, 1]);
+  });
+
+  it('never writes a significant neuron\'s position anywhere in the output, even interleaved with non-significant ones', () => {
+    // Neuron 2 (significant, position [9, 9, 9]) must not appear anywhere in
+    // `out` — this is the assertion a reversed `emphasize[neuron]` check
+    // (outlining significant neurons instead) would fail.
+    const basePositions = Float32Array.from([5, 5, 5, 7, 7, 7, 9, 9, 9, 11, 11, 11]);
+    const emphasize = [false, true, false, true];
+    const out = new Float32Array(basePositions.length);
+
+    const count = writeOutlinePositions(basePositions, emphasize, out);
+
+    expect(count).toBe(2);
+    const written = Array.from(out.subarray(0, count * 3));
+    expect(written).toEqual([5, 5, 5, 9, 9, 9]);
+    expect(written).not.toContain(7);
+    expect(written).not.toContain(11);
   });
 });
