@@ -22,6 +22,8 @@ Three predeclared analyses (`.agents/plans/null-explanation/00-overview.md`), ev
 
 **Multiple comparisons.** 66 metrics are tested (24 transfer entries, 2 derived predictors, 40 structural features; 23 of these are constant across the null and so can never reach the |rho| threshold). Correlations are reported descriptively, without per-metric significance testing; a permutation calibration (1000 seeded permutations of the score, applied jointly to every metric family at once) found that at least one of the tested metrics reaches \|rho\| >= 0.3 by chance alone in 0 of 1000 permutations (0.0%) -- this chance rate applies to any triggered linear-pathway or structural-feature finding below.
 
+Throughout this report's metric tables, rows shown in **bold** independently pass both predeclared gates (outside the null's 2.5-97.5% range and |rho| at or above the threshold above) -- see the Finding section for the full, mechanically generated list.
+
 ## Decoder-convention check
 
 | Condition | Biological score | Null mean | Bio percentile | p_low | p_high |
@@ -65,8 +67,8 @@ Mirrored biological percentile (0.0%) stayed below the predeclared 25% threshold
 
 | metric | biological | null median | null 2.5% | null 97.5% | bio percentile | rho | rho 95% CI |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| T:rightClearance->thrust | 0.0031 | 0.0204 | 0.0055 | 0.0440 | 0.6% | 0.467 | [0.393, 0.539] |
-| T:forwardClearance->thrust | 0.0022 | 0.0195 | 0.0079 | 0.0391 | 0.0% | 0.353 | [0.275, 0.429] |
+| **T:rightClearance->thrust** | 0.0031 | 0.0204 | 0.0055 | 0.0440 | 0.6% | 0.467 | [0.393, 0.539] |
+| **T:forwardClearance->thrust** | 0.0022 | 0.0195 | 0.0079 | 0.0391 | 0.0% | 0.353 | [0.275, 0.429] |
 | T:leftClearance->thrust | 0.0030 | 0.0168 | 0.0045 | 0.0337 | 1.0% | 0.298 | [0.215, 0.378] |
 | T:hazardBearing->thrust | -0.0170 | 0.0246 | 0.0069 | 0.0522 | 0.0% | 0.249 | [0.166, 0.328] |
 | T:foodBearing->thrust | 0.0101 | 0.0435 | 0.0145 | 0.0863 | 0.6% | -0.189 | [-0.271, -0.105] |
@@ -128,11 +130,17 @@ The unrestricted reading is disclosed here as **exploratory, non-predeclared**: 
 
 The unrestricted reading's strongest population correlation is \|rho\| = 0.072, below the predeclared 0.3 threshold on every population -- under the unrestricted reading, feature 6 would not itself qualify for the structural-feature-associated category on any population.
 
+**Biological's percentile under each reading** (not just the rho comparison above -- a definition change can flip which tail biological sits in, not merely weaken the effect size):
+
+- `weightedInDegree:thrust`: restricted 0th percentile (bio 0.0000 vs null 94.8125-161.9375) -> unrestricted 100th percentile (bio 1476.5000 vs null 984.5625-1272.6250) -- **the two readings disagree on direction, not just magnitude**
+- `weightedInDegree:yaw`: restricted 0th percentile (bio 0.2500 vs null 71.2500-135.7500) -> unrestricted 96.2th percentile (bio 1039.0000 vs null 805.3125-1066.6250)
+- `weightedInDegree:brake`: restricted 25.4th percentile (bio 111.0625 vs null 89.2500-161.5000) -> unrestricted 60.5th percentile (bio 1125.2500 vs null 962.1875-1270.3125)
+
 **This report's `structuralFeature` finding is definition-sensitive**: it is triggered by a `weightedInDegree` entry, and the finding would not hold under the unrestricted reading above.
 
 | metric | biological | null median | null 2.5% | null 97.5% | bio percentile | rho | rho 95% CI |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| weightedInDegree:thrust | 0.0000 | 123.3125 | 94.8125 | 161.9375 | 0.0% | 0.394 | [0.318, 0.468] |
+| **weightedInDegree:thrust** | 0.0000 | 123.3125 | 94.8125 | 161.9375 | 0.0% | 0.394 | [0.318, 0.468] |
 | weightBalance:thrust | 2866.0000 | 2035.5000 | -612.0000 | 4638.0000 | 74.6% | 0.202 | [0.115, 0.286] |
 | inhibitoryPathCount:thrust | 191667.0000 | 164767.0000 | 156614.0000 | 172749.0000 | 100.0% | -0.157 | [-0.240, -0.074] |
 | weightBalance:brake | 5918.0000 | 2076.0000 | -469.0000 | 4616.0000 | 99.8% | -0.122 | [-0.210, -0.034] |
@@ -177,6 +185,8 @@ The unrestricted reading's strongest population correlation is \|rho\| = 0.072, 
 
 Biological's low score is associated with: the linear transfer entry T:rightClearance->thrust sits outside the null's 2.5-97.5% range (rank correlation with score rho=0.467); the structural feature weightedInDegree:thrust sits outside the null's 2.5-97.5% range (rank correlation with score rho=0.394) -- a descriptive correlation, not a causal claim.
 
+3 metrics independently pass both predeclared gates (outside the null's 2.5-97.5% range and |rho| at or above the threshold): T:rightClearance->thrust (rho=0.467); weightedInDegree:thrust (rho=0.394); T:forwardClearance->thrust (rho=0.353).
+
 Categories that hold, ranked by effect size: linearPathway, structuralFeature.
 
 ## Limitations
@@ -188,4 +198,5 @@ Categories that hold, ranked by effect size: linearPathway, structuralFeature.
 - **Correlation is not causation.** A rank correlation between a structural or transfer metric and score across the 500 rewirings describes an association within this null model's sample, not a causal mechanism.
 - **Bootstrap CIs are approximate.** Each metric's 95% Spearman CI resamples the already rank-transformed pairs and does not re-rank within each resample -- a bootstrap of the rank-transformed sample's Pearson correlation, not a fully faithful re-ranking bootstrap. The CIs are descriptive only and play no role in any outcome-category decision (only the point estimate and the predeclared |rho| threshold do).
 - **A metric constant across the null (`n/a (constant in null)` in the tables above) has an undefined, not zero, Spearman correlation** and can never trigger the |rho| threshold; it is still counted toward the metrics-tested total above.
+- **Provenance pins two independent things.** Every input's `sourceGraphSha256`/`rewireSourceSha256` pins *graph identity* (all five inputs were computed against the same 502 graphs -- biological, disconnected, 500 rewirings). `transfer.json`/`features.json`/`regime.json` additionally pin *producer code identity*: each records a `producer.sourceSha256` (`transfer.py` 22f012cfdd7c..., `features.py` 3b25ee0e0cde..., `regime-check.ts` 1ecf48b6dfa4...) -- a sha256 over that script's own source plus its shared helpers, the same `filename+NUL+bytes` scheme `scripts/data/compile.py`'s `compiler_source_sha256()` already uses -- and `verify_provenance` recomputes that hash from the current working tree and refuses to combine a stale input. The one deliberate exception is `features-exploratory-unrestricted.json`: a pinned, stale-code exploratory input (feature 6's pre-adjudication run, disclosed above) -- its *content* sha256 is still pinned and verified, but it is explicitly exempt from the code-identity check, since re-running it against current code would defeat its purpose as a historical snapshot of what the unrestricted reading looked like at adjudication time.
 - **No biological claim.** See "This model only" above.

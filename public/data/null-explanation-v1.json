@@ -18,6 +18,7 @@
           "nullMedian": 1124.78125,
           "p2_5": 984.5625,
           "p97_5": 1272.625,
+          "qualifiesBothGates": false,
           "spearman": 0.026685629315721732,
           "spearmanCi": [
             -0.06347454639784707,
@@ -33,6 +34,7 @@
           "nullMedian": 906.59375,
           "p2_5": 805.3125,
           "p97_5": 1066.625,
+          "qualifiesBothGates": false,
           "spearman": 0.02089968264650751,
           "spearmanCi": [
             -0.06533325019986881,
@@ -48,6 +50,7 @@
           "nullMedian": 1099.0625,
           "p2_5": 962.1875,
           "p97_5": 1270.3125,
+          "qualifiesBothGates": false,
           "spearman": 0.07161528030537366,
           "spearmanCi": [
             -0.017193770805138533,
@@ -64,6 +67,24 @@
       "structuralFeature"
     ],
     "definitionSensitive": true,
+    "qualifyingMetrics": [
+      {
+        "kind": "transfer",
+        "name": "T:rightClearance->thrust",
+        "spearman": 0.4669248436993748
+      },
+      {
+        "kind": "feature",
+        "name": "weightedInDegree:thrust",
+        "spearman": 0.3943192055100449
+      },
+      {
+        "kind": "transfer",
+        "name": "T:forwardClearance->thrust",
+        "spearman": 0.3534047736190945
+      }
+    ],
+    "qualifyingMetricsNote": "3 metrics independently pass both predeclared gates (outside the null's 2.5-97.5% range and |rho| at or above the threshold): T:rightClearance->thrust (rho=0.467); weightedInDegree:thrust (rho=0.394); T:forwardClearance->thrust (rho=0.353).",
     "ranked": [
       "linearPathway",
       "structuralFeature"
@@ -85,6 +106,7 @@
       "nullMedian": 0.04348511652427045,
       "p2_5": 0.014464744238001162,
       "p97_5": 0.08630490811229082,
+      "qualifiesBothGates": false,
       "spearman": -0.18945253381013524,
       "spearmanCi": [
         -0.27127169955335484,
@@ -100,6 +122,7 @@
       "nullMedian": 0.035275225228109275,
       "p2_5": 0.011752689241270311,
       "p97_5": 0.07220297328302047,
+      "qualifiesBothGates": false,
       "spearman": -0.07635918543674175,
       "spearmanCi": [
         -0.16333521027853085,
@@ -115,6 +138,7 @@
       "nullMedian": 0.04322010213526235,
       "p2_5": 0.016422038806008003,
       "p97_5": 0.08147797904455678,
+      "qualifiesBothGates": false,
       "spearman": 0.14252178608714436,
       "spearmanCi": [
         0.05237411899809242,
@@ -130,6 +154,7 @@
       "nullMedian": 0.02900863718792425,
       "p2_5": 0.007462658424149004,
       "p97_5": 0.061809404751978526,
+      "qualifiesBothGates": false,
       "spearman": 0.1718437593750375,
       "spearmanCi": [
         0.0820722339098283,
@@ -145,6 +170,7 @@
       "nullMedian": 0.02298438029985093,
       "p2_5": 0.005917241715251208,
       "p97_5": 0.055175928434003034,
+      "qualifiesBothGates": false,
       "spearman": -0.030575258301033203,
       "spearmanCi": [
         -0.11880696072406534,
@@ -160,6 +186,7 @@
       "nullMedian": 0.02836073162976807,
       "p2_5": 0.009793775335182886,
       "p97_5": 0.060023121629764586,
+      "qualifiesBothGates": false,
       "spearman": -0.1361626246504986,
       "spearmanCi": [
         -0.2228346316149827,
@@ -175,6 +202,7 @@
       "nullMedian": 0.024594922096812542,
       "p2_5": 0.006895265183216282,
       "p97_5": 0.05224813100326243,
+      "qualifiesBothGates": false,
       "spearman": 0.24924944499777998,
       "spearmanCi": [
         0.1660591434559041,
@@ -190,6 +218,7 @@
       "nullMedian": 0.01895567214077761,
       "p2_5": 0.0038242086058790955,
       "p97_5": 0.045678877000515324,
+      "qualifiesBothGates": false,
       "spearman": 0.02691428365713463,
       "spearmanCi": [
         -0.055700192380716565,
@@ -205,6 +234,7 @@
       "nullMedian": 0.023729520046021507,
       "p2_5": 0.006472668526314857,
       "p97_5": 0.05294078281698994,
+      "qualifiesBothGates": false,
       "spearman": -0.07655905823623295,
       "spearmanCi": [
         -0.161562558176901,
@@ -220,6 +250,7 @@
       "nullMedian": 0.01625335018192417,
       "p2_5": 0.003649202045747284,
       "p97_5": 0.03562804845971932,
+      "qualifiesBothGates": false,
       "spearman": 0.1877190548762195,
       "spearmanCi": [
         0.10202858620715993,
@@ -235,6 +266,7 @@
       "nullMedian": 0.013374594876420884,
       "p2_5": 0.0019281892237356356,
       "p97_5": 0.03093185984046333,
+      "qualifiesBothGates": false,
       "spearman": 0.059372301489205956,
       "spearmanCi": [
         -0.02512403108059809,
@@ -250,6 +282,7 @@
       "nullMedian": 0.01649811198916916,
       "p2_5": 0.003652530696671743,
       "p97_5": 0.033166504231049145,
+      "qualifiesBothGates": false,
       "spearman": 0.04329799719198877,
       "spearmanCi": [
         -0.04635941516769398,
@@ -265,6 +298,7 @@
       "nullMedian": 0.019513711098169528,
       "p2_5": 0.007855921785643177,
       "p97_5": 0.03912663634345049,
+      "qualifiesBothGates": true,
       "spearman": 0.3534047736190945,
       "spearmanCi": [
         0.27495257009425395,
@@ -280,6 +314,7 @@
       "nullMedian": 0.015892232283290897,
       "p2_5": 0.0039378811340910775,
       "p97_5": 0.03464726193197696,
+      "qualifiesBothGates": false,
       "spearman": 0.010775179100716403,
       "spearmanCi": [
         -0.0746303158041897,
@@ -295,6 +330,7 @@
       "nullMedian": 0.0197603630035842,
       "p2_5": 0.006780393878533077,
       "p97_5": 0.036349748923806526,
+      "qualifiesBothGates": false,
       "spearman": -0.11054492217968871,
       "spearmanCi": [
         -0.19872118394737595,
@@ -310,6 +346,7 @@
       "nullMedian": 0.016781631044479654,
       "p2_5": 0.004514977268638678,
       "p97_5": 0.03365309941277794,
+      "qualifiesBothGates": false,
       "spearman": 0.2976446785787143,
       "spearmanCi": [
         0.21481459446609735,
@@ -325,6 +362,7 @@
       "nullMedian": 0.014072588358200678,
       "p2_5": 0.004048583117727423,
       "p97_5": 0.028833243858974622,
+      "qualifiesBothGates": false,
       "spearman": 0.001056004224016896,
       "spearmanCi": [
         -0.08218183723504023,
@@ -340,6 +378,7 @@
       "nullMedian": 0.01698392224792179,
       "p2_5": 0.005899103535610271,
       "p97_5": 0.03559986059966141,
+      "qualifiesBothGates": false,
       "spearman": -0.07735509342037368,
       "spearmanCi": [
         -0.16510350287425216,
@@ -355,6 +394,7 @@
       "nullMedian": 0.020400241502824445,
       "p2_5": 0.005461747163834823,
       "p97_5": 0.044017410977135074,
+      "qualifiesBothGates": true,
       "spearman": 0.4669248436993748,
       "spearmanCi": [
         0.39276590444870013,
@@ -370,6 +410,7 @@
       "nullMedian": 0.016569936555645468,
       "p2_5": 0.004990373728422042,
       "p97_5": 0.03729784929559639,
+      "qualifiesBothGates": false,
       "spearman": 0.1048498913995656,
       "spearmanCi": [
         0.015748831899603084,
@@ -385,6 +426,7 @@
       "nullMedian": 0.020163506347381996,
       "p2_5": 0.0054858888354645564,
       "p97_5": 0.04332712358236984,
+      "qualifiesBothGates": false,
       "spearman": -0.05973182292729171,
       "spearmanCi": [
         -0.1447360728153287,
@@ -400,6 +442,7 @@
       "nullMedian": 0.01976922569703049,
       "p2_5": 0.004952365840073363,
       "p97_5": 0.04311412149106084,
+      "qualifiesBothGates": false,
       "spearman": 0.03666523466093864,
       "spearmanCi": [
         -0.05146295482621126,
@@ -415,6 +458,7 @@
       "nullMedian": 0.01667472447181658,
       "p2_5": 0.002661291099094936,
       "p97_5": 0.0362900219120076,
+      "qualifiesBothGates": false,
       "spearman": 0.015254845019380077,
       "spearmanCi": [
         -0.07084207040894668,
@@ -430,6 +474,7 @@
       "nullMedian": 0.01914020492064919,
       "p2_5": 0.0042511260742688645,
       "p97_5": 0.04129187707082263,
+      "qualifiesBothGates": false,
       "spearman": -0.03126041304165217,
       "spearmanCi": [
         -0.11864634301641663,
@@ -445,6 +490,7 @@
       "nullMedian": 0.015521962180713403,
       "p2_5": -0.016936820981498353,
       "p97_5": 0.05072790968291531,
+      "qualifiesBothGates": false,
       "spearman": -0.09879005916023664,
       "spearmanCi": [
         -0.18929646400284236,
@@ -460,6 +506,7 @@
       "nullMedian": 0.02900863718792425,
       "p2_5": 0.007462658424149004,
       "p97_5": 0.061809404751978526,
+      "qualifiesBothGates": false,
       "spearman": 0.1718437593750375,
       "spearmanCi": [
         0.08280000385715577,
@@ -475,6 +522,7 @@
       "nullMedian": 1.0,
       "p2_5": 1.0,
       "p97_5": 1.0,
+      "qualifiesBothGates": false,
       "spearman": 0.0,
       "spearmanCi": [
         0.0,
@@ -490,6 +538,7 @@
       "nullMedian": 1.0,
       "p2_5": 1.0,
       "p97_5": 1.0,
+      "qualifiesBothGates": false,
       "spearman": 0.0,
       "spearmanCi": [
         0.0,
@@ -505,6 +554,7 @@
       "nullMedian": 1.0,
       "p2_5": 1.0,
       "p97_5": 1.0,
+      "qualifiesBothGates": false,
       "spearman": 0.0,
       "spearmanCi": [
         0.0,
@@ -520,6 +570,7 @@
       "nullMedian": 1.0,
       "p2_5": 1.0,
       "p97_5": 1.0,
+      "qualifiesBothGates": false,
       "spearman": 0.0,
       "spearmanCi": [
         0.0,
@@ -535,6 +586,7 @@
       "nullMedian": 1.0,
       "p2_5": 1.0,
       "p97_5": 1.0,
+      "qualifiesBothGates": false,
       "spearman": 0.0,
       "spearmanCi": [
         0.0,
@@ -550,6 +602,7 @@
       "nullMedian": 1.0,
       "p2_5": 1.0,
       "p97_5": 1.0,
+      "qualifiesBothGates": false,
       "spearman": 0.0,
       "spearmanCi": [
         0.0,
@@ -565,6 +618,7 @@
       "nullMedian": 1.0,
       "p2_5": 1.0,
       "p97_5": 1.0,
+      "qualifiesBothGates": false,
       "spearman": 0.0,
       "spearmanCi": [
         0.0,
@@ -580,6 +634,7 @@
       "nullMedian": 1.0,
       "p2_5": 1.0,
       "p97_5": 1.0,
+      "qualifiesBothGates": false,
       "spearman": 0.0,
       "spearmanCi": [
         0.0,
@@ -595,6 +650,7 @@
       "nullMedian": 1.0,
       "p2_5": 1.0,
       "p97_5": 1.0,
+      "qualifiesBothGates": false,
       "spearman": 0.0,
       "spearmanCi": [
         0.0,
@@ -610,6 +666,7 @@
       "nullMedian": 1.0,
       "p2_5": 1.0,
       "p97_5": 1.0,
+      "qualifiesBothGates": false,
       "spearman": 0.0,
       "spearmanCi": [
         0.0,
@@ -625,6 +682,7 @@
       "nullMedian": 1.0,
       "p2_5": 1.0,
       "p97_5": 1.0,
+      "qualifiesBothGates": false,
       "spearman": 0.0,
       "spearmanCi": [
         0.0,
@@ -640,6 +698,7 @@
       "nullMedian": 1.0,
       "p2_5": 1.0,
       "p97_5": 1.0,
+      "qualifiesBothGates": false,
       "spearman": 0.0,
       "spearmanCi": [
         0.0,
@@ -655,6 +714,7 @@
       "nullMedian": 1.0,
       "p2_5": 1.0,
       "p97_5": 1.0,
+      "qualifiesBothGates": false,
       "spearman": 0.0,
       "spearmanCi": [
         0.0,
@@ -670,6 +730,7 @@
       "nullMedian": 1.0,
       "p2_5": 1.0,
       "p97_5": 1.0,
+      "qualifiesBothGates": false,
       "spearman": 0.0,
       "spearmanCi": [
         0.0,
@@ -685,6 +746,7 @@
       "nullMedian": 1.0,
       "p2_5": 1.0,
       "p97_5": 1.0,
+      "qualifiesBothGates": false,
       "spearman": 0.0,
       "spearmanCi": [
         0.0,
@@ -700,6 +762,7 @@
       "nullMedian": 1.0,
       "p2_5": 1.0,
       "p97_5": 1.0,
+      "qualifiesBothGates": false,
       "spearman": 0.0,
       "spearmanCi": [
         0.0,
@@ -715,6 +778,7 @@
       "nullMedian": 1.0,
       "p2_5": 1.0,
       "p97_5": 1.0,
+      "qualifiesBothGates": false,
       "spearman": 0.0,
       "spearmanCi": [
         0.0,
@@ -730,6 +794,7 @@
       "nullMedian": 1.0,
       "p2_5": 1.0,
       "p97_5": 1.0,
+      "qualifiesBothGates": false,
       "spearman": 0.0,
       "spearmanCi": [
         0.0,
@@ -745,6 +810,7 @@
       "nullMedian": 1.0,
       "p2_5": 1.0,
       "p97_5": 1.0,
+      "qualifiesBothGates": false,
       "spearman": 0.0,
       "spearmanCi": [
         0.0,
@@ -760,6 +826,7 @@
       "nullMedian": 1.0,
       "p2_5": 1.0,
       "p97_5": 1.0,
+      "qualifiesBothGates": false,
       "spearman": 0.0,
       "spearmanCi": [
         0.0,
@@ -775,6 +842,7 @@
       "nullMedian": 1.0,
       "p2_5": 1.0,
       "p97_5": 1.0,
+      "qualifiesBothGates": false,
       "spearman": 0.0,
       "spearmanCi": [
         0.0,
@@ -790,6 +858,7 @@
       "nullMedian": 1.0,
       "p2_5": 1.0,
       "p97_5": 1.0,
+      "qualifiesBothGates": false,
       "spearman": 0.0,
       "spearmanCi": [
         0.0,
@@ -805,6 +874,7 @@
       "nullMedian": 1.0,
       "p2_5": 1.0,
       "p97_5": 1.0,
+      "qualifiesBothGates": false,
       "spearman": -0.03303093156909242,
       "spearmanCi": [
         -0.06131931016465984,
@@ -820,6 +890,7 @@
       "nullMedian": 1.0,
       "p2_5": 1.0,
       "p97_5": 1.0,
+      "qualifiesBothGates": false,
       "spearman": 0.0,
       "spearmanCi": [
         0.0,
@@ -835,6 +906,7 @@
       "nullMedian": 1.0,
       "p2_5": 1.0,
       "p97_5": 1.0,
+      "qualifiesBothGates": false,
       "spearman": -0.03303093156909242,
       "spearmanCi": [
         -0.06095099627976081,
@@ -850,6 +922,7 @@
       "nullMedian": 165096.0,
       "p2_5": 157104.0,
       "p97_5": 172754.0,
+      "qualifiesBothGates": false,
       "spearman": -0.10985267395655304,
       "spearmanCi": [
         -0.19495973091536922,
@@ -865,6 +938,7 @@
       "nullMedian": 133166.5,
       "p2_5": 126397.0,
       "p97_5": 139231.0,
+      "qualifiesBothGates": false,
       "spearman": -0.033064172985634764,
       "spearmanCi": [
         -0.12079822304812098,
@@ -880,6 +954,7 @@
       "nullMedian": 161651.0,
       "p2_5": 153813.0,
       "p97_5": 169198.0,
+      "qualifiesBothGates": false,
       "spearman": 0.010264556260767096,
       "spearmanCi": [
         -0.07875927532659578,
@@ -895,6 +970,7 @@
       "nullMedian": 164767.0,
       "p2_5": 156614.0,
       "p97_5": 172749.0,
+      "qualifiesBothGates": false,
       "spearman": -0.15683767769944287,
       "spearmanCi": [
         -0.23960217115112403,
@@ -910,6 +986,7 @@
       "nullMedian": 133076.0,
       "p2_5": 126200.0,
       "p97_5": 139421.0,
+      "qualifiesBothGates": false,
       "spearman": -0.06935008003075596,
       "spearmanCi": [
         -0.1579531133753785,
@@ -925,6 +1002,7 @@
       "nullMedian": 161702.0,
       "p2_5": 154125.0,
       "p97_5": 168636.0,
+      "qualifiesBothGates": false,
       "spearman": -0.050209414092943445,
       "spearmanCi": [
         -0.13774752503476292,
@@ -940,6 +1018,7 @@
       "nullMedian": 0.06322471982898231,
       "p2_5": 0.060244866230485195,
       "p97_5": 0.0659454557232623,
+      "qualifiesBothGates": false,
       "spearman": 0.006302022684296025,
       "spearmanCi": [
         -0.08068979686704615,
@@ -955,6 +1034,7 @@
       "nullMedian": 2035.5,
       "p2_5": -612.0,
       "p97_5": 4638.0,
+      "qualifiesBothGates": false,
       "spearman": 0.20165041075231308,
       "spearmanCi": [
         0.11536770861642201,
@@ -970,6 +1050,7 @@
       "nullMedian": 1797.0,
       "p2_5": -549.0,
       "p97_5": 4151.0,
+      "qualifiesBothGates": false,
       "spearman": -0.011576552308354748,
       "spearmanCi": [
         -0.09819814420740192,
@@ -985,6 +1066,7 @@
       "nullMedian": 2076.0,
       "p2_5": -469.0,
       "p97_5": 4616.0,
+      "qualifiesBothGates": false,
       "spearman": -0.12198287683161915,
       "spearmanCi": [
         -0.20987718285533638,
@@ -1000,6 +1082,7 @@
       "nullMedian": 1464.0,
       "p2_5": 1395.0,
       "p97_5": 1527.0,
+      "qualifiesBothGates": false,
       "spearman": 0.006302022684296025,
       "spearmanCi": [
         -0.08024699798748716,
@@ -1015,6 +1098,7 @@
       "nullMedian": 221693.0,
       "p2_5": 220079.0,
       "p97_5": 223013.0,
+      "qualifiesBothGates": false,
       "spearman": 0.08089527929913407,
       "spearmanCi": [
         -0.0105532940523426,
@@ -1030,6 +1114,7 @@
       "nullMedian": 123.3125,
       "p2_5": 94.8125,
       "p97_5": 161.9375,
+      "qualifiesBothGates": true,
       "spearman": 0.3943192055100449,
       "spearmanCi": [
         0.3184902434763177,
@@ -1045,6 +1130,7 @@
       "nullMedian": 99.4375,
       "p2_5": 71.25,
       "p97_5": 135.75,
+      "qualifiesBothGates": false,
       "spearman": 0.05251333882886543,
       "spearmanCi": [
         -0.03240952486492764,
@@ -1060,6 +1146,7 @@
       "nullMedian": 122.6875,
       "p2_5": 89.25,
       "p97_5": 161.5,
+      "qualifiesBothGates": false,
       "spearman": -0.04029441973181036,
       "spearmanCi": [
         -0.12971084178300474,
@@ -1095,10 +1182,32 @@
     }
   },
   "sources": {
-    "featuresSha": "90bbbc0ebd0b20ead890fca5c3d686b832724edd1136660b0a2eecb3232da112",
-    "regimeSha": "cd00bd4ec5536127fe21648fb3c1483d37584b4b4cbd8be1b343a5d4efff2cdc",
+    "featuresSha": "7243020c757003ab393d5bfaf93ce56404594e5bc2cdf97303311d27f3e390a2",
+    "producers": {
+      "features": {
+        "host": {
+          "arch": "aarch64",
+          "python": "3.12.3"
+        },
+        "script": "scripts/analysis/features.py",
+        "sourceSha256": "3b25ee0e0cde8d50c0c70e908157b041edeaaf1ada9a4574f43e679180e7a047"
+      },
+      "regime": {
+        "script": "scripts/null/regime-check.ts",
+        "sourceSha256": "1ecf48b6dfa4077423e85a8f4c960e7d6dc1b714912be54d8d41cfbbaddadf59"
+      },
+      "transfer": {
+        "host": {
+          "arch": "aarch64",
+          "python": "3.12.3"
+        },
+        "script": "scripts/analysis/transfer.py",
+        "sourceSha256": "22f012cfdd7c56395360c75b02f1fad273fed471a4f25d4b8642d2ffdbbe65a7"
+      }
+    },
+    "regimeSha": "173a7551c596a68a6853b2952c13605b01b1ba761f68f06da06291857cd6abe4",
     "rewiringNullSha256": "592446bb387acbc5354db807ae2f824547d168d9e338d3a55f94f525e39083d1",
-    "transferSha": "bcf161dd60500f2460f0edb9af0f03e6db1c5a891ad4caadfd52f2c3b52d9266",
+    "transferSha": "3219fd51a7e41355a329105701930cd7d795323eb8de278429ac7a9ada105371",
     "variantShas": {
       "flipBoth": "7639bbe1cdc9f4e8dba3a9dbba93b4e1fd68145f0b117c70ed5b55ccd7f73d15"
     }
