@@ -1182,32 +1182,76 @@
     }
   },
   "sources": {
-    "featuresSha": "7243020c757003ab393d5bfaf93ce56404594e5bc2cdf97303311d27f3e390a2",
+    "featuresSha": "64ca32c2ca0d1a16f818033c892b1dbe12b9448cfeb2d72c0c4ca974f4cd4966",
     "producers": {
       "features": {
+        "dependencies": [
+          "scripts/analysis/env_guard.py",
+          "scripts/analysis/features.py",
+          "scripts/analysis/graph_io.py",
+          "scripts/data/binfmt.py",
+          "scripts/data/fsutil.py",
+          "scripts/data/rewire.py"
+        ],
         "host": {
           "arch": "aarch64",
           "python": "3.12.3"
         },
         "script": "scripts/analysis/features.py",
-        "sourceSha256": "3b25ee0e0cde8d50c0c70e908157b041edeaaf1ada9a4574f43e679180e7a047"
+        "sourceSha256": "f90d48bb13abe713751fda0d890764de382a2765ac9e3c1b5fcbbe29dc34704a"
       },
       "regime": {
+        "dependencies": [
+          "scripts/lib/import-graph.ts",
+          "scripts/null/null-evaluate.ts",
+          "scripts/null/null-worker-shared.ts",
+          "scripts/null/null-worker.ts",
+          "scripts/null/regime-check.ts",
+          "scripts/null/regime-task.ts",
+          "scripts/null/regime-worker.ts",
+          "scripts/training/cli.ts",
+          "scripts/training/episode.ts",
+          "scripts/training/fsio.ts",
+          "src/lib/arena/actions.ts",
+          "src/lib/arena/config.ts",
+          "src/lib/arena/replay.ts",
+          "src/lib/arena/sensors.ts",
+          "src/lib/arena/types.ts",
+          "src/lib/arena/world.ts",
+          "src/lib/connectome/constants.ts",
+          "src/lib/connectome/format.ts",
+          "src/lib/connectome/model.ts",
+          "src/lib/connectome/readout.ts",
+          "src/lib/connectome/telemetry.ts",
+          "src/lib/experiment/bindings.ts",
+          "src/lib/experiment/runner.ts",
+          "src/lib/experiment/state.ts",
+          "src/lib/worker/client.ts",
+          "src/lib/worker/protocol.ts"
+        ],
         "script": "scripts/null/regime-check.ts",
-        "sourceSha256": "1ecf48b6dfa4077423e85a8f4c960e7d6dc1b714912be54d8d41cfbbaddadf59"
+        "sourceSha256": "fa4e08e4ab69e99c26c8d12f53e0e8ce83a41aec3959eeb083bca858b245950b"
       },
       "transfer": {
+        "dependencies": [
+          "scripts/analysis/env_guard.py",
+          "scripts/analysis/graph_io.py",
+          "scripts/analysis/transfer.py",
+          "scripts/data/binfmt.py",
+          "scripts/data/fsutil.py",
+          "scripts/data/rewire.py"
+        ],
         "host": {
           "arch": "aarch64",
           "python": "3.12.3"
         },
         "script": "scripts/analysis/transfer.py",
-        "sourceSha256": "22f012cfdd7c56395360c75b02f1fad273fed471a4f25d4b8642d2ffdbbe65a7"
+        "sourceSha256": "201ed62c560f7c6ae5afe9a6b9fbd1a1104d36c0780eec18d774c9aa5c9df5e5"
       }
     },
-    "regimeSha": "173a7551c596a68a6853b2952c13605b01b1ba761f68f06da06291857cd6abe4",
+    "regimeSha": "43a875dba45fd0e742cea7c22629d22ef1d2c41299ae4ac9be69b897ce279ac3",
     "rewiringNullSha256": "592446bb387acbc5354db807ae2f824547d168d9e338d3a55f94f525e39083d1",
-    "transferSha": "3219fd51a7e41355a329105701930cd7d795323eb8de278429ac7a9ada105371",
+    "transferSha": "8dd5487a2c8f4bd9920ff561bd2eb724ee74060780cc3ff2fc972b4fbcf3e813",
     "variantShas": {
       "flipBoth": "7639bbe1cdc9f4e8dba3a9dbba93b4e1fd68145f0b117c70ed5b55ccd7f73d15"
     }
