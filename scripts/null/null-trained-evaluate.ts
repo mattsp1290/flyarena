@@ -578,7 +578,12 @@ interface InterventionRunSpec {
 const parseRunSpecs = (flag: string, value: string): readonly InterventionRunSpec[] => {
   const specs = value.split(',').map((raw) => {
     const trimmed = raw.trim();
-    const match = /^([^:,\s]+):(\d+)$/.exec(trimmed);
+    // Restricted to letters/digits/underscore/hyphen (a review finding,
+    // defense in depth): `id` feeds directly into `--trained-dir`/
+    // `--arms-dir` lookups below (`resolve(args.trainedDir, "${id}-seed${trainerSeed}")`,
+    // `resolve(args.armsDir, id)`), and matches `train-sample.sh`'s own
+    // identical restriction on the ids it writes those same paths from.
+    const match = /^([A-Za-z0-9_-]+):(\d+)$/.exec(trimmed);
     if (!match) {
       throw new Error(`${flag} must be a comma-separated list of id:trainerSeed pairs (got "${value}")`);
     }
@@ -613,11 +618,14 @@ export interface NullTrainedInterventionEvaluateArgs {
   readonly hiddenSize: number;
   readonly shards: number;
   readonly out: string;
+  /** See `assertConfigsMatchManifest`'s doc comment (a review finding). */
+  readonly manifestPath: string;
 }
 
 const DEFAULT_INTERVENTION_TRAINED_DIR = resolve(repoRoot, 'training/runs/interventions/trained');
 const DEFAULT_INTERVENTION_ARMS_DIR = resolve(repoRoot, 'training/runs/interventions/arms');
 const DEFAULT_INTERVENTION_OUT = resolve(repoRoot, 'training/runs/interventions/trained.json');
+const DEFAULT_INTERVENTION_MANIFEST_PATH = resolve(repoRoot, 'public/data/trained-readout-v1.manifest.json');
 
 export const parseNullTrainedInterventionEvaluateArgs = (argv: readonly string[]): NullTrainedInterventionEvaluateArgs => {
   let graphList: string | undefined;
@@ -630,6 +638,7 @@ export const parseNullTrainedInterventionEvaluateArgs = (argv: readonly string[]
   let hiddenSize = DEFAULT_HIDDEN_SIZE;
   let shards = DEFAULT_SHARDS;
   let out = DEFAULT_INTERVENTION_OUT;
+  let manifestPath = DEFAULT_INTERVENTION_MANIFEST_PATH;
 
   let index = 0;
   while (index < argv.length) {
@@ -664,6 +673,9 @@ export const parseNullTrainedInterventionEvaluateArgs = (argv: readonly string[]
     } else if (flag === '--out') {
       out = resolve(process.cwd(), requireValue(flag, argv[index + 1]));
       index += 2;
+    } else if (flag === '--manifest') {
+      manifestPath = resolve(process.cwd(), requireValue(flag, argv[index + 1]));
+      index += 2;
     } else {
       throw new Error(`Unknown argument: ${flag}`);
     }
@@ -673,7 +685,7 @@ export const parseNullTrainedInterventionEvaluateArgs = (argv: readonly string[]
   if (!runs) throw new Error('--runs is required');
   if (!out.endsWith('.json')) throw new Error(`--out must end with ".json" (got "${out}")`);
 
-  return { graphList, runs, trainedDir, armsDir, heldOutStart, heldOutCount, ticks, hiddenSize, shards, out };
+  return { graphList, runs, trainedDir, armsDir, heldOutStart, heldOutCount, ticks, hiddenSize, shards, out, manifestPath };
 };
 
 /**
@@ -723,6 +735,77 @@ const assertBundleMatchesInterventionGraph = (
   }
 };
 
+/**
+ * `train-sample.sh`'s CEM hyperparameters (population/elites/generations/
+ * alpha/stdFloor/initStd/trainingSeedsPerGeneration) plus top-level `H` --
+ * the exact fields `train-sample.sh`'s own `read_manifest_cem_config`
+ * reads from `public/data/trained-readout-v1.manifest.json` before any
+ * export-arms/flyarena-train call.
+ */
+const MANIFEST_CEM_FIELDS = [
+  'population',
+  'elites',
+  'generations',
+  'alpha',
+  'stdFloor',
+  'initStd',
+  'trainingSeedsPerGeneration'
+] as const;
+
+const readManifestExpectedConfig = (manifestPath: string): Record<string, unknown> => {
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
+    readonly training?: Record<string, unknown>;
+    readonly H?: unknown;
+  };
+  if (!manifest.training) throw new Error(`null-trained-evaluate: ${manifestPath} has no "training" object`);
+  const expected: Record<string, unknown> = { H: manifest.H };
+  for (const field of MANIFEST_CEM_FIELDS) expected[field] = manifest.training[field];
+  return expected;
+};
+
+/**
+ * A review finding: `reconcileCemConfig` (above) only checks this mode's own
+ * runs against EACH OTHER, using the first biological-or-`tasks[0]` task as
+ * its baseline -- a baseline every intervention-mode task fails to provide
+ * (there is no biological task in this mode), so it silently falls back to
+ * `tasks[0]`, i.e. whichever run happened to be listed FIRST in `--runs`.
+ * If every run in a given invocation shared the same override (e.g. a
+ * `--generations 10` left over from a calibration wrapper script, or the
+ * manifest was regenerated between this study and `flyarena-bigq`), every
+ * task would "agree" with every other and `reconcileCemConfig` would raise
+ * nothing -- exactly the "CEM config is never shrunk silently" guarantee
+ * (`03-evaluation.md`'s WP3 section) failing right at publication. This
+ * checks every task's recorded CEM config directly against the shipped
+ * manifest's `training` block (the same source of truth
+ * `train-sample.sh`'s own preflight reads), independent of `--runs`'
+ * argument order. A task with NO recorded CEM fields at all is tolerated
+ * (matches `isEmptyCemConfig`'s own precedent -- an older/tiny test-fixture
+ * run dir predates these fields); a task with SOME fields recorded must
+ * match the manifest on every one of them.
+ */
+export const assertConfigsMatchManifest = (
+  tasks: readonly NullTrainedWorkerTask[],
+  manifestPath: string
+): void => {
+  const expected = readManifestExpectedConfig(manifestPath);
+  const fields = Object.keys(expected);
+  for (const task of tasks) {
+    const { config } = readRunDir(task.runDir);
+    const candidate = config as unknown as Record<string, unknown>;
+    if (fields.every((field) => candidate[field] === undefined)) continue;
+    for (const field of fields) {
+      if (candidate[field] === undefined) continue;
+      if (JSON.stringify(candidate[field]) !== JSON.stringify(expected[field])) {
+        throw new Error(
+          `null-trained-evaluate: "${task.graphId}"'s ${field}=${JSON.stringify(candidate[field])} does not match ` +
+            `${manifestPath}'s ${field}=${JSON.stringify(expected[field])} -- the CEM config must never be ` +
+            'silently shrunk or otherwise drift from the shipped manifest'
+        );
+      }
+    }
+  }
+};
+
 export const buildInterventionTasks = (
   args: Readonly<NullTrainedInterventionEvaluateArgs>
 ): NullTrainedWorkerTask[] => {
@@ -765,6 +848,10 @@ export const buildInterventionTasks = (
 export interface NullTrainedInterventionGraphRaw extends NullTrainedGraphRaw {
   readonly id: string;
   readonly trainerSeed: number;
+  /** `id`'s `--graph-list` entry `gzipSha256`, re-verified (not merely copied) by `buildInterventionTasks`/`verifiedInterventionEntry` before this row was scored -- a review finding: the row itself should carry the graph it was scored against, not require a reader to cross-reference the archived index separately. */
+  readonly gzipSha256: string;
+  /** The arm bundle's own self-certifying `sha256` (`export-arms.ts`'s `computeArmBundleSha256`), already proven to equal `config.armBundleSha256` (`null-trained-worker.ts`'s `runTask`) and tied to `gzipSha256` above (`assertBundleMatchesInterventionGraph`). */
+  readonly armBundleSha256: string;
 }
 
 /**
@@ -800,13 +887,45 @@ export const assembleInterventionRaw = (
     return found;
   };
 
+  // A review finding: each output row now carries the exact graph and arm
+  // bundle hashes it was scored against, rather than requiring a reader to
+  // separately cross-reference the archived `--graph-list`/arms tree.
+  // `gzipSha256` comes from the SAME verified index entry
+  // `buildInterventionTasks` already checked this task's bundle against
+  // (`assertBundleMatchesInterventionGraph`); `armBundleSha256` is the
+  // bundle's own self-certifying hash, already proven equal to
+  // `config.armBundleSha256` by the worker (`null-trained-worker.ts`'s
+  // `runTask`) before this task was ever scored.
+  const graphListBytes = readFileSync(args.graphList);
+  const index = readInterventionIndex(args.graphList);
+  const gzipShaById = new Map(index.entries.map((entry) => [entry.id, entry.gzipSha256]));
+  const armBundleSha256ByGraphId = new Map<string, string>();
+  for (const task of tasks) {
+    const bundle = JSON.parse(readFileSync(task.armBundlePath, 'utf8')) as { readonly sha256?: unknown };
+    if (typeof bundle.sha256 !== 'string') {
+      throw new Error(`null-trained-evaluate: ${task.armBundlePath} has no "sha256" field`);
+    }
+    armBundleSha256ByGraphId.set(task.graphId, bundle.sha256);
+  }
+
   const runs: NullTrainedInterventionGraphRaw[] = [...args.runs]
     .sort((a, b) => (a.id === b.id ? a.trainerSeed - b.trainerSeed : a.id < b.id ? -1 : 1))
-    .map((run) => ({
-      id: run.id,
-      trainerSeed: run.trainerSeed,
-      ...toGraphRaw(require(`${run.id}-seed${run.trainerSeed}`))
-    }));
+    .map((run) => {
+      const graphId = `${run.id}-seed${run.trainerSeed}`;
+      const gzipSha256 = gzipShaById.get(run.id);
+      if (!gzipSha256) {
+        throw new Error(`null-trained-evaluate: id "${run.id}" not found in --graph-list ${args.graphList}`);
+      }
+      const armBundleSha256 = armBundleSha256ByGraphId.get(graphId);
+      if (!armBundleSha256) throw new Error(`null-trained-evaluate: missing arm bundle sha256 for "${graphId}"`);
+      return {
+        id: run.id,
+        trainerSeed: run.trainerSeed,
+        gzipSha256,
+        armBundleSha256,
+        ...toGraphRaw(require(graphId))
+      };
+    });
 
   if (tasks.length === 0) throw new Error('null-trained-evaluate: assembleInterventionRaw requires at least one task');
   const { cemConfig, warnings: cemConfigWarnings } = reconcileCemConfig(tasks);
@@ -816,7 +935,7 @@ export const assembleInterventionRaw = (
     seeds: { start: args.heldOutStart, count: args.heldOutCount },
     ticks: args.ticks,
     substeps: NEURAL_SUBSTEPS_PER_TICK,
-    graphListSha256: sha256Hex(readFileSync(args.graphList)),
+    graphListSha256: sha256Hex(graphListBytes),
     runs,
     host: { arch: process.arch, node: process.version },
     d: readBundleD(tasks[0].armBundlePath),
@@ -830,6 +949,10 @@ export const runNullTrainedInterventionEvaluate = async (
   args: Readonly<NullTrainedInterventionEvaluateArgs>
 ): Promise<{ out: string; runMetaOut: string; taskCount: number; elapsedMs: number }> => {
   const tasks = buildInterventionTasks(args);
+  // Fails fast, before the (potentially long) sharded rescoring pass below,
+  // and independent of `--runs`' argument order -- see
+  // `assertConfigsMatchManifest`'s own doc comment (a review finding).
+  assertConfigsMatchManifest(tasks, args.manifestPath);
   const workerPath = fileURLToPath(new URL('./null-trained-worker.ts', import.meta.url));
 
   const started = performance.now();

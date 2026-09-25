@@ -235,6 +235,19 @@ if [[ ! "$seed_count" =~ ^[0-9]+$ ]] || [[ "$seed_count" -eq 0 ]]; then
   echo "train-sample.sh: --seed-count must be a positive integer, got \"$seed_count\"" >&2
   exit 1
 fi
+# --graph-list/--ids mode's id_out/config_path embed `$replica_seed` verbatim
+# as "<id>-seed<replica_seed>" (a review finding): an out-of-canonical-form
+# value ("0101", "+101") would still train correctly (flyarena-train's own
+# argparse `type=int` canonicalizes it for `config.json`'s `trainerSeed`),
+# but would write to a directory name (e.g. "P-seed0101") that no later
+# invocation with the canonical "101" -- including null-trained-evaluate.ts's
+# own "<id>-seed<trainerSeed>" lookup -- would ever find, silently wasting a
+# full retrain. Required to already be in canonical (no leading zero, no
+# sign) form, not merely integer-valued.
+if [[ ! "$replica_seed" =~ ^[1-9][0-9]*$ ]]; then
+  echo "train-sample.sh: --replica-seed must be a positive integer with no leading zeros, got \"$replica_seed\"" >&2
+  exit 1
+fi
 
 # Reads public/data/trained-readout-v1.manifest.json's "training" block
 # (population/elites/generations/trainingSeedsPerGeneration/alpha/stdFloor/
@@ -404,11 +417,82 @@ verified_intervention_graph_for_id() {
   node --import tsx scripts/null/lookup-intervention-graph.ts "$index_path" "$id"
 }
 
+# Reused by two checks below (a review finding, both independently):
+# (1) before trusting the resumability skip, that an existing config.json
+#     actually describes the run being requested right now, not a stale or
+#     differently-configured run (a calibration run left in the default
+#     --trained-out, an interrupted smoke test, ...); (2) after exporting an
+#     arm bundle (or finding one already on disk), that its
+#     `provenance.artifactSha256` still matches the id's `--graph-list`
+#     entry, closing the gap between `verified_intervention_graph_for_id`'s
+#     own read of the graph file and `export-arms`'s separate, later read of
+#     the same file.
+verify_resumed_config_matches_request() {
+  local config_path="$1"
+  python3 - "$config_path" "$replica_seed" "$population" "$elites" "$generations" \
+    "$train_seeds_per_generation" "$alpha" "$std_floor" "$init_std" "$hidden_size" "$ticks" <<'PY'
+import json
+import sys
+
+config_path = sys.argv[1]
+with open(config_path) as f:
+    c = json.load(f)
+
+want = {
+    "arm": "rewired",
+    "trainerSeed": int(sys.argv[2]),
+    "population": int(sys.argv[3]),
+    "elites": int(sys.argv[4]),
+    "generations": int(sys.argv[5]),
+    "trainingSeedsPerGeneration": int(sys.argv[6]),
+    "alpha": float(sys.argv[7]),
+    "stdFloor": float(sys.argv[8]),
+    "initStd": float(sys.argv[9]),
+    "H": int(sys.argv[10]),
+    "ticks": int(sys.argv[11]),
+}
+mismatches = {k: (c.get(k), v) for k, v in want.items() if c.get(k) != v}
+if mismatches:
+    sys.stderr.write(f"{config_path} does not match the requested run: {mismatches}\n")
+    sys.exit(1)
+PY
+}
+
+verify_arm_bundle_matches_graph() {
+  local bundle_path="$1" expected_gzip_sha256="$2"
+  python3 - "$bundle_path" "$expected_gzip_sha256" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as f:
+    bundle = json.load(f)
+provenance = bundle.get("provenance") or {}
+if provenance.get("kind") != "rewired-artifact" or provenance.get("artifactSha256") != sys.argv[2]:
+    sys.exit(1)
+PY
+}
+
 mkdir -p "$trained_out"
 
 if [[ "$graph_list_mode" -eq 1 ]]; then
   if [[ "$dry_run_fixture" -eq 0 && ! -f "$graph_list" ]]; then
     echo "train-sample.sh: --graph-list ${graph_list} not found" >&2
+    exit 1
+  fi
+
+  # A review finding: --ids must be exactly one comma-separated line with no
+  # whitespace. `IFS=',' read -r -a` silently reads only the FIRST LINE of
+  # its input, so an --ids value containing an embedded newline (e.g.
+  # `--ids "$(cat ids.txt)"` with one id per line) would otherwise silently
+  # train only the first id and report success. Whitespace around an id
+  # (e.g. "C000, C001") would otherwise become a literal " C001" id that
+  # fails lookup only once the loop reaches it.
+  if [[ "$ids" == *$'\n'* ]]; then
+    echo "train-sample.sh: --ids must not contain a newline (a single comma-separated line)" >&2
+    exit 1
+  fi
+  if [[ "$ids" =~ [[:space:]] ]]; then
+    echo "train-sample.sh: --ids must not contain whitespace (a comma-separated list with no spaces)" >&2
     exit 1
   fi
 
@@ -424,13 +508,47 @@ if [[ "$graph_list_mode" -eq 1 ]]; then
     exit 1
   fi
 
-  id_index=0
+  declare -A seen_ids=()
   for id in "${id_list[@]}"; do
     if [[ -z "$id" ]]; then
       echo "train-sample.sh: --ids has an empty entry (check for a stray comma)" >&2
       exit 1
     fi
+    # A review finding (defense in depth): every id feeds directly into
+    # filesystem paths ("${trained_out}/${id}-seed${replica_seed}",
+    # "${arms_out}/${id}"), and the resumability check above tests
+    # `-f "$config_path"` before any id is ever looked up against
+    # --graph-list (and --dry-run-fixture never looks ids up at all) -- so
+    # restricting ids to a safe character set here, unconditionally, closes
+    # that gap rather than relying on the lookup's sha check alone.
+    if [[ ! "$id" =~ ^[A-Za-z0-9_-]+$ ]]; then
+      echo "train-sample.sh: --ids has an invalid id \"${id}\" (letters, digits, underscore, hyphen only)" >&2
+      exit 1
+    fi
+    if [[ -n "${seen_ids[$id]:-}" ]]; then
+      echo "train-sample.sh: --ids lists \"${id}\" more than once" >&2
+      exit 1
+    fi
+    seen_ids[$id]=1
+  done
 
+  # Preflight (a review finding): resolve and sha256-verify EVERY requested
+  # id against --graph-list before training ANY of them. Without this, a
+  # typo, an id missing from the index, or a corrupted graph at position k
+  # of a long (e.g. this study's 10-id, multi-hour) batch would only surface
+  # once the training loop reached it -- after k-1 ids' worth of real GPU
+  # time already ran, with the remaining queue then sitting idle until an
+  # operator notices. This costs only a few seconds (hashing small gzip
+  # files) and never touches flyarena-train. Skipped entirely under
+  # --dry-run-fixture, which never reads a real --graph-list at all.
+  if [[ "$dry_run_fixture" -eq 0 ]]; then
+    for id in "${id_list[@]}"; do
+      verified_intervention_graph_for_id "$graph_list" "$id" >/dev/null
+    done
+  fi
+
+  id_index=0
+  for id in "${id_list[@]}"; do
     # id-and-trainer-seed-keyed, NOT id-only: this study trains "P" at three
     # different --replica-seed values (101/202/303) across three separate
     # invocations of this script, and each one is its own run directory --
@@ -441,7 +559,16 @@ if [[ "$graph_list_mode" -eq 1 ]]; then
     config_path="${id_out}/config.json"
 
     if [[ -f "$config_path" ]]; then
-      echo "train-sample.sh: id ${id} (seed ${replica_seed}): ${config_path} already exists -- skipping (resumable)"
+      # A review finding: an existing config.json is only trusted as "this
+      # run is done" once it is confirmed to actually describe THIS request
+      # (same arm/trainerSeed/CEM hyperparameters) -- never merely because a
+      # file happens to exist at this path (e.g. a calibration run, or a
+      # smoke test, that reused the default --trained-out).
+      if ! verify_resumed_config_matches_request "$config_path"; then
+        echo "train-sample.sh: id ${id}: ${config_path} exists but does NOT match this run's requested config (see stderr above) -- move it aside (a stale/calibration run?) and rerun" >&2
+        exit 1
+      fi
+      echo "train-sample.sh: id ${id} (seed ${replica_seed}): ${config_path} already exists and matches -- skipping (resumable, config verified)"
       id_index=$((id_index + 1))
       continue
     fi
@@ -449,22 +576,45 @@ if [[ "$graph_list_mode" -eq 1 ]]; then
     # Exported once per id (not once per id+trainer-seed): the rewired arm
     # bundle itself doesn't depend on the trainer seed, only training does --
     # matches this script's existing seed-based mode, which likewise exports
-    # arms once per rewiring seed regardless of --replica-seed.
+    # arms once per rewiring seed regardless of --replica-seed. A review
+    # finding: re-exporting unconditionally on every invocation risked
+    # silently orphaning an already-trained run's bundle (the bundle's
+    # self-hash includes `provenance.artifactPath`, an ABSOLUTE path built by
+    # `lookup-intervention-graph.ts` -- re-exporting from a different
+    # worktree/checkout, or after a moved --graph-list, would rewrite the
+    # SAME id's bundle with a DIFFERENT sha256, and an already-trained run's
+    # config.json still points at the old one). An existing, still-verified
+    # bundle is now reused instead of being unconditionally overwritten.
     arms_id_out="${arms_out}/${id}"
 
     if [[ "$dry_run_fixture" -eq 1 ]]; then
       echo "train-sample.sh: id ${id}: exporting fixture-rewired arms (fixture-rewire-seed=${id_index})"
       npm run training:export-arms -- --fixture-rewire --fixture-rewire-seed "$id_index" --out "$arms_id_out"
       bundle_dir="$(find "$arms_id_out" -mindepth 1 -maxdepth 1 -type d)"
+      bundle_path="${bundle_dir}/rewired.json"
     else
       rewired_path="$(verified_intervention_graph_for_id "$graph_list" "$id")"
-      echo "train-sample.sh: id ${id}: exporting arms from ${rewired_path}"
-      npm run training:export-arms -- --graph "$graph_path" --rewired "$rewired_path" --out "$arms_id_out"
+      expected_gzip_sha256="$(sha256sum "$rewired_path" | cut -d' ' -f1)"
       graph_sha256="$(sha256sum "$graph_path" | cut -d' ' -f1)"
       bundle_dir="${arms_id_out}/${graph_sha256}"
+      bundle_path="${bundle_dir}/rewired.json"
+
+      if [[ -f "$bundle_path" ]] && verify_arm_bundle_matches_graph "$bundle_path" "$expected_gzip_sha256"; then
+        echo "train-sample.sh: id ${id}: reusing existing verified arm bundle ${bundle_path}"
+      else
+        echo "train-sample.sh: id ${id}: exporting arms from ${rewired_path}"
+        npm run training:export-arms -- --graph "$graph_path" --rewired "$rewired_path" --out "$arms_id_out"
+        # Closes a TOCTOU gap (a review finding): lookup-intervention-graph.ts
+        # and export-arms each independently read $rewired_path from disk --
+        # re-verify what export-arms actually read, right here, before any
+        # GPU time is spent on it, rather than trusting it only implicitly.
+        if [[ ! -f "$bundle_path" ]] || ! verify_arm_bundle_matches_graph "$bundle_path" "$expected_gzip_sha256"; then
+          echo "train-sample.sh: id ${id}: exported ${bundle_path} does not match --graph-list's gzipSha256 for id ${id} (did the graph change between verification and export?)" >&2
+          exit 1
+        fi
+      fi
     fi
 
-    bundle_path="${bundle_dir}/rewired.json"
     if [[ ! -f "$bundle_path" ]]; then
       echo "train-sample.sh: id ${id}: expected export-arms bundle not found at ${bundle_path}" >&2
       exit 1

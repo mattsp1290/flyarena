@@ -13,6 +13,7 @@ import { createFixtureRewiredTraceGraph } from '../fixtures/trace-graph-rewire';
 import { runExportArms } from '../../scripts/training/export-arms';
 import {
   assembleInterventionRaw,
+  assertConfigsMatchManifest,
   buildInterventionTasks,
   parseNullTrainedInterventionEvaluateArgs,
   type NullTrainedInterventionEvaluateArgs
@@ -50,6 +51,19 @@ describe('parseNullTrainedInterventionEvaluateArgs', () => {
     expect(args.trainedDir.endsWith('training/runs/interventions/trained')).toBe(true);
     expect(args.armsDir.endsWith('training/runs/interventions/arms')).toBe(true);
     expect(args.out.endsWith('training/runs/interventions/trained.json')).toBe(true);
+    expect(args.manifestPath.endsWith('public/data/trained-readout-v1.manifest.json')).toBe(true);
+  });
+
+  it('parses --manifest', () => {
+    const args = parseNullTrainedInterventionEvaluateArgs([
+      '--graph-list',
+      'index.json',
+      '--runs',
+      'P:101',
+      '--manifest',
+      'my-manifest.json'
+    ]);
+    expect(args.manifestPath.endsWith('my-manifest.json')).toBe(true);
   });
 
   it('parses multiple id:trainerSeed pairs, including the same id at different seeds', () => {
@@ -123,6 +137,7 @@ describe('buildInterventionTasks / assembleInterventionRaw', () => {
     hiddenSize: 4,
     shards: 2,
     out: join(root, 'trained.json'),
+    manifestPath: join(root, 'manifest.json'),
     ...overrides
   });
 
@@ -182,6 +197,21 @@ describe('buildInterventionTasks / assembleInterventionRaw', () => {
     addInterventionGraph(entries, 'P', 0);
     addInterventionGraph(entries, 'C000', 1);
     writeFileSync(indexPath, JSON.stringify({ entries, version: 1 }));
+    writeFileSync(
+      join(root, 'manifest.json'),
+      JSON.stringify({
+        H: 4,
+        training: {
+          population: 128,
+          elites: 32,
+          generations: 150,
+          alpha: 0.7,
+          stdFloor: 0.02,
+          initStd: 0.5,
+          trainingSeedsPerGeneration: 16
+        }
+      })
+    );
   });
 
   afterEach(() => rmSync(root, { recursive: true, force: true }));
@@ -242,11 +272,65 @@ describe('buildInterventionTasks / assembleInterventionRaw', () => {
     expect(raw.evaluatorGitRev === null || typeof raw.evaluatorGitRev === 'string').toBe(true);
     expect(raw.cemConfig).toBeNull(); // writeTinyRunDir wasn't given any cemConfig fields in this fixture
     expect(raw.cemConfigWarnings).toEqual([]);
+
+    // Each row carries the exact graph/bundle hashes it was scored against.
+    const index = JSON.parse(readFileSync(indexPath, 'utf8')) as {
+      entries: Array<{ id: string; gzipSha256: string }>;
+    };
+    const gzipShaById = new Map(index.entries.map((e) => [e.id, e.gzipSha256]));
+    for (const row of raw.runs) {
+      expect(row.gzipSha256).toBe(gzipShaById.get(row.id));
+      const bundlePath = tasks.find((t) => t.graphId === `${row.id}-seed${row.trainerSeed}`)!.armBundlePath;
+      const bundleSha256 = (JSON.parse(readFileSync(bundlePath, 'utf8')) as { sha256: string }).sha256;
+      expect(row.armBundleSha256).toBe(bundleSha256);
+    }
   });
 
   it('assembleInterventionRaw throws when a task has no matching result', () => {
     const args = baseArgs();
     const tasks = buildInterventionTasks(args);
     expect(() => assembleInterventionRaw(args, tasks, new Map())).toThrow(/missing results for/);
+  });
+
+  describe('assertConfigsMatchManifest', () => {
+    it('tolerates a run with no recorded CEM fields at all (matches isEmptyCemConfig precedent)', () => {
+      const args = baseArgs();
+      const tasks = buildInterventionTasks(args);
+      // writeTinyRunDir's fixture run dirs record no CEM fields -- must not throw.
+      expect(() => assertConfigsMatchManifest(tasks, args.manifestPath)).not.toThrow();
+    });
+
+    it('throws when a run\'s recorded generations disagrees with the manifest', () => {
+      const args = baseArgs();
+      const tasks = buildInterventionTasks(args);
+      const configPath = join(trainedDir, 'P-seed101', 'config.json');
+      const config = JSON.parse(readFileSync(configPath, 'utf8')) as Record<string, unknown>;
+      writeFileSync(configPath, JSON.stringify({ ...config, generations: 10, population: 128 }));
+      expect(() => assertConfigsMatchManifest(tasks, args.manifestPath)).toThrow(
+        /"P-seed101"'s generations=10 does not match .*generations=150/
+      );
+    });
+
+    it('does not throw when every recorded CEM field matches the manifest exactly', () => {
+      const args = baseArgs();
+      const tasks = buildInterventionTasks(args);
+      const manifest = JSON.parse(readFileSync(args.manifestPath, 'utf8')) as {
+        H: number;
+        training: Record<string, number>;
+      };
+      for (const graphId of ['P-seed101', 'P-seed202', 'C000-seed101']) {
+        const configPath = join(trainedDir, graphId, 'config.json');
+        const config = JSON.parse(readFileSync(configPath, 'utf8')) as Record<string, unknown>;
+        writeFileSync(configPath, JSON.stringify({ ...config, ...manifest.training, H: manifest.H }));
+      }
+      expect(() => assertConfigsMatchManifest(tasks, args.manifestPath)).not.toThrow();
+    });
+
+    it('throws when the manifest has no "training" object', () => {
+      const args = baseArgs();
+      const tasks = buildInterventionTasks(args);
+      writeFileSync(args.manifestPath, JSON.stringify({ H: 4 }));
+      expect(() => assertConfigsMatchManifest(tasks, args.manifestPath)).toThrow(/has no "training" object/);
+    });
   });
 });
