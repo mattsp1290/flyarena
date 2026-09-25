@@ -83,6 +83,7 @@ they were).
 from __future__ import annotations
 
 import argparse
+import platform
 import sys
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor
@@ -120,6 +121,30 @@ OBSERVATION_CHANNELS: tuple[str, ...] = (
 
 #: `src/lib/arena/actions.ts`'s `OUTPUT_POPULATION`.
 OUTPUT_POPULATIONS: tuple[str, ...] = ("thrust", "yaw", "brake")
+
+#: Files that determine `features.json`'s own output bytes -- see
+#: `transfer.py`'s identically-shaped `TRANSFER_SOURCE_FILENAMES` doc
+#: comment for why (`graph_io.py`/`env_guard.py` as shared deps, hashed via
+#: `graph_io.source_identity_sha256` into `producer.sourceSha256`). The
+#: pre-adjudication `--features-exploratory-unrestricted` run is a
+#: deliberate exception: it is exempt from `explain.py`'s code-identity
+#: check by design (a pinned historical, stale-code snapshot -- see
+#: `explain.py`'s `verify_provenance` doc comment), so this producer block
+#: applies to it the same as any other `features.py` output; it is
+#: `explain.py`'s policy, not this module's, that decides which check to run
+#: on which input.
+FEATURES_SOURCE_FILENAMES: tuple[str, ...] = ("features.py", "graph_io.py", "env_guard.py")
+FEATURES_SOURCE_DIR = Path(__file__).resolve().parent
+
+
+def features_producer() -> dict:
+    """See `transfer.py`'s `transfer_producer()` doc comment -- identical
+    shape and rationale, `features.py`'s own source files."""
+    return {
+        "script": "scripts/analysis/features.py",
+        "sourceSha256": graph_io.source_identity_sha256(FEATURES_SOURCE_DIR, FEATURES_SOURCE_FILENAMES),
+        "host": {"arch": platform.machine(), "python": platform.python_version()},
+    }
 
 
 def _multi_source_bfs(edge_bool: np.ndarray, sources: np.ndarray) -> np.ndarray:
@@ -394,6 +419,7 @@ def main(argv: list[str] | None = None) -> None:
         "sourceGraphSha256": index["sourceSha256"],
         "rewireSourceSha256": index["rewireSourceSha256"],
         "graphs": results,
+        "producer": features_producer(),
     }
     write_canonical_json(args.out, out_payload)
     print(f"features: wrote {args.out} ({len(results)} graphs)")

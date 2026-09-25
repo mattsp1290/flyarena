@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -53,6 +54,49 @@ import type { RegimeSeedResult, RegimeWorkerMessage, RegimeWorkerTask } from './
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, '../..');
 const PUBLIC_DATA_DIR = resolve(repoRoot, 'public/data');
+
+/**
+ * Files that determine `regime.json`'s own output bytes: this driver plus
+ * the task/worker/shared modules it dispatches work through. Hashed into
+ * `producer.sourceSha256` below via `computeSourceIdentitySha256`, the same
+ * filename+NUL+bytes-per-file scheme Python's `scripts/data/compile.py`'s
+ * `compiler_source_sha256()` and `scripts/analysis/graph_io.py`'s
+ * `source_identity_sha256()` already use -- reused here (a third, TS-side
+ * implementation of the identical scheme, not a new one) so
+ * `scripts/analysis/explain.py`'s `verify_provenance` can recompute this
+ * exact hash from raw file bytes, with no TypeScript execution required,
+ * and refuse a `regime.json` regenerated from a different version of this
+ * code (a thermo-methodology review finding -- see `explain.py`'s
+ * `verify_provenance` doc comment). `null-worker-shared.ts` is included
+ * because both `regime-worker.ts` and (indirectly, via `null-evaluate.ts`'s
+ * generic `runShardedEvaluation`) this driver's actual episode-stepping
+ * logic depend on it; `null-evaluate.ts` itself is deliberately excluded --
+ * it is shared, pre-existing infrastructure this bean did not author or
+ * change, not part of "this study's own producer code" in the sense the
+ * task's code-identity provenance requirement targets.
+ */
+const REGIME_SOURCE_FILENAMES = ['regime-check.ts', 'regime-task.ts', 'regime-worker.ts', 'null-worker-shared.ts'] as const;
+
+const computeSourceIdentitySha256 = (sourceDir: string, filenames: readonly string[]): string => {
+  const hash = createHash('sha256');
+  for (const name of [...filenames].sort()) {
+    hash.update(name, 'utf-8');
+    hash.update(Buffer.from([0]));
+    hash.update(readFileSync(resolve(sourceDir, name)));
+  }
+  return hash.digest('hex');
+};
+
+export interface RegimeProducer {
+  readonly script: string;
+  readonly sourceSha256: string;
+}
+
+/** This run's code-identity block -- see `REGIME_SOURCE_FILENAMES`'s doc comment. */
+export const regimeProducer = (): RegimeProducer => ({
+  script: 'scripts/null/regime-check.ts',
+  sourceSha256: computeSourceIdentitySha256(here, REGIME_SOURCE_FILENAMES)
+});
 
 const DEFAULT_HELD_OUT_START = 30001;
 const DEFAULT_HELD_OUT_COUNT = 10;
@@ -339,6 +383,7 @@ export interface RegimeEvaluationRaw {
   readonly disconnected?: RegimeGraphRaw;
   readonly rewired: readonly RegimeRewiredGraphRaw[];
   readonly host: { readonly arch: string; readonly node: string };
+  readonly producer: RegimeProducer;
 }
 
 const toGraphRaw = (results: readonly RegimeSeedResult[]): RegimeGraphRaw => ({
@@ -375,7 +420,8 @@ export const assembleRegimeRaw = (
       ? { biological: toGraphRaw(require('biological')), disconnected: toGraphRaw(require('disconnected')) }
       : {}),
     rewired,
-    host: { arch: process.arch, node: process.version }
+    host: { arch: process.arch, node: process.version },
+    producer: regimeProducer()
   };
 };
 

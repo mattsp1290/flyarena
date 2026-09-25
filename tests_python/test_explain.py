@@ -5,6 +5,15 @@ together, none); a regime gate failure yields `regime-invalid` and never
 chance rate is deterministic with a fixed seed; percentile tie rule;
 deterministic output."
 
+Covers `scripts/analysis/explain.py`'s own domain: the regime gate,
+per-metric building, outcome-category evaluation (including the
+`qualifies`/`qualifyingMetrics` full-disclosure machinery), provenance
+(graph identity + producer code identity), and the CLI/`main()` end-to-end
+determinism gate. Pure statistics (`quantile_index`, `spearman_rho`, the
+permutation calibration, ...) are tested in `test_explain_stats.py`, and
+Markdown rendering in `test_explain_report.py` -- both split out alongside
+`explain.py`'s own module split (see `explain_stats.py`'s doc comment).
+
 Every pure-function test below constructs its own small synthetic input --
 none reads the real (gitignored) `training/runs/null/` artifacts, so this
 file runs standalone and fast, independent of any Spark run. The single
@@ -27,116 +36,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "analys
 
 import explain  # noqa: E402
 from features import OBSERVATION_CHANNELS, OUTPUT_POPULATIONS  # noqa: E402
-
-
-# ---------------------------------------------------------------------------
-# Empirical quantiles / rank statistics ("percentile tie rule")
-# ---------------------------------------------------------------------------
-
-
-def test_quantile_index_matches_null_stats_ts_convention():
-    # Mirrors `scripts/null/null-stats.ts`'s own `quantileIndex` doc comment
-    # examples: n=500 -> floor(0.025*500)=12, min(499, ceil(0.975*500)-1)=487.
-    assert explain.quantile_index(500, 0.025) == 12
-    assert explain.quantile_index(500, 0.975) == 487
-    # p == 0.5 uses the low-tail floor branch.
-    assert explain.quantile_index(500, 0.5) == 250
-    # High-tail branch never exceeds n - 1.
-    assert explain.quantile_index(4, 0.975) == 3
-
-
-def test_null_range_summary_median_and_quantiles():
-    values = [float(v) for v in range(1, 501)]  # 1..500, evenly spaced
-    summary = explain.null_range_summary(values)
-    assert summary["median"] == pytest.approx(250.5)
-    assert summary["p2_5"] == pytest.approx(values[12])
-    assert summary["p97_5"] == pytest.approx(values[487])
-
-
-def test_rank_statistics_tie_rule():
-    # 3 below, 2 equal, 5 total -> bioPercentile = (3 + 0.5*2)/5 = 0.8.
-    null_values = [1.0, 2.0, 3.0, 5.0, 5.0]
-    stats = explain.rank_statistics(null_values, 5.0)
-    assert stats["kBelow"] == 3
-    assert stats["kEqual"] == 2
-    assert stats["bioPercentile"] == pytest.approx(0.8)
-
-
-def test_outside_range():
-    assert explain.outside_range(0.0, 1.0, 2.0) is True
-    assert explain.outside_range(3.0, 1.0, 2.0) is True
-    assert explain.outside_range(1.5, 1.0, 2.0) is False
-    assert explain.outside_range(1.0, 1.0, 2.0) is False  # boundary is inside
-
-
-# ---------------------------------------------------------------------------
-# Spearman correlation
-# ---------------------------------------------------------------------------
-
-
-def test_spearman_rho_perfect_monotonic():
-    x = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
-    y = np.array([10.0, 20.0, 30.0, 40.0, 50.0])
-    assert explain.spearman_rho(x, y) == pytest.approx(1.0)
-    assert explain.spearman_rho(x, y[::-1]) == pytest.approx(-1.0)
-
-
-def test_spearman_rho_degenerate_constant_input_is_zero_not_nan():
-    x = np.array([1.0, 1.0, 1.0, 1.0])
-    y = np.array([1.0, 2.0, 3.0, 4.0])
-    assert explain.spearman_rho(x, y) == 0.0
-
-
-def test_spearman_rho_ties_use_average_rank():
-    # x has a tie at rank (1,2) -> average rank 1.5 each; verified against
-    # a hand-computed Spearman value (equivalent to scipy.stats.spearmanr
-    # with tie correction).
-    x = np.array([1.0, 1.0, 2.0, 3.0])
-    y = np.array([1.0, 2.0, 3.0, 4.0])
-    rho = explain.spearman_rho(x, y)
-    assert rho == pytest.approx(0.9486832980505138, rel=1e-9)
-
-
-# ---------------------------------------------------------------------------
-# Deterministic RNG / bootstrap / permutation calibration
-# ---------------------------------------------------------------------------
-
-
-def test_metric_rng_is_deterministic_and_label_dependent():
-    rng_a1 = explain.metric_rng(42, "foo")
-    rng_a2 = explain.metric_rng(42, "foo")
-    rng_b = explain.metric_rng(42, "bar")
-    assert rng_a1.integers(0, 1_000_000, size=5).tolist() == rng_a2.integers(0, 1_000_000, size=5).tolist()
-    # A different label gives a different stream (not a hard mathematical
-    # guarantee, but true with overwhelming probability for a sha256-derived
-    # seed -- a collision here would indicate a bug, not bad luck).
-    rng_a3 = explain.metric_rng(42, "foo")
-    assert rng_a3.integers(0, 1_000_000, size=5).tolist() != rng_b.integers(0, 1_000_000, size=5).tolist()
-
-
-def test_bootstrap_spearman_ci_deterministic_with_fixed_seed():
-    rank_x = np.arange(50.0)
-    rank_y = np.arange(50.0) + np.array([0.0, 1.0] * 25)
-    ci_a = explain.bootstrap_spearman_ci(rank_x, rank_y, 2_000, explain.metric_rng(7, "m"))
-    ci_b = explain.bootstrap_spearman_ci(rank_x, rank_y, 2_000, explain.metric_rng(7, "m"))
-    assert ci_a == ci_b
-
-
-def test_permutation_chance_rate_deterministic_with_fixed_seed():
-    rng = np.random.default_rng(0)
-    n = 200
-    score = rng.standard_normal(n)
-    # One metric strongly correlated with score, one pure noise.
-    metric_matrix = np.stack([score + rng.standard_normal(n) * 0.01, rng.standard_normal(n)], axis=1)
-    rank_matrix = np.stack([explain._rank(metric_matrix[:, i]) for i in range(2)], axis=1)
-    rank_score = explain._rank(score)
-
-    rate_a = explain.permutation_chance_rate(rank_matrix, rank_score, 0.3, 500, np.random.default_rng(123))
-    rate_b = explain.permutation_chance_rate(rank_matrix, rank_score, 0.3, 500, np.random.default_rng(123))
-    assert rate_a == rate_b
-    # Under permutation the true association is broken, so a high-|rho|
-    # column should be rare, not near-certain.
-    assert 0.0 <= rate_a <= 0.2
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +202,26 @@ def test_build_metric_drops_excluded_graphs_from_the_null_set(monkeypatch):
     assert metric_excluded["p97_5"] == pytest.approx(0.1)
 
 
+def test_build_metric_stamps_qualifies_both_gates_from_the_single_predicate(monkeypatch):
+    # `build_metric` stamps `qualifiesBothGates` by calling the module-scope
+    # `explain.qualifies` on its own just-built dict -- not a second,
+    # hand-written boolean. Constructed to obviously qualify (bio far
+    # outside a tight null range, |rho| large).
+    monkeypatch.setattr(explain, "REWIRED_COUNT", 10)
+    graphs = {
+        "biological": _transfer_entry(),
+        **{f"rewired-{i}": _transfer_entry() for i in range(10)},
+    }
+    for i in range(10):
+        graphs[f"rewired-{i}"]["T"][0][0] = 0.1 + i * 0.001  # tight null range around 0.1
+    graphs["biological"]["T"][0][0] = 999.0  # far outside the null range
+    score_by_seed = {i: float(i) for i in range(10)}
+    metric = explain.build_metric(
+        "T:foodBearing->thrust", "transfer", explain.extract_transfer_value, graphs, score_by_seed, frozenset(), 1
+    )
+    assert metric["qualifiesBothGates"] == explain.qualifies(metric)
+
+
 # ---------------------------------------------------------------------------
 # Outcome category evaluation
 # ---------------------------------------------------------------------------
@@ -431,53 +350,77 @@ def test_linear_pathway_detail_flags_direction_inconsistency_in_summary():
 
 
 # ---------------------------------------------------------------------------
-# Permutation calibration: missing values fail loud, joint rate is a real union
+# `qualifies` / `qualifyingMetrics` full disclosure (thermo-methodology
+# review, Important 1: the Finding must name EVERY metric that passes both
+# predeclared gates, not only the per-category `max(..., key=abs(spearman))`
+# exemplar `linearDetail`/`structuralDetail` each surface).
 # ---------------------------------------------------------------------------
 
 
-def test_build_family_rank_matrix_raises_on_missing_value(monkeypatch):
-    monkeypatch.setattr(explain, "REWIRED_COUNT", 3)
-    graphs = {f"rewired-{i}": {"weightBalance": {"thrust": None if i == 1 else float(i)}} for i in range(3)}
-    metrics = [{"name": "weightBalance:thrust"}]
-    with pytest.raises(ValueError, match="missing value"):
-        explain.build_family_rank_matrix(metrics, explain.extract_feature_value, graphs, frozenset())
+def test_qualifies_is_module_scope_function():
+    qualifying = _metric("T:a->b", "transfer", 0.0, 1.0, 2.0, 0.5)
+    non_qualifying = _metric("T:c->d", "transfer", 1.5, 1.0, 2.0, 0.9)
+    assert explain.qualifies(qualifying) is True
+    assert explain.qualifies(non_qualifying) is False
 
 
-def test_joint_permutation_chance_rate_is_deterministic_and_at_least_max_of_families():
-    rng = np.random.default_rng(0)
-    n = 100
-    scores = rng.standard_normal(n)
-    # Family A: one metric strongly correlated with score.
-    metric_a = scores + rng.standard_normal(n) * 0.01
-    rank_a = explain._rank(metric_a).reshape(-1, 1)
-    # Family B: pure noise.
-    metric_b = rng.standard_normal(n)
-    rank_b = explain._rank(metric_b).reshape(-1, 1)
-    seed_indices = np.arange(n)
+def test_qualifying_metrics_lists_every_metric_passing_both_gates_not_just_category_winners():
+    # Mirrors this study's real published numbers exactly: two transfer
+    # entries and one structural feature independently pass both predeclared
+    # gates, but `evaluate_categories` (via `max(..., key=abs(spearman))`)
+    # only ever names the single strongest metric per category as its
+    # `linearDetail`/`structuralDetail`.
+    strong_linear = _metric("T:rightClearance->thrust", "transfer", 0.0, 90.0, 160.0, 0.467)
+    weak_linear = _metric("T:forwardClearance->thrust", "transfer", 0.0, 90.0, 160.0, 0.353)
+    structural = _metric("weightedInDegree:thrust", "feature", 0.0, 90.0, 160.0, 0.394)
+    non_qualifying = _metric("T:speed->brake", "transfer", 1.5, 1.0, 2.0, 0.9)  # inside range -- excluded
 
-    joint_rate_a = explain.joint_permutation_chance_rate(
-        [(rank_a, seed_indices)], scores, 0.3, 300, np.random.default_rng(99)
-    )
-    joint_rate_both = explain.joint_permutation_chance_rate(
-        [(rank_a, seed_indices), (rank_b, seed_indices)], scores, 0.3, 300, np.random.default_rng(99)
-    )
-    # Adding a second family (evaluated under the *same* permutation draws)
-    # can only add hits, never remove them -- the union rate must be at
-    # least as large as any single family's rate.
-    assert joint_rate_both >= joint_rate_a
+    finding = explain.evaluate_categories(0.0, [strong_linear, weak_linear, non_qualifying], [structural], PASSING_REGIME)
 
-    rate_repeat = explain.joint_permutation_chance_rate(
-        [(rank_a, seed_indices), (rank_b, seed_indices)], scores, 0.3, 300, np.random.default_rng(99)
-    )
-    assert joint_rate_both == rate_repeat
+    # The category-level exemplars name only one metric each.
+    assert finding["linearDetail"]["name"] == "T:rightClearance->thrust"
+    assert finding["structuralDetail"]["name"] == "weightedInDegree:thrust"
+
+    # But `qualifyingMetrics` discloses every metric meeting the bar, sorted
+    # by |rho| descending -- including the category runner-up
+    # (`T:forwardClearance->thrust`), which the exemplar fields above never
+    # surface at all.
+    names = [m["name"] for m in finding["qualifyingMetrics"]]
+    assert names == ["T:rightClearance->thrust", "weightedInDegree:thrust", "T:forwardClearance->thrust"]
+    assert "T:speed->brake" not in names
 
 
-def test_joint_permutation_chance_rate_empty_families_returns_zero():
-    assert explain.joint_permutation_chance_rate([], np.array([1.0, 2.0, 3.0]), 0.3, 10, np.random.default_rng(0)) == 0.0
+def test_qualifying_metrics_empty_when_nothing_qualifies():
+    finding = explain.evaluate_categories(0.0, [], [], PASSING_REGIME)
+    assert finding["qualifyingMetrics"] == []
+
+
+def test_build_qualifying_metrics_note_names_every_qualifying_metric():
+    metrics = [
+        _metric("T:rightClearance->thrust", "transfer", 0.0, 90.0, 160.0, 0.467),
+        _metric("weightedInDegree:thrust", "feature", 0.0, 90.0, 160.0, 0.394),
+        _metric("T:forwardClearance->thrust", "transfer", 0.0, 90.0, 160.0, 0.353),
+    ]
+    note = explain.build_qualifying_metrics_note(metrics)
+    for m in metrics:
+        assert m["name"] in note
+        assert f"{m['spearman']:.3f}" in note
+    assert "3 metrics" in note
+
+
+def test_build_qualifying_metrics_note_singular_wording_for_one_metric():
+    note = explain.build_qualifying_metrics_note([_metric("T:a->b", "transfer", 0.0, 1.0, 2.0, 0.5)])
+    assert "1 metric " in note
+    assert "1 metrics" not in note
+
+
+def test_build_qualifying_metrics_note_empty_says_none_qualify():
+    note = explain.build_qualifying_metrics_note([])
+    assert "No metric" in note
 
 
 # ---------------------------------------------------------------------------
-# Seed coverage and report-rendering defensiveness
+# Seed coverage
 # ---------------------------------------------------------------------------
 
 
@@ -496,22 +439,6 @@ def test_require_complete_seed_coverage_rejects_duplicate_seed(monkeypatch):
     monkeypatch.setattr(explain, "REWIRED_COUNT", 5)
     with pytest.raises(ValueError, match="does not cover"):
         explain._require_complete_seed_coverage("test", [0, 1, 2, 3, 3])
-
-
-def test_render_transfer_matrix_handles_missing_metric_without_crashing():
-    # Simulates biological's transfer solve being singular: every `T:*`
-    # metric is dropped, so `metrics_by_name` has none of them.
-    rendered = explain.render_transfer_matrix({}, "bio")
-    assert "n/a" in rendered
-    assert "foodBearing" in rendered
-
-
-def test_render_metric_stats_table_shows_null_constant_as_na():
-    constant_metric = _metric("pathLength:a->b", "feature", 2.0, 1.0, 1.0, 0.0)
-    constant_metric["nullConstant"] = True
-    rendered = explain.render_metric_stats_table([constant_metric])
-    assert "n/a (constant in null)" in rendered
-    assert "0.000" not in rendered
 
 
 # ---------------------------------------------------------------------------
@@ -559,13 +486,20 @@ def synthetic_inputs(tmp_path, monkeypatch):
     `explain.main()` -- values only (no real graph algebra), built
     deterministically so the two calls in
     `test_main_produces_deterministic_output` see identical inputs.
-    `REWIRED_COUNT` is monkeypatched down from 500 so this stays fast."""
+    `REWIRED_COUNT` is monkeypatched down from 500 so this stays fast.
+    `transfer.json`/`features.json`/`regime.json` each carry a `producer`
+    block computed from `explain.current_*_source_sha256()` -- i.e. the
+    *real* current working tree's code identity, the same way a real
+    `transfer.py`/`features.py`/`regime-check.ts` run would -- so
+    `verify_provenance`'s code-identity check passes against this fixture
+    exactly as it would against real WP2 output regenerated just now."""
     monkeypatch.setattr(explain, "REWIRED_COUNT", 20)
     rng = np.random.default_rng(1234)
 
     source_sha = "a" * 64
     rewire_sha = "b" * 64
     host = {"arch": "arm64", "node": "v22.22.3"}
+    python_host = {"arch": "aarch64", "python": "3.12.3"}
 
     rewired = []
     transfer_graphs = {"biological": _synthetic_transfer_graph(rng)}
@@ -611,16 +545,32 @@ def synthetic_inputs(tmp_path, monkeypatch):
         "sourceGraphSha256": source_sha,
         "rewireSourceSha256": rewire_sha,
         "graphs": transfer_graphs,
+        "producer": {
+            "script": "scripts/analysis/transfer.py",
+            "sourceSha256": explain.current_transfer_source_sha256(),
+            "host": python_host,
+        },
     }
     features_json = {
         "sourceGraphSha256": source_sha,
         "rewireSourceSha256": rewire_sha,
         "graphs": features_graphs,
+        "producer": {
+            "script": "scripts/analysis/features.py",
+            "sourceSha256": explain.current_features_source_sha256(),
+            "host": python_host,
+        },
     }
     features_exploratory_json = {
         "sourceGraphSha256": source_sha,
         "rewireSourceSha256": rewire_sha,
         "graphs": features_exploratory_graphs,
+        # Deliberately NOT given a producer block matching current code --
+        # exempt from the code-identity check by design (see
+        # `explain.verify_provenance`'s doc comment). A stale-looking
+        # `producer` here confirms that exemption is real, not an accident
+        # of the fixture happening to match.
+        "producer": {"script": "scripts/analysis/features.py", "sourceSha256": "stale" * 16, "host": python_host},
     }
     regime_json = {
         "sourceGraphSha256": source_sha,
@@ -632,6 +582,10 @@ def synthetic_inputs(tmp_path, monkeypatch):
         },
         "rewired": regime_rewired,
         "host": host,
+        "producer": {
+            "script": "scripts/null/regime-check.ts",
+            "sourceSha256": explain.current_regime_source_sha256(),
+        },
     }
 
     paths = {}
@@ -693,6 +647,28 @@ def test_main_produces_deterministic_output(tmp_path, synthetic_inputs):
     assert payload["calibration"]["chanceHits"] == round(payload["calibration"]["chanceRate"] * payload["calibration"]["permutations"])
     assert "exploratory" in payload
     assert len(payload["exploratory"]["featureSixUnrestricted"]["metrics"]) == 3
+
+    # `qualifyingMetrics`/`qualifyingMetricsNote`: the full-disclosure set
+    # must exactly match an independent recomputation of `qualifies` over
+    # every published metric (not just what happened to trigger a category).
+    expected_qualifying_names = {m["name"] for m in payload["metrics"] if explain.qualifies(m)}
+    actual_qualifying_names = {m["name"] for m in payload["finding"]["qualifyingMetrics"]}
+    assert actual_qualifying_names == expected_qualifying_names
+    for m in payload["finding"]["qualifyingMetrics"]:
+        assert m["name"] in payload["finding"]["qualifyingMetricsNote"]
+
+    # Every published metric carries the `qualifiesBothGates` stamp, and it
+    # agrees with an independent recomputation of `explain.qualifies`.
+    for m in payload["metrics"]:
+        assert m["qualifiesBothGates"] == explain.qualifies(m)
+
+    # Producer code-identity blocks are recorded in the published artifact
+    # (thermo-methodology review, Important 2's "record the input producer
+    # shas in the published artifact").
+    producers = payload["sources"]["producers"]
+    assert producers["transfer"]["sourceSha256"] == explain.current_transfer_source_sha256()
+    assert producers["features"]["sourceSha256"] == explain.current_features_source_sha256()
+    assert producers["regime"]["sourceSha256"] == explain.current_regime_source_sha256()
 
 
 # ---------------------------------------------------------------------------
@@ -784,4 +760,61 @@ def test_regime_seed_gap_is_rejected(tmp_path, synthetic_inputs):
     regime["rewired"].pop()  # drop one seed -- coverage is now incomplete
     synthetic_inputs["regime.json"].write_text(json.dumps(regime))
     with pytest.raises(ValueError, match="does not cover rewired seeds"):
+        _run_main(tmp_path, synthetic_inputs, [])
+
+
+# ---------------------------------------------------------------------------
+# Provenance: producer code identity (thermo-methodology review, Important
+# 2 -- `verify_provenance` must REFUSE any input whose recorded
+# `producer.sourceSha256` doesn't match the current source).
+# ---------------------------------------------------------------------------
+
+
+def test_transfer_json_stale_producer_sha_is_rejected(tmp_path, synthetic_inputs):
+    transfer_json = json.loads(synthetic_inputs["transfer.json"].read_text())
+    transfer_json["producer"]["sourceSha256"] = "0" * 64  # does not match current transfer.py
+    synthetic_inputs["transfer.json"].write_text(json.dumps(transfer_json))
+    with pytest.raises(ValueError, match="code-identity provenance mismatch"):
+        _run_main(tmp_path, synthetic_inputs, [])
+
+
+def test_features_json_stale_producer_sha_is_rejected(tmp_path, synthetic_inputs):
+    features_json = json.loads(synthetic_inputs["features.json"].read_text())
+    features_json["producer"]["sourceSha256"] = "0" * 64
+    synthetic_inputs["features.json"].write_text(json.dumps(features_json))
+    with pytest.raises(ValueError, match="code-identity provenance mismatch"):
+        _run_main(tmp_path, synthetic_inputs, [])
+
+
+def test_regime_json_stale_producer_sha_is_rejected(tmp_path, synthetic_inputs):
+    regime_json = json.loads(synthetic_inputs["regime.json"].read_text())
+    regime_json["producer"]["sourceSha256"] = "0" * 64
+    synthetic_inputs["regime.json"].write_text(json.dumps(regime_json))
+    with pytest.raises(ValueError, match="code-identity provenance mismatch"):
+        _run_main(tmp_path, synthetic_inputs, [])
+
+
+def test_transfer_json_missing_producer_block_is_rejected(tmp_path, synthetic_inputs):
+    transfer_json = json.loads(synthetic_inputs["transfer.json"].read_text())
+    del transfer_json["producer"]
+    synthetic_inputs["transfer.json"].write_text(json.dumps(transfer_json))
+    with pytest.raises(ValueError, match="has no 'producer' block"):
+        _run_main(tmp_path, synthetic_inputs, [])
+
+
+def test_features_exploratory_unrestricted_is_exempt_from_producer_check(tmp_path, synthetic_inputs):
+    # The fixture already gives this input a deliberately-stale-looking
+    # producer sha (see `synthetic_inputs`'s doc comment) -- confirms
+    # `verify_provenance` really does skip the code-identity check for it,
+    # not merely that this test forgot to break it.
+    exploratory = json.loads(synthetic_inputs["features-exploratory-unrestricted.json"].read_text())
+    assert exploratory["producer"]["sourceSha256"] == "stale" * 16
+    _run_main(tmp_path, synthetic_inputs, [])  # must not raise
+
+
+def test_transfer_features_producer_host_arch_mismatch_is_rejected(tmp_path, synthetic_inputs):
+    transfer_json = json.loads(synthetic_inputs["transfer.json"].read_text())
+    transfer_json["producer"]["host"] = {"arch": "x86_64", "python": "3.12.3"}
+    synthetic_inputs["transfer.json"].write_text(json.dumps(transfer_json))
+    with pytest.raises(ValueError, match="producer host arch"):
         _run_main(tmp_path, synthetic_inputs, [])

@@ -20,7 +20,8 @@ Inputs (all already computed by WP1/WP2, none re-simulated here):
   `features-exploratory-unrestricted.json` run with feature 6
   (`weightedInDegree`) unrestricted -- disclosed in the report as
   exploratory/non-predeclared, never used in the outcome-category
-  evaluation (see `render_feature6_disclosure`'s doc comment);
+  evaluation (see `explain_report.render_feature6_disclosure`'s doc
+  comment);
 - `scripts/null/regime-check.ts`'s `regime.json` (per-graph clamp-fraction
   and steady-state-distance samples on 10 held-out seeds).
 
@@ -42,12 +43,21 @@ Run with `OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
 DD_IAST_ENABLED=false` and `PYTHONPATH` unset, matching every other
 `scripts/analysis/` CLI (`env_guard.assert_single_threaded_blas`, checked
 before `numpy` does any work, below).
+
+This module is the CLI/orchestration entry point only: pure statistics
+(`quantile_index`, `spearman_rho`, the permutation calibration, ...) live in
+`explain_stats.py`, and Markdown report rendering lives in
+`explain_report.py` -- both extracted out of what was previously a single
+1498-line file, 50% past this repo's own "do not let a file cross 1000
+lines without a very strong reason" rule (a thermo-maintainability review
+finding; see `explain_stats.py`'s doc comment for the precedent, `scripts/
+null/null-report-trained.ts`, this study's Python sibling did not originally
+get the same treatment).
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import sys
 from pathlib import Path
@@ -58,16 +68,32 @@ from env_guard import assert_single_threaded_blas
 assert_single_threaded_blas()
 
 import numpy as np  # noqa: E402
-import pandas as pd  # noqa: E402
 
 import graph_io  # noqa: E402
 from graph_io import canonical_json_text, sha256_hex, write_canonical_json  # noqa: E402
 from features import OBSERVATION_CHANNELS, OUTPUT_POPULATIONS  # noqa: E402
 from transfer import ILL_CONDITIONED_THRESHOLD, OBSERVATION_CHANNEL_INDEX, OUTPUT_POPULATION_INDEX  # noqa: E402
 
+from explain_stats import (  # noqa: E402
+    _rank,
+    bootstrap_spearman_ci,
+    build_family_rank_matrix,
+    format_pct,
+    joint_permutation_chance_rate,
+    metric_rng,
+    null_range_summary,
+    outside_range,
+    rank_statistics,
+    spearman_rho,
+)
+from explain_report import render_report_markdown  # noqa: E402
+import explain_provenance  # noqa: E402
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PUBLIC_DATA_DIR = REPO_ROOT / "public" / "data"
 DOCS_DIR = REPO_ROOT / "docs"
+NULL_SOURCE_DIR = REPO_ROOT / "scripts" / "null"
+ANALYSIS_SOURCE_DIR = Path(__file__).resolve().parent
 
 VERSION = 1
 REWIRED_COUNT = 500
@@ -115,243 +141,6 @@ PERMUTATION_COUNT = 1_000
 #: computation.
 BOOTSTRAP_BASE_SEED = 0x4E554C4C_45585031  # "NULLEXP1", read as hex digits
 PERMUTATION_BASE_SEED = 0x4E554C4C_45585032  # "NULLEXP2"
-
-
-# ---------------------------------------------------------------------------
-# Empirical quantiles / rank statistics -- mirrors
-# `scripts/null/null-stats.ts`'s `nullSummary`/`rankStatistics` exactly (the
-# same low-tail-floor / high-tail-ceil-minus-one convention), so this
-# module's per-metric percentile and range statistics are computed the same
-# way as the rest of this study's null artifacts (`03-explanation-report.md`:
-# "same tie rule as `scripts/null/null-stats.ts`").
-# ---------------------------------------------------------------------------
-
-
-def quantile_index(n: int, p: float) -> int:
-    if p <= 0.5:
-        return int(np.floor(p * n))
-    return min(n - 1, int(np.ceil(p * n)) - 1)
-
-
-def null_range_summary(values: Sequence[float]) -> dict:
-    sorted_values = sorted(float(v) for v in values)
-    n = len(sorted_values)
-    if n == 0:
-        raise ValueError("explain: null_range_summary requires at least one value")
-    median = (
-        sorted_values[(n - 1) // 2]
-        if n % 2 == 1
-        else (sorted_values[n // 2 - 1] + sorted_values[n // 2]) / 2
-    )
-    return {
-        "median": float(median),
-        "p2_5": float(sorted_values[quantile_index(n, 0.025)]),
-        "p97_5": float(sorted_values[quantile_index(n, 0.975)]),
-    }
-
-
-def rank_statistics(null_values: Sequence[float], bio_value: float) -> dict:
-    n = len(null_values)
-    if n == 0:
-        raise ValueError("explain: rank_statistics requires a non-empty null set")
-    k_below = sum(1 for v in null_values if v < bio_value)
-    k_equal = sum(1 for v in null_values if v == bio_value)
-    return {"kBelow": k_below, "kEqual": k_equal, "bioPercentile": (k_below + 0.5 * k_equal) / n}
-
-
-def outside_range(bio_value: float, p2_5: float, p97_5: float) -> bool:
-    return bio_value < p2_5 or bio_value > p97_5
-
-
-# ---------------------------------------------------------------------------
-# Spearman correlation + bootstrap CI
-#
-# Ranks use `pandas.Series.rank(method="average")` (average-tie ranking,
-# `scipy`-equivalent) rather than a plain double-argsort -- several feature
-# metrics are small integer counts (`twoCycleCount`, path lengths) with real
-# ties, and an untied rank would silently misstate rho for those (a concern
-# the WP2 feature-6 adjudication debate's own standalone script flagged and
-# did not resolve; `scipy` is not a project dependency, so this reuses the
-# `pandas` this repo already depends on instead of adding one).
-#
-# The bootstrap CI resamples the *already-ranked* pairs (not raw values) and
-# does not re-rank within each resample -- the standard, vectorizable way to
-# bootstrap a rank correlation's CI, and honest to disclose: a resample with
-# repeated indices has repeated rank values, so this is a bootstrap of "the
-# correlation of this fixed rank-transformed sample," not a full re-ranking
-# bootstrap. For a 500-point, effectively-tie-free biological/null sample
-# this distinction is immaterial; it is called out here and in the report's
-# limitations because a fully faithful bootstrap is not what is computed.
-# ---------------------------------------------------------------------------
-
-
-def _rank(values: np.ndarray) -> np.ndarray:
-    return pd.Series(values).rank(method="average").to_numpy(dtype=np.float64)
-
-
-def _pearson(x: np.ndarray, y: np.ndarray) -> float:
-    x_c = x - x.mean()
-    y_c = y - y.mean()
-    denom = float(np.sqrt(np.sum(x_c * x_c) * np.sum(y_c * y_c)))
-    if denom == 0.0:
-        return 0.0
-    return float(np.sum(x_c * y_c) / denom)
-
-
-def spearman_rho(x: np.ndarray, y: np.ndarray) -> float:
-    return _pearson(_rank(x), _rank(y))
-
-
-def metric_rng(base_seed: int, label: str) -> np.random.Generator:
-    """A deterministic, per-metric-independent RNG stream: every metric's
-    bootstrap CI is an independent function of `(base_seed, its own name)`,
-    the same design `scripts/training/stats.ts`'s `conditionRng` uses for
-    this study's other bootstrap CIs (`scripts/null/null-stats.ts`'s doc
-    comment), reimplemented here in Python via a sha256 digest of the label
-    rather than that file's own string-hash + `xoshiro`-style generator
-    (not reused across languages -- this module owns its own, equally
-    deterministic, construction)."""
-    digest = hashlib.sha256(f"{base_seed}:{label}".encode("utf-8")).digest()
-    seed = int.from_bytes(digest[:8], "big")
-    return np.random.default_rng(seed)
-
-
-def bootstrap_spearman_ci(
-    rank_x: np.ndarray, rank_y: np.ndarray, resamples: int, rng: np.random.Generator
-) -> tuple[float, float]:
-    n = rank_x.shape[0]
-    idx = rng.integers(0, n, size=(resamples, n))
-    rx = rank_x[idx]
-    ry = rank_y[idx]
-    rx_c = rx - rx.mean(axis=1, keepdims=True)
-    ry_c = ry - ry.mean(axis=1, keepdims=True)
-    num = np.sum(rx_c * ry_c, axis=1)
-    den = np.sqrt(np.sum(rx_c * rx_c, axis=1) * np.sum(ry_c * ry_c, axis=1))
-    with np.errstate(invalid="ignore", divide="ignore"):
-        rhos = np.where(den > 0, num / den, 0.0)
-    sorted_rhos = np.sort(rhos)
-    lo = sorted_rhos[quantile_index(resamples, 0.025)]
-    hi = sorted_rhos[quantile_index(resamples, 0.975)]
-    return float(lo), float(hi)
-
-
-def permutation_chance_rate(
-    rank_matrix: np.ndarray,
-    rank_score: np.ndarray,
-    threshold: float,
-    permutations: int,
-    rng: np.random.Generator,
-) -> float:
-    """`00-overview.md`'s multiple-comparisons calibration: across
-    `permutations` random re-pairings of the score vector against the fixed
-    metric matrix, the fraction of permutations where *at least one* of
-    `rank_matrix`'s columns reaches `|rho| >= threshold` by chance alone.
-    `rank_matrix` is `(n_graphs, n_metrics)`, already rank-transformed (see
-    `spearman_rho`'s doc comment for why ranking, not raw values, is used);
-    `rank_score` is `(n_graphs,)`. Vectorized over all metrics per
-    permutation (a Python loop only over the 1,000 permutations, not over
-    each of the ~66 metrics inside it)."""
-    metric_c = rank_matrix - rank_matrix.mean(axis=0, keepdims=True)
-    metric_denom = np.sqrt(np.sum(metric_c * metric_c, axis=0))
-    score_c = rank_score - rank_score.mean()
-    score_denom = float(np.sqrt(np.sum(score_c * score_c)))
-    hits = 0
-    n = rank_score.shape[0]
-    for _ in range(permutations):
-        perm = rng.permutation(n)
-        permuted = score_c[perm]
-        num = metric_c.T @ permuted
-        denom = metric_denom * score_denom
-        with np.errstate(invalid="ignore", divide="ignore"):
-            rhos = np.where(denom > 0, num / denom, 0.0)
-        if np.max(np.abs(rhos)) >= threshold:
-            hits += 1
-    return hits / permutations
-
-
-def joint_permutation_chance_rate(
-    families: Sequence[tuple[np.ndarray, np.ndarray]],
-    full_scores: np.ndarray,
-    threshold: float,
-    permutations: int,
-    rng: np.random.Generator,
-) -> float:
-    """The real multiple-comparisons calibration across *every* metric
-    family at once: `families` is `[(rank_matrix, seed_indices), ...]`, one
-    pair per metric family (transfer/derived, structural-feature), where
-    `rank_matrix` is that family's `(n_family, n_metrics)` array of metric
-    ranks (fixed, computed once from the real, unpermuted scores via
-    `_family_rank_matrix`) and `seed_indices` are the 0-based seeds each row
-    corresponds to, indexing into `full_scores` (length `REWIRED_COUNT`).
-    One shared permutation of the *full* score vector is drawn per
-    iteration, then subset (and re-ranked, since a subset's own average-tie
-    ranks differ from the full array's) per family -- both families see the
-    same underlying seed-to-score re-pairing, not two independently permuted
-    draws -- and a permutation counts as a hit if *any* family reaches the
-    threshold, which is the actual "at least one of the ~66 metrics" union
-    probability `00-overview.md` describes.
-
-    Replaces an earlier version that ran two independent single-family
-    permutation loops (`permutation_chance_rate`, above) and reported their
-    `max`, mislabeled "the more conservative (larger) chance rate" -- for a
-    union of two families, P(A or B) >= max(P(A), P(B)), so `max`
-    *understates* the true union rate (a dual-review finding, both
-    reviewers independently)."""
-    prepared: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
-    for rank_matrix, seed_indices in families:
-        if rank_matrix.shape[1] == 0:
-            continue
-        metric_c = rank_matrix - rank_matrix.mean(axis=0, keepdims=True)
-        metric_denom = np.sqrt(np.sum(metric_c * metric_c, axis=0))
-        prepared.append((metric_c, metric_denom, seed_indices))
-    if not prepared:
-        return 0.0
-    n_full = full_scores.shape[0]
-    hits = 0
-    for _ in range(permutations):
-        permuted_full = full_scores[rng.permutation(n_full)]
-        hit = False
-        for metric_c, metric_denom, seed_indices in prepared:
-            ry = _rank(permuted_full[seed_indices])
-            y_c = ry - ry.mean()
-            y_denom = float(np.sqrt(np.sum(y_c * y_c)))
-            num = metric_c.T @ y_c
-            denom = metric_denom * y_denom
-            with np.errstate(invalid="ignore", divide="ignore"):
-                rhos = np.where(denom > 0, num / denom, 0.0)
-            if np.max(np.abs(rhos)) >= threshold:
-                hit = True
-                break
-        hits += int(hit)
-    return hits / permutations
-
-
-def build_family_rank_matrix(
-    metrics: Sequence[dict], extractor, graphs: Mapping[str, dict], excluded_ids: frozenset[str]
-) -> tuple[np.ndarray, np.ndarray]:
-    """`(rank_matrix, seed_indices)` for `joint_permutation_chance_rate`:
-    `rank_matrix[i, j]` is metric `j`'s average rank at seed `seed_indices[i]`
-    (restricted to non-excluded seeds), for every metric in `metrics`.
-    Raises rather than silently letting a `None` extracted value become
-    `NaN` through `numpy`/`pandas` -- an all-`NaN`-propagated column would
-    otherwise make that column's rho `NaN` in every permutation, and because
-    `NaN >= threshold` is `False`, would silently make that column *never*
-    register a hit, understating the chance rate without raising anywhere
-    (an edge-case-review finding). This study's real `features.json` has no
-    `None`s among non-excluded rewired graphs, so this path was previously
-    unexercised, not previously safe."""
-    seed_indices = np.array([s for s in range(REWIRED_COUNT) if f"rewired-{s}" not in excluded_ids], dtype=np.int64)
-    columns = []
-    for metric in metrics:
-        raw = [extractor(graphs[f"rewired-{s}"], metric["name"]) for s in seed_indices]
-        if any(v is None for v in raw):
-            raise ValueError(
-                f"explain: {metric['name']} has a missing value on a non-excluded rewiring -- the permutation "
-                "calibration requires a complete column"
-            )
-        columns.append(_rank(np.asarray(raw, dtype=np.float64)))
-    rank_matrix = np.stack(columns, axis=1) if columns else np.zeros((seed_indices.shape[0], 0))
-    return rank_matrix, seed_indices
 
 
 # ---------------------------------------------------------------------------
@@ -573,21 +362,21 @@ def build_metric(
     rank_stats = rank_statistics(null_values, bio_value)
 
     # A metric constant across the (non-excluded) null set has an undefined
-    # Spearman rho, not a zero one -- `_pearson` returns `0.0` as a safe
-    # internal sentinel (it can never spuriously clear `SPEARMAN_RHO_
-    # THRESHOLD`), but reporting "0.000 [0.000, 0.000]" to a reader would
-    # read as a precisely measured null correlation rather than "not
-    # computable" (a rigor-review finding). `nullConstant` lets
-    # `render_metric_stats_table` show "n/a" instead.
+    # Spearman rho, not a zero one -- `explain_stats._pearson` returns `0.0`
+    # as a safe internal sentinel (it can never spuriously clear
+    # `SPEARMAN_RHO_THRESHOLD`), but reporting "0.000 [0.000, 0.000]" to a
+    # reader would read as a precisely measured null correlation rather than
+    # "not computable" (a rigor-review finding). `nullConstant` lets
+    # `explain_report.render_metric_stats_table` show "n/a" instead.
     null_constant = bool(np.ptp(metric_values) == 0.0)
 
     rx = _rank(metric_values)
     ry = _rank(scores)
-    rho = _pearson(rx, ry)
+    rho = spearman_rho(metric_values, scores)
     rng = metric_rng(bootstrap_base_seed, name)
     ci_lo, ci_hi = bootstrap_spearman_ci(rx, ry, BOOTSTRAP_RESAMPLES, rng)
 
-    return {
+    metric = {
         "name": name,
         "kind": kind,
         "bio": float(bio_value),
@@ -599,6 +388,16 @@ def build_metric(
         "spearmanCi": [ci_lo, ci_hi],
         "nullConstant": null_constant,
     }
+    # Stamped from the single module-scope `qualifies` predicate below (not
+    # a second, hand-written boolean expression) -- lets `explain_report.
+    # render_metric_stats_table` visually flag a qualifying row without
+    # itself depending on `explain.py` (this module's own one-directional
+    # import boundary; see `explain_report.py`'s doc comment) or
+    # re-implementing the gate a third time (a thermo-maintainability review
+    # finding, M3, generalized: every qualification decision in this
+    # pipeline routes through one function).
+    metric["qualifiesBothGates"] = qualifies(metric)
+    return metric
 
 
 def build_all_metrics(
@@ -636,6 +435,17 @@ def build_all_metrics(
 # ---------------------------------------------------------------------------
 
 
+def qualifies(metric: Mapping[str, object]) -> bool:
+    """The predeclared linear-pathway/structural-feature gate
+    (`.agents/plans/null-explanation/00-overview.md`): biological sits
+    outside the null's 2.5-97.5% range AND `|rho| >= SPEARMAN_RHO_THRESHOLD`.
+    Module-scope, not a closure local to `evaluate_categories` (M3):
+    `evaluate_categories`, `main()`'s `definitionSensitive` computation, and
+    `build_metric`'s `qualifiesBothGates` stamp all call this one function,
+    so there is exactly one implementation of "qualifies" in this pipeline."""
+    return outside_range(metric["bio"], metric["p2_5"], metric["p97_5"]) and abs(metric["spearman"]) >= SPEARMAN_RHO_THRESHOLD
+
+
 def _direction_consistent(metric: Mapping[str, object]) -> bool:
     """Whether a qualifying metric's sign is consistent with explaining
     biological's *low* score: a positive rho with biological in the null's
@@ -671,9 +481,6 @@ def evaluate_categories(
         categories.append("decoderConvention")
         triggers.append(("decoderConvention", decoder_bio_percentile, None))
 
-    def qualifies(metric: dict) -> bool:
-        return outside_range(metric["bio"], metric["p2_5"], metric["p97_5"]) and abs(metric["spearman"]) >= SPEARMAN_RHO_THRESHOLD
-
     linear_candidates = [m for m in transfer_and_derived_metrics if qualifies(m)]
     regime_gate_passed = bool(regime["gatePassed"])
     linear_triggered = bool(linear_candidates) and regime_gate_passed
@@ -707,6 +514,15 @@ def evaluate_categories(
     ranked = [t[0] for t in sorted(triggers, key=lambda t: t[1], reverse=True)]
     unexplained = not categories
 
+    # Every metric that independently passes both predeclared gates, across
+    # both families, not only the single representative each triggered
+    # category surfaces via `max(..., key=abs(spearman))` above -- the
+    # Finding narrative names this full set, not just the per-category
+    # exemplar. Sorted by |rho| descending, matching `ranked`'s convention.
+    qualifying_metrics = sorted(
+        linear_candidates + structural_candidates, key=lambda m: abs(m["spearman"]), reverse=True
+    )
+
     return {
         "categories": categories,
         "ranked": ranked,
@@ -715,13 +531,8 @@ def evaluate_categories(
         "decoderBioPercentile": decoder_bio_percentile,
         "linearDetail": linear_detail,
         "structuralDetail": structural_detail,
+        "qualifyingMetrics": qualifying_metrics,
     }
-
-
-def format_pct(value: float) -> str:
-    return f"{value * 100:.1f}th percentile" if value not in (0.0, 1.0) else (
-        "0th percentile" if value == 0.0 else "100th percentile"
-    )
 
 
 def build_summary_sentence(finding: Mapping[str, object]) -> str:
@@ -761,29 +572,52 @@ def build_summary_sentence(finding: Mapping[str, object]) -> str:
     return "Biological's low score is associated with: " + "; ".join(parts) + " -- a descriptive correlation, not a causal claim."
 
 
+def build_qualifying_metrics_note(qualifying_metrics: Sequence[Mapping[str, object]]) -> str:
+    """Full disclosure sentence for the Finding section: names *every*
+    metric passing both predeclared gates, not only the single
+    representative each outcome category surfaces via its own
+    `max(..., key=abs(spearman))` exemplar. Generated mechanically from
+    `qualifying_metrics` (computed from `explanation["metrics"]` in
+    `evaluate_categories`) -- never a hand-picked subset."""
+    if not qualifying_metrics:
+        return (
+            "No metric passes both predeclared gates (outside the null's 2.5-97.5% range and |rho| at or above "
+            "the threshold)."
+        )
+    parts = [f"{m['name']} (rho={m['spearman']:.3f})" for m in qualifying_metrics]
+    plural = "metric" if len(qualifying_metrics) == 1 else "metrics"
+    return (
+        f"{len(qualifying_metrics)} {plural} independently pass both predeclared gates (outside the null's "
+        "2.5-97.5% range and |rho| at or above the threshold): " + "; ".join(parts) + "."
+    )
+
+
 # ---------------------------------------------------------------------------
-# Provenance
+# Provenance -- graph identity + producer code identity, both verified by
+# `explain_provenance.verify_provenance` (extracted to its own module for
+# the same "keep each file under this repo's 1000-line rule" reason as
+# `explain_stats.py`/`explain_report.py`; see that module's doc comment).
+# The two thin wrappers below bind `REWIRED_COUNT`/`ANALYSIS_SOURCE_DIR`/
+# `NULL_SOURCE_DIR` (this module's own globals) into `explain_provenance`'s
+# otherwise-parameterized functions, so callers below read like the
+# single-module version did.
 # ---------------------------------------------------------------------------
 
 
-def _require_matching_source(label: str, value: str, expected: str) -> None:
-    if value != expected:
-        raise ValueError(f"explain: {label} sourceGraphSha256/rewireSourceSha256 does not match rewiring-null-v1.json")
+def current_transfer_source_sha256() -> str:
+    return explain_provenance.current_transfer_source_sha256(ANALYSIS_SOURCE_DIR)
+
+
+def current_features_source_sha256() -> str:
+    return explain_provenance.current_features_source_sha256(ANALYSIS_SOURCE_DIR)
+
+
+def current_regime_source_sha256() -> str:
+    return explain_provenance.current_regime_source_sha256(NULL_SOURCE_DIR)
 
 
 def _require_complete_seed_coverage(label: str, seeds: Sequence[int]) -> None:
-    """A rewired-graph seed missing from `regime.json` or
-    `rewiring-null-v1.json` would otherwise be silently dropped: a seed
-    absent from `regime.json["rewired"]` is never checked against the
-    per-graph regime thresholds (so it can never be excluded, correctly or
-    not), and a seed absent from `rewiring-null-v1.json["rewired"]` is
-    simply missing from `score_by_seed`, which raises a `KeyError` deep in
-    `build_metric` with no context about which input was short. A duplicate
-    seed would silently overwrite a dict entry the same way. Checked once,
-    loudly, at load time (an edge-case-review finding: previously
-    unchecked)."""
-    if sorted(seeds) != list(range(REWIRED_COUNT)):
-        raise ValueError(f"explain: {label} does not cover rewired seeds 0..{REWIRED_COUNT - 1} exactly once")
+    explain_provenance.require_complete_seed_coverage(label, seeds, REWIRED_COUNT)
 
 
 def verify_provenance(
@@ -794,413 +628,16 @@ def verify_provenance(
     features_exploratory_json: dict,
     regime_json: dict,
 ) -> None:
-    """`variants` is every loaded decoder-variant payload (flip-both, plus
-    any provided single-axis ones) -- checked in one loop rather than a
-    fixed `variant_flip_both` parameter, so the (previously unchecked)
-    single-axis path gets the same provenance guarantee (an edge-case-review
-    finding)."""
-    expected_source = rewiring_null["sourceGraphSha256"]
-    expected_rewire = rewiring_null["rewireSourceSha256"]
-    payloads: list[tuple[str, dict]] = [(f"variant-{key}", payload) for key, payload in variants.items()]
-    payloads += [
-        ("transfer.json", transfer_json),
-        ("features.json", features_json),
-        ("features-exploratory-unrestricted.json", features_exploratory_json),
-    ]
-    for label, payload in payloads:
-        _require_matching_source(f"{label}.sourceGraphSha256", payload["sourceGraphSha256"], expected_source)
-        _require_matching_source(f"{label}.rewireSourceSha256", payload["rewireSourceSha256"], expected_rewire)
-    _require_matching_source("regime.json.sourceGraphSha256", regime_json["sourceGraphSha256"], expected_source)
-    _require_matching_source("regime.json.rewireSourceSha256", regime_json["rewireSourceSha256"], expected_rewire)
-
-
-# ---------------------------------------------------------------------------
-# Report markdown
-# ---------------------------------------------------------------------------
-
-
-def _fmt(value: float | None, digits: int = 4) -> str:
-    if value is None:
-        return "n/a"
-    return f"{value:.{digits}f}"
-
-
-def render_transfer_matrix(metrics_by_name: Mapping[str, dict], field: str) -> str:
-    """`metrics_by_name.get(...)` (not direct indexing): if biological's own
-    transfer solve is singular, `build_all_metrics` drops every `T:*` metric
-    entirely (`build_metric` returns `None` when `bio_value is None`), so a
-    direct `metrics_by_name[name]` would raise `KeyError` here -- reported
-    as "n/a" instead (an edge-case-review finding: this study's actual data
-    never singular, so this path was previously unexercised and untested)."""
-    header = "| channel \\ population | " + " | ".join(OUTPUT_POPULATIONS) + " |"
-    sep = "| --- | " + " | ".join("---" for _ in OUTPUT_POPULATIONS) + " |"
-    rows = [header, sep]
-    for channel in OBSERVATION_CHANNELS:
-        cells = [
-            _fmt(metrics_by_name.get(f"T:{channel}->{population}", {}).get(field), 6)
-            for population in OUTPUT_POPULATIONS
-        ]
-        rows.append(f"| {channel} | " + " | ".join(cells) + " |")
-    return "\n".join(rows)
-
-
-def render_metric_stats_table(metrics: Sequence[dict]) -> str:
-    header = "| metric | biological | null median | null 2.5% | null 97.5% | bio percentile | rho | rho 95% CI |"
-    sep = "| --- | --- | --- | --- | --- | --- | --- | --- |"
-    rows = [header, sep]
-    for metric in sorted(metrics, key=lambda m: abs(m["spearman"]), reverse=True):
-        # A metric constant across the null has an undefined (not zero)
-        # Spearman rho -- shown as "n/a" rather than the internal `0.0`
-        # sentinel `build_metric` stores (a rigor-review finding).
-        if metric.get("nullConstant"):
-            rho_cell, ci_cell = "n/a (constant in null)", "n/a"
-        else:
-            rho_cell = f"{metric['spearman']:.3f}"
-            ci_cell = f"[{metric['spearmanCi'][0]:.3f}, {metric['spearmanCi'][1]:.3f}]"
-        rows.append(
-            f"| {metric['name']} | {_fmt(metric['bio'])} | {_fmt(metric['nullMedian'])} | {_fmt(metric['p2_5'])} | "
-            f"{_fmt(metric['p97_5'])} | {metric['bioPercentile'] * 100:.1f}% | {rho_cell} | {ci_cell} |"
-        )
-    return "\n".join(rows)
-
-
-def render_feature6_disclosure(explanation: dict) -> list[str]:
-    """The feature-6 (`weightedInDegree`) adjudication disclosure, built
-    entirely from computed values in `explanation["exploratory"]` (never
-    hardcoded prose numbers) -- a dual-review finding: an earlier version
-    hardcoded the exploratory statistics as prose and asserted the restricted
-    reading was "decided before any result was seen", which the repository's
-    own timestamps and the adjudication debate's write-ups (both computed
-    and compared each reading's outcome, including its Spearman rho against
-    score, before the restricted reading was adopted) contradict. This
-    version states what actually happened and computes every number from a
-    sha-pinned input (`--features-exploratory-unrestricted`) instead of an
-    unpinned, session-local `/tmp` citation."""
-    exploratory = explanation["exploratory"]["featureSixUnrestricted"]
-    restricted_by_name = {
-        m["name"]: m
-        for m in explanation["metrics"]
-        if m["kind"] == "feature" and m["name"].startswith("weightedInDegree:")
-    }
-    exploratory_by_name = {m["name"]: m for m in exploratory["metrics"]}
-    thresholds = explanation["thresholds"]
-
-    lines = [
-        "**Feature 6 adjudication.** `weightedInDegree` (mean weighted in-degree per output population) was "
-        "first implemented and run **unrestricted** (counting edges from any presynaptic neuron), matching one "
-        "reading of the plan's ambiguous \"input->output weighted in-degree\" wording. A review flagged that "
-        "wording as ambiguous against features 1/2's own restrictive use of \"input\" (channel-mapped neurons "
-        "only); the resulting adjudication computed **both** readings' full statistics -- including each reading's "
-        "rank correlation with score across all 500 rewirings -- before the input-restricted reading was adopted "
-        "on plan-text grounds (bean `flyarena-r37r`'s log). Because both readings' outcomes were visible before "
-        "the decision, this was not a fully outcome-blind pre-registration, and the `structuralFeature` finding "
-        "below should be read with that limitation in mind, not as a clean, one-shot predeclared test."
-    ]
-    lines.append("")
-    lines.append(
-        "The unrestricted reading is disclosed here as **exploratory, non-predeclared**: it is not part of the "
-        "frozen 40-feature list and plays no role in the outcome-category evaluation. Both readings, computed by "
-        "this same pipeline (`exploratory.featureSixUnrestricted.sourceSha256` = "
-        f"`{exploratory['sourceSha256'][:12]}...`):"
+    explain_provenance.verify_provenance(
+        rewiring_null,
+        variants,
+        transfer_json,
+        features_json,
+        features_exploratory_json,
+        regime_json,
+        ANALYSIS_SOURCE_DIR,
+        NULL_SOURCE_DIR,
     )
-    lines.append("")
-    lines.append(
-        "| population | restricted (predeclared) bio | restricted rho | unrestricted (exploratory) bio | "
-        "unrestricted rho |"
-    )
-    lines.append("| --- | --- | --- | --- | --- |")
-    for population in OUTPUT_POPULATIONS:
-        restricted = restricted_by_name[f"weightedInDegree:{population}"]
-        unrestricted = exploratory_by_name[f"weightedInDegree:{population}"]
-        lines.append(
-            f"| {population} | {_fmt(restricted['bio'])} | {restricted['spearman']:.3f} | "
-            f"{_fmt(unrestricted['bio'])} | {unrestricted['spearman']:.3f} |"
-        )
-    lines.append("")
-    max_unrestricted_rho = max(abs(m["spearman"]) for m in exploratory["metrics"])
-    lines.append(
-        f"The unrestricted reading's strongest population correlation is \\|rho\\| = {max_unrestricted_rho:.3f}, "
-        f"below the predeclared {thresholds['spearmanRho']} threshold on every population -- under the "
-        "unrestricted reading, feature 6 would not itself qualify for the structural-feature-associated category "
-        "on any population."
-    )
-    if explanation["finding"].get("definitionSensitive"):
-        lines.append("")
-        lines.append(
-            "**This report's `structuralFeature` finding is definition-sensitive**: it is triggered by a "
-            "`weightedInDegree` entry, and the finding would not hold under the unrestricted reading above."
-        )
-    return lines
-
-
-def render_report_markdown(explanation: dict, rewiring_null: dict) -> str:
-    """`rewiring_null` (the already-loaded, already-sha-verified
-    `rewiring-null-v1.json`, `explanation["sources"]["rewiringNullSha256"]`'s
-    own source) supplies the authored-condition baseline numbers quoted in
-    the "Question" section and the decoder-convention table's first row --
-    read from that file directly rather than hardcoded, so this report can
-    never drift from the artifact it is describing."""
-    metrics_by_name = {m["name"]: m for m in explanation["metrics"]}
-    transfer_metrics = [m for m in explanation["metrics"] if m["kind"] == "transfer"]
-    derived_metrics = [m for m in explanation["metrics"] if m["kind"] == "derived"]
-    feature_metrics = [m for m in explanation["metrics"] if m["kind"] == "feature"]
-    finding = explanation["finding"]
-    regime = explanation["regime"]
-    variants = explanation["variants"]
-    calibration = explanation["calibration"]
-    authored_bio_score = rewiring_null["biological"]["score"]
-    authored_null_mean = rewiring_null["null"]["mean"]
-    authored_null_std = rewiring_null["null"]["std"]
-    authored_bio_percentile = rewiring_null["bioPercentile"]
-    authored_p_low = rewiring_null["pLow"]
-    authored_p_high = rewiring_null["pHigh"]
-
-    lines: list[str] = []
-    lines.append("# Explaining the null result (under this model)")
-    lines.append("")
-    lines.append(
-        "**Question.** `docs/rewiring-null-report.md` found the biological MaleCNS graph scoring below all 500 "
-        f"degree-preserving rewirings under the authored decoder (biological {authored_bio_score:.4f}, null mean "
-        f"{authored_null_mean:.4f}, sd {authored_null_std:.4f}, {authored_bio_percentile * 100:.1f}th percentile, "
-        f"`p_low = {authored_p_low:.4f}`). This report tests three predeclared, descriptive explanations for "
-        "that result under this model only -- the authored encoder, this rate-model dynamics, and this arena -- "
-        "and makes no claim about the real fly."
-    )
-    lines.append("")
-    lines.append("## Method")
-    lines.append("")
-    lines.append(
-        "Three predeclared analyses (`.agents/plans/null-explanation/00-overview.md`), evaluated only after all "
-        "three finished (see the feature-6 disclosure under \"Structural features\" below for one qualification "
-        "to the feature list's predeclaration):"
-    )
-    lines.append("")
-    lines.append(
-        "1. **Decoder-convention check.** Re-score biological and all 500 rewirings with the authored decoder's "
-        "thrust and yaw signs both flipped (`authored-flip-both`). Predeclared rule: only run the two single-axis "
-        "variants if the mirrored run moves biological to at least the 25th percentile."
-    )
-    lines.append(
-        "2. **Linear transfer analysis.** For each graph, the steady-state linear transfer matrix "
-        "`T = O(lambda I - g A)^-1 B` (3 outputs x 8 input channels), gated by a linear-regime validity check."
-    )
-    lines.append(
-        "3. **Structural feature attribution.** 40 predeclared graph features, each compared against the null and "
-        "rank-correlated with score."
-    )
-    lines.append("")
-    lines.append("**Predeclared thresholds:**")
-    lines.append("")
-    thresholds = explanation["thresholds"]
-    lines.append("| Threshold | Value |")
-    lines.append("| --- | --- |")
-    lines.append(f"| Decoder-convention bio percentile | >= {thresholds['decoderPercentile'] * 100:.0f}% |")
-    lines.append(f"| Spearman \\|rho\\| (linear-pathway / structural-feature) | >= {thresholds['spearmanRho']} |")
-    lines.append(f"| Regime gate: rate-clamp fraction | <= {thresholds['clampFraction'] * 100:.0f}% |")
-    lines.append(f"| Regime gate: steady-state distance | <= {thresholds['steadyStateDistance']} |")
-    lines.append(f"| Regime gate: condition number | <= {thresholds['conditionNumber']:.0e} |")
-    lines.append("")
-    lines.append(
-        f"**Multiple comparisons.** {calibration['metricsTested']} metrics are tested ({len(transfer_metrics)} "
-        f"transfer entries, {len(derived_metrics)} derived predictors, {len(feature_metrics)} structural features"
-        f"{' (predeclared count: 24/2/40; fewer here because some were not computable -- see the finding above)' if calibration['metricsTested'] != 66 else ''}"
-        f"; {calibration['constantMetricCount']} of these are constant "
-        "across the null and so can never reach the |rho| threshold). Correlations are reported descriptively, "
-        "without per-metric significance testing; a permutation calibration "
-        f"({calibration['permutations']} seeded permutations of the score, applied jointly to every metric family "
-        "at once) found that at least one of the tested metrics reaches "
-        f"\\|rho\\| >= {thresholds['spearmanRho']} by chance alone in {calibration['chanceHits']} of "
-        f"{calibration['permutations']} permutations ({calibration['chanceRate'] * 100:.1f}%) -- this chance rate "
-        "applies to any triggered linear-pathway or structural-feature finding below."
-    )
-    lines.append("")
-
-    lines.append("## Decoder-convention check")
-    lines.append("")
-    flip_both = variants["flipBoth"]
-    lines.append("| Condition | Biological score | Null mean | Bio percentile | p_low | p_high |")
-    lines.append("| --- | --- | --- | --- | --- | --- |")
-    lines.append(
-        f"| authored, opponent parked | {authored_bio_score:.4f} | {authored_null_mean:.4f} | "
-        f"{authored_bio_percentile * 100:.1f}% | {authored_p_low:.4f} | {authored_p_high:.4f} |"
-    )
-    lines.append(
-        f"| authored (thrust and yaw flipped), opponent parked | {flip_both['bioScore']:.4f} | "
-        f"{flip_both['nullMean']:.4f} | {flip_both['bioPercentile'] * 100:.1f}% | {flip_both['pLow']:.4f} | "
-        f"{flip_both['pHigh']:.4f} |"
-    )
-    single_axis_labels = {
-        "flipThrust": "authored (thrust flipped), opponent parked",
-        "flipYaw": "authored (yaw flipped), opponent parked",
-    }
-    for key, label in single_axis_labels.items():
-        if key in variants:
-            entry = variants[key]
-            lines.append(
-                f"| {label} | {entry['bioScore']:.4f} | {entry['nullMean']:.4f} | "
-                f"{entry['bioPercentile'] * 100:.1f}% | {entry['pLow']:.4f} | {entry['pHigh']:.4f} |"
-            )
-    lines.append("")
-    if variants.get("singleAxisSkipped"):
-        lines.append(
-            f"Mirrored biological percentile ({flip_both['bioPercentile'] * 100:.1f}%) stayed below the predeclared "
-            f"{thresholds['decoderPercentile'] * 100:.0f}% threshold, so the single-axis variants "
-            "(`authored-flip-thrust`, `authored-flip-yaw`) were skipped per the predeclared rule "
-            "(`.agents/plans/null-explanation/00-overview.md`)."
-        )
-    lines.append("")
-
-    lines.append("## Linear transfer analysis")
-    lines.append("")
-    lines.append(
-        "`T[channel, population]`: steady-state gain from a unit-held input on that channel to that output "
-        "population, exact within the model's rate/input clamps."
-    )
-    lines.append("")
-    lines.append("**Biological `T`:**")
-    lines.append("")
-    lines.append(render_transfer_matrix(metrics_by_name, "bio"))
-    lines.append("")
-    lines.append("**Null median `T`:**")
-    lines.append("")
-    lines.append(render_transfer_matrix(metrics_by_name, "nullMedian"))
-    lines.append("")
-    lines.append("**Transfer entry statistics (sorted by \\|rho\\|):**")
-    lines.append("")
-    lines.append(render_metric_stats_table(transfer_metrics))
-    lines.append("")
-    lines.append("**Derived predictors** (`turnGain = T[yaw,foodBearing] - T[yaw,hazardBearing]`, "
-                  "`approachGain = T[thrust,foodDistance]`):")
-    lines.append("")
-    lines.append(render_metric_stats_table(derived_metrics))
-    lines.append("")
-
-    lines.append("## Regime check")
-    lines.append("")
-    lines.append(
-        "Authored episodes on 10 held-out seeds (`30001..30010`) for biological, disconnected, and all 500 "
-        "rewirings, measuring the fraction of neuron-substeps with an active rate clamp and the linear steady-state "
-        "distance `||r_t - r*(u_t)|| / ||r*(u_t)||`."
-    )
-    lines.append("")
-    lines.append("| | rate-clamp fraction | steady-state distance |")
-    lines.append("| --- | --- | --- |")
-    lines.append(f"| biological | {regime['bio']['clampFraction'] * 100:.2f}% | {regime['bio']['steadyStateDistance']:.4f} |")
-    lines.append(
-        f"| null (median over 500 rewirings) | {regime['nullSampleMedian']['clampFraction'] * 100:.2f}% | "
-        f"{regime['nullSampleMedian']['steadyStateDistance']:.4f} |"
-    )
-    lines.append("")
-    lines.append(
-        f"{regime['excludedCount']} of 500 rewirings were individually excluded from the transfer-kind "
-        "correlations above for failing their own per-graph regime threshold "
-        f"({', '.join(regime['excludedGraphIds']) if regime['excludedGraphIds'] else 'none'})."
-    )
-    lines.append("")
-    if regime["gatePassed"]:
-        lines.append(
-            "The aggregate regime gate **passed**: biological's steady-state distance "
-            f"({regime['bio']['steadyStateDistance']:.4f}) and the null median's "
-            f"({regime['nullSampleMedian']['steadyStateDistance']:.4f}) are both at or below the "
-            f"{thresholds['steadyStateDistance']} threshold; biological's rate-clamp fraction "
-            f"({regime['bio']['clampFraction'] * 100:.2f}%) and the null median's "
-            f"({regime['nullSampleMedian']['clampFraction'] * 100:.2f}%) are both at or below "
-            f"{thresholds['clampFraction'] * 100:.0f}%; and biological's transfer solve is not singular, "
-            "ill-conditioned, or unstable. This licenses treating the linear analysis as applicable to both "
-            "biological and the null sample under this model; it does not by itself certify that any single "
-            "transfer entry explains the score -- that still requires the outside-range-and-\\|rho\\|-threshold "
-            "test above."
-        )
-    else:
-        lines.append(
-            "The aggregate regime gate **failed**: biological's or the null median's steady-state distance or "
-            "rate-clamp fraction exceeded threshold, or biological's own transfer solve was singular, "
-            "ill-conditioned, or unstable. Per the predeclared rule, the linear transfer analysis is therefore "
-            "reported as **regime-invalid (inconclusive)** and is never reported as a positive `linearPathway` "
-            "finding, regardless of any individual transfer entry's statistics above."
-        )
-    lines.append("")
-    stability = regime["stability"]
-    lines.append(
-        "**Stability** (`T`'s own docstring: both numbers reported side by side, never `stable` alone). "
-        f"Biological's continuous-time spectral abscissa is {stability['bio']['spectralAbscissa']:.4f} against a "
-        f"leak rate of {stability['bio']['leakRate']:.4f} ({'stable' if stability['bio']['stable'] else 'UNSTABLE'}); "
-        f"its per-substep discretized spectral radius is {stability['bio']['discretizedSpectralRadius']:.4f} "
-        f"({'stable' if stability['bio']['discretizedStable'] else 'UNSTABLE'} -- must be < 1). Null medians: "
-        f"spectral abscissa {stability['nullMedian']['spectralAbscissa']:.4f}, discretized spectral radius "
-        f"{stability['nullMedian']['discretizedSpectralRadius']:.4f}. "
-        f"{stability['unstableNullCount']} of 500 rewirings are unstable (continuous-time or discretized)."
-    )
-    lines.append("")
-
-    lines.append("## Structural features")
-    lines.append("")
-    lines.append(
-        "40 predeclared graph features. The plan's stop/go gate 3 (`00-overview.md`: \"The feature list is not "
-        "edited after the first run\") was **not met for feature 6**: its definition changed after a full "
-        "production run against the original (unrestricted) reading, as disclosed below. The other 39 features "
-        "were never edited."
-    )
-    lines.append("")
-    lines.extend(render_feature6_disclosure(explanation))
-    lines.append("")
-    lines.append(render_metric_stats_table(feature_metrics))
-    lines.append("")
-
-    lines.append("## Finding")
-    lines.append("")
-    lines.append(finding["summarySentence"])
-    lines.append("")
-    if finding["categories"]:
-        lines.append(f"Categories that hold, ranked by effect size: {', '.join(finding['ranked'])}.")
-    else:
-        lines.append("No predeclared category holds.")
-    lines.append("")
-
-    lines.append("## Limitations")
-    lines.append("")
-    lines.append(
-        f"- **{calibration['metricsTested']} metrics tested.** No per-metric significance testing is performed; "
-        f"correlations are descriptive. The permutation calibration above found a {calibration['chanceRate'] * 100:.1f}% "
-        "chance that at least one metric reaches the |rho| threshold by chance alone, and that rate applies to any "
-        "triggered linear-pathway or structural-feature finding in this report."
-    )
-    lines.append(
-        "- **Regime-invalid is never reported as a positive finding.** If the aggregate regime gate fails, the "
-        "linear-pathway analysis is reported as regime-invalid (inconclusive), never as a positive finding, "
-        "regardless of any individual transfer entry's statistics."
-    )
-    lines.append(
-        "- **This model only.** Every analysis here describes the authored decoder, this rate-model dynamics, and "
-        "this arena running on the measured biological topology versus 500 degree-preserving rewirings of it. "
-        "Nothing here is a claim about the real fly's neural function or behavior, and no rewiring's topology is "
-        "claimed to be causally \"worse\" or \"better\" than biological's."
-    )
-    lines.append(
-        "- **The linear analysis is valid only to the measured regime extent.** `T` is the model's exact "
-        "fixed-point gain when no rate/input clamp is active; the regime check quantifies how close the real, "
-        "clamped, discretized simulation actually sits to that fixed point, and the linear-pathway category is "
-        "gated on that check, not assumed."
-    )
-    lines.append(
-        "- **Correlation is not causation.** A rank correlation between a structural or transfer metric and score "
-        "across the 500 rewirings describes an association within this null model's sample, not a causal "
-        "mechanism."
-    )
-    lines.append(
-        "- **Bootstrap CIs are approximate.** Each metric's 95% Spearman CI resamples the already rank-transformed "
-        "pairs and does not re-rank within each resample -- a bootstrap of the rank-transformed sample's Pearson "
-        "correlation, not a fully faithful re-ranking bootstrap. The CIs are descriptive only and play no role in "
-        "any outcome-category decision (only the point estimate and the predeclared |rho| threshold do)."
-    )
-    lines.append(
-        "- **A metric constant across the null (`n/a (constant in null)` in the tables above) has an undefined, "
-        "not zero, Spearman correlation** and can never trigger the |rho| threshold; it is still counted toward "
-        "the metrics-tested total above."
-    )
-    lines.append("- **No biological claim.** See \"This model only\" above.")
-    lines.append("")
-    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -1384,20 +821,24 @@ def main(argv: list[str] | None = None) -> None:
         regime,
     )
     structural_detail = finding_internal["structuralDetail"]
+    # Reuses the single module-scope `qualifies` predicate (M3) instead of a
+    # second hand-written copy of `evaluate_categories`'s own boolean.
     definition_sensitive = bool(
         structural_detail is not None
         and structural_detail["name"].startswith("weightedInDegree:")
-        and not any(
-            outside_range(m["bio"], m["p2_5"], m["p97_5"]) and abs(m["spearman"]) >= SPEARMAN_RHO_THRESHOLD
-            for m in exploratory_metrics
-        )
+        and not any(qualifies(m) for m in exploratory_metrics)
     )
     finding = {
         "categories": finding_internal["categories"],
         "ranked": finding_internal["ranked"],
         "regimeInvalid": finding_internal["regimeInvalid"],
         "definitionSensitive": definition_sensitive,
+        "qualifyingMetrics": [
+            {"name": m["name"], "kind": m["kind"], "spearman": m["spearman"]}
+            for m in finding_internal["qualifyingMetrics"]
+        ],
         "summarySentence": build_summary_sentence(finding_internal),
+        "qualifyingMetricsNote": build_qualifying_metrics_note(finding_internal["qualifyingMetrics"]),
     }
 
     ordered_names = TRANSFER_METRIC_NAMES + DERIVED_METRIC_NAMES + FEATURE_METRIC_NAMES
@@ -1410,9 +851,10 @@ def main(argv: list[str] | None = None) -> None:
         lambda g, n: extract_transfer_value(g, n) if n.startswith("T:") else extract_derived_value(g, n),
         transfer_json["graphs"],
         excluded,
+        REWIRED_COUNT,
     )
     feature_family = build_family_rank_matrix(
-        metrics_by_kind["feature"], extract_feature_value, features_json["graphs"], frozenset()
+        metrics_by_kind["feature"], extract_feature_value, features_json["graphs"], frozenset(), REWIRED_COUNT
     )
     full_scores = np.array([score_by_seed[s] for s in range(REWIRED_COUNT)], dtype=np.float64)
     chance_rate = joint_permutation_chance_rate(
@@ -1438,6 +880,23 @@ def main(argv: list[str] | None = None) -> None:
         if payload["host"] != host:
             raise ValueError(f"explain: {label}'s host {payload['host']} does not match {host}")
 
+    # `transfer.json`/`features.json` are Python producers -- cross-check
+    # their `producer.host.arch` against *each other* only, not against the
+    # Node-recorded `host` above: `platform.machine()` and Node's
+    # `process.arch` report the same physical ARM64 host differently
+    # ("aarch64" vs "arm64", confirmed empirically on this study's own
+    # Spark), so a cross-runtime check would spuriously refuse a consistent
+    # run ("cross-check where applicable" means same-runtime producers only
+    # -- see the report's Limitations section).
+    transfer_producer_host = transfer_json["producer"]["host"]
+    features_producer_host = features_json["producer"]["host"]
+    if transfer_producer_host["arch"] != features_producer_host["arch"]:
+        raise ValueError(
+            f"explain: transfer.json's producer host arch ({transfer_producer_host['arch']!r}) does not match "
+            f"features.json's ({features_producer_host['arch']!r}) -- these two Python producers should always "
+            "run on the same host"
+        )
+
     explanation = {
         "version": VERSION,
         "sources": {
@@ -1446,6 +905,14 @@ def main(argv: list[str] | None = None) -> None:
             "transferSha": sha256_hex(args.transfer.read_bytes()),
             "featuresSha": sha256_hex(args.features.read_bytes()),
             "regimeSha": sha256_hex(args.regime.read_bytes()),
+            # Producer code-identity blocks, recorded (not merely verified)
+            # in the published artifact so a reader can see exactly what
+            # code produced each input.
+            "producers": {
+                "transfer": transfer_json["producer"],
+                "features": features_json["producer"],
+                "regime": regime_json["producer"],
+            },
         },
         "thresholds": {
             "decoderPercentile": DECODER_PERCENTILE_THRESHOLD,

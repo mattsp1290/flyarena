@@ -21,6 +21,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 
@@ -42,6 +43,31 @@ class GraphVerificationError(ValueError):
 
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def source_identity_sha256(source_dir: Path, filenames: "Sequence[str]") -> str:
+    """sha256 over a set of source files: sorted filenames, each contributing
+    the filename (UTF-8 bytes), then a single NUL byte, then the file's raw
+    bytes, into one hasher. This is the exact scheme `scripts/data/compile.py`'s
+    `compiler_source_sha256()` already uses for "does the committed artifact
+    reflect the code that produced it" (and its TypeScript mirror,
+    `tests/unit/malecns-artifact.test.ts`'s `computeCompilerSourceSha256`) --
+    reused here, unchanged, so `transfer.py`'s/`features.py`'s own
+    `producer.sourceSha256` (and `explain.py`'s recomputation of it, plus its
+    cross-language recomputation of `scripts/null/regime-check.ts`'s own
+    producer sha over its `.ts` source files -- reading raw bytes only, no
+    TypeScript execution required) are all computed the same, already-
+    reviewed way rather than a fourth reimplementation of the same idea.
+    Including the filename (not just concatenated bytes) means two files
+    swapping content is not an accidental hash collision; the NUL byte gives
+    an unambiguous filename/content boundary."""
+    hasher = hashlib.sha256()
+    for name in sorted(filenames):
+        path = source_dir / name
+        hasher.update(path.name.encode("utf-8"))
+        hasher.update(b"\0")
+        hasher.update(path.read_bytes())
+    return hasher.hexdigest()
 
 
 def load_verified_graph(path: Path, expected_sha256: str) -> "binfmt.GraphArrays":

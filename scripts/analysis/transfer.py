@@ -68,6 +68,7 @@ they were).
 from __future__ import annotations
 
 import argparse
+import platform
 import sys
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -110,6 +111,38 @@ OUTPUT_POPULATION_INDEX: Mapping[str, int] = {"thrust": 0, "yaw": 1, "brake": 2}
 #: Graphs whose `(lambda I - g A)` condition number exceeds this are flagged
 #: `illConditioned` (the plan's predeclared threshold).
 ILL_CONDITIONED_THRESHOLD = 1e8
+
+#: Files that determine `transfer.json`'s own output bytes: this module
+#: itself, plus the two shared helpers it depends on for graph loading/
+#: dense-matrix construction (`graph_io.py`) and the single-threaded-BLAS
+#: guard (`env_guard.py`). Hashed into `producer.sourceSha256` below (via
+#: `graph_io.source_identity_sha256`, the same filename+NUL+bytes-per-file
+#: scheme `scripts/data/compile.py`'s `compiler_source_sha256()` already
+#: uses) so `explain.py`'s `verify_provenance` can mechanically refuse a
+#: `transfer.json` regenerated from a different version of this code -- a
+#: thermo-methodology review finding: this pipeline previously pinned only
+#: *graph* identity (`sourceGraphSha256`/`rewireSourceSha256`), never *code*
+#: identity, so a `transfer.json` regenerated from stale code against the
+#: same 502 graphs would have passed every existing check silently.
+TRANSFER_SOURCE_FILENAMES: tuple[str, ...] = ("transfer.py", "graph_io.py", "env_guard.py")
+TRANSFER_SOURCE_DIR = Path(__file__).resolve().parent
+
+
+def transfer_producer() -> dict:
+    """This run's code-identity block: which script produced this output,
+    the sha256 of its own source (`TRANSFER_SOURCE_FILENAMES`), and the host
+    it ran on. `host` uses `platform.machine()`/`platform.python_version()`
+    (not `scripts/null/regime-check.ts`'s `process.arch`/`process.version`
+    convention) because this is a Python producer -- `platform.machine()`
+    and Node's `process.arch` report the *same* physical ARM64 host
+    differently (`"aarch64"` vs `"arm64"`), so `explain.py` cross-checks this
+    block's `arch` only against `features.py`'s own (another Python
+    producer), never against a TypeScript producer's `host.arch` string."""
+    return {
+        "script": "scripts/analysis/transfer.py",
+        "sourceSha256": graph_io.source_identity_sha256(TRANSFER_SOURCE_DIR, TRANSFER_SOURCE_FILENAMES),
+        "host": {"arch": platform.machine(), "python": platform.python_version()},
+    }
 
 
 @dataclass(frozen=True)
@@ -424,6 +457,7 @@ def main(argv: list[str] | None = None) -> None:
         "sourceGraphSha256": index["sourceSha256"],
         "rewireSourceSha256": index["rewireSourceSha256"],
         "graphs": results,
+        "producer": transfer_producer(),
     }
     write_canonical_json(args.out, out_payload)
 
