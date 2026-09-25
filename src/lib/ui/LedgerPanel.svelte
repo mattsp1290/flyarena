@@ -1,9 +1,10 @@
 <script lang="ts">
   import type { ArenaManifest, TrainedReadoutLoadResult } from '../experiment/assets';
   import type { RewiringNullLoadResult } from '../experiment/rewiringNull';
-  import type { NullExplanationLoadResult, NullExplanationQualifyingMetric } from '../experiment/nullExplanation';
+  import type { NullExplanationLoadResult } from '../experiment/nullExplanation';
   import type { DecoderKind } from '../worker/protocol';
   import NullHistogram from './NullHistogram.svelte';
+  import NullExplanationNote from './NullExplanationNote.svelte';
   import { githubDocUrl } from './links';
 
   /**
@@ -138,125 +139,6 @@
     `${import.meta.env.BASE_URL}data/${manifest?.rewiringNull?.artifact ?? 'rewiring-null-v1.json'}`
   );
 
-  /** WP4 of `.agents/plans/null-explanation`'s report link, built the same way `NullHistogram.svelte`'s own `GITHUB_REPORT_URL` is (`./links.ts#githubDocUrl`). */
-  const NULL_EXPLANATION_REPORT_URL = githubDocUrl('null-explanation-report.md');
-  /**
-   * The definition-sensitivity disclosure lives under
-   * `docs/null-explanation-report.md`'s "Structural features" heading (the
-   * feature-6/`weightedInDegree` adjudication) — GitHub slugifies that
-   * heading to this same anchor. There is no more specific heading to link:
-   * the adjudication itself is inline bold text within that section, not its
-   * own markdown heading.
-   */
-  const NULL_EXPLANATION_DISCLOSURE_URL = `${NULL_EXPLANATION_REPORT_URL}#structural-features`;
-
-  /**
-   * Turns a lowerCamelCase channel/population identifier into lowercase
-   * words separated by spaces (e.g. "rightClearance" -> "right clearance",
-   * "foodBearing" -> "food bearing") — used only to phrase a qualifying
-   * metric's own name in plain words below; every sentence built from it is
-   * still generated from the verified artifact's own metric names, never a
-   * hard-coded per-metric string table.
-   */
-  const humanizeIdentifier = (identifier: string): string => identifier.replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase();
-
-  /**
-   * Plain-words phrasing for one qualifying metric
-   * (`NullExplanationFinding.qualifyingMetrics[]`), generated from the
-   * verified artifact's own `kind`/`name` — never a hard-coded per-metric
-   * string table. Two name shapes get their own plain-English phrasing per
-   * the bean's non-negotiables ("explain T entries and 'weighted in-degree
-   * from input neurons' plainly"); any other kind/name combination (none
-   * currently qualify, but the formatter must not silently drop a future
-   * one) falls back to a generic, still-honest phrasing built from the same
-   * fields.
-   */
-  const describeQualifyingMetric = (metric: NullExplanationQualifyingMetric): string => {
-    const transferMatch = metric.kind === 'transfer' ? /^T:([A-Za-z0-9]+)->([A-Za-z0-9]+)$/.exec(metric.name) : null;
-    if (transferMatch) {
-      const [, channel, population] = transferMatch;
-      return `linear signal gain from ${humanizeIdentifier(channel)} input to ${humanizeIdentifier(population)} output`;
-    }
-    if (metric.kind === 'feature' && metric.name.startsWith('weightedInDegree:')) {
-      const population = metric.name.slice('weightedInDegree:'.length);
-      return `weighted in-degree from input neurons to ${humanizeIdentifier(population)} output`;
-    }
-    return `${metric.kind} metric "${humanizeIdentifier(metric.name)}"`;
-  };
-
-  /**
-   * `explain.py`'s own `definitionSensitive` flag is computed only from its
-   * single top structural candidate (`structuralDetail`, the
-   * highest-|rho| structural metric), and is `true` only when *that one*
-   * metric's name starts with `weightedInDegree:` — never from
-   * `finding.qualifyingMetrics` as a whole, which can independently list
-   * several `feature`-kind metrics at once (`scripts/analysis/explain.py`'s
-   * `qualifying_metrics = linear_candidates + structural_candidates`).
-   * Flagging every `feature`-kind qualifying metric whenever
-   * `definitionSensitive` is true (an earlier version of this file did)
-   * would mislabel any other qualifying structural feature (e.g.
-   * `reciprocity`) with a disclosure link that says nothing about it —
-   * round-2 dual review, Important. Restricting the flag to this same name
-   * family keeps it sound even if a future re-run qualifies more than one
-   * structural feature at once.
-   */
-  const isWeightedInDegreeFeature = (metric: NullExplanationQualifyingMetric): boolean =>
-    metric.kind === 'feature' && metric.name.startsWith('weightedInDegree:');
-
-  interface QualifyingMetricLine {
-    key: string;
-    text: string;
-    /** True only for the `weightedInDegree:*` qualifying metric, and only when the finding's own `definitionSensitive` flag is set — see `isWeightedInDegreeFeature`'s doc comment. */
-    sensitive: boolean;
-  }
-
-  const qualifyingMetricLines = $derived<QualifyingMetricLine[]>(
-    nullExplanation?.status === 'ok'
-      ? nullExplanation.data.finding.qualifyingMetrics.map((metric, index) => ({
-          key: `${metric.kind}:${metric.name}:${index}`,
-          text: `${describeQualifyingMetric(metric)} (ρ = ${metric.spearman.toFixed(3)})`,
-          sensitive: nullExplanation.data.finding.definitionSensitive && isWeightedInDegreeFeature(metric)
-        }))
-      : []
-  );
-
-  /**
-   * States the mirrored decoder-convention check's result (`variants.flipBoth`,
-   * the one required re-scoring with thrust and yaw signs both flipped)
-   * against the *un-mirrored* baseline percentile
-   * (`rewiringNull.data.bioPercentile` — already in scope, since this note
-   * only ever renders inside `{#if rewiringNull.status === 'ok'}` below).
-   * Round-2 dual review, Important: an earlier version compared only the
-   * mirrored value against a hard-coded "0", so the "still" wording was true
-   * for the current shipped data by coincidence, not because it was actually
-   * derived from the baseline — a re-run where the baseline itself moved
-   * while the mirrored value stayed at 0 would have rendered a false
-   * "still". Both sides are now read from their own verified artifact.
-   */
-  const mirroredDecoderClause = $derived(
-    nullExplanation?.status === 'ok' && rewiringNull?.status === 'ok'
-      ? (() => {
-          const percentileLabel = (value: number): string => `${(value * 100).toFixed(1)}th percentile`;
-          const baseline = rewiringNull.data.bioPercentile;
-          const mirrored = nullExplanation.data.variants.flipBoth.bioPercentile;
-          if (baseline <= 0 && mirrored <= 0) {
-            return "Mirroring the decoder's thrust and yaw signs still leaves biological at the bottom of the null distribution (0th percentile).";
-          }
-          return mirrored === baseline
-            ? `Mirroring the decoder's thrust and yaw signs leaves biological at the same ${percentileLabel(mirrored)} of the null distribution.`
-            : `Mirroring the decoder's thrust and yaw signs moves biological from the ${percentileLabel(baseline)} to the ${percentileLabel(mirrored)} of the null distribution.`;
-        })()
-      : ''
-  );
-
-  /** States the regime-check outcome (`finding.regimeInvalid`) in one clause. */
-  const regimeClause = $derived(
-    nullExplanation?.status === 'ok'
-      ? nullExplanation.data.finding.regimeInvalid
-        ? 'The linear-regime check failed, so the linear-transfer analysis is reported as regime-invalid (inconclusive).'
-        : 'The linear-regime check passed, so the linear-transfer analysis is treated as valid under this model.'
-      : ''
-  );
 </script>
 
 <section class="panel ledger" aria-labelledby="ledger-heading">
@@ -284,7 +166,7 @@
 
   {#if trainedReadout?.status === 'ok'}
     {@const readout = trainedReadout}
-    <div class="trained-readout-detail">
+    <div class="detail-box trained-readout-detail">
       <p>
         Weights optimized offline by the cross-entropy method (CEM) against
         the arena score — an engineering artifact, not biology, with
@@ -348,49 +230,13 @@
 
       <!-- WP4 of `.agents/plans/null-explanation`: the finding note that
            explains, under this model only, why biological scored where it
-           did above. `'missing'` hides this whole block (the bean's own
-           contract) — the histogram above still renders on its own,
-           unaffected. `'unavailable'`/`'invalid'` each show their own
-           honestly-worded message instead of the note, mirroring
+           did above. Extracted into its own component
+           (`NullExplanationNote.svelte`, thermo-maintainability review I1) —
+           it owns its own `'missing'`/`'unavailable'`/`'invalid'` split
+           internally (`'missing'` hides the whole block; the other two show
+           their own honestly-worded message), mirroring
            `rewiringNull.status`'s own three-way split just below. -->
-      {#if nullExplanation?.status === 'ok'}
-        {@const explanation = nullExplanation.data}
-        <div class="null-explanation-detail">
-          <h4>Why biological scores low (under this model)</h4>
-          <p>{explanation.finding.summarySentence}</p>
-          {#if qualifyingMetricLines.length > 0}
-            <ul class="metric-list">
-              {#each qualifyingMetricLines as line (line.key)}
-                <li>
-                  {line.text}
-                  {#if line.sensitive}
-                    — <a href={NULL_EXPLANATION_DISCLOSURE_URL} target="_blank" rel="noreferrer">definition-sensitive, see disclosure</a>
-                  {/if}
-                </li>
-              {/each}
-            </ul>
-          {/if}
-          <p>{mirroredDecoderClause} {regimeClause}</p>
-          <p class="disclaimer">
-            This is a descriptive association within this model, not a cause. "Authored" means a fixed, hand-written decoder — not biology and not trained.
-          </p>
-          <ul class="links">
-            <li><a href={NULL_EXPLANATION_REPORT_URL} target="_blank" rel="noreferrer">Full explanation report</a></li>
-          </ul>
-        </div>
-      {:else if nullExplanation?.status === 'unavailable'}
-        <!-- A fetch/network failure or an unexpected runtime error — not a
-             claim about the artifact's integrity, so this must not say
-             "failed verification" (mirrors `rewiringNull.status ===
-             'unavailable'` just below). -->
-        <p class="error-message">
-          Explanation could not be loaded: {nullExplanation.reason}
-        </p>
-      {:else if nullExplanation?.status === 'invalid'}
-        <p class="error-message">
-          Explanation failed verification: {nullExplanation.reason}
-        </p>
-      {/if}
+      <NullExplanationNote {nullExplanation} baselinePercentile={rewiringNull.data.bioPercentile} rewiringCount={rewiringNull.data.null.n} />
     {:else if rewiringNull.status === 'unavailable'}
       <!-- A fetch/network failure or an unexpected runtime error
            (`controller.ts`'s leading `.catch`) — not a claim about the
@@ -454,14 +300,11 @@
     color: #79d8d0;
   }
 
-  .trained-readout-detail {
-    margin: 0.9rem 0;
-    padding: 0.65rem 0.75rem;
-    border: 1px solid #304355;
-    border-radius: 0.4rem;
-    background: rgb(121 216 208 / 6%);
-  }
-
+  /* `.detail-box` (margin/padding/border/border-radius/background) is
+     shared with `NullExplanationNote.svelte`'s `.null-explanation-detail`
+     via `src/app.css` (thermo-maintainability review, carried-over
+     Suggestion) — this class keeps only the trained-readout block's own
+     content-specific rules. */
   .trained-readout-detail dl {
     margin: 0.5rem 0;
     display: grid;
@@ -483,54 +326,6 @@
     margin: 0;
     color: #edf4ff;
     text-align: right;
-  }
-
-  /* Mirrors `.trained-readout-detail`'s own box. A distinct class, not a
-     shared one — round-2 dual review corrected an earlier version of this
-     comment, which wrongly claimed the two blocks are never both shown at
-     once: `trainedReadout?.status === 'ok'` and `nullExplanation?.status
-     === 'ok'` are independent conditions and commonly both hold in
-     production, so the two boxes do render together. The distinct class
-     name is still the right call regardless — sharing one would be
-     misleading about which content it wraps when they *are* both visible. */
-  .null-explanation-detail {
-    margin: 0.9rem 0;
-    padding: 0.65rem 0.75rem;
-    border: 1px solid #304355;
-    border-radius: 0.4rem;
-    background: rgb(121 216 208 / 6%);
-  }
-
-  .null-explanation-detail h4 {
-    margin: 0 0 0.4rem;
-    color: #cbd8e7;
-    font-size: 0.78rem;
-    font-weight: 700;
-  }
-
-  .null-explanation-detail p {
-    margin: 0.5rem 0;
-    color: #cbd8e7;
-    font-size: 0.8rem;
-    line-height: 1.5;
-  }
-
-  /* Overrides the global `.ledger ul`/`.ledger li` term/label row styling
-     (`src/app.css`) — that styling is for the top-level ledger rows and the
-     `.links` lists, not for a plain, bulleted list of qualifying metrics. */
-  .null-explanation-detail .metric-list {
-    margin: 0.5rem 0;
-    padding-left: 1.2rem;
-    list-style: disc;
-  }
-
-  .null-explanation-detail .metric-list li {
-    display: list-item;
-    border: none;
-    padding: 0.15rem 0;
-    font-size: 0.8rem;
-    color: #cbd8e7;
-    text-align: left;
   }
 
   .error-message {

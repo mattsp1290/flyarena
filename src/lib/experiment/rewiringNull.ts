@@ -24,6 +24,7 @@
  */
 
 import { fetchAndVerifySidecarJson, type ArenaManifest } from './assets';
+import type { SidecarLoadResult } from './sidecarResult';
 
 export interface RewiringNullScoreStats {
   score: number;
@@ -92,12 +93,18 @@ export interface RewiringNullArtifact {
  * cross-manifest consistency check). `LedgerPanel.svelte` words each of
  * these differently so "the network hiccuped" is never described to a
  * visitor as "failed verification".
+ *
+ * A type alias for the shared `SidecarLoadResult` (thermo-maintainability
+ * review I3), with `'absent'` (not the default `'missing'`) as its
+ * "nothing was ever shipped" status — the vocabulary difference from
+ * `NullExplanationLoadResult`/`LesionAtlasLoadResult` is deliberately kept
+ * as-is here (see `SidecarLoadResult`'s own doc comment): `'absent'` is
+ * already public-ish, asserted against directly in tests, and renaming it
+ * needs its own separate decision. Zero behavior change otherwise — the
+ * discriminated union shape below is identical to what this type used to
+ * define inline.
  */
-export type RewiringNullLoadResult =
-  | { status: 'ok'; data: RewiringNullArtifact }
-  | { status: 'absent'; reason: string }
-  | { status: 'unavailable'; reason: string }
-  | { status: 'invalid'; reason: string };
+export type RewiringNullLoadResult = SidecarLoadResult<RewiringNullArtifact, 'absent'>;
 
 /** Exported as a small, reusable guard for any future caller that needs the same one-line predicate (round-2 dual review: the doc comment previously claimed `NullHistogram.svelte` imports this, but its own local copy — used for a since-removed `trained`-section narrowing — was deleted outright rather than replaced with this import). */
 export const isFiniteNumber = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);

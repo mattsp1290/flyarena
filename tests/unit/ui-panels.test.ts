@@ -577,7 +577,7 @@ describe('LedgerPanel', () => {
     expect(ledgerRow(container, 'Null-result explanation')).toHaveTextContent('Computed (offline)');
   });
 
-  it('renders the finding sentence, every qualifying metric in plain words with rho, the definition-sensitive flag/link, the mirrored-decoder clause, the regime clause, the non-causal disclaimer, and the report link', () => {
+  it('renders the data-driven lead sentence, every qualifying metric in plain words with rho, the definition-sensitive flag/link, the mirrored-decoder clause, the regime clause, the rho gloss, the non-causal disclaimer, and the report link', () => {
     render(LedgerPanel, {
       manifest,
       decoder: 'authored',
@@ -586,8 +586,18 @@ describe('LedgerPanel', () => {
       nullExplanation: nullExplanationOk
     });
 
-    expect(screen.getByRole('heading', { name: /why biological scores low/i })).toBeInTheDocument();
-    expect(screen.getByText(nullExplanationOk.data.finding.summarySentence)).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: /what biological's low score is associated with/i })).toBeInTheDocument();
+    // Thermo review I1: the lead sentence is a short, data-driven count
+    // (never the raw `finding.summarySentence` pasted verbatim, which
+    // duplicated the plain-language bullets below in jargon) — built from
+    // the fixture's own qualifying-metric count (3) and the rewiring-null
+    // fixture's own `null.n` (2, not a hard-coded "500").
+    expect(
+      screen.getByText(
+        /biological's low score lines up with 3 metrics that fall outside the range seen across the graph's 2 rewired versions/i
+      )
+    ).toBeInTheDocument();
+    expect(screen.queryByText(nullExplanationOk.data.finding.summarySentence)).not.toBeInTheDocument();
 
     // Every qualifying metric is listed in plain words with its own rho —
     // never a hard-coded per-metric string table (the artifact drives every
@@ -611,10 +621,22 @@ describe('LedgerPanel', () => {
       'https://github.com/mattsp1290/flyarena/blob/main/docs/null-explanation-report.md#structural-features'
     );
 
-    // Mirrored decoder-convention check: still the bottom (0th percentile).
-    expect(screen.getByText(/mirroring the decoder's thrust and yaw signs still leaves biological at the bottom/i)).toBeInTheDocument();
-    // Regime check outcome.
-    expect(screen.getByText(/linear-regime check passed/i)).toBeInTheDocument();
+    // Mirrored decoder-convention check: still the bottom (0.0th percentile
+    // — the shared `formatPercentile` helper's one-decimal formatting,
+    // consistently applied to this early-return branch too, thermo-
+    // maintainability review's carried-over correctness Suggestion).
+    expect(
+      screen.getByText(/mirroring the decoder's thrust and yaw signs still leaves biological at the bottom.*0\.0th percentile/i)
+    ).toBeInTheDocument();
+    // Regime check outcome (thermo review S2 fix: "applicable to this
+    // model's dynamics," not the report-overclaiming "treated as valid").
+    expect(screen.getByText(/linear-regime check passed.*treated as applicable to this model's dynamics/i)).toBeInTheDocument();
+
+    // Thermo review Suggestion: ρ is glossed once in plain words, in the
+    // disclaimer paragraph, using the same fixture's rewiring count (2).
+    expect(
+      screen.getByText(/ρ is the rank correlation between a metric and score across the 2 rewirings/i)
+    ).toBeInTheDocument();
 
     // Always-carried framing.
     expect(screen.getByText(/descriptive association within this model, not a cause/i)).toBeInTheDocument();
@@ -673,6 +695,12 @@ describe('LedgerPanel', () => {
   // true only when *that* metric is `weightedInDegree:*` — never a blanket
   // flag over every `feature`-kind qualifying metric.
   it('flags only the weightedInDegree qualifying metric as definition-sensitive, never another feature-kind metric', () => {
+    // `reciprocity` listed *before* `weightedInDegree:thrust` (thermo-
+    // maintainability review, carried-over Suggestion — order-independence):
+    // an earlier fixture listed `weightedInDegree:thrust` first, so an
+    // implementation that flagged "the first feature-kind metric" instead of
+    // matching by name would still have passed this test. This order forces
+    // the assertion to depend on name matching, not position.
     const twoFeatureMetrics = {
       status: 'ok',
       data: {
@@ -680,8 +708,8 @@ describe('LedgerPanel', () => {
         finding: {
           ...nullExplanationOk.data.finding,
           qualifyingMetrics: [
-            { kind: 'feature', name: 'weightedInDegree:thrust', spearman: 0.394 },
-            { kind: 'feature', name: 'reciprocity', spearman: 0.35 }
+            { kind: 'feature', name: 'reciprocity', spearman: 0.35 },
+            { kind: 'feature', name: 'weightedInDegree:thrust', spearman: 0.394 }
           ]
         }
       }
@@ -697,10 +725,10 @@ describe('LedgerPanel', () => {
     expect(sensitiveLinks).toHaveLength(1);
     const items = container.querySelectorAll('.metric-list li');
     expect(items).toHaveLength(2);
-    expect(items[0].textContent).toMatch(/weighted in-degree/i);
-    expect(items[0].textContent).toMatch(/definition-sensitive/i);
-    expect(items[1].textContent).toMatch(/reciprocity/i);
-    expect(items[1].textContent).not.toMatch(/definition-sensitive/i);
+    expect(items[0].textContent).toMatch(/reciprocity/i);
+    expect(items[0].textContent).not.toMatch(/definition-sensitive/i);
+    expect(items[1].textContent).toMatch(/weighted in-degree/i);
+    expect(items[1].textContent).toMatch(/definition-sensitive/i);
   });
 
   it('shows the honest "Explanation failed verification" message when the null-explanation artifact is invalid', () => {
@@ -713,7 +741,7 @@ describe('LedgerPanel', () => {
     });
     const message = screen.getByText(/explanation failed verification/i);
     expect(message).toHaveTextContent(/sha256 mismatch/i);
-    expect(screen.queryByRole('heading', { name: /why biological scores low/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: /what biological's low score is associated with/i })).not.toBeInTheDocument();
   });
 
   it('shows a "could not be loaded" message (not "failed verification") when the null-explanation artifact is unavailable', () => {
@@ -727,7 +755,7 @@ describe('LedgerPanel', () => {
     const message = screen.getByText(/explanation could not be loaded/i);
     expect(message).toHaveTextContent(/network error \(test\)/i);
     expect(screen.queryByText(/explanation failed verification/i)).not.toBeInTheDocument();
-    expect(screen.queryByRole('heading', { name: /why biological scores low/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: /what biological's low score is associated with/i })).not.toBeInTheDocument();
   });
 
   it('hides the explanation paragraph entirely when the null-explanation artifact is missing, while the histogram above it keeps rendering', () => {
@@ -738,7 +766,7 @@ describe('LedgerPanel', () => {
       rewiringNull: rewiringNullOk,
       nullExplanation: { status: 'missing', reason: 'The manifest has no nullExplanation artifact entry.' }
     });
-    expect(screen.queryByRole('heading', { name: /why biological scores low/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: /what biological's low score is associated with/i })).not.toBeInTheDocument();
     expect(screen.queryByText(/explanation failed verification/i)).not.toBeInTheDocument();
     // The histogram (a required, independent load) is unaffected.
     expect(container.querySelector('.null-histogram')).not.toBeNull();

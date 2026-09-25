@@ -168,6 +168,49 @@ const graphBinarySha256ForMode = (manifest: ArenaManifest, mode: GraphMode): str
  * `topologySwitchChains`, unrelated to the decoder/topology invariant) —
  * only the read used to decide whether a decoder switch may start.
  */
+/**
+ * Shared "load a sidecar artifact, then dispatch it to a host callback"
+ * pipeline for `initialize()`'s `nullLoad`/explanation forks below
+ * (thermo-maintainability review I2). Both forks used to hand-roll the same
+ * four steps — wrap the injectable loader in `Promise.resolve().then(...)`
+ * so a synchronously-throwing test double is still caught, map any thrown
+ * error to a resolved `'unavailable'` result, dispatch to a host callback
+ * once `isDestroyed()` is re-checked, and route a throwing host callback to
+ * `onError` instead of an unhandled rejection — and had already drifted:
+ * the explanation fork alone grew an extra pre-guard skipping the fetch
+ * itself when already destroyed, which a prior review flagged as
+ * "goes beyond the round-1 ask" and untested. Using one helper for both
+ * forks makes that a single decision instead of two call sites that can
+ * silently disagree, in favor of the simpler, already-tested shape (never
+ * skip the fetch itself; only gate the dispatch/onError step).
+ *
+ * Returns the settled result promise (never rejects) so a caller can also
+ * use it as a sequencing gate for a second, dependent sidecar load, the way
+ * the explanation fork below needs to wait for `nullLoad` to settle without
+ * chaining directly onto its `onRewiringNull` dispatch (round-2 dual
+ * review, Important — see the call site's own comment for the isolation bug
+ * that chaining onto the dispatch step caused).
+ */
+function runSidecarLoad<T>(
+  load: () => Promise<T>,
+  onUnexpectedError: (reason: string) => T,
+  isDestroyed: () => boolean,
+  dispatch: (result: T) => void,
+  onError: (message: string) => void
+): Promise<T> {
+  const result = Promise.resolve()
+    .then(load)
+    .catch((error: unknown) => onUnexpectedError(error instanceof Error ? error.message : String(error)));
+  void result
+    .then((value) => {
+      if (!isDestroyed()) dispatch(value);
+    })
+    .catch((error: unknown) => {
+      if (!isDestroyed()) onError(error instanceof Error ? error.message : String(error));
+    });
+  return result;
+}
+
 class DecoderSwitch {
   private inFlight = false;
 
@@ -354,109 +397,73 @@ export class ExperimentController {
     // WP4: fire-and-forget, deliberately not awaited here (unlike the
     // trained-readout load just below) — "loading must not block Start"
     // means this must not sit in this method's own `await` chain ahead of
-    // Worker construction. `loadRewiringNull` documents itself as "never
-    // throws", but the leading `.catch` enforces that contract at the call
-    // site too (dual review, Important — mirrors `App.svelte`'s own
-    // `onManifest` handler, which added the equivalent `.catch` around
-    // `loadPositions` for the same reason): without it, an unexpected throw
-    // anywhere in the loader's chain would become an unhandled rejection and
-    // leave `rewiringNullStatus` `undefined` forever (the ledger row stuck
-    // on "Loading…"). The trailing `.catch` guards the *callback* instead —
-    // `onRewiringNull` is host code (`App.svelte`), and a throw there would
-    // otherwise also become an unhandled rejection with no error reported
-    // anywhere.
-    // `Promise.resolve().then(...)` rather than calling `loadNull` directly:
-    // the production `loadRewiringNull` is `async` and can never throw
-    // synchronously, but `loadNull` here can also be a test-injected
-    // `ExperimentControllerOptions.loadRewiringNull` double, which is only
-    // typed as returning a `Promise` — nothing stops a non-async double from
-    // throwing before it ever produces one. Without this wrapper, that throw
-    // would propagate out of `initialize()` synchronously, after `onManifest`
-    // has already fired, bypassing both `.catch`es below entirely (round-2
-    // dual review, Suggestion).
-    // Never rejects (`loadNull` failures are converted to a resolved
-    // `'unavailable'` status right here) — both `nullLoad.then(...)` chains
-    // below fork off this *settled* promise independently, rather than one
-    // chaining onto the other's own `.then((result) => onRewiringNull(...))`
-    // step. That independence matters (round-2 dual review, Important): an
-    // earlier version chained the null-explanation load directly after the
-    // `onRewiringNull(result)` callback call, so a throwing `onRewiringNull`
-    // host callback (host code, e.g. `App.svelte`) silently skipped the
-    // null-explanation load too, contradicting this method's own "attempted
-    // unconditionally" comment below. Forking both chains off `nullLoad`
-    // instead means the two host callbacks (`onRewiringNull`,
-    // `onNullExplanation`) can never take each other down.
-    const nullLoad = Promise.resolve()
-      .then(() => loadNull(artifacts.manifest, dataBaseUrl))
-      .catch(
-        // `'unavailable'`, not `'invalid'` (thermo review, Suggestion): this
-        // is a genuine runtime/JS error — a throw somewhere in the loader's
-        // chain, not a hash/shape/cross-check failure — so it must not be
-        // described to a visitor as "failed verification" (`LedgerPanel.svelte`).
-        (error: unknown): RewiringNullLoadResult => ({
-          status: 'unavailable',
-          reason: `unexpected error while loading the rewiring null: ${error instanceof Error ? error.message : String(error)}`
-        })
-      );
-
-    void nullLoad
-      .then((result) => {
-        if (this.destroyed) return;
-        this.options.callbacks.onRewiringNull(result);
-      })
-      .catch((error: unknown) => {
-        if (this.destroyed) return;
-        this.options.callbacks.onError(error instanceof Error ? error.message : String(error));
-      });
+    // Worker construction. `runSidecarLoad` (module-level helper above)
+    // owns the leading-`.catch`/trailing-`.catch` wrapping both forks need:
+    // the leading one enforces `loadRewiringNull`'s own "never throws"
+    // contract at this call site too (dual review, Important — mirrors
+    // `App.svelte`'s own `onManifest` handler, which added the equivalent
+    // `.catch` around `loadPositions` for the same reason), so an unexpected
+    // throw anywhere in the loader's chain can never leave
+    // `rewiringNullStatus` `undefined` forever (the ledger row stuck on
+    // "Loading…") or become an unhandled rejection; the trailing one guards
+    // the *callback* instead — `onRewiringNull` is host code (`App.svelte`),
+    // and a throw there is routed to `onError` rather than becoming an
+    // unhandled rejection.
+    //
+    // `runSidecarLoad` returns the settled result promise (never rejects —
+    // `loadNull` failures are converted to a resolved `'unavailable'` status
+    // right here) so the explanation fork below can fork off *this same
+    // settled promise* independently, rather than chaining onto this fork's
+    // own dispatch step. That independence matters (round-2 dual review,
+    // Important): an earlier version chained the null-explanation load
+    // directly after the `onRewiringNull(result)` callback call, so a
+    // throwing `onRewiringNull` host callback (host code, e.g. `App.svelte`)
+    // silently skipped the null-explanation load too, contradicting this
+    // method's own "attempted unconditionally" comment below. Forking both
+    // chains off the same settled `nullLoad` promise instead means the two
+    // host callbacks (`onRewiringNull`, `onNullExplanation`) can never take
+    // each other down.
+    const nullLoad = runSidecarLoad<RewiringNullLoadResult>(
+      () => loadNull(artifacts.manifest, dataBaseUrl),
+      // `'unavailable'`, not `'invalid'` (thermo review, Suggestion): this
+      // is a genuine runtime/JS error — a throw somewhere in the loader's
+      // chain, not a hash/shape/cross-check failure — so it must not be
+      // described to a visitor as "failed verification" (`LedgerPanel.svelte`).
+      (reason) => ({ status: 'unavailable', reason: `unexpected error while loading the rewiring null: ${reason}` }),
+      () => this.destroyed,
+      (result) => this.options.callbacks.onRewiringNull(result),
+      (message) => this.options.callbacks.onError(message)
+    );
 
     // WP4 of `.agents/plans/null-explanation` (`04-ledger-note.md`): "Load
     // after the null result" — sequenced after `nullLoad` *settles* (so it
     // never races ahead of the null histogram's own load and never issues a
-    // duplicate fetch for the rewiring-null artifact), but forked off that
-    // same promise rather than chained after the `onRewiringNull` callback
-    // above (see the comment on `nullLoad` for why). `loadExplanation` only
-    // needs `manifest`/`dataBaseUrl` (its own cross-check re-reads
-    // `manifest.rewiringNull.sha256` directly, not the resolved
-    // `RewiringNullLoadResult`), so it is attempted here unconditionally,
-    // independent of whichever status the null load itself resolved to —
-    // and independent of whether `onRewiringNull` throws.
-    void nullLoad
-      .then(() =>
-        this.destroyed
-          ? undefined
-          : // `Promise.resolve().then(...)` rather than calling `loadExplanation`
-            // directly — the same seam `nullLoad` above needs `loadNull` for
-            // (round-2 dual review, Suggestion): the production
-            // `loadNullExplanation` is `async` and can never throw
-            // synchronously, but `loadExplanation` here can also be a
-            // test-injected `ExperimentControllerOptions.loadNullExplanation`
-            // double, which is only typed as returning a `Promise` — nothing
-            // stops a non-async double from throwing before it ever produces
-            // one. Without this wrapper, that throw would reject this
-            // `.then()` callback itself, skipping the `.catch` below entirely
-            // and routing to `onError` instead of `onNullExplanation`.
-            Promise.resolve()
-              .then(() => loadExplanation(artifacts.manifest, dataBaseUrl))
-              .catch(
-                // `'unavailable'`, not `'invalid'` (mirrors `nullLoad`'s own
-                // catch just above, and `NullExplanationLoadResult`'s doc
-                // comment): a genuine runtime/JS error is not a verification
-                // failure, and `LedgerPanel.svelte` renders `'invalid'` as
-                // "Explanation failed verification".
-                (error: unknown): NullExplanationLoadResult => ({
-                  status: 'unavailable',
-                  reason: `unexpected error while loading the null explanation: ${error instanceof Error ? error.message : String(error)}`
-                })
-              )
-      )
-      .then((result) => {
-        if (this.destroyed || result === undefined) return;
-        this.options.callbacks.onNullExplanation(result);
-      })
-      .catch((error: unknown) => {
-        if (this.destroyed) return;
-        this.options.callbacks.onError(error instanceof Error ? error.message : String(error));
-      });
+    // duplicate fetch for the rewiring-null artifact), by making `nullLoad`
+    // itself part of this fork's own `load` thunk rather than chaining onto
+    // the `onRewiringNull` dispatch above (see `nullLoad`'s own comment for
+    // why). `loadExplanation` only needs `manifest`/`dataBaseUrl` (its own
+    // cross-check re-reads `manifest.rewiringNull.sha256` directly, not the
+    // resolved `RewiringNullLoadResult`), so it is attempted here
+    // unconditionally, independent of whichever status the null load itself
+    // resolved to — and independent of whether `onRewiringNull` throws.
+    // `runSidecarLoad` never pre-guards the fetch itself on `this.destroyed`
+    // (only the dispatch/onError step) — an earlier version of this fork
+    // alone added such a pre-guard, which a prior review flagged as
+    // untested and beyond what was asked; using the same shared helper as
+    // `nullLoad` above keeps both forks' `destroyed` handling identical by
+    // construction instead of two call sites that can silently disagree.
+    void runSidecarLoad<NullExplanationLoadResult>(
+      () => nullLoad.then(() => loadExplanation(artifacts.manifest, dataBaseUrl)),
+      // `'unavailable'`, not `'invalid'` (mirrors `nullLoad`'s own mapping
+      // above, and `NullExplanationLoadResult`'s doc comment): a genuine
+      // runtime/JS error is not a verification failure, and
+      // `LedgerPanel.svelte` renders `'invalid'` as "Explanation failed
+      // verification".
+      (reason) => ({ status: 'unavailable', reason: `unexpected error while loading the null explanation: ${reason}` }),
+      () => this.destroyed,
+      (result) => this.options.callbacks.onNullExplanation(result),
+      (message) => this.options.callbacks.onError(message)
+    );
 
     // Trained-readout artifact: optional relative to the required arena
     // graph artifacts above — `loadTrainedReadoutArtifact` never throws, and

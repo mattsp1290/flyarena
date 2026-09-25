@@ -23,6 +23,7 @@
 import type { ConnectomeGraph, GraphMode } from '../connectome/format';
 import { fetchAndVerifySidecarJson, type ArenaManifest } from './assets';
 import { isFiniteNumber } from './rewiringNull';
+import type { SidecarLoadResult } from './sidecarResult';
 
 /** One graph's per-neuron lesion data — the fields this WP's color mode actually consumes. */
 export interface LesionAtlasGraphData {
@@ -141,23 +142,29 @@ const validateLesionAtlasShape = (
  * graphs — and, within a graph, biological vs. rewired-seed-0 — are always
  * shown on one comparable scale rather than each auto-normalizing to its own
  * range.
+ *
+ * A type alias for the shared `SidecarLoadResult` (thermo-maintainability
+ * review I3): `TOkExtra` carries `absMax` alongside `data` on the `'ok'`
+ * branch, and the default `'missing'` status (not `RewiringNullLoadResult`'s
+ * `'absent'`) already matches this type's own vocabulary. Zero behavior
+ * change — the discriminated union shape below is identical to what this
+ * type used to define inline:
+ * - `{ status: 'ok'; data: LesionAtlasArtifact; absMax: number }`
+ * - `{ status: 'missing'; reason: string }` — no `manifest.lesionAtlas`
+ *   entry at all; nothing was ever shipped. Never retried (there is nothing
+ *   to retry).
+ * - `{ status: 'unavailable'; reason: string }` — a fetch/network failure,
+ *   not a claim about the artifact's integrity. Distinct from
+ *   `'missing'`/`'invalid'` for the same reason
+ *   `rewiringNull.ts#RewiringNullLoadResult` keeps its own `'unavailable'`
+ *   apart from `'absent'`/`'invalid'` (round-2 dual review, Important): a
+ *   dropped request or a transient 5xx is retryable, unlike a genuinely
+ *   missing manifest entry or a hash/shape failure, so
+ *   `ActivityPanel.svelte#ensureLesionAtlasLoaded` deliberately does not
+ *   memoize this outcome — selecting the mode again retries the fetch.
+ * - `{ status: 'invalid'; reason: string }`
  */
-export type LesionAtlasLoadResult =
-  | { status: 'ok'; data: LesionAtlasArtifact; absMax: number }
-  /** No `manifest.lesionAtlas` entry at all — nothing was ever shipped. Never retried (there is nothing to retry). */
-  | { status: 'missing'; reason: string }
-  /**
-   * A fetch/network failure — not a claim about the artifact's integrity.
-   * Distinct from `'missing'`/`'invalid'` for the same reason
-   * `rewiringNull.ts#RewiringNullLoadResult` keeps its own `'unavailable'`
-   * apart from `'absent'`/`'invalid'` (round-2 dual review, Important): a
-   * dropped request or a transient 5xx is retryable, unlike a genuinely
-   * missing manifest entry or a hash/shape failure, so
-   * `ActivityPanel.svelte#ensureLesionAtlasLoaded` deliberately does not
-   * memoize this outcome — selecting the mode again retries the fetch.
-   */
-  | { status: 'unavailable'; reason: string }
-  | { status: 'invalid'; reason: string };
+export type LesionAtlasLoadResult = SidecarLoadResult<LesionAtlasArtifact, 'missing', { absMax: number }>;
 
 /**
  * Fetch, sha256-verify, and structurally validate `lesion-atlas-v1.json`

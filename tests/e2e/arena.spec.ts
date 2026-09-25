@@ -333,12 +333,15 @@ test.describe('model ledger and provenance', () => {
     await expect(ledgerRow('Null-result explanation')).toContainText('Computed (offline)');
 
     const detail = page.locator('.null-explanation-detail');
-    await expect(page.getByRole('heading', { name: /why biological scores low/i })).toBeVisible();
+    await expect(page.getByRole('heading', { name: /what biological's low score is associated with/i })).toBeVisible();
 
-    // The summary sentence is generated from the verified artifact's own
-    // `finding.summarySentence` — this asserts the real shipped content
-    // rather than a hardcoded placeholder.
-    await expect(detail).toContainText(/descriptive correlation, not a causal claim/i);
+    // Thermo review I1: the lead sentence is a short, data-driven count
+    // (never `finding.summarySentence` pasted verbatim) — this asserts the
+    // real shipped artifact's own qualifying-metric count (3) and rewiring
+    // count (500), not a hardcoded placeholder.
+    await expect(detail).toContainText(
+      /biological's low score lines up with 3 metrics that fall outside the range seen across the graph's 500 rewired versions/i
+    );
 
     // Every qualifying metric is listed in plain words with its own rho, and
     // the structural-feature (weighted in-degree) entry is flagged
@@ -355,7 +358,11 @@ test.describe('model ledger and provenance', () => {
     // Mirrored decoder-convention check and regime-check outcome, each in
     // one clause.
     await expect(detail).toContainText(/mirroring the decoder's thrust and yaw signs still leaves biological at the bottom/i);
-    await expect(detail).toContainText(/linear-regime check passed/i);
+    await expect(detail).toContainText(/linear-regime check passed, so the linear-transfer analysis above is treated as applicable to this model's dynamics/i);
+
+    // Thermo review Suggestion: ρ is glossed once in plain words, using the
+    // real shipped artifact's own rewiring count (500).
+    await expect(detail).toContainText(/ρ is the rank correlation between a metric and score across the 500 rewirings/i);
 
     // Always-carried framing: descriptive association, not a cause; what
     // "authored" means; never a claim that biology performed worse.
@@ -420,7 +427,7 @@ test.describe('null-explanation hash-mismatch integrity check', () => {
     await expect(page.locator('.ledger')).toContainText(/sha256/i);
     // The note itself must never render over unverified bytes.
     await expect(page.locator('.null-explanation-detail')).toHaveCount(0);
-    await expect(page.getByRole('heading', { name: /why biological scores low/i })).toHaveCount(0);
+    await expect(page.getByRole('heading', { name: /what biological's low score is associated with/i })).toHaveCount(0);
 
     // The null histogram above it is an independent load and keeps working.
     await expect(page.locator('.null-histogram')).toBeVisible();
@@ -449,7 +456,7 @@ test.describe('null-explanation hash-mismatch integrity check', () => {
     await waitForReady(page);
 
     await expect(page.locator('.ledger')).not.toContainText(/explanation failed verification/i);
-    await expect(page.getByRole('heading', { name: /why biological scores low/i })).toHaveCount(0);
+    await expect(page.getByRole('heading', { name: /what biological's low score is associated with/i })).toHaveCount(0);
     await expect(page.locator('.null-explanation-detail')).toHaveCount(0);
 
     // The histogram is unaffected: it has its own manifest entry.

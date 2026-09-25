@@ -22,6 +22,7 @@
 
 import { fetchAndVerifySidecarJson, type ArenaManifest } from './assets';
 import { isFiniteNumber } from './rewiringNull';
+import type { SidecarLoadResult } from './sidecarResult';
 
 /** The three metric families `docs/null-explanation-report.md` tests (transfer entries, derived predictors, and structural features) — matches `explain.py`'s own `kind` vocabulary. */
 export type NullExplanationMetricKind = 'transfer' | 'derived' | 'feature';
@@ -84,12 +85,13 @@ export interface NullExplanationArtifact {
  * - `'invalid'`: the artifact was actually fetched and failed a real
  *   verification step (sha256, shape, or the cross-check against the shipped
  *   rewiring-null artifact). Shown as "Explanation failed verification: …".
+ *
+ * A type alias for the shared `SidecarLoadResult` (thermo-maintainability
+ * review I3) — zero behavior change, the discriminated union shape below is
+ * identical to what this type used to define inline, so every existing
+ * `status ===` narrowing site keeps working unchanged.
  */
-export type NullExplanationLoadResult =
-  | { status: 'ok'; data: NullExplanationArtifact }
-  | { status: 'missing'; reason: string }
-  | { status: 'unavailable'; reason: string }
-  | { status: 'invalid'; reason: string };
+export type NullExplanationLoadResult = SidecarLoadResult<NullExplanationArtifact>;
 
 const isMetricKind = (value: unknown): value is NullExplanationMetricKind =>
   value === 'transfer' || value === 'derived' || value === 'feature';
