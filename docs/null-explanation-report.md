@@ -4,7 +4,7 @@
 
 ## Method
 
-Three predeclared analyses (`.agents/plans/null-explanation/00-overview.md`), evaluated only after all three finished, with a fixed feature list not edited after the first run:
+Three predeclared analyses (`.agents/plans/null-explanation/00-overview.md`), evaluated only after all three finished (see the feature-6 disclosure under "Structural features" below for one qualification to the feature list's predeclaration):
 
 1. **Decoder-convention check.** Re-score biological and all 500 rewirings with the authored decoder's thrust and yaw signs both flipped (`authored-flip-both`). Predeclared rule: only run the two single-axis variants if the mirrored run moves biological to at least the 25th percentile.
 2. **Linear transfer analysis.** For each graph, the steady-state linear transfer matrix `T = O(lambda I - g A)^-1 B` (3 outputs x 8 input channels), gated by a linear-regime validity check.
@@ -20,7 +20,7 @@ Three predeclared analyses (`.agents/plans/null-explanation/00-overview.md`), ev
 | Regime gate: steady-state distance | <= 0.5 |
 | Regime gate: condition number | <= 1e+08 |
 
-**Multiple comparisons.** 66 metrics are tested (24 transfer entries, 2 derived predictors, 40 structural features). Correlations are reported descriptively, without per-metric significance testing; a permutation calibration (1000 seeded permutations of the score against the fixed metric set) found that at least one of the 66 metrics reaches \|rho\| >= 0.3 by chance alone in 0.0% of permutations -- this chance rate applies to any triggered linear-pathway or structural-feature finding below.
+**Multiple comparisons.** 66 metrics are tested (24 transfer entries, 2 derived predictors, 40 structural features; 23 of these are constant across the null and so can never reach the |rho| threshold). Correlations are reported descriptively, without per-metric significance testing; a permutation calibration (1000 seeded permutations of the score, applied jointly to every metric family at once) found that at least one of the tested metrics reaches \|rho\| >= 0.3 by chance alone in 0 of 1000 permutations (0.0%) -- this chance rate applies to any triggered linear-pathway or structural-feature finding below.
 
 ## Decoder-convention check
 
@@ -106,13 +106,27 @@ Authored episodes on 10 held-out seeds (`30001..30010`) for biological, disconne
 | biological | 0.63% | 0.1371 |
 | null (median over 500 rewirings) | 1.04% | 0.1516 |
 
-The aggregate regime gate **passed** (biological and the null median both within threshold, biological's transfer solve not ill-conditioned or singular). 0 of 500 rewirings were individually excluded from the transfer-kind correlations above for failing their own per-graph regime threshold (none).
+0 of 500 rewirings were individually excluded from the transfer-kind correlations above for failing their own per-graph regime threshold (none).
 
-This licenses treating the linear analysis as applicable to both biological and the null sample under this model (steady-state distances and clamp fractions are all well inside threshold); it does not by itself certify that any single transfer entry explains the score -- that still requires the outside-range-and-\|rho\|-threshold test above.
+The aggregate regime gate **passed**: biological's steady-state distance (0.1371) and the null median's (0.1516) are both at or below the 0.5 threshold; biological's rate-clamp fraction (0.63%) and the null median's (1.04%) are both at or below 20%; and biological's transfer solve is not singular, ill-conditioned, or unstable. This licenses treating the linear analysis as applicable to both biological and the null sample under this model; it does not by itself certify that any single transfer entry explains the score -- that still requires the outside-range-and-\|rho\|-threshold test above.
 
 ## Structural features
 
-40 predeclared graph features (fixed before any analysis ran; not edited after the first run). Feature 6 (`weightedInDegree`, mean input-restricted weighted in-degree per output population) was adjudicated during WP2: the plan's "input->output weighted in-degree" wording was read as restricted to edges whose *presynaptic* neuron is input-labeled (channel-mapped), on plan-text grounds (features 1/2's own "input"/"from any input neuron" usage, and the parallel with feature 4's unqualified "edges into output neurons" phrasing) decided **before any result was seen**, not selected because of its outcome (bean `flyarena-r37r`'s log; advocate write-ups under `/tmp/claude-1000/feature6-debate/`). An **unrestricted** variant (counting edges from *any* presynaptic neuron, not only input-labeled ones) was also computed during that adjudication for comparison and is disclosed here as **exploratory, non-predeclared** -- it is not part of the frozen feature list and is not used in the outcome-category evaluation below: biological's unrestricted thrust in-degree is 1476.5 (null mean 1126.4, sd 72.4, ~100th percentile), with rank correlation to score rho <= 0.072 on every output population -- weaker on every population than the predeclared, input-restricted reading, and it would not itself qualify for the structural-feature-associated category (\|rho\| < 0.3).
+40 predeclared graph features (fixed before any analysis ran; the frozen list is not edited after the first *production* run against it -- see the feature-6 disclosure below for what happened before that).
+
+**Feature 6 adjudication.** `weightedInDegree` (mean weighted in-degree per output population) was first implemented and run **unrestricted** (counting edges from any presynaptic neuron), matching one reading of the plan's ambiguous "input->output weighted in-degree" wording. A review flagged that wording as ambiguous against features 1/2's own restrictive use of "input" (channel-mapped neurons only); the resulting adjudication computed **both** readings' full statistics -- including each reading's rank correlation with score across all 500 rewirings -- before the input-restricted reading was adopted on plan-text grounds (bean `flyarena-r37r`'s log). Because both readings' outcomes were visible before the decision, this was not a fully outcome-blind pre-registration, and the `structuralFeature` finding below should be read with that limitation in mind, not as a clean, one-shot predeclared test.
+
+The unrestricted reading is disclosed here as **exploratory, non-predeclared**: it is not part of the frozen 40-feature list and plays no role in the outcome-category evaluation. Both readings, computed by this same pipeline (`exploratory.featureSixUnrestricted.sourceSha256` = `b76502476d2f...`):
+
+| population | restricted (predeclared) bio | restricted rho | unrestricted (exploratory) bio | unrestricted rho |
+| --- | --- | --- | --- | --- |
+| thrust | 0.0000 | 0.394 | 1476.5000 | 0.027 |
+| yaw | 0.2500 | 0.053 | 1039.0000 | 0.021 |
+| brake | 111.0625 | -0.040 | 1125.2500 | 0.072 |
+
+The unrestricted reading's strongest population correlation is \|rho\| = 0.072, below the predeclared 0.3 threshold on every population -- under the unrestricted reading, feature 6 would not itself qualify for the structural-feature-associated category on any population.
+
+**This report's `structuralFeature` finding is definition-sensitive**: it is triggered by a `weightedInDegree` entry, and the finding would not hold under the unrestricted reading above.
 
 | metric | biological | null median | null 2.5% | null 97.5% | bio percentile | rho | rho 95% CI |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -133,29 +147,29 @@ This licenses treating the linear analysis as applicable to both biological and 
 | excitatoryPathCount:brake | 197073.0000 | 161651.0000 | 153813.0000 | 169198.0000 | 100.0% | 0.010 | [-0.079, 0.099] |
 | reciprocity | 0.2526 | 0.0632 | 0.0602 | 0.0659 | 100.0% | 0.006 | [-0.081, 0.093] |
 | twoCycleCount | 5849.0000 | 1464.0000 | 1395.0000 | 1527.0000 | 100.0% | 0.006 | [-0.080, 0.095] |
-| pathLength:foodBearing->thrust | 2.0000 | 1.0000 | 1.0000 | 1.0000 | 100.0% | 0.000 | [0.000, 0.000] |
-| pathLength:foodBearing->yaw | 2.0000 | 1.0000 | 1.0000 | 1.0000 | 100.0% | 0.000 | [0.000, 0.000] |
-| pathLength:foodBearing->brake | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 50.0% | 0.000 | [0.000, 0.000] |
-| pathLength:foodDistance->thrust | 2.0000 | 1.0000 | 1.0000 | 1.0000 | 100.0% | 0.000 | [0.000, 0.000] |
-| pathLength:foodDistance->yaw | 2.0000 | 1.0000 | 1.0000 | 1.0000 | 100.0% | 0.000 | [0.000, 0.000] |
-| pathLength:foodDistance->brake | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 50.0% | 0.000 | [0.000, 0.000] |
-| pathLength:hazardBearing->thrust | 2.0000 | 1.0000 | 1.0000 | 1.0000 | 100.0% | 0.000 | [0.000, 0.000] |
-| pathLength:hazardBearing->yaw | 2.0000 | 1.0000 | 1.0000 | 1.0000 | 100.0% | 0.000 | [0.000, 0.000] |
-| pathLength:hazardBearing->brake | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 50.0% | 0.000 | [0.000, 0.000] |
-| pathLength:hazardDistance->thrust | 2.0000 | 1.0000 | 1.0000 | 1.0000 | 100.0% | 0.000 | [0.000, 0.000] |
-| pathLength:hazardDistance->yaw | 2.0000 | 1.0000 | 1.0000 | 1.0000 | 100.0% | 0.000 | [0.000, 0.000] |
-| pathLength:hazardDistance->brake | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 50.0% | 0.000 | [0.000, 0.000] |
-| pathLength:forwardClearance->thrust | 2.0000 | 1.0000 | 1.0000 | 1.0000 | 100.0% | 0.000 | [0.000, 0.000] |
-| pathLength:forwardClearance->yaw | 2.0000 | 1.0000 | 1.0000 | 1.0000 | 100.0% | 0.000 | [0.000, 0.000] |
-| pathLength:forwardClearance->brake | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 50.0% | 0.000 | [0.000, 0.000] |
-| pathLength:leftClearance->thrust | 2.0000 | 1.0000 | 1.0000 | 1.0000 | 100.0% | 0.000 | [0.000, 0.000] |
-| pathLength:leftClearance->yaw | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 50.0% | 0.000 | [0.000, 0.000] |
-| pathLength:leftClearance->brake | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 50.0% | 0.000 | [0.000, 0.000] |
-| pathLength:rightClearance->thrust | 2.0000 | 1.0000 | 1.0000 | 1.0000 | 100.0% | 0.000 | [0.000, 0.000] |
-| pathLength:rightClearance->yaw | 2.0000 | 1.0000 | 1.0000 | 1.0000 | 100.0% | 0.000 | [0.000, 0.000] |
-| pathLength:rightClearance->brake | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 50.0% | 0.000 | [0.000, 0.000] |
-| pathLength:speed->thrust | 2.0000 | 1.0000 | 1.0000 | 1.0000 | 100.0% | 0.000 | [0.000, 0.000] |
-| pathLength:speed->brake | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 50.0% | 0.000 | [0.000, 0.000] |
+| pathLength:foodBearing->thrust | 2.0000 | 1.0000 | 1.0000 | 1.0000 | 100.0% | n/a (constant in null) | n/a |
+| pathLength:foodBearing->yaw | 2.0000 | 1.0000 | 1.0000 | 1.0000 | 100.0% | n/a (constant in null) | n/a |
+| pathLength:foodBearing->brake | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 50.0% | n/a (constant in null) | n/a |
+| pathLength:foodDistance->thrust | 2.0000 | 1.0000 | 1.0000 | 1.0000 | 100.0% | n/a (constant in null) | n/a |
+| pathLength:foodDistance->yaw | 2.0000 | 1.0000 | 1.0000 | 1.0000 | 100.0% | n/a (constant in null) | n/a |
+| pathLength:foodDistance->brake | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 50.0% | n/a (constant in null) | n/a |
+| pathLength:hazardBearing->thrust | 2.0000 | 1.0000 | 1.0000 | 1.0000 | 100.0% | n/a (constant in null) | n/a |
+| pathLength:hazardBearing->yaw | 2.0000 | 1.0000 | 1.0000 | 1.0000 | 100.0% | n/a (constant in null) | n/a |
+| pathLength:hazardBearing->brake | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 50.0% | n/a (constant in null) | n/a |
+| pathLength:hazardDistance->thrust | 2.0000 | 1.0000 | 1.0000 | 1.0000 | 100.0% | n/a (constant in null) | n/a |
+| pathLength:hazardDistance->yaw | 2.0000 | 1.0000 | 1.0000 | 1.0000 | 100.0% | n/a (constant in null) | n/a |
+| pathLength:hazardDistance->brake | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 50.0% | n/a (constant in null) | n/a |
+| pathLength:forwardClearance->thrust | 2.0000 | 1.0000 | 1.0000 | 1.0000 | 100.0% | n/a (constant in null) | n/a |
+| pathLength:forwardClearance->yaw | 2.0000 | 1.0000 | 1.0000 | 1.0000 | 100.0% | n/a (constant in null) | n/a |
+| pathLength:forwardClearance->brake | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 50.0% | n/a (constant in null) | n/a |
+| pathLength:leftClearance->thrust | 2.0000 | 1.0000 | 1.0000 | 1.0000 | 100.0% | n/a (constant in null) | n/a |
+| pathLength:leftClearance->yaw | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 50.0% | n/a (constant in null) | n/a |
+| pathLength:leftClearance->brake | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 50.0% | n/a (constant in null) | n/a |
+| pathLength:rightClearance->thrust | 2.0000 | 1.0000 | 1.0000 | 1.0000 | 100.0% | n/a (constant in null) | n/a |
+| pathLength:rightClearance->yaw | 2.0000 | 1.0000 | 1.0000 | 1.0000 | 100.0% | n/a (constant in null) | n/a |
+| pathLength:rightClearance->brake | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 50.0% | n/a (constant in null) | n/a |
+| pathLength:speed->thrust | 2.0000 | 1.0000 | 1.0000 | 1.0000 | 100.0% | n/a (constant in null) | n/a |
+| pathLength:speed->brake | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 50.0% | n/a (constant in null) | n/a |
 
 ## Finding
 
@@ -170,4 +184,6 @@ Categories that hold, ranked by effect size: linearPathway, structuralFeature.
 - **This model only.** Every analysis here describes the authored decoder, this rate-model dynamics, and this arena running on the measured biological topology versus 500 degree-preserving rewirings of it. Nothing here is a claim about the real fly's neural function or behavior, and no rewiring's topology is claimed to be causally "worse" or "better" than biological's.
 - **The linear analysis is valid only to the measured regime extent.** `T` is the model's exact fixed-point gain when no rate/input clamp is active; the regime check quantifies how close the real, clamped, discretized simulation actually sits to that fixed point, and the linear-pathway category is gated on that check, not assumed.
 - **Correlation is not causation.** A rank correlation between a structural or transfer metric and score across the 500 rewirings describes an association within this null model's sample, not a causal mechanism.
+- **Bootstrap CIs are approximate.** Each metric's 95% Spearman CI resamples the already rank-transformed pairs and does not re-rank within each resample -- a bootstrap of the rank-transformed sample's Pearson correlation, not a fully faithful re-ranking bootstrap. The CIs are descriptive only and play no role in any outcome-category decision (only the point estimate and the predeclared |rho| threshold do).
+- **A metric constant across the null (`n/a (constant in null)` in the tables above) has an undefined, not zero, Spearman correlation** and can never trigger the |rho| threshold; it is still counted toward the metrics-tested total above.
 - **No biological claim.** See "This model only" above.
