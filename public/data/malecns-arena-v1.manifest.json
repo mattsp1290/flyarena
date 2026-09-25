@@ -8,6 +8,10 @@
   "gzipBytes": 107391,
   "gzipSha256": "ce247668a63df9a84d8e9969227de7b85d5eba679c45821644812ce0740dfb90",
   "inputChannelCount": 8,
+  "lesionAtlas": {
+    "artifact": "lesion-atlas-v1.json",
+    "sha256": "b18fe1569ef49aa4095b20d301b0d3c3147b01f9da282f954cf9db6a12da15b1"
+  },
   "license": "CC-BY-4.0",
   "neuronCount": 1008,
   "outputPopulationCount": 3,
