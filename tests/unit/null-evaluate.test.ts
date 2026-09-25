@@ -14,8 +14,10 @@ import { encodeGraphBinary } from '../../src/lib/connectome/format';
 import { createTraceGraph } from '../fixtures/trace-graph';
 import { createFixtureRewiredTraceGraph } from '../fixtures/trace-graph-rewire';
 import {
+  buildGraphListTasks,
   buildTasks,
   parseNullEvaluateArgs,
+  readGraphListIndex,
   readRewireIndex,
   runNullEvaluate,
   runShardedEvaluation
@@ -134,6 +136,29 @@ describe('parseNullEvaluateArgs', () => {
     expect(() => parseNullEvaluateArgs(['--rewired-index', 'i.json', '--graphs-dir', 'g', '--bogus'])).toThrow(
       /Unknown argument/
     );
+  });
+
+  it('parses --graph-list without --rewired-index/--graphs-dir', () => {
+    const args = parseNullEvaluateArgs(['--graph-list', 'list.json']);
+    expect(args.graphList).toBe(resolve(process.cwd(), 'list.json'));
+    expect(args.rewiredIndex).toBeUndefined();
+    expect(args.graphsDir).toBeUndefined();
+  });
+
+  it('rejects --graph-list combined with --rewired-index', () => {
+    expect(() =>
+      parseNullEvaluateArgs(['--graph-list', 'list.json', '--rewired-index', 'i.json'])
+    ).toThrow(/--graph-list is mutually exclusive with --rewired-index\/--graphs-dir/);
+  });
+
+  it('rejects --graph-list combined with --graphs-dir', () => {
+    expect(() =>
+      parseNullEvaluateArgs(['--graph-list', 'list.json', '--graphs-dir', 'g'])
+    ).toThrow(/--graph-list is mutually exclusive with --rewired-index\/--graphs-dir/);
+  });
+
+  it('rejects neither --graph-list nor --rewired-index/--graphs-dir', () => {
+    expect(() => parseNullEvaluateArgs([])).toThrow(/--rewired-index is required/);
   });
 
   it('rejects --out without a .json extension', () => {
@@ -375,6 +400,233 @@ describe('null-evaluate CLI: shard determinism (trace-graph fixture)', () => {
   });
 });
 
+describe('null-evaluate CLI: --graph-list mode (trace-graph fixture)', () => {
+  // `.agents/plans/pathway-interventions/03-evaluation.md`'s WP2 tests:
+  // "--graph-list on fixture graphs: 1 vs 3 shards give identical output; a
+  // sha mismatch fails; --graph-list with --rewired-index fails". This
+  // mirrors the `--rewired-index` shard-determinism block above exactly,
+  // over a `scripts/analysis/interventions.py`-shaped index.json (id/path/
+  // gzipSha256/binarySha256 entries, keyed by an arbitrary string id) instead
+  // of a `rewire_batch.py`-shaped one (numeric seed entries).
+  let root: string;
+  let graphListPath: string;
+  let bioGzipPath: string;
+
+  const GRAPH_IDS = ['P', 'C000', 'C001', 'MQ2000'];
+  const HELD_OUT_START = 30001;
+  const HELD_OUT_COUNT = 3;
+  const TICKS = 20;
+
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), 'null-evaluate-graph-list-fixture-'));
+
+    const bioGraph = createTraceGraph();
+    const bioBinary = Buffer.from(encodeGraphBinary(bioGraph));
+    const bioSha256 = sha256Hex(bioBinary);
+    bioGzipPath = join(root, 'trace-graph.bin.gz');
+    writeFileSync(bioGzipPath, gzipSync(bioBinary));
+
+    const entries = GRAPH_IDS.map((id, i) => {
+      const rewired = createFixtureRewiredTraceGraph(bioGraph, i);
+      const binary = Buffer.from(encodeGraphBinary(rewired));
+      const binarySha256 = sha256Hex(binary);
+      const gzipBytes = gzipSync(binary);
+      const relativePath = `graphs/${id}.bin.gz`;
+      mkdirSync(join(root, 'graphs'), { recursive: true });
+      writeFileSync(join(root, relativePath), gzipBytes);
+      return { id, path: relativePath, gzipSha256: sha256Hex(gzipBytes), binarySha256 };
+    });
+
+    const index = {
+      sourceArtifact: 'trace-graph.bin.gz',
+      sourceSha256: bioSha256,
+      entries
+    };
+    graphListPath = join(root, 'index.json');
+    writeFileSync(graphListPath, JSON.stringify(index, null, 2));
+  });
+
+  afterAll(() => {
+    if (root) rmSync(root, { recursive: true, force: true });
+  });
+
+  const runCli = (shards: number, out: string) =>
+    spawnSync(
+      process.execPath,
+      [
+        '--import',
+        'tsx',
+        'scripts/null/null-evaluate.ts',
+        '--biological',
+        '--graph',
+        bioGzipPath,
+        '--graph-list',
+        graphListPath,
+        '--held-out-start',
+        String(HELD_OUT_START),
+        '--held-out-count',
+        String(HELD_OUT_COUNT),
+        '--ticks',
+        String(TICKS),
+        '--shards',
+        String(shards),
+        '--out',
+        out
+      ],
+      { encoding: 'utf8', timeout: 60_000 }
+    );
+
+  it('--shards 1 and --shards 3 produce byte-identical output, keyed by id and sorted', () => {
+    const out1 = join(root, 'authored-shards1.json');
+    const out3 = join(root, 'authored-shards3.json');
+
+    const result1 = runCli(1, out1);
+    expect(result1.status, result1.stderr).toBe(0);
+
+    const result3 = runCli(3, out3);
+    expect(result3.status, result3.stderr).toBe(0);
+
+    const bytes1 = readFileSync(out1);
+    const bytes3 = readFileSync(out3);
+    expect(bytes3.equals(bytes1)).toBe(true);
+
+    const parsed = JSON.parse(bytes1.toString('utf8'));
+    expect(parsed.version).toBe(1);
+    expect(parsed.ticks).toBe(TICKS);
+    expect(parsed.seeds).toEqual({ start: HELD_OUT_START, count: HELD_OUT_COUNT });
+    expect(parsed.biological.movementScore).toHaveLength(HELD_OUT_COUNT);
+    expect(parsed.disconnected.movementScore).toHaveLength(HELD_OUT_COUNT);
+    expect(parsed.graphs).toHaveLength(GRAPH_IDS.length);
+    // Sorted by id ascending (plain string comparison): 'C000' < 'C001' < 'MQ2000' < 'P'.
+    expect(parsed.graphs.map((g: { id: string }) => g.id)).toEqual(['C000', 'C001', 'MQ2000', 'P']);
+    for (const entry of parsed.graphs) {
+      expect(entry.movementScore).toHaveLength(HELD_OUT_COUNT);
+      for (const score of entry.movementScore) expect(Number.isFinite(score)).toBe(true);
+    }
+  });
+
+  it('rejects a graph-list file whose bytes do not match index.json (sha mismatch)', () => {
+    const tamperedRoot = mkdtempSync(join(tmpdir(), 'null-evaluate-graph-list-tampered-'));
+    cpSync(root, tamperedRoot, { recursive: true });
+    const victim = join(tamperedRoot, 'graphs', 'C000.bin.gz');
+    const bytes = readFileSync(victim);
+    bytes[bytes.length - 5] ^= 0xff;
+    writeFileSync(victim, bytes);
+
+    const out = join(tamperedRoot, 'authored-tampered.json');
+    const result = spawnSync(
+      process.execPath,
+      [
+        '--import',
+        'tsx',
+        'scripts/null/null-evaluate.ts',
+        '--graph-list',
+        join(tamperedRoot, 'index.json'),
+        '--held-out-count',
+        '1',
+        '--ticks',
+        String(TICKS),
+        '--shards',
+        '1',
+        '--out',
+        out
+      ],
+      { encoding: 'utf8', timeout: 60_000 }
+    );
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/gzip sha256/);
+    rmSync(tamperedRoot, { recursive: true, force: true });
+  });
+
+  it('--graph-list combined with --rewired-index fails at the CLI', () => {
+    const out = join(root, 'authored-mutex.json');
+    const result = spawnSync(
+      process.execPath,
+      [
+        '--import',
+        'tsx',
+        'scripts/null/null-evaluate.ts',
+        '--graph-list',
+        graphListPath,
+        '--rewired-index',
+        graphListPath,
+        '--graphs-dir',
+        root,
+        '--out',
+        out
+      ],
+      { encoding: 'utf8', timeout: 60_000 }
+    );
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/--graph-list is mutually exclusive with --rewired-index\/--graphs-dir/);
+  });
+});
+
+describe('readGraphListIndex: duplicate/malformed entry rejection', () => {
+  it('rejects a duplicate graph id', () => {
+    const root = mkdtempSync(join(tmpdir(), 'null-evaluate-graph-list-dup-id-'));
+    const indexPath = join(root, 'index.json');
+    const entry = { id: 'P', path: 'x.bin.gz', gzipSha256: 'a'.repeat(64), binarySha256: 'b'.repeat(64) };
+    writeFileSync(
+      indexPath,
+      JSON.stringify({
+        sourceArtifact: 'src.bin.gz',
+        sourceSha256: 'c'.repeat(64),
+        entries: [entry, { ...entry }]
+      })
+    );
+    expect(() => readGraphListIndex(indexPath)).toThrow(/more than once/);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('rejects a malformed entry', () => {
+    const root = mkdtempSync(join(tmpdir(), 'null-evaluate-graph-list-bad-entry-'));
+    const indexPath = join(root, 'index.json');
+    writeFileSync(
+      indexPath,
+      JSON.stringify({
+        sourceArtifact: 'src.bin.gz',
+        sourceSha256: 'c'.repeat(64),
+        entries: [{ id: 'P', path: 'x.bin.gz', gzipSha256: 'a'.repeat(64) }] // missing binarySha256
+      })
+    );
+    expect(() => readGraphListIndex(indexPath)).toThrow(/malformed graph-list entry/);
+    rmSync(root, { recursive: true, force: true });
+  });
+});
+
+describe('buildGraphListTasks: --decoder propagation', () => {
+  it('every task (biological, disconnected, and each graph-list entry) carries the requested decoder, sorted by id', () => {
+    const index = {
+      sourceArtifact: 'src.bin.gz',
+      sourceSha256: 'c'.repeat(64),
+      entries: [
+        { id: 'P', path: 'p.bin.gz', gzipSha256: 'a'.repeat(64), binarySha256: '1'.repeat(64) },
+        { id: 'C000', path: 'c000.bin.gz', gzipSha256: 'b'.repeat(64), binarySha256: '2'.repeat(64) }
+      ]
+    };
+    const args = {
+      biological: true,
+      graph: undefined,
+      rewiredIndex: undefined,
+      graphsDir: undefined,
+      graphList: 'unused',
+      heldOutStart: 30001,
+      heldOutCount: 2,
+      ticks: 20,
+      shards: 1,
+      out: 'unused.json',
+      decoder: 'authored-flip-both' as const,
+      rewiredSeeds: undefined
+    };
+    const tasks = buildGraphListTasks(index, args, '/graphs-dir', 'bio.bin.gz');
+    expect(tasks.length).toBeGreaterThan(0);
+    for (const task of tasks) expect(task.decoder).toBe('authored-flip-both');
+    const graphListGraphIds = tasks.filter((t) => t.mode === 'rewired').map((t) => t.graphId);
+    expect(graphListGraphIds).toEqual(['C000', 'P']);
+  });
+});
+
 describe('readRewireIndex: duplicate/malformed seed rejection', () => {
   it('rejects a duplicate rewiring seed', () => {
     const root = mkdtempSync(join(tmpdir(), 'null-evaluate-dup-seed-'));
@@ -537,6 +789,43 @@ describe('runNullEvaluate: refuses to overwrite the canonical default --out with
     await expect(runNullEvaluate(nonCanonicalArgsWithDefaultOut({}))).rejects.not.toThrow(
       /refusing to write a non-canonical run/
     );
+  });
+
+  it('throws for a --graph-list run writing to the default (--rewired-index-shaped) --out', async () => {
+    await expect(
+      runNullEvaluate(
+        nonCanonicalArgsWithDefaultOut({
+          rewiredIndex: undefined,
+          graphsDir: undefined,
+          graphList: '/nonexistent/graph-list.json'
+        })
+      )
+    ).rejects.toThrow(/refusing to write a non-canonical run/);
+  });
+});
+
+describe('runNullEvaluate: --graph-list mutual exclusion (direct call, bypassing the CLI parser)', () => {
+  // parseNullEvaluateArgs already rejects this combination (see the CLI-level
+  // test above), but runNullEvaluate is also called directly by any caller
+  // that builds its own NullEvaluateArgs -- this proves the function itself
+  // re-checks rather than trusting every caller routes through the parser.
+  it('rejects --graph-list combined with --rewired-index/--graphs-dir', async () => {
+    await expect(
+      runNullEvaluate({
+        biological: false,
+        graph: undefined,
+        rewiredIndex: '/nonexistent/index.json',
+        graphsDir: '/nonexistent/graphs',
+        graphList: '/nonexistent/graph-list.json',
+        heldOutStart: 30001,
+        heldOutCount: 1,
+        ticks: 20,
+        shards: 1,
+        out: resolve(process.cwd(), 'training/runs/interventions/scratch.json'),
+        decoder: 'authored' as const,
+        rewiredSeeds: undefined
+      })
+    ).rejects.toThrow(/--graph-list is mutually exclusive with --rewired-index\/--graphs-dir/);
   });
 });
 
