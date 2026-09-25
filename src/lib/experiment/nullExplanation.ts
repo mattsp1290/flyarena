@@ -42,6 +42,7 @@ export interface NullExplanationQualifyingMetric {
  * regime-gate outcome, and the templated one-sentence summary.
  */
 export interface NullExplanationFinding {
+  /** Validated as a cheap structural guard (every entry is a real string) but never itself rendered — `summarySentence` already states which categories held in prose, and `qualifyingMetrics` names the individual metrics behind them. */
   readonly categories: readonly string[];
   readonly definitionSensitive: boolean;
   readonly qualifyingMetrics: readonly NullExplanationQualifyingMetric[];
@@ -65,21 +66,29 @@ export interface NullExplanationArtifact {
 }
 
 /**
- * `'ok' | 'missing' | 'invalid'` — three states, not `loadRewiringNull`'s
- * four (`assets.ts#loadPositions`'s exact precedent, not a new invention):
- * a fetch/network failure is folded into `'missing'` alongside "the manifest
- * has no entry at all", because this note is optional presentation next to
- * the (already-required) null histogram, and its own failure text ("could
- * not be loaded" vs. "failed verification") is not the load-bearing honesty
- * distinction here the way it is for the histogram's own required section
- * heading — `'invalid'` is reserved for a genuine verification failure
- * (sha256, shape, or the cross-check against the shipped rewiring-null
- * artifact), matching the bean's "invalid shows 'Explanation failed
- * verification'; missing hides the paragraph" contract exactly.
+ * Four states, mirroring `RewiringNullLoadResult`'s/`LesionAtlasLoadResult`'s
+ * own split (round-2 dual review, Important — an earlier version folded a
+ * fetch/network failure and an unexpected runtime error into `'missing'`/
+ * `'invalid'` respectively, which meant a dropped connection silently hid
+ * the note with no trace, and a `crypto.subtle`-unavailable throw was shown
+ * to a visitor as "Explanation failed verification" even though nothing was
+ * ever verified):
+ * - `'missing'`: the manifest has no `nullExplanation` entry at all — nothing
+ *   was ever shipped. The bean's own contract: the paragraph is hidden with
+ *   no message.
+ * - `'unavailable'`: a fetch/network failure, or an unexpected exception
+ *   anywhere in the load chain (`controller.ts`'s leading `.catch`) — not a
+ *   claim about the artifact's integrity. Shown as "Explanation could not be
+ *   loaded: …", the same wording `LedgerPanel.svelte` already uses for
+ *   `RewiringNullLoadResult`'s own `'unavailable'`.
+ * - `'invalid'`: the artifact was actually fetched and failed a real
+ *   verification step (sha256, shape, or the cross-check against the shipped
+ *   rewiring-null artifact). Shown as "Explanation failed verification: …".
  */
 export type NullExplanationLoadResult =
   | { status: 'ok'; data: NullExplanationArtifact }
   | { status: 'missing'; reason: string }
+  | { status: 'unavailable'; reason: string }
   | { status: 'invalid'; reason: string };
 
 const isMetricKind = (value: unknown): value is NullExplanationMetricKind =>
@@ -139,6 +148,21 @@ const validateNullExplanationShape = (
     return { ok: false, reason: 'null-explanation artifact has a malformed "finding" field' };
   }
 
+  // Cross-field consistency (round-2 dual review, Important — mirrors
+  // `rewiringNull.ts`'s own recomputed-rank-statistics precedent): the real
+  // producer sets `finding.regimeInvalid = not regime.gatePassed` always
+  // (`scripts/analysis/explain.py`'s `evaluate_categories`), and
+  // `NullExplanationArtifact`'s own doc comment already claims this. A
+  // hash-valid artifact whose two fields disagree would otherwise pass
+  // validation and let the regime clause below state the wrong outcome —
+  // `regime.gatePassed` would then be a validated field with no consumer
+  // and no payoff.
+  const regimeGatePassed = (regime as Record<string, unknown>).gatePassed as boolean;
+  const finding = v.finding as NullExplanationFinding;
+  if (finding.regimeInvalid !== !regimeGatePassed) {
+    return { ok: false, reason: 'null-explanation finding.regimeInvalid disagrees with regime.gatePassed' };
+  }
+
   return { ok: true, data: value as NullExplanationArtifact };
 };
 
@@ -165,7 +189,7 @@ export const loadNullExplanation = async (
     return { status: 'missing', reason: 'The manifest has no nullExplanation artifact entry.' };
   }
   if (fetched.status === 'fetch-error') {
-    return { status: 'missing', reason: fetched.reason };
+    return { status: 'unavailable', reason: fetched.reason };
   }
   if (fetched.status === 'hash-mismatch' || fetched.status === 'parse-error') {
     return { status: 'invalid', reason: fetched.reason };

@@ -184,10 +184,29 @@
     return `${metric.kind} metric "${humanizeIdentifier(metric.name)}"`;
   };
 
+  /**
+   * `explain.py`'s own `definitionSensitive` flag is computed only from its
+   * single top structural candidate (`structuralDetail`, the
+   * highest-|rho| structural metric), and is `true` only when *that one*
+   * metric's name starts with `weightedInDegree:` — never from
+   * `finding.qualifyingMetrics` as a whole, which can independently list
+   * several `feature`-kind metrics at once (`scripts/analysis/explain.py`'s
+   * `qualifying_metrics = linear_candidates + structural_candidates`).
+   * Flagging every `feature`-kind qualifying metric whenever
+   * `definitionSensitive` is true (an earlier version of this file did)
+   * would mislabel any other qualifying structural feature (e.g.
+   * `reciprocity`) with a disclosure link that says nothing about it —
+   * round-2 dual review, Important. Restricting the flag to this same name
+   * family keeps it sound even if a future re-run qualifies more than one
+   * structural feature at once.
+   */
+  const isWeightedInDegreeFeature = (metric: NullExplanationQualifyingMetric): boolean =>
+    metric.kind === 'feature' && metric.name.startsWith('weightedInDegree:');
+
   interface QualifyingMetricLine {
     key: string;
     text: string;
-    /** True when this metric is a structural feature and the finding's own `definitionSensitive` flag is set — the report's disclosure ties that sensitivity specifically to a `feature`-kind qualifying metric (the `weightedInDegree` reading), never to a `transfer`/`derived` one. */
+    /** True only for the `weightedInDegree:*` qualifying metric, and only when the finding's own `definitionSensitive` flag is set — see `isWeightedInDegreeFeature`'s doc comment. */
     sensitive: boolean;
   }
 
@@ -196,26 +215,36 @@
       ? nullExplanation.data.finding.qualifyingMetrics.map((metric, index) => ({
           key: `${metric.kind}:${metric.name}:${index}`,
           text: `${describeQualifyingMetric(metric)} (ρ = ${metric.spearman.toFixed(3)})`,
-          sensitive: nullExplanation.data.finding.definitionSensitive && metric.kind === 'feature'
+          sensitive: nullExplanation.data.finding.definitionSensitive && isWeightedInDegreeFeature(metric)
         }))
       : []
   );
 
   /**
    * States the mirrored decoder-convention check's result (`variants.flipBoth`,
-   * the one required re-scoring with thrust and yaw signs both flipped).
-   * "Still at the bottom" is itself derived from the artifact's own
-   * `bioPercentile` (a real check against the loaded data, at or below 0),
-   * never assumed — a future re-run where the mirrored check moves
-   * biological up is phrased with its own real percentile instead.
+   * the one required re-scoring with thrust and yaw signs both flipped)
+   * against the *un-mirrored* baseline percentile
+   * (`rewiringNull.data.bioPercentile` — already in scope, since this note
+   * only ever renders inside `{#if rewiringNull.status === 'ok'}` below).
+   * Round-2 dual review, Important: an earlier version compared only the
+   * mirrored value against a hard-coded "0", so the "still" wording was true
+   * for the current shipped data by coincidence, not because it was actually
+   * derived from the baseline — a re-run where the baseline itself moved
+   * while the mirrored value stayed at 0 would have rendered a false
+   * "still". Both sides are now read from their own verified artifact.
    */
   const mirroredDecoderClause = $derived(
-    nullExplanation?.status === 'ok'
+    nullExplanation?.status === 'ok' && rewiringNull?.status === 'ok'
       ? (() => {
-          const percentile = nullExplanation.data.variants.flipBoth.bioPercentile;
-          return percentile <= 0
-            ? "Mirroring the decoder's thrust and yaw signs still leaves biological at the bottom of the null distribution (0th percentile)."
-            : `Mirroring the decoder's thrust and yaw signs moves biological to the ${(percentile * 100).toFixed(1)}th percentile of the null distribution.`;
+          const percentileLabel = (value: number): string => `${(value * 100).toFixed(1)}th percentile`;
+          const baseline = rewiringNull.data.bioPercentile;
+          const mirrored = nullExplanation.data.variants.flipBoth.bioPercentile;
+          if (baseline <= 0 && mirrored <= 0) {
+            return "Mirroring the decoder's thrust and yaw signs still leaves biological at the bottom of the null distribution (0th percentile).";
+          }
+          return mirrored === baseline
+            ? `Mirroring the decoder's thrust and yaw signs leaves biological at the same ${percentileLabel(mirrored)} of the null distribution.`
+            : `Mirroring the decoder's thrust and yaw signs moves biological from the ${percentileLabel(baseline)} to the ${percentileLabel(mirrored)} of the null distribution.`;
         })()
       : ''
   );
@@ -321,23 +350,26 @@
            explains, under this model only, why biological scored where it
            did above. `'missing'` hides this whole block (the bean's own
            contract) — the histogram above still renders on its own,
-           unaffected. `'invalid'` shows an honest failure message instead of
-           the note. -->
+           unaffected. `'unavailable'`/`'invalid'` each show their own
+           honestly-worded message instead of the note, mirroring
+           `rewiringNull.status`'s own three-way split just below. -->
       {#if nullExplanation?.status === 'ok'}
         {@const explanation = nullExplanation.data}
         <div class="null-explanation-detail">
           <h4>Why biological scores low (under this model)</h4>
           <p>{explanation.finding.summarySentence}</p>
-          <ul class="metric-list">
-            {#each qualifyingMetricLines as line (line.key)}
-              <li>
-                {line.text}
-                {#if line.sensitive}
-                  — <a href={NULL_EXPLANATION_DISCLOSURE_URL} target="_blank" rel="noreferrer">definition-sensitive, see disclosure</a>
-                {/if}
-              </li>
-            {/each}
-          </ul>
+          {#if qualifyingMetricLines.length > 0}
+            <ul class="metric-list">
+              {#each qualifyingMetricLines as line (line.key)}
+                <li>
+                  {line.text}
+                  {#if line.sensitive}
+                    — <a href={NULL_EXPLANATION_DISCLOSURE_URL} target="_blank" rel="noreferrer">definition-sensitive, see disclosure</a>
+                  {/if}
+                </li>
+              {/each}
+            </ul>
+          {/if}
           <p>{mirroredDecoderClause} {regimeClause}</p>
           <p class="disclaimer">
             This is a descriptive association within this model, not a cause. "Authored" means a fixed, hand-written decoder — not biology and not trained.
@@ -346,6 +378,14 @@
             <li><a href={NULL_EXPLANATION_REPORT_URL} target="_blank" rel="noreferrer">Full explanation report</a></li>
           </ul>
         </div>
+      {:else if nullExplanation?.status === 'unavailable'}
+        <!-- A fetch/network failure or an unexpected runtime error — not a
+             claim about the artifact's integrity, so this must not say
+             "failed verification" (mirrors `rewiringNull.status ===
+             'unavailable'` just below). -->
+        <p class="error-message">
+          Explanation could not be loaded: {nullExplanation.reason}
+        </p>
       {:else if nullExplanation?.status === 'invalid'}
         <p class="error-message">
           Explanation failed verification: {nullExplanation.reason}

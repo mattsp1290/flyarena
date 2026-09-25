@@ -451,7 +451,7 @@ describe('LedgerPanel', () => {
       pHigh: 1,
       bins: { edges: [-2, 0, 2, 4], counts: [0, 1, 1] }
     }
-  } as unknown as RewiringNullLoadResult;
+  } as unknown as Extract<RewiringNullLoadResult, { status: 'ok' }>;
 
   const nullExplanationOk = {
     status: 'ok',
@@ -627,7 +627,7 @@ describe('LedgerPanel', () => {
     );
   });
 
-  it('states a nonzero mirrored-decoder percentile and a failed regime gate in their own words', () => {
+  it('states a nonzero mirrored-decoder percentile (moved up from a 0th-percentile baseline) and a failed regime gate in their own words', () => {
     const movedUp = {
       status: 'ok',
       data: {
@@ -643,8 +643,64 @@ describe('LedgerPanel', () => {
       rewiringNull: rewiringNullOk,
       nullExplanation: movedUp
     });
-    expect(screen.getByText(/moves biological to the 33\.7th percentile/i)).toBeInTheDocument();
+    // rewiringNullOk.data.bioPercentile is 0 — the baseline is read from the
+    // real un-mirrored result, not assumed to be 0 (round-2 dual review,
+    // Important).
+    expect(screen.getByText(/moves biological from the 0\.0th percentile to the 33\.7th percentile/i)).toBeInTheDocument();
     expect(screen.getByText(/regime-invalid \(inconclusive\)/i)).toBeInTheDocument();
+  });
+
+  it('never says "still" when the mirrored percentile moved away from a nonzero baseline, and states both real values', () => {
+    const nonzeroBaseline = {
+      status: 'ok',
+      data: { ...rewiringNullOk.data, bioPercentile: 0.2 }
+    } as unknown as RewiringNullLoadResult;
+    // (typed via `RewiringNullLoadResult`, the full union — this value is
+    // only ever passed as a prop below, never narrowed with `.data` again)
+    render(LedgerPanel, {
+      manifest,
+      decoder: 'authored',
+      trainedReadout: undefined,
+      rewiringNull: nonzeroBaseline,
+      nullExplanation: nullExplanationOk
+    });
+    expect(screen.getByText(/moves biological from the 20\.0th percentile to the 0\.0th percentile/i)).toBeInTheDocument();
+    expect(screen.queryByText(/still leaves biological at the bottom/i)).not.toBeInTheDocument();
+  });
+
+  // Round-2 dual review, Important: `explain.py`'s `definitionSensitive`
+  // flag is computed only from its single top structural candidate, and is
+  // true only when *that* metric is `weightedInDegree:*` — never a blanket
+  // flag over every `feature`-kind qualifying metric.
+  it('flags only the weightedInDegree qualifying metric as definition-sensitive, never another feature-kind metric', () => {
+    const twoFeatureMetrics = {
+      status: 'ok',
+      data: {
+        ...nullExplanationOk.data,
+        finding: {
+          ...nullExplanationOk.data.finding,
+          qualifyingMetrics: [
+            { kind: 'feature', name: 'weightedInDegree:thrust', spearman: 0.394 },
+            { kind: 'feature', name: 'reciprocity', spearman: 0.35 }
+          ]
+        }
+      }
+    } as unknown as NullExplanationLoadResult;
+    const { container } = render(LedgerPanel, {
+      manifest,
+      decoder: 'authored',
+      trainedReadout: undefined,
+      rewiringNull: rewiringNullOk,
+      nullExplanation: twoFeatureMetrics
+    });
+    const sensitiveLinks = screen.getAllByRole('link', { name: /definition-sensitive/i });
+    expect(sensitiveLinks).toHaveLength(1);
+    const items = container.querySelectorAll('.metric-list li');
+    expect(items).toHaveLength(2);
+    expect(items[0].textContent).toMatch(/weighted in-degree/i);
+    expect(items[0].textContent).toMatch(/definition-sensitive/i);
+    expect(items[1].textContent).toMatch(/reciprocity/i);
+    expect(items[1].textContent).not.toMatch(/definition-sensitive/i);
   });
 
   it('shows the honest "Explanation failed verification" message when the null-explanation artifact is invalid', () => {
@@ -657,6 +713,20 @@ describe('LedgerPanel', () => {
     });
     const message = screen.getByText(/explanation failed verification/i);
     expect(message).toHaveTextContent(/sha256 mismatch/i);
+    expect(screen.queryByRole('heading', { name: /why biological scores low/i })).not.toBeInTheDocument();
+  });
+
+  it('shows a "could not be loaded" message (not "failed verification") when the null-explanation artifact is unavailable', () => {
+    render(LedgerPanel, {
+      manifest,
+      decoder: 'authored',
+      trainedReadout: undefined,
+      rewiringNull: rewiringNullOk,
+      nullExplanation: { status: 'unavailable', reason: 'network error (test)' }
+    });
+    const message = screen.getByText(/explanation could not be loaded/i);
+    expect(message).toHaveTextContent(/network error \(test\)/i);
+    expect(screen.queryByText(/explanation failed verification/i)).not.toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: /why biological scores low/i })).not.toBeInTheDocument();
   });
 

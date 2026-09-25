@@ -8,10 +8,13 @@ import { createCallbacks, createWorker, SEED, TOTAL_TICKS, useControllerTestLife
  * coverage for `onNullExplanation`, split into its own file (rather than
  * folded into `tests/unit/experiment-controller.test.ts`, which is already
  * near the thermo review's 1000-line threshold — see that file's own doc
- * comment for the precedent). Mirrors
- * `experiment-controller.test.ts`'s "ExperimentController rewiring-null
- * loading (WP4)" describe block structurally, since `onNullExplanation` is
- * chained onto the exact same promise as `onRewiringNull`.
+ * comment for the precedent). Mirrors `experiment-controller.test.ts`'s
+ * "ExperimentController rewiring-null loading (WP4)" describe block
+ * structurally: `onNullExplanation` is sequenced after `onRewiringNull`'s
+ * own loader settles (`controller.ts`'s `nullLoad`), but fired from an
+ * independent promise fork, so the two host callbacks can never take each
+ * other down (see the "still fires onNullExplanation even when the
+ * onRewiringNull host callback throws" test below).
  */
 
 const { trackController } = useControllerTestLifecycle();
@@ -55,7 +58,7 @@ describe('ExperimentController null-explanation loading (WP4 of .agents/plans/nu
     }
   });
 
-  it('is "missing" when the injectable loadRewiringNull leaves the manifest\'s rewiringNull entry stubbed away, mirroring a manifest built before either WP shipped', async () => {
+  it('is "missing" when the injectable loadNullExplanation directly returns a stubbed "missing" result', async () => {
     const callbacks = createCallbacks();
     const controller = new ExperimentController({
       seed: SEED,
@@ -92,6 +95,20 @@ describe('ExperimentController null-explanation loading (WP4 of .agents/plans/nu
   });
 
   /**
+   * A macrotask flush (`setTimeout(0)`), not a fixed count of
+   * `await Promise.resolve()` hops (round-2 dual review, Important —
+   * empirically confirmed: two hops settle *before* the chained
+   * `loadExplanation(...).catch(...)`'s own inner-promise adoption
+   * completes, which made both the negative assertion below and its
+   * `destroyed`-guard removal pass vacuously). `flush()` drains every queued
+   * microtask regardless of how many hops the real chain has, and is
+   * exercised by a genuine positive control just below so a future chain
+   * change can never silently make the negative assertion pass for the
+   * wrong reason again.
+   */
+  const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+  /**
    * Same "actual post-ready race" coverage `experiment-controller.test.ts`
    * gives `onRewiringNull`'s own `destroyed` guard, for this load's guard.
    */
@@ -117,20 +134,52 @@ describe('ExperimentController null-explanation loading (WP4 of .agents/plans/nu
 
     controller.dispose();
     resolveExplanation({ status: 'missing', reason: 'settled after dispose' });
-    await Promise.resolve();
-    await Promise.resolve();
+    await flush();
 
     expect(callbacks.nullExplanationResults).toHaveLength(0);
   });
 
   /**
-   * Mirrors `experiment-controller.test.ts`'s "maps a rejecting
-   * loadRewiringNull to an 'unavailable' onRewiringNull result" test, but
-   * for `loadNullExplanation`: `NullExplanationLoadResult` has no
-   * `'unavailable'` variant of its own (`loadPositions`'s exact precedent),
-   * so an unexpected throw maps to `'invalid'` instead.
+   * Positive control for the test above: the identical setup, minus
+   * `dispose()`. Proves `flush()` waits long enough for the result to land
+   * when nothing should be dropping it — without this, a `flush()` that
+   * resolved too early would make the test above pass for the wrong reason
+   * (never actually reaching the callback either way).
    */
-  it('maps a rejecting loadNullExplanation to an "invalid" onNullExplanation result instead of an unhandled rejection', async () => {
+  it('(positive control) the same settle-after-a-delay setup without dispose() reports the result after flush()', async () => {
+    let resolveExplanation!: (result: NullExplanationLoadResult) => void;
+    const callbacks = createCallbacks();
+    const controller = new ExperimentController({
+      seed: SEED,
+      totalTicks: TOTAL_TICKS,
+      initialTopology: { left: 'biological', right: 'rewired' },
+      createWorker,
+      callbacks,
+      loadNullExplanation: () =>
+        new Promise((resolve) => {
+          resolveExplanation = resolve;
+        })
+    });
+    trackController(controller);
+
+    await controller.initialize();
+    expect(callbacks.nullExplanationResults).toHaveLength(0);
+
+    resolveExplanation({ status: 'missing', reason: 'settled without dispose' });
+    await flush();
+
+    expect(callbacks.nullExplanationResults).toHaveLength(1);
+  });
+
+  /**
+   * Mirrors `experiment-controller.test.ts`'s "maps a rejecting
+   * loadRewiringNull to an 'unavailable' onRewiringNull result" test:
+   * `NullExplanationLoadResult` now has its own `'unavailable'` variant
+   * (round-2 dual review, Important — an earlier version mapped this to
+   * `'invalid'`, which `LedgerPanel.svelte` renders as "Explanation failed
+   * verification" even though nothing was actually verified).
+   */
+  it('maps a rejecting loadNullExplanation to an "unavailable" onNullExplanation result instead of an unhandled rejection', async () => {
     const callbacks = createCallbacks();
     const controller = new ExperimentController({
       seed: SEED,
@@ -148,8 +197,38 @@ describe('ExperimentController null-explanation loading (WP4 of .agents/plans/nu
 
     expect(callbacks.nullExplanationResults).toHaveLength(1);
     const result = callbacks.nullExplanationResults[0];
-    expect(result.status).toBe('invalid');
-    if (result.status === 'invalid') expect(result.reason).toMatch(/unexpected error.*boom/);
+    expect(result.status).toBe('unavailable');
+    if (result.status === 'unavailable') expect(result.reason).toMatch(/unexpected error.*boom/);
+  });
+
+  /**
+   * Round-2 dual review, Important: an earlier version chained
+   * `loadExplanation`/`onNullExplanation` directly after the
+   * `onRewiringNull(result)` callback call, so a throwing `onRewiringNull`
+   * host callback silently skipped the null-explanation load too — the two
+   * host callbacks must stay independent (`controller.ts`'s `nullLoad` doc
+   * comment).
+   */
+  it('still fires onNullExplanation even when the onRewiringNull host callback throws', async () => {
+    const callbacks = createCallbacks();
+    callbacks.onRewiringNull = () => {
+      throw new Error('onRewiringNull host callback boom');
+    };
+    const controller = new ExperimentController({
+      seed: SEED,
+      totalTicks: TOTAL_TICKS,
+      initialTopology: { left: 'biological', right: 'rewired' },
+      createWorker,
+      callbacks,
+      loadNullExplanation: async () => ({ status: 'missing', reason: 'stubbed for this test' })
+    });
+    trackController(controller);
+
+    await controller.initialize();
+
+    expect(callbacks.errors.some((message) => message.includes('onRewiringNull host callback boom'))).toBe(true);
+    expect(callbacks.nullExplanationResults).toHaveLength(1);
+    expect(callbacks.nullExplanationResults[0]).toEqual({ status: 'missing', reason: 'stubbed for this test' });
   });
 
   it('routes a throwing onNullExplanation callback to onError instead of an unhandled rejection', async () => {

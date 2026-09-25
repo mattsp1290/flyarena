@@ -88,13 +88,15 @@ export interface ExperimentControllerCallbacks {
   onRewiringNull: (result: RewiringNullLoadResult) => void;
   /**
    * Fired once `loadNullExplanation` resolves (WP4 of
-   * `.agents/plans/null-explanation`) — chained after the rewiring-null load
-   * above (`initialize()`'s own doc comment explains why: same fetch, no
-   * duplicate request, and this note's cross-check needs `manifest`, not the
-   * resolved rewiring-null data). Like `onRewiringNull`, this never blocks
-   * reaching `ready`. The host's hook for the ledger panel's finding note,
-   * rendered next to `NullHistogram.svelte` inside the "Topology null
-   * distribution" section.
+   * `.agents/plans/null-explanation`) — sequenced after the rewiring-null
+   * load settles (`initialize()`'s own `nullLoad` doc comment explains why:
+   * never races ahead of the histogram's own load, and this note's
+   * cross-check needs `manifest`, not the resolved rewiring-null data), but
+   * fired independently of `onRewiringNull` itself (a throwing
+   * `onRewiringNull` host callback must never also skip this one). Like
+   * `onRewiringNull`, this never blocks reaching `ready`. The host's hook
+   * for the ledger panel's finding note, rendered next to
+   * `NullHistogram.svelte` inside the "Topology null distribution" section.
    */
   onNullExplanation: (result: NullExplanationLoadResult) => void;
   /**
@@ -372,7 +374,19 @@ export class ExperimentController {
     // would propagate out of `initialize()` synchronously, after `onManifest`
     // has already fired, bypassing both `.catch`es below entirely (round-2
     // dual review, Suggestion).
-    void Promise.resolve()
+    // Never rejects (`loadNull` failures are converted to a resolved
+    // `'unavailable'` status right here) — both `nullLoad.then(...)` chains
+    // below fork off this *settled* promise independently, rather than one
+    // chaining onto the other's own `.then((result) => onRewiringNull(...))`
+    // step. That independence matters (round-2 dual review, Important): an
+    // earlier version chained the null-explanation load directly after the
+    // `onRewiringNull(result)` callback call, so a throwing `onRewiringNull`
+    // host callback (host code, e.g. `App.svelte`) silently skipped the
+    // null-explanation load too, contradicting this method's own "attempted
+    // unconditionally" comment below. Forking both chains off `nullLoad`
+    // instead means the two host callbacks (`onRewiringNull`,
+    // `onNullExplanation`) can never take each other down.
+    const nullLoad = Promise.resolve()
       .then(() => loadNull(artifacts.manifest, dataBaseUrl))
       .catch(
         // `'unavailable'`, not `'invalid'` (thermo review, Suggestion): this
@@ -383,34 +397,47 @@ export class ExperimentController {
           status: 'unavailable',
           reason: `unexpected error while loading the rewiring null: ${error instanceof Error ? error.message : String(error)}`
         })
-      )
+      );
+
+    void nullLoad
       .then((result) => {
         if (this.destroyed) return;
         this.options.callbacks.onRewiringNull(result);
       })
+      .catch((error: unknown) => {
+        if (this.destroyed) return;
+        this.options.callbacks.onError(error instanceof Error ? error.message : String(error));
+      });
+
+    // WP4 of `.agents/plans/null-explanation` (`04-ledger-note.md`): "Load
+    // after the null result" — sequenced after `nullLoad` *settles* (so it
+    // never races ahead of the null histogram's own load and never issues a
+    // duplicate fetch for the rewiring-null artifact), but forked off that
+    // same promise rather than chained after the `onRewiringNull` callback
+    // above (see the comment on `nullLoad` for why). `loadExplanation` only
+    // needs `manifest`/`dataBaseUrl` (its own cross-check re-reads
+    // `manifest.rewiringNull.sha256` directly, not the resolved
+    // `RewiringNullLoadResult`), so it is attempted here unconditionally,
+    // independent of whichever status the null load itself resolved to —
+    // and independent of whether `onRewiringNull` throws.
+    void nullLoad
       .then(() =>
-        // WP4 of `.agents/plans/null-explanation` (`04-ledger-note.md`):
-        // "Load after the null result" — chained onto this same promise
-        // (after `onRewiringNull` has already fired above) so it never races
-        // ahead of the null histogram's own load and never issues a
-        // duplicate fetch for the rewiring-null artifact. `loadExplanation`
-        // only needs `manifest`/`dataBaseUrl` (its own cross-check re-reads
-        // `manifest.rewiringNull.sha256` directly, not the resolved
-        // `RewiringNullLoadResult` above), so it is attempted here
-        // unconditionally, independent of whichever status the null load
-        // itself resolved to. The leading `.catch` mirrors the null load's
-        // own (`loadPositions`'s exact "unexpected error -> 'invalid'"
-        // precedent, since `NullExplanationLoadResult` has no `'unavailable'`
-        // variant of its own).
-        loadExplanation(artifacts.manifest, dataBaseUrl).catch(
-          (error: unknown): NullExplanationLoadResult => ({
-            status: 'invalid',
-            reason: `unexpected error while loading the null explanation: ${error instanceof Error ? error.message : String(error)}`
-          })
-        )
+        this.destroyed
+          ? undefined
+          : loadExplanation(artifacts.manifest, dataBaseUrl).catch(
+              // `'unavailable'`, not `'invalid'` (mirrors `nullLoad`'s own
+              // catch just above, and `NullExplanationLoadResult`'s doc
+              // comment): a genuine runtime/JS error is not a verification
+              // failure, and `LedgerPanel.svelte` renders `'invalid'` as
+              // "Explanation failed verification".
+              (error: unknown): NullExplanationLoadResult => ({
+                status: 'unavailable',
+                reason: `unexpected error while loading the null explanation: ${error instanceof Error ? error.message : String(error)}`
+              })
+            )
       )
       .then((result) => {
-        if (this.destroyed) return;
+        if (this.destroyed || result === undefined) return;
         this.options.callbacks.onNullExplanation(result);
       })
       .catch((error: unknown) => {

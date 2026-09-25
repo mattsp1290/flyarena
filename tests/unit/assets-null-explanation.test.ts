@@ -49,13 +49,14 @@ describe('loadNullExplanation (against the real committed WP3 artifact)', () => 
     expect(result.status).toBe('missing');
   });
 
-  // `loadPositions`'s exact precedent (`assets.ts`): a fetch/network failure
-  // is folded into `'missing'` too, not a fourth `'unavailable'` state — see
-  // `NullExplanationLoadResult`'s own doc comment for why.
-  it('is "missing" (never throws) when the artifact 404s', async () => {
+  // `'unavailable'`, not `'missing'` (round-2 dual review, Important): a
+  // 404/network failure is a genuine fetch failure, distinct from "the
+  // manifest has no entry at all" — mirrors `loadRewiringNull`'s own
+  // `'absent'`/`'unavailable'` split.
+  it('is "unavailable" (never throws) when the artifact 404s', async () => {
     vi.stubGlobal('fetch', async () => new Response(null, { status: 404, statusText: 'Not Found' }));
     const result = await loadNullExplanation(manifest, '/data');
-    expect(result.status).toBe('missing');
+    expect(result.status).toBe('unavailable');
   });
 
   it('is "invalid" with a sha256 reason when null-explanation-v1.json is tampered', async () => {
@@ -196,5 +197,36 @@ describe('loadNullExplanation (shape validation, with a synthetic manifest sha25
     const result = await loadNullExplanation(manifestForBody, '/data');
     expect(result.status).toBe('invalid');
     if (result.status === 'invalid') expect(result.reason).toMatch(/missing rewiringNull\.sha256/);
+  });
+
+  // Mirrors `loadRewiringNull`'s own recomputed-rank-statistics precedent:
+  // a hash-valid artifact can still ship internally-contradictory numbers.
+  it('is "invalid" when finding.regimeInvalid disagrees with regime.gatePassed', async () => {
+    const { manifest: manifestForBody } = manifestServing({
+      ...validArtifact,
+      regime: { gatePassed: true },
+      finding: { ...validArtifact.finding, regimeInvalid: true }
+    });
+    const result = await loadNullExplanation(manifestForBody, '/data');
+    expect(result.status).toBe('invalid');
+    if (result.status === 'invalid') expect(result.reason).toMatch(/regimeInvalid disagrees with regime\.gatePassed/);
+  });
+
+  // Exercises the true `parse-error` path (sha256-matching bytes that are
+  // not valid JSON) directly — distinct from the "real committed artifact"
+  // describe block's tampered-bytes test above, whose served bytes never
+  // match the real manifest's sha256 in the first place, so it only ever
+  // exercises the hash-mismatch branch.
+  it('is "invalid" when the sha256-matching bytes are not valid JSON (exercises the JSON.parse failure path specifically)', async () => {
+    const raw = 'not json';
+    const hash = sha256Hex(raw);
+    vi.stubGlobal('fetch', async () => new Response(raw, { status: 200, headers: { 'content-type': 'application/json' } }));
+    const manifestForBody: ArenaManifest = {
+      ...manifest,
+      nullExplanation: { artifact: 'null-explanation-v1.json', sha256: hash }
+    };
+    const result = await loadNullExplanation(manifestForBody, '/data');
+    expect(result.status).toBe('invalid');
+    if (result.status === 'invalid') expect(result.reason).toMatch(/not valid JSON/i);
   });
 });
