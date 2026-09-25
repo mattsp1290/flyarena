@@ -111,16 +111,25 @@ const DIVERGING_HIGH: readonly [number, number, number] = [213 / 255, 94 / 255, 
  * background is near-black (`ActivityScene.ts`'s `#05070c`), so blending
  * toward white makes an "unreliable, de-emphasized" neuron the *highest*-
  * contrast, most visually prominent point on screen — the opposite of the
- * intended effect, and especially severe for the biological graph, where the
- * shared `absMax` (dominated by the rewired graph's larger effects) leaves
- * even FDR-significant biological neurons only faintly tinted to begin with.
- * This dim, low-saturation neutral instead reads as visually quiet against
- * the dark canvas, the same way `ActivityScene.ts#NO_DATA_COLOR` is a muted
- * (not bright) grey for the same reason — but deliberately a different,
- * darker value than `NO_DATA_COLOR` so "unreliable effect, still has atlas
- * coverage" is never visually confused with "no lesion data at all" (a real
- * risk a review pass flagged: the two states mean different things and must
- * stay visually distinguishable).
+ * intended effect. This value is itself considerably darker than
+ * `ActivityScene.ts#NO_DATA_COLOR` (a muted, not bright, grey for the same
+ * "de-emphasize, don't fabricate prominence" reason), and the two are kept
+ * distinct on purpose — "unreliable effect, still has atlas coverage" must
+ * never be visually confused with "no lesion data at all".
+ *
+ * Round-2, round-2 (a second dual review pass): because
+ * `NON_SIGNIFICANT_BLEND` is 60%, not 100% (`activity-layout.ts` keeps 40%
+ * of the neuron's own raw color on purpose — see that constant's doc
+ * comment — so a faded neuron's sign/magnitude tint is never fully erased),
+ * a neuron whose *raw* color was already near `DIVERGING_MID` (near-zero
+ * effect, common on the biological graph — see that module's own doc
+ * comment on the shared-`absMax` scale) still blends out closer to a
+ * middling grey (~0.4 + 0.6x this value, well above `NO_DATA_COLOR`) than
+ * to this constant's own dark value. That residual brightness is an honest
+ * consequence of keeping some raw-color information visible even while
+ * de-emphasized, not a bug — but it means this constant is a *ceiling* on
+ * how de-emphasized a faded point can look, not a guarantee that every
+ * faded point reads as dark.
  */
 export const DIVERGING_FADE_TARGET: readonly [number, number, number] = [0.14, 0.15, 0.17];
 

@@ -401,13 +401,15 @@
   /**
    * Fetches, sha256-verifies, and cross-checks the lesion atlas the first
    * time it is needed (WP3's "load the atlas only when the mode is first
-   * selected" non-negotiable) and memoizes the result so a later mode
-   * switch, or the reactive `$effect` below re-applying colors after a
-   * topology switch, never re-fetches. Returns `undefined` (never a
-   * `status`) only when `manifest`/`biologicalGraph` have not arrived from
-   * `App.svelte` yet — a real, if narrow, race the caller must also handle,
-   * since a user could in principle click the radio before `onManifest` has
-   * fired.
+   * selected" non-negotiable). An `'ok'`/`'missing'`/`'invalid'` result is
+   * memoized into `lesionAtlasStatus` so a later mode switch, or the
+   * reactive `$effect` below re-applying colors after a topology switch,
+   * never re-fetches — but an `'unavailable'` result (fetch/network
+   * failure) is deliberately *not* memoized this way; see that branch
+   * below. Returns `undefined` (never a `status`) only when
+   * `manifest`/`biologicalGraph` have not arrived from `App.svelte` yet —
+   * a real, if narrow, race the caller must also handle, since a user
+   * could in principle click the radio before `onManifest` has fired.
    */
   const ensureLesionAtlasLoaded = async (): Promise<LesionAtlasLoadResult | undefined> => {
     if (lesionAtlasStatus) return lesionAtlasStatus;
@@ -426,10 +428,15 @@
     if (result.status === 'unavailable') {
       // Round-2 dual review (Important): a fetch/network failure is
       // retryable, unlike a genuinely missing manifest entry or a hash/
-      // shape failure — clearing the memoized promise (but not returning
-      // the result as-is) lets the *next* mode selection try the fetch
-      // again instead of permanently disabling the mode for the rest of
-      // the session over one dropped request.
+      // shape failure. The caller (`switchColorMode`) still receives this
+      // exact `result` on this call (so *this* selection attempt reports
+      // the real reason), but it is deliberately never written into
+      // `lesionAtlasStatus` (the `if (lesionAtlasStatus) return ...` guard
+      // above would otherwise short-circuit every later call forever) —
+      // clearing the memoized promise here is what lets the *next* mode
+      // selection actually retry the fetch instead of permanently
+      // disabling the mode for the rest of the session over one dropped
+      // request.
       lesionAtlasLoadPromise = undefined;
       lesionAtlasTransientReason = result.reason;
     } else {

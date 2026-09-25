@@ -559,6 +559,54 @@ describe('ActivityPanel lesion-effect color mode (WP3)', () => {
     expect(loadLesionAtlas).not.toHaveBeenCalled();
   });
 
+  it('a transient "unavailable" (fetch/network) failure shows a non-blocking hint and retries on the next selection, instead of permanently disabling the mode', async () => {
+    // Round-2 dual review (Important — both reviewers independently flagged
+    // this exact gap): this is the one behavior the whole point of adding
+    // `'unavailable'` (as distinct from `'missing'`/`'invalid'`) exists for,
+    // and it previously had no test — a regression reverting the "don't
+    // memoize an unavailable result" fix in `ensureLesionAtlasLoaded` would
+    // have passed the full suite undetected.
+    vi.mocked(loadLesionAtlas)
+      .mockResolvedValueOnce({ status: 'unavailable', reason: 'network hiccup (test)' })
+      .mockResolvedValueOnce(fakeLesionAtlasOk());
+    const runner = makeRunner();
+    render(ActivityPanel, {
+      runner,
+      positionsStatus: okPositionsStatus,
+      telemetry: undefined,
+      topologySwitchPending: false,
+      manifest: fakeManifest(),
+      biologicalGraph: fakeBiologicalGraph,
+      topology: { left: 'biological', right: 'rewired' }
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    await waitFor(() => expect(instances).toHaveLength(1));
+
+    const lesionRadio = screen.getByRole('radio', { name: /lesion effect \(offline\)/i });
+    await fireEvent.click(lesionRadio);
+
+    // First attempt fails transiently: the radio stays enabled (not the
+    // permanently-disabling path `lesionOptionDisabledReason` drives), a
+    // non-blocking hint names the reason, and the mode stays on Live.
+    await waitFor(() => expect(loadLesionAtlas).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByText(/could not be loaded \(retrying is available\)/i)).toBeInTheDocument());
+    expect(screen.getByText(/network hiccup \(test\)/i)).toBeInTheDocument();
+    expect(lesionRadio).toBeEnabled();
+    expect(lesionRadio).not.toBeChecked();
+    expect(instances[0].setMode).not.toHaveBeenCalledWith('lesion');
+
+    // Selecting Lesion again retries the fetch (not a cached failure) and
+    // this time succeeds.
+    await fireEvent.click(lesionRadio);
+    await waitFor(() => expect(loadLesionAtlas).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(instances[0].setMode).toHaveBeenCalledWith('lesion'));
+    expect(lesionRadio).toBeChecked();
+    // The transient hint from the earlier failed attempt is gone now that
+    // the mode is active.
+    expect(screen.queryByText(/could not be loaded \(retrying is available\)/i)).not.toBeInTheDocument();
+  });
+
   it('selecting Lesion effect loads the atlas once, disables streaming, and paints static colors for both arms', async () => {
     vi.mocked(loadLesionAtlas).mockResolvedValue(fakeLesionAtlasOk());
     const runner = makeRunner();
@@ -737,6 +785,31 @@ describe('ActivityPanel lesion-effect color mode (WP3)', () => {
 
     await waitFor(() => expect(instances[0].clear).toHaveBeenCalledWith('left'));
     expect(instances[0].clear).toHaveBeenCalledWith('right');
+
+    // Round-2, round-2 dual review (Important): the mocked `ActivityScene`
+    // is a plain spy that doesn't itself gate `clear()` on `mode` the way
+    // the real `ActivityScene.ts` does (`clear()` is a no-op there while
+    // `this.mode === 'lesion'`) — so the two assertions above alone would
+    // still pass even if `switchColorMode` called `scene.clear()` *before*
+    // `scene.setMode('live')`, which against the real scene would silently
+    // no-op and reproduce the original bug. Assert the real call order
+    // directly against both mocks' own `invocationCallOrder`.
+    //
+    // `setMode('live')` is called *twice* in this test: once from
+    // `expand()`'s own initial sync (`colorMode` starts `'live'`, before the
+    // user ever selects Lesion) and once from this test's actual switch
+    // back to Live at the end — `lastIndexOf`, not `findIndex`, to get the
+    // one this assertion actually cares about (an earlier version of this
+    // test used `findIndex` here, found the *first* `'live'` call from
+    // `expand()` instead, and passed for the wrong reason regardless of
+    // `switchColorMode`'s own call order — caught by mutation-testing this
+    // assertion itself, not just the source fix it guards).
+    const setModeCallArgs = instances[0].setMode.mock.calls.map((call) => call[0]);
+    const setModeLiveCallIndex = setModeCallArgs.lastIndexOf('live');
+    expect(setModeLiveCallIndex).toBeGreaterThanOrEqual(0);
+    const setModeLiveOrder = instances[0].setMode.mock.invocationCallOrder[setModeLiveCallIndex];
+    const clearLeftOrder = instances[0].clear.mock.invocationCallOrder[0];
+    expect(clearLeftOrder).toBeGreaterThan(setModeLiveOrder);
   });
 
   it('a topology change while lesion mode is active re-applies static colors for the changed arm (plan requirement)', async () => {
@@ -772,10 +845,14 @@ describe('ActivityPanel lesion-effect color mode (WP3)', () => {
     });
 
     await waitFor(() => expect(instances[0].setNoLesionData).toHaveBeenCalledWith('right'));
-    // The left arm's topology did not change — it must not be repainted
-    // with the biological effect (and if it were, it would still use the
-    // right effect data on a bug that ignored `agentId`); asserting the
-    // right arm's own call proves the effect actually re-ran per-arm.
+    // Round-2 dual review (comment accuracy): the `$effect` re-applies
+    // colors for *both* arms on every rerun (including the left arm, whose
+    // topology did not change here) — this assertion is not about whether
+    // the left arm was repainted, but that the *right* arm, now
+    // disconnected, was correctly routed to `setNoLesionData` and never to
+    // `setStaticColors` (which would mean it kept showing stale rewired-arm
+    // colors, or worse, picked up the left arm's biological data on a bug
+    // that ignored `agentId`).
     expect(instances[0].setStaticColors).not.toHaveBeenCalledWith('right', expect.anything(), expect.anything(), expect.anything());
   });
 

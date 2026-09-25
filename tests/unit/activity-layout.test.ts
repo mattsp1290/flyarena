@@ -255,25 +255,34 @@ describe('writeEffectColors (WP3 lesion-effect color mode)', () => {
     expect(out[0]).toBeLessThan(0.9);
   });
 
-  it('writes only the requested indices, into the caller-owned buffer, never allocating, and uses each slot\'s own neuron data (not positional/identity indexing)', () => {
-    // Non-identity index order (thermo review S6/S3: a prior version of this
-    // test used a 1-element buffer with identity indices, which would still
-    // pass a regression that read `effect[k]`/`emphasize[k]` instead of
-    // `effect[indices[k]]`/`emphasize[indices[k]]`). Neuron 2 (effect +10,
-    // significant) is written to slot 0; neuron 0 (effect -10, significant)
-    // to slot 1 — every neuron's actual index/data is distinguishable in the
-    // output.
-    const effect = Float32Array.from([-10, 0, 10]);
-    const emphasize = [true, true, true];
-    const indices = Int32Array.from([2, 0]);
+  it('writes only the requested indices, into the caller-owned buffer, never allocating, and uses each slot\'s own neuron data for BOTH effect and emphasize (not positional/identity indexing)', () => {
+    // Round-2 dual review (Important — Architecture Maintainer): a prior
+    // version of this test used `emphasize = [true, true, true]` (uniform),
+    // so even though the *effect* indirection was exercised, an
+    // `emphasize[k]` (positional) vs `emphasize[indices[k]]` (correct)
+    // regression could never be distinguished — every entry was `true`
+    // either way. `indices = [1, 0]` (swapped) with genuinely different
+    // per-neuron `effect`/`emphasize` values makes *both* a positional-
+    // effect bug and a positional-emphasize bug independently detectable at
+    // every slot: slot 0 (neuron 1: effect +10, non-significant) would read
+    // as neuron 0's data (effect -10, significant) under either bug, and
+    // vice versa for slot 1.
+    const effect = Float32Array.from([-10, 10, 0]);
+    const emphasize = [true, false, true];
+    const indices = Int32Array.from([1, 0]);
     const out = new Float32Array(6).fill(-1);
 
     writeEffectColors(effect, emphasize, indices, 10, DIVERGING_LUT, out);
 
     const lastOffset = (COLORMAP_SIZE - 1) * 3;
-    expect(Array.from(out.subarray(0, 3))).toEqual([DIVERGING_LUT[lastOffset], DIVERGING_LUT[lastOffset + 1], DIVERGING_LUT[lastOffset + 2]]);
+    // slot 0 <- neuron 1 (effect +10, NOT significant): blended toward the fade target, not full saturation.
+    const expectedSlot0 = [0, 1, 2].map((c) => DIVERGING_LUT[lastOffset + c] * 0.4 + DIVERGING_FADE_TARGET[c] * 0.6);
+    expect(out[0]).toBeCloseTo(expectedSlot0[0], 5);
+    expect(out[1]).toBeCloseTo(expectedSlot0[1], 5);
+    expect(out[2]).toBeCloseTo(expectedSlot0[2], 5);
+    // slot 1 <- neuron 0 (effect -10, significant): full saturation, unblended.
     expect(Array.from(out.subarray(3, 6))).toEqual([DIVERGING_LUT[0], DIVERGING_LUT[1], DIVERGING_LUT[2]]);
-    // Neuron 1 (effect 0) is never requested — nothing here matches its color.
+    // Neuron 2 (effect 0) is never requested — nothing here matches its color.
     const centerOffset = DIVERGING_LUT_CENTER_INDEX * 3;
     expect(out[0]).not.toBeCloseTo(DIVERGING_LUT[centerOffset], 2);
     expect(out[3]).not.toBeCloseTo(DIVERGING_LUT[centerOffset], 2);
