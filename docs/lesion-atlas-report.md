@@ -50,13 +50,21 @@ should be read as reliable effects, not every neuron whose raw CI happens to exc
 | Neurons per graph | 1008 |
 | Evaluation shards | 18 |
 | Wall time | 7177.3s |
-| Per-episode time | 35.6 ms |
+| Per-episode time (wall-clock ÷ episode count, 18-way parallel -- **not** a serial-cost estimate; see "Timing correction" below) | 35.6 ms |
 | Bootstrap resamples | 10000 |
 | Bootstrap seed | 1279611721 |
 | FDR q | 0.05 |
 | Host | arm64, Node v22.22.3 |
 
 ## Results
+
+**On the "Role" column below.** `sensory`/`bridge`/`descending` is an anatomical/graph-position label from
+the connectome, not a functional claim: `sensory` neurons are exactly this model's hand-wired input-channel
+injection points (`src/lib/connectome/model.ts`'s external sensory drive, clamped into the network before any
+dynamics run), so lesioning one removes an entire raw observation stream, mechanically different from lesioning
+a `bridge`/`descending` neuron, which perturbs an internal or output computation instead. Sensory-lesion
+effects therefore partly reflect this hand-authored encoder, the same caveat "What this measures" already makes
+about the decoder side.
 
 ### Biological
 
@@ -69,30 +77,32 @@ should be read as reliable effects, not every neuron whose raw CI happens to exc
 | CIs excluding 0 (uncorrected) | 332 (expected by chance: 50.4) |
 | FDR-surviving neurons (q=0.05) | 280 |
 
+Sorted by raw \|effect\|, not by reliability: a larger effect is not automatically a more reliable one -- e.g. neuron 54 (effect -0.4504, CI (-0.9904, 0.0374), sd(diff) 2.6239, FDR: no) ranks above neuron 821 (effect 0.2061, CI (0.0052, 0.5071), sd(diff) 1.4034, FDR: yes) only because its point estimate is larger -- its per-seed variability (sd(diff)) is also larger, which is exactly what the wider CI (and the FDR flag) reflect.
+
 Top 20 neurons by \|effect\|:
 
-| Index | Body ID | Role | Effect | 95% CI | p (bootstrap) | FDR significant |
-| --- | --- | --- | --- | --- | --- | --- |
-| 54 | 10671 | bridge | -0.4504 | (-0.9904, 0.0374) | 0.0730 | no |
-| 3 | 10045 | descending | -0.4136 | (-0.8943, 0.0447) | 0.0740 | no |
-| 4 | 10056 | descending | -0.4111 | (-0.9048, 0.0354) | 0.0778 | no |
-| 14 | 10177 | descending | -0.3486 | (-0.9216, 0.2071) | 0.2222 | no |
-| 15 | 10180 | bridge | -0.3402 | (-0.8190, 0.0991) | 0.1350 | no |
-| 49 | 10581 | bridge | 0.3234 | (-0.0907, 0.7834) | 0.1246 | no |
-| 813 | 805722 | sensory | -0.2738 | (-0.7585, 0.1805) | 0.2336 | no |
-| 534 | 800473 | bridge | 0.2307 | (-0.1443, 0.6305) | 0.2336 | no |
-| 852 | 807736 | sensory | 0.2064 | (-0.1513, 0.5873) | 0.2272 | no |
-| 821 | 806053 | sensory | 0.2061 | (0.0052, 0.5071) | < 1e-4 | yes |
-| 866 | 808225 | sensory | 0.2041 | (0.0031, 0.5050) | < 1e-4 | yes |
-| 819 | 805939 | sensory | 0.2016 | (0.0008, 0.5025) | 0.0106 | yes |
-| 536 | 800485 | bridge | 0.2003 | (-0.0003, 0.5010) | 0.1172 | no |
-| 31 | 10286 | descending | 0.1994 | (0.0003, 0.4790) | 0.0226 | no |
-| 814 | 805733 | sensory | -0.1917 | (-0.6037, 0.1931) | 0.3236 | no |
-| 29 | 10281 | descending | -0.1862 | (-0.7218, 0.3298) | 0.4884 | no |
-| 848 | 807446 | sensory | 0.1819 | (-0.1781, 0.5633) | 0.3064 | no |
-| 251 | 27702 | bridge | 0.1809 | (-0.0397, 0.4813) | 0.1262 | no |
-| 2 | 10038 | descending | 0.1784 | (-0.1804, 0.5596) | 0.3564 | no |
-| 28 | 10274 | descending | -0.1733 | (-0.6294, 0.2300) | 0.4418 | no |
+| Index | Body ID | Role | Effect | 95% CI | sd(diff) | p (bootstrap) | FDR significant |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 54 | 10671 | bridge | -0.4504 | (-0.9904, 0.0374) | 2.6239 | 0.0730 | no |
+| 3 | 10045 | descending | -0.4136 | (-0.8943, 0.0447) | 2.4067 | 0.0740 | no |
+| 4 | 10056 | descending | -0.4111 | (-0.9048, 0.0354) | 2.4067 | 0.0778 | no |
+| 14 | 10177 | descending | -0.3486 | (-0.9216, 0.2071) | 2.8514 | 0.2222 | no |
+| 15 | 10180 | bridge | -0.3402 | (-0.8190, 0.0991) | 2.3252 | 0.1350 | no |
+| 49 | 10581 | bridge | 0.3234 | (-0.0907, 0.7834) | 2.1939 | 0.1246 | no |
+| 813 | 805722 | sensory | -0.2738 | (-0.7585, 0.1805) | 2.3743 | 0.2336 | no |
+| 534 | 800473 | bridge | 0.2307 | (-0.1443, 0.6305) | 1.9702 | 0.2336 | no |
+| 852 | 807736 | sensory | 0.2064 | (-0.1513, 0.5873) | 1.9004 | 0.2272 | no |
+| 821 | 806053 | sensory | 0.2061 | (0.0052, 0.5071) | 1.4034 | < 1e-4 | yes |
+| 866 | 808225 | sensory | 0.2041 | (0.0031, 0.5050) | 1.4032 | < 1e-4 | yes |
+| 819 | 805939 | sensory | 0.2016 | (0.0008, 0.5025) | 1.4017 | 0.0106 | yes |
+| 536 | 800485 | bridge | 0.2003 | (-0.0003, 0.5010) | 1.4009 | 0.1172 | no |
+| 31 | 10286 | descending | 0.1994 | (0.0003, 0.4790) | 1.2748 | 0.0226 | no |
+| 814 | 805733 | sensory | -0.1917 | (-0.6037, 0.1931) | 1.9986 | 0.3236 | no |
+| 29 | 10281 | descending | -0.1862 | (-0.7218, 0.3298) | 2.7038 | 0.4884 | no |
+| 848 | 807446 | sensory | 0.1819 | (-0.1781, 0.5633) | 1.9128 | 0.3064 | no |
+| 251 | 27702 | bridge | 0.1809 | (-0.0397, 0.4813) | 1.3550 | 0.1262 | no |
+| 2 | 10038 | descending | 0.1784 | (-0.1804, 0.5596) | 1.9018 | 0.3564 | no |
+| 28 | 10274 | descending | -0.1733 | (-0.6294, 0.2300) | 2.1868 | 0.4418 | no |
 
 ### Rewired seed 0
 
@@ -105,30 +115,32 @@ Top 20 neurons by \|effect\|:
 | CIs excluding 0 (uncorrected) | 486 (expected by chance: 50.4) |
 | FDR-surviving neurons (q=0.05) | 448 |
 
+Sorted by raw \|effect\|, not by reliability: two neurons with the same effect size can have very different per-seed variability (compare CI width and sd(diff) below), so a larger effect is not automatically a more reliable one -- only FDR-surviving neurons (see "Multiple comparisons" above) should be read as reliable effects.
+
 Top 20 neurons by \|effect\|:
 
-| Index | Body ID | Role | Effect | 95% CI | p (bootstrap) | FDR significant |
-| --- | --- | --- | --- | --- | --- | --- |
-| 31 | 10286 | descending | 1.3940 | (0.3296, 2.5881) | 0.0110 | yes |
-| 893 | 902565 | sensory | 0.9844 | (0.0343, 1.9870) | 0.0428 | no |
-| 105 | 12601 | descending | 0.9466 | (0.1745, 1.7978) | 0.0098 | yes |
-| 33 | 10301 | descending | 0.8759 | (0.1232, 1.6749) | 0.0164 | yes |
-| 776 | 803739 | sensory | 0.7724 | (-0.0735, 1.6785) | 0.0744 | no |
-| 22 | 10234 | descending | 0.7609 | (-0.0314, 1.6459) | 0.0608 | no |
-| 34 | 10360 | descending | 0.7588 | (-0.0035, 1.6059) | 0.0556 | no |
-| 28 | 10274 | descending | 0.7086 | (-0.0521, 1.5720) | 0.0672 | no |
-| 713 | 801756 | sensory | 0.7074 | (-0.0034, 1.4435) | 0.0432 | no |
-| 728 | 801960 | sensory | 0.6106 | (-0.0277, 1.2641) | 0.0540 | no |
-| 746 | 802409 | sensory | 0.5626 | (-0.0602, 1.2211) | 0.0802 | no |
-| 725 | 801906 | sensory | 0.5450 | (-0.1689, 1.3148) | 0.1402 | no |
-| 902 | 903119 | sensory | 0.5437 | (-0.2095, 1.4016) | 0.1724 | no |
-| 30 | 10283 | descending | 0.5036 | (-0.0734, 1.2035) | 0.0952 | no |
-| 37 | 10417 | descending | 0.4587 | (-0.1864, 1.2060) | 0.1788 | no |
-| 43 | 10520 | descending | 0.4446 | (-0.1957, 1.1620) | 0.1846 | no |
-| 24 | 10247 | descending | 0.4400 | (-0.1940, 1.1586) | 0.1816 | no |
-| 19 | 10221 | descending | 0.4120 | (-0.1614, 1.0321) | 0.1698 | no |
-| 18 | 10218 | descending | 0.3918 | (-0.3169, 1.1103) | 0.2832 | no |
-| 6 | 10090 | descending | 0.3889 | (-0.1703, 1.0014) | 0.1970 | no |
+| Index | Body ID | Role | Effect | 95% CI | sd(diff) | p (bootstrap) | FDR significant |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 31 | 10286 | descending | 1.3940 | (0.3296, 2.5881) | 5.7660 | 0.0110 | yes |
+| 893 | 902565 | sensory | 0.9844 | (0.0343, 1.9870) | 4.9679 | 0.0428 | no |
+| 105 | 12601 | descending | 0.9466 | (0.1745, 1.7978) | 4.0908 | 0.0098 | yes |
+| 33 | 10301 | descending | 0.8759 | (0.1232, 1.6749) | 3.9455 | 0.0164 | yes |
+| 776 | 803739 | sensory | 0.7724 | (-0.0735, 1.6785) | 4.5030 | 0.0744 | no |
+| 22 | 10234 | descending | 0.7609 | (-0.0314, 1.6459) | 4.1813 | 0.0608 | no |
+| 34 | 10360 | descending | 0.7588 | (-0.0035, 1.6059) | 4.1377 | 0.0556 | no |
+| 28 | 10274 | descending | 0.7086 | (-0.0521, 1.5720) | 4.1850 | 0.0672 | no |
+| 713 | 801756 | sensory | 0.7074 | (-0.0034, 1.4435) | 3.6479 | 0.0432 | no |
+| 728 | 801960 | sensory | 0.6106 | (-0.0277, 1.2641) | 3.3222 | 0.0540 | no |
+| 746 | 802409 | sensory | 0.5626 | (-0.0602, 1.2211) | 3.2995 | 0.0802 | no |
+| 725 | 801906 | sensory | 0.5450 | (-0.1689, 1.3148) | 3.8122 | 0.1402 | no |
+| 902 | 903119 | sensory | 0.5437 | (-0.2095, 1.4016) | 4.0185 | 0.1724 | no |
+| 30 | 10283 | descending | 0.5036 | (-0.0734, 1.2035) | 3.2456 | 0.0952 | no |
+| 37 | 10417 | descending | 0.4587 | (-0.1864, 1.2060) | 3.5668 | 0.1788 | no |
+| 43 | 10520 | descending | 0.4446 | (-0.1957, 1.1620) | 3.4819 | 0.1846 | no |
+| 24 | 10247 | descending | 0.4400 | (-0.1940, 1.1586) | 3.4123 | 0.1816 | no |
+| 19 | 10221 | descending | 0.4120 | (-0.1614, 1.0321) | 3.0556 | 0.1698 | no |
+| 18 | 10218 | descending | 0.3918 | (-0.3169, 1.1103) | 3.6827 | 0.2832 | no |
+| 6 | 10090 | descending | 0.3889 | (-0.1703, 1.0014) | 3.0306 | 0.1970 | no |
 
 ## Limitations
 
@@ -145,6 +157,7 @@ Top 20 neurons by \|effect\|:
   competitive one.
 - **No biological claim.** This describes how this specific hand-authored decoder and rate-model dynamics
   interact with the measured topology, not a measurement of the real fly's neural function.
+- **A small cluster of held-out seeds produces large single-seed outliers for a minority of neurons.** Biological: 96/1008 neurons (9.5%) have at least one held-out seed whose paired difference (lesioned - baseline) exceeds +5; these concentrate on a handful of seeds (30013 (72), 30065 (32), 30095 (26), 30046 (18), 30016 (2), 30029 (1)), consistent with a threshold/bistable-dynamics artifact rather than a baseline failure -- none of these seeds' own baseline scores are themselves extreme. This graph's own headline (largest-\|effect\|) neuron 54 (effect -0.4504): excluding its 2 most extreme seeds, the effect remains substantial (-0.2306, 51% of the full effect) -- broadly supported, not dependent on a couple of seeds. Rewired seed 0: 82/1008 neurons (8.1%) have at least one held-out seed whose paired difference (lesioned - baseline) exceeds +5; these concentrate on a handful of seeds (30071 (30), 30097 (29), 30093 (28), 30029 (24), 30033 (21), 30095 (19)), consistent with a threshold/bistable-dynamics artifact rather than a baseline failure -- none of these seeds' own baseline scores are themselves extreme. This graph's own headline (largest-\|effect\|) neuron 31 (effect 1.3940): excluding its 2 most extreme seeds, the effect remains substantial (0.9756, 70% of the full effect) -- broadly supported, not dependent on a couple of seeds. Both graphs' headline effects above are broadly supported, not single-seed artifacts; worth a check for future re-runs and for any consumer normalizing on the full effect range (e.g. a diverging-colormap \|effect\| max).
 - **Timing correction.** `.agents/plans/lesion-atlas/02-atlas-computation.md` projected "about 6 min at 18
   shards" for this run. The actual measured wall time was 119.6 minutes
   (7177.3s, see Parameters above) -- roughly 20x longer. The plan's

@@ -10,7 +10,7 @@
   "inputChannelCount": 8,
   "lesionAtlas": {
     "artifact": "lesion-atlas-v1.json",
-    "sha256": "b18fe1569ef49aa4095b20d301b0d3c3147b01f9da282f954cf9db6a12da15b1"
+    "sha256": "6e817e330cd45dfc615b4d03cf06f459b4a8e09c226c75c4ad13b57380267c94"
   },
   "license": "CC-BY-4.0",
   "neuronCount": 1008,
