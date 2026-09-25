@@ -16,7 +16,7 @@
   "neuronCount": 1008,
   "nullExplanation": {
     "artifact": "null-explanation-v1.json",
-    "sha256": "baabe4a149bfd7b5f48759ec2aa45098071ddf42c4bc2c38beabe6b95981834b"
+    "sha256": "e33e299148ca9975ead56cacc77844ae374ac4d98f62f0a59f2052e04b16ffd9"
   },
   "outputPopulationCount": 3,
   "positions": {
@@ -50,7 +50,7 @@
   },
   "rewiringNull": {
     "artifact": "rewiring-null-v1.json",
-    "sha256": "e1669220beb3999a2ffff1cb8e742117b16df02242ae6b6bffc6b2848f464482"
+    "sha256": "06294ee5d631e26669ae52c999534b959a4156fa1a558f47c335033a58c4005f"
   },
   "sourceDataset": "male-cns:v1.0 (Janelia FlyEM Male CNS connectome)"
 }

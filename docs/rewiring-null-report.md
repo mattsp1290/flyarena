@@ -35,6 +35,8 @@ null set `N` is the 500 rewired graphs' mean scores.
 | Substeps (K) | 4 |
 | Rewired graphs | 500 (seeds 0..499) |
 | Evaluation shards | 18 |
+| Wall time | 1610.3s |
+| Per-episode time | 32.1 ms |
 | Bootstrap resamples | 10000 |
 | Bootstrap seed | 1314212940 |
 | Histogram bins | 30 |
@@ -187,8 +189,8 @@ distinguishable at this sample size.
 Biological trained scores across the 3 `flyarena-bigq` replicas (trainer seeds
 101/202/303) span
 `62.7420` to `72.2304`
-(range `9.4884`) — **trainer-noise variance at fixed (biological) topology -- NOT comparable to the null's topology variance at a fixed trainer seed (bioPercentile, above); no overlap-based conclusion may be drawn from comparing the two.** — at the
-*same* biological topology. For context on how large this kind of noise alone can be: the merged
+(range `9.4884`). This is **trainer-noise variance at fixed (biological) topology -- NOT comparable to the null's topology variance at a fixed trainer seed (bioPercentile, above); no overlap-based conclusion may be drawn from comparing the two.**
+For context on how large this kind of noise alone can be: the merged
 [`trained-readout-v1.manifest.json`](../public/data/trained-readout-v1.manifest.json)'s recorded CUDA
 rerun of the shipped biological replica moved TS held-out `trained` fitness by
 `6.3540` (rerun minus original, that report's sign convention) —
@@ -196,9 +198,19 @@ rerun of the shipped biological replica moved TS held-out `trained` fitness by
 a claim that the two numbers should match. **This spread is not comparable to the 0.0%
 percentile above**: the spread measures trainer-seed/run-to-run noise at *fixed* topology; the percentile
 measures where one topology (biological, at trainer seed 101) falls among
-20 different topologies, each at the *same* one trainer seed. Whether these two
-numbers happen to overlap, and neither's size relative to the other, supports any conclusion about topology
-"mattering more or less" than trainer-seed noise.
+20 different topologies, each at the *same* one trainer seed. Neither whether these
+two numbers happen to overlap, nor either's size relative to the other, supports any conclusion about
+topology "mattering more or less" than trainer-seed noise.
+
+**Robustness of the headline percentile to which replica is used.** Ranking each of the
+3 biological replicas separately against the same
+20 rewired trained scores (same tie rule as above): trainer seed 101 (the headline above, and the seed the rewired runs were matched to) ranks at 0.0%, trainer seed 202 ranks at 40.0%, trainer seed 303 ranks at 0.0%. The headline 0.0% percentile above is therefore one sample from
+this trainer-seed-noise distribution, not a stable property of the biological topology: because
+trainer-seed variation at fixed topology (the `9.4884` spread above)
+is comparable in magnitude to the spread across the 20 rewirings (null IQR
+`5.7613`, std `11.8110`), this trained-readout comparison is **not
+robust to the choice of trainer-seed replica** and should not be read as biological reliably scoring lowest
+among the rewirings — no causal or superiority claim is made.
 
 ## Limitations
 
