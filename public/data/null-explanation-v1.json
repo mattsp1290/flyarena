@@ -1,0 +1,989 @@
+{
+  "calibration": {
+    "chanceRate": 0.0,
+    "metricsTested": 66,
+    "permutations": 1000
+  },
+  "finding": {
+    "categories": [
+      "linearPathway",
+      "structuralFeature"
+    ],
+    "ranked": [
+      "linearPathway",
+      "structuralFeature"
+    ],
+    "regimeInvalid": false,
+    "summarySentence": "Biological's low score is associated with: the linear transfer entry T:rightClearance->thrust sits outside the null's 2.5-97.5% range (rank correlation with score rho=0.467); the structural feature weightedInDegree:thrust sits outside the null's 2.5-97.5% range (rank correlation with score rho=0.394) -- a descriptive correlation, not a causal claim."
+  },
+  "host": {
+    "arch": "arm64",
+    "node": "v22.22.3"
+  },
+  "metrics": [
+    {
+      "bio": 0.010067731687991691,
+      "bioPercentile": 0.006,
+      "kind": "transfer",
+      "name": "T:foodBearing->thrust",
+      "nullMedian": 0.04348511652427045,
+      "p2_5": 0.014464744238001162,
+      "p97_5": 0.08630490811229082,
+      "spearman": -0.18945253381013524,
+      "spearmanCi": [
+        -0.27127169955335484,
+        -0.10530989009694289
+      ]
+    },
+    {
+      "bio": 0.025640409635507736,
+      "bioPercentile": 0.266,
+      "kind": "transfer",
+      "name": "T:foodBearing->yaw",
+      "nullMedian": 0.035275225228109275,
+      "p2_5": 0.011752689241270311,
+      "p97_5": 0.07220297328302047,
+      "spearman": -0.07635918543674175,
+      "spearmanCi": [
+        -0.16333521027853085,
+        0.015104131941536548
+      ]
+    },
+    {
+      "bio": 0.06118470510622244,
+      "bioPercentile": 0.844,
+      "kind": "transfer",
+      "name": "T:foodBearing->brake",
+      "nullMedian": 0.04322010213526235,
+      "p2_5": 0.016422038806008003,
+      "p97_5": 0.08147797904455678,
+      "spearman": 0.14252178608714436,
+      "spearmanCi": [
+        0.05237411899809242,
+        0.2322518177836597
+      ]
+    },
+    {
+      "bio": 0.00489783671735871,
+      "bioPercentile": 0.02,
+      "kind": "transfer",
+      "name": "T:foodDistance->thrust",
+      "nullMedian": 0.02900863718792425,
+      "p2_5": 0.007462658424149004,
+      "p97_5": 0.061809404751978526,
+      "spearman": 0.1718437593750375,
+      "spearmanCi": [
+        0.0820722339098283,
+        0.258419752218749
+      ]
+    },
+    {
+      "bio": 0.015219649270427345,
+      "bioPercentile": 0.24,
+      "kind": "transfer",
+      "name": "T:foodDistance->yaw",
+      "nullMedian": 0.02298438029985093,
+      "p2_5": 0.005917241715251208,
+      "p97_5": 0.055175928434003034,
+      "spearman": -0.030575258301033203,
+      "spearmanCi": [
+        -0.11880696072406534,
+        0.058494905798967836
+      ]
+    },
+    {
+      "bio": 0.04327699165716653,
+      "bioPercentile": 0.842,
+      "kind": "transfer",
+      "name": "T:foodDistance->brake",
+      "nullMedian": 0.02836073162976807,
+      "p2_5": 0.009793775335182886,
+      "p97_5": 0.060023121629764586,
+      "spearman": -0.1361626246504986,
+      "spearmanCi": [
+        -0.2228346316149827,
+        -0.049165764131880625
+      ]
+    },
+    {
+      "bio": -0.01703489711566496,
+      "bioPercentile": 0.0,
+      "kind": "transfer",
+      "name": "T:hazardBearing->thrust",
+      "nullMedian": 0.024594922096812542,
+      "p2_5": 0.006895265183216282,
+      "p97_5": 0.05224813100326243,
+      "spearman": 0.24924944499777998,
+      "spearmanCi": [
+        0.1660591434559041,
+        0.32836390557332895
+      ]
+    },
+    {
+      "bio": -0.0007904647081494685,
+      "bioPercentile": 0.0,
+      "kind": "transfer",
+      "name": "T:hazardBearing->yaw",
+      "nullMedian": 0.01895567214077761,
+      "p2_5": 0.0038242086058790955,
+      "p97_5": 0.045678877000515324,
+      "spearman": 0.02691428365713463,
+      "spearmanCi": [
+        -0.055700192380716565,
+        0.11307786330794505
+      ]
+    },
+    {
+      "bio": 0.029803594418232215,
+      "bioPercentile": 0.688,
+      "kind": "transfer",
+      "name": "T:hazardBearing->brake",
+      "nullMedian": 0.023729520046021507,
+      "p2_5": 0.006472668526314857,
+      "p97_5": 0.05294078281698994,
+      "spearman": -0.07655905823623295,
+      "spearmanCi": [
+        -0.161562558176901,
+        0.010122155382946234
+      ]
+    },
+    {
+      "bio": 0.0020508475079342907,
+      "bioPercentile": 0.008,
+      "kind": "transfer",
+      "name": "T:hazardDistance->thrust",
+      "nullMedian": 0.01625335018192417,
+      "p2_5": 0.003649202045747284,
+      "p97_5": 0.03562804845971932,
+      "spearman": 0.1877190548762195,
+      "spearmanCi": [
+        0.10202858620715993,
+        0.2709386446615114
+      ]
+    },
+    {
+      "bio": 0.005298060576968631,
+      "bioPercentile": 0.096,
+      "kind": "transfer",
+      "name": "T:hazardDistance->yaw",
+      "nullMedian": 0.013374594876420884,
+      "p2_5": 0.0019281892237356356,
+      "p97_5": 0.03093185984046333,
+      "spearman": 0.059372301489205956,
+      "spearmanCi": [
+        -0.02512403108059809,
+        0.14481246795783137
+      ]
+    },
+    {
+      "bio": 0.017775840518628176,
+      "bioPercentile": 0.55,
+      "kind": "transfer",
+      "name": "T:hazardDistance->brake",
+      "nullMedian": 0.01649811198916916,
+      "p2_5": 0.003652530696671743,
+      "p97_5": 0.033166504231049145,
+      "spearman": 0.04329799719198877,
+      "spearmanCi": [
+        -0.04635941516769398,
+        0.13139417273934198
+      ]
+    },
+    {
+      "bio": 0.002152455175662089,
+      "bioPercentile": 0.0,
+      "kind": "transfer",
+      "name": "T:forwardClearance->thrust",
+      "nullMedian": 0.019513711098169528,
+      "p2_5": 0.007855921785643177,
+      "p97_5": 0.03912663634345049,
+      "spearman": 0.3534047736190945,
+      "spearmanCi": [
+        0.27495257009425395,
+        0.42887167659235487
+      ]
+    },
+    {
+      "bio": 0.006691571516357344,
+      "bioPercentile": 0.1,
+      "kind": "transfer",
+      "name": "T:forwardClearance->yaw",
+      "nullMedian": 0.015892232283290897,
+      "p2_5": 0.0039378811340910775,
+      "p97_5": 0.03464726193197696,
+      "spearman": 0.010775179100716403,
+      "spearmanCi": [
+        -0.0746303158041897,
+        0.0986140280531509
+      ]
+    },
+    {
+      "bio": 0.01563472296297244,
+      "bioPercentile": 0.306,
+      "kind": "transfer",
+      "name": "T:forwardClearance->brake",
+      "nullMedian": 0.0197603630035842,
+      "p2_5": 0.006780393878533077,
+      "p97_5": 0.036349748923806526,
+      "spearman": -0.11054492217968871,
+      "spearmanCi": [
+        -0.19872118394737595,
+        -0.019239052265022594
+      ]
+    },
+    {
+      "bio": 0.0030176734695987503,
+      "bioPercentile": 0.01,
+      "kind": "transfer",
+      "name": "T:leftClearance->thrust",
+      "nullMedian": 0.016781631044479654,
+      "p2_5": 0.004514977268638678,
+      "p97_5": 0.03365309941277794,
+      "spearman": 0.2976446785787143,
+      "spearmanCi": [
+        0.21481459446609735,
+        0.37794285176904036
+      ]
+    },
+    {
+      "bio": 0.005661791388496055,
+      "bioPercentile": 0.05,
+      "kind": "transfer",
+      "name": "T:leftClearance->yaw",
+      "nullMedian": 0.014072588358200678,
+      "p2_5": 0.004048583117727423,
+      "p97_5": 0.028833243858974622,
+      "spearman": 0.001056004224016896,
+      "spearmanCi": [
+        -0.08218183723504023,
+        0.08359788590928041
+      ]
+    },
+    {
+      "bio": 0.015303660442922381,
+      "bioPercentile": 0.404,
+      "kind": "transfer",
+      "name": "T:leftClearance->brake",
+      "nullMedian": 0.01698392224792179,
+      "p2_5": 0.005899103535610271,
+      "p97_5": 0.03559986059966141,
+      "spearman": -0.07735509342037368,
+      "spearmanCi": [
+        -0.16510350287425216,
+        0.011271572019178583
+      ]
+    },
+    {
+      "bio": 0.0030867068716744976,
+      "bioPercentile": 0.006,
+      "kind": "transfer",
+      "name": "T:rightClearance->thrust",
+      "nullMedian": 0.020400241502824445,
+      "p2_5": 0.005461747163834823,
+      "p97_5": 0.044017410977135074,
+      "spearman": 0.4669248436993748,
+      "spearmanCi": [
+        0.39276590444870013,
+        0.5394541615696907
+      ]
+    },
+    {
+      "bio": 0.006745720934683556,
+      "bioPercentile": 0.08,
+      "kind": "transfer",
+      "name": "T:rightClearance->yaw",
+      "nullMedian": 0.016569936555645468,
+      "p2_5": 0.004990373728422042,
+      "p97_5": 0.03729784929559639,
+      "spearman": 0.1048498913995656,
+      "spearmanCi": [
+        0.015748831899603084,
+        0.18971101935557486
+      ]
+    },
+    {
+      "bio": 0.021814624494880454,
+      "bioPercentile": 0.564,
+      "kind": "transfer",
+      "name": "T:rightClearance->brake",
+      "nullMedian": 0.020163506347381996,
+      "p2_5": 0.0054858888354645564,
+      "p97_5": 0.04332712358236984,
+      "spearman": -0.05973182292729171,
+      "spearmanCi": [
+        -0.1447360728153287,
+        0.02694317020124876
+      ]
+    },
+    {
+      "bio": 0.0015466566399466508,
+      "bioPercentile": 0.01,
+      "kind": "transfer",
+      "name": "T:speed->thrust",
+      "nullMedian": 0.01976922569703049,
+      "p2_5": 0.004952365840073363,
+      "p97_5": 0.04311412149106084,
+      "spearman": 0.03666523466093864,
+      "spearmanCi": [
+        -0.05146295482621126,
+        0.12265637763321366
+      ]
+    },
+    {
+      "bio": 0.005250887220953538,
+      "bioPercentile": 0.08,
+      "kind": "transfer",
+      "name": "T:speed->yaw",
+      "nullMedian": 0.01667472447181658,
+      "p2_5": 0.002661291099094936,
+      "p97_5": 0.0362900219120076,
+      "spearman": 0.015254845019380077,
+      "spearmanCi": [
+        -0.07084207040894668,
+        0.10020124841349892
+      ]
+    },
+    {
+      "bio": 0.022019438359602416,
+      "bioPercentile": 0.612,
+      "kind": "transfer",
+      "name": "T:speed->brake",
+      "nullMedian": 0.01914020492064919,
+      "p2_5": 0.0042511260742688645,
+      "p97_5": 0.04129187707082263,
+      "spearman": -0.03126041304165217,
+      "spearmanCi": [
+        -0.11864634301641663,
+        0.05780229862932233
+      ]
+    },
+    {
+      "bio": 0.026430874343657203,
+      "bioPercentile": 0.718,
+      "kind": "derived",
+      "name": "turnGain",
+      "nullMedian": 0.015521962180713403,
+      "p2_5": -0.016936820981498353,
+      "p97_5": 0.05072790968291531,
+      "spearman": -0.09879005916023664,
+      "spearmanCi": [
+        -0.18929646400284236,
+        -0.010254224588862002
+      ]
+    },
+    {
+      "bio": 0.00489783671735871,
+      "bioPercentile": 0.02,
+      "kind": "derived",
+      "name": "approachGain",
+      "nullMedian": 0.02900863718792425,
+      "p2_5": 0.007462658424149004,
+      "p97_5": 0.061809404751978526,
+      "spearman": 0.1718437593750375,
+      "spearmanCi": [
+        0.08280000385715577,
+        0.25884220388370566
+      ]
+    },
+    {
+      "bio": 2.0,
+      "bioPercentile": 1.0,
+      "kind": "feature",
+      "name": "pathLength:foodBearing->thrust",
+      "nullMedian": 1.0,
+      "p2_5": 1.0,
+      "p97_5": 1.0,
+      "spearman": 0.0,
+      "spearmanCi": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "bio": 2.0,
+      "bioPercentile": 1.0,
+      "kind": "feature",
+      "name": "pathLength:foodBearing->yaw",
+      "nullMedian": 1.0,
+      "p2_5": 1.0,
+      "p97_5": 1.0,
+      "spearman": 0.0,
+      "spearmanCi": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "bio": 1.0,
+      "bioPercentile": 0.5,
+      "kind": "feature",
+      "name": "pathLength:foodBearing->brake",
+      "nullMedian": 1.0,
+      "p2_5": 1.0,
+      "p97_5": 1.0,
+      "spearman": 0.0,
+      "spearmanCi": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "bio": 2.0,
+      "bioPercentile": 1.0,
+      "kind": "feature",
+      "name": "pathLength:foodDistance->thrust",
+      "nullMedian": 1.0,
+      "p2_5": 1.0,
+      "p97_5": 1.0,
+      "spearman": 0.0,
+      "spearmanCi": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "bio": 2.0,
+      "bioPercentile": 1.0,
+      "kind": "feature",
+      "name": "pathLength:foodDistance->yaw",
+      "nullMedian": 1.0,
+      "p2_5": 1.0,
+      "p97_5": 1.0,
+      "spearman": 0.0,
+      "spearmanCi": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "bio": 1.0,
+      "bioPercentile": 0.5,
+      "kind": "feature",
+      "name": "pathLength:foodDistance->brake",
+      "nullMedian": 1.0,
+      "p2_5": 1.0,
+      "p97_5": 1.0,
+      "spearman": 0.0,
+      "spearmanCi": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "bio": 2.0,
+      "bioPercentile": 1.0,
+      "kind": "feature",
+      "name": "pathLength:hazardBearing->thrust",
+      "nullMedian": 1.0,
+      "p2_5": 1.0,
+      "p97_5": 1.0,
+      "spearman": 0.0,
+      "spearmanCi": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "bio": 2.0,
+      "bioPercentile": 1.0,
+      "kind": "feature",
+      "name": "pathLength:hazardBearing->yaw",
+      "nullMedian": 1.0,
+      "p2_5": 1.0,
+      "p97_5": 1.0,
+      "spearman": 0.0,
+      "spearmanCi": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "bio": 1.0,
+      "bioPercentile": 0.5,
+      "kind": "feature",
+      "name": "pathLength:hazardBearing->brake",
+      "nullMedian": 1.0,
+      "p2_5": 1.0,
+      "p97_5": 1.0,
+      "spearman": 0.0,
+      "spearmanCi": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "bio": 2.0,
+      "bioPercentile": 1.0,
+      "kind": "feature",
+      "name": "pathLength:hazardDistance->thrust",
+      "nullMedian": 1.0,
+      "p2_5": 1.0,
+      "p97_5": 1.0,
+      "spearman": 0.0,
+      "spearmanCi": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "bio": 2.0,
+      "bioPercentile": 1.0,
+      "kind": "feature",
+      "name": "pathLength:hazardDistance->yaw",
+      "nullMedian": 1.0,
+      "p2_5": 1.0,
+      "p97_5": 1.0,
+      "spearman": 0.0,
+      "spearmanCi": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "bio": 1.0,
+      "bioPercentile": 0.5,
+      "kind": "feature",
+      "name": "pathLength:hazardDistance->brake",
+      "nullMedian": 1.0,
+      "p2_5": 1.0,
+      "p97_5": 1.0,
+      "spearman": 0.0,
+      "spearmanCi": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "bio": 2.0,
+      "bioPercentile": 1.0,
+      "kind": "feature",
+      "name": "pathLength:forwardClearance->thrust",
+      "nullMedian": 1.0,
+      "p2_5": 1.0,
+      "p97_5": 1.0,
+      "spearman": 0.0,
+      "spearmanCi": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "bio": 2.0,
+      "bioPercentile": 1.0,
+      "kind": "feature",
+      "name": "pathLength:forwardClearance->yaw",
+      "nullMedian": 1.0,
+      "p2_5": 1.0,
+      "p97_5": 1.0,
+      "spearman": 0.0,
+      "spearmanCi": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "bio": 1.0,
+      "bioPercentile": 0.5,
+      "kind": "feature",
+      "name": "pathLength:forwardClearance->brake",
+      "nullMedian": 1.0,
+      "p2_5": 1.0,
+      "p97_5": 1.0,
+      "spearman": 0.0,
+      "spearmanCi": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "bio": 2.0,
+      "bioPercentile": 1.0,
+      "kind": "feature",
+      "name": "pathLength:leftClearance->thrust",
+      "nullMedian": 1.0,
+      "p2_5": 1.0,
+      "p97_5": 1.0,
+      "spearman": 0.0,
+      "spearmanCi": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "bio": 1.0,
+      "bioPercentile": 0.5,
+      "kind": "feature",
+      "name": "pathLength:leftClearance->yaw",
+      "nullMedian": 1.0,
+      "p2_5": 1.0,
+      "p97_5": 1.0,
+      "spearman": 0.0,
+      "spearmanCi": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "bio": 1.0,
+      "bioPercentile": 0.5,
+      "kind": "feature",
+      "name": "pathLength:leftClearance->brake",
+      "nullMedian": 1.0,
+      "p2_5": 1.0,
+      "p97_5": 1.0,
+      "spearman": 0.0,
+      "spearmanCi": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "bio": 2.0,
+      "bioPercentile": 1.0,
+      "kind": "feature",
+      "name": "pathLength:rightClearance->thrust",
+      "nullMedian": 1.0,
+      "p2_5": 1.0,
+      "p97_5": 1.0,
+      "spearman": 0.0,
+      "spearmanCi": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "bio": 2.0,
+      "bioPercentile": 1.0,
+      "kind": "feature",
+      "name": "pathLength:rightClearance->yaw",
+      "nullMedian": 1.0,
+      "p2_5": 1.0,
+      "p97_5": 1.0,
+      "spearman": 0.0,
+      "spearmanCi": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "bio": 1.0,
+      "bioPercentile": 0.5,
+      "kind": "feature",
+      "name": "pathLength:rightClearance->brake",
+      "nullMedian": 1.0,
+      "p2_5": 1.0,
+      "p97_5": 1.0,
+      "spearman": 0.0,
+      "spearmanCi": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "bio": 2.0,
+      "bioPercentile": 1.0,
+      "kind": "feature",
+      "name": "pathLength:speed->thrust",
+      "nullMedian": 1.0,
+      "p2_5": 1.0,
+      "p97_5": 1.0,
+      "spearman": 0.0,
+      "spearmanCi": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "bio": 2.0,
+      "bioPercentile": 0.999,
+      "kind": "feature",
+      "name": "pathLength:speed->yaw",
+      "nullMedian": 1.0,
+      "p2_5": 1.0,
+      "p97_5": 1.0,
+      "spearman": -0.03303093156909242,
+      "spearmanCi": [
+        -0.06131931016465984,
+        0.0
+      ]
+    },
+    {
+      "bio": 1.0,
+      "bioPercentile": 0.5,
+      "kind": "feature",
+      "name": "pathLength:speed->brake",
+      "nullMedian": 1.0,
+      "p2_5": 1.0,
+      "p97_5": 1.0,
+      "spearman": 0.0,
+      "spearmanCi": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "bio": 1.625,
+      "bioPercentile": 1.0,
+      "kind": "feature",
+      "name": "meanPathLength",
+      "nullMedian": 1.0,
+      "p2_5": 1.0,
+      "p97_5": 1.0,
+      "spearman": -0.03303093156909242,
+      "spearmanCi": [
+        -0.06095099627976081,
+        0.0
+      ]
+    },
+    {
+      "bio": 190092.0,
+      "bioPercentile": 1.0,
+      "kind": "feature",
+      "name": "excitatoryPathCount:thrust",
+      "nullMedian": 165096.0,
+      "p2_5": 157104.0,
+      "p97_5": 172754.0,
+      "spearman": -0.10985267395655304,
+      "spearmanCi": [
+        -0.19495973091536922,
+        -0.024877929648124273
+      ]
+    },
+    {
+      "bio": 173197.0,
+      "bioPercentile": 1.0,
+      "kind": "feature",
+      "name": "excitatoryPathCount:yaw",
+      "nullMedian": 133166.5,
+      "p2_5": 126397.0,
+      "p97_5": 139231.0,
+      "spearman": -0.033064172985634764,
+      "spearmanCi": [
+        -0.12079822304812098,
+        0.05295520679361979
+      ]
+    },
+    {
+      "bio": 197073.0,
+      "bioPercentile": 1.0,
+      "kind": "feature",
+      "name": "excitatoryPathCount:brake",
+      "nullMedian": 161651.0,
+      "p2_5": 153813.0,
+      "p97_5": 169198.0,
+      "spearman": 0.010264556260767096,
+      "spearmanCi": [
+        -0.07875927532659578,
+        0.0992853466161806
+      ]
+    },
+    {
+      "bio": 191667.0,
+      "bioPercentile": 1.0,
+      "kind": "feature",
+      "name": "inhibitoryPathCount:thrust",
+      "nullMedian": 164767.0,
+      "p2_5": 156614.0,
+      "p97_5": 172749.0,
+      "spearman": -0.15683767769944287,
+      "spearmanCi": [
+        -0.23960217115112403,
+        -0.07392489092373972
+      ]
+    },
+    {
+      "bio": 145738.0,
+      "bioPercentile": 1.0,
+      "kind": "feature",
+      "name": "inhibitoryPathCount:yaw",
+      "nullMedian": 133076.0,
+      "p2_5": 126200.0,
+      "p97_5": 139421.0,
+      "spearman": -0.06935008003075596,
+      "spearmanCi": [
+        -0.1579531133753785,
+        0.01990582917997254
+      ]
+    },
+    {
+      "bio": 175309.0,
+      "bioPercentile": 1.0,
+      "kind": "feature",
+      "name": "inhibitoryPathCount:brake",
+      "nullMedian": 161702.0,
+      "p2_5": 154125.0,
+      "p97_5": 168636.0,
+      "spearman": -0.050209414092943445,
+      "spearmanCi": [
+        -0.13774752503476292,
+        0.038054874777102746
+      ]
+    },
+    {
+      "bio": 0.25259657532767593,
+      "bioPercentile": 1.0,
+      "kind": "feature",
+      "name": "reciprocity",
+      "nullMedian": 0.06322471982898231,
+      "p2_5": 0.060244866230485195,
+      "p97_5": 0.0659454557232623,
+      "spearman": 0.006302022684296025,
+      "spearmanCi": [
+        -0.08068979686704615,
+        0.09344589521075403
+      ]
+    },
+    {
+      "bio": 2866.0,
+      "bioPercentile": 0.746,
+      "kind": "feature",
+      "name": "weightBalance:thrust",
+      "nullMedian": 2035.5,
+      "p2_5": -612.0,
+      "p97_5": 4638.0,
+      "spearman": 0.20165041075231308,
+      "spearmanCi": [
+        0.11536770861642201,
+        0.2864494280230786
+      ]
+    },
+    {
+      "bio": 5170.0,
+      "bioPercentile": 0.994,
+      "kind": "feature",
+      "name": "weightBalance:yaw",
+      "nullMedian": 1797.0,
+      "p2_5": -549.0,
+      "p97_5": 4151.0,
+      "spearman": -0.011576552308354748,
+      "spearmanCi": [
+        -0.09819814420740192,
+        0.07459308414754941
+      ]
+    },
+    {
+      "bio": 5918.0,
+      "bioPercentile": 0.998,
+      "kind": "feature",
+      "name": "weightBalance:brake",
+      "nullMedian": 2076.0,
+      "p2_5": -469.0,
+      "p97_5": 4616.0,
+      "spearman": -0.12198287683161915,
+      "spearmanCi": [
+        -0.20987718285533638,
+        -0.03420696356320189
+      ]
+    },
+    {
+      "bio": 5849.0,
+      "bioPercentile": 1.0,
+      "kind": "feature",
+      "name": "twoCycleCount",
+      "nullMedian": 1464.0,
+      "p2_5": 1395.0,
+      "p97_5": 1527.0,
+      "spearman": 0.006302022684296025,
+      "spearmanCi": [
+        -0.08024699798748716,
+        0.09471034367168024
+      ]
+    },
+    {
+      "bio": 506380.0,
+      "bioPercentile": 1.0,
+      "kind": "feature",
+      "name": "feedForwardTriangleCount",
+      "nullMedian": 221693.0,
+      "p2_5": 220079.0,
+      "p97_5": 223013.0,
+      "spearman": 0.08089527929913407,
+      "spearmanCi": [
+        -0.0105532940523426,
+        0.17291323423502614
+      ]
+    },
+    {
+      "bio": 0.0,
+      "bioPercentile": 0.0,
+      "kind": "feature",
+      "name": "weightedInDegree:thrust",
+      "nullMedian": 123.3125,
+      "p2_5": 94.8125,
+      "p97_5": 161.9375,
+      "spearman": 0.3943192055100449,
+      "spearmanCi": [
+        0.3184902434763177,
+        0.467534075171734
+      ]
+    },
+    {
+      "bio": 0.25,
+      "bioPercentile": 0.0,
+      "kind": "feature",
+      "name": "weightedInDegree:yaw",
+      "nullMedian": 99.4375,
+      "p2_5": 71.25,
+      "p97_5": 135.75,
+      "spearman": 0.05251333882886543,
+      "spearmanCi": [
+        -0.03240952486492764,
+        0.14041431745804747
+      ]
+    },
+    {
+      "bio": 111.0625,
+      "bioPercentile": 0.254,
+      "kind": "feature",
+      "name": "weightedInDegree:brake",
+      "nullMedian": 122.6875,
+      "p2_5": 89.25,
+      "p97_5": 161.5,
+      "spearman": -0.04029441973181036,
+      "spearmanCi": [
+        -0.12971084178300474,
+        0.05019105671023948
+      ]
+    }
+  ],
+  "regime": {
+    "bio": {
+      "clampFraction": 0.006323729607583775,
+      "steadyStateDistance": 0.13711929718747312
+    },
+    "excludedCount": 0,
+    "excludedGraphIds": [],
+    "gatePassed": true,
+    "nullSampleMedian": {
+      "clampFraction": 0.010440951554232804,
+      "steadyStateDistance": 0.15157044835381617
+    }
+  },
+  "sources": {
+    "featuresSha": "90bbbc0ebd0b20ead890fca5c3d686b832724edd1136660b0a2eecb3232da112",
+    "regimeSha": "cd00bd4ec5536127fe21648fb3c1483d37584b4b4cbd8be1b343a5d4efff2cdc",
+    "rewiringNullSha256": "592446bb387acbc5354db807ae2f824547d168d9e338d3a55f94f525e39083d1",
+    "transferSha": "bcf161dd60500f2460f0edb9af0f03e6db1c5a891ad4caadfd52f2c3b52d9266",
+    "variantShas": {
+      "flipBoth": "7639bbe1cdc9f4e8dba3a9dbba93b4e1fd68145f0b117c70ed5b55ccd7f73d15"
+    }
+  },
+  "thresholds": {
+    "clampFraction": 0.2,
+    "conditionNumber": 100000000.0,
+    "decoderPercentile": 0.25,
+    "spearmanRho": 0.3,
+    "steadyStateDistance": 0.5
+  },
+  "variants": {
+    "flipBoth": {
+      "bioPercentile": 0,
+      "bioScore": -0.7234421585994104,
+      "nullMean": 4.289308485239096,
+      "pHigh": 1,
+      "pLow": 0.001996007984031936
+    },
+    "singleAxisSkipped": true
+  },
+  "version": 1
+}

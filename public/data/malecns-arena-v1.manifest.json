@@ -14,6 +14,10 @@
   },
   "license": "CC-BY-4.0",
   "neuronCount": 1008,
+  "nullExplanation": {
+    "artifact": "null-explanation-v1.json",
+    "sha256": "5dcd82c75730fc94d01d42820b9e81a13b1c314869f1aaf52df2e320cc779eba"
+  },
   "outputPopulationCount": 3,
   "positions": {
     "artifact": "malecns-arena-v1.positions.json",
