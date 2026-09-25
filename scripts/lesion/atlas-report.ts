@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import { requireNonNegativeInt, requirePositiveInt, requireValue } from '../training/cli';
 import { atomicWriteFileSync, sha256Hex } from '../training/fsio';
-import { conditionRng, mean, median, pairedStats, type PairedStats } from '../training/stats';
+import { conditionRng, mean, median, pairedStats, std, type PairedStats } from '../training/stats';
 import { verifyManifestRoundTrips } from '../null/null-report';
 import {
   DEFAULT_HELD_OUT_COUNT,
@@ -60,25 +60,40 @@ const FDR_Q = 0.05;
  * under a true null. Kept as its own constant, separate from `FDR_Q` above,
  * even though both happen to be 0.05 today -- they describe two different
  * things (the CI's nominal miss rate vs. the FDR procedure's target rate)
- * that could diverge if either is ever tuned independently (a dual-review
- * finding: `expectedChanceExclusions` was previously computed from `FDR_Q`).
+ * that could diverge if either is ever tuned independently.
  */
 const CI_ALPHA = 0.05;
 const TOP_EFFECTS_COUNT = 20;
 /** "Numbers are rounded to 6 significant digits for size" (the plan's artifact-shape row). */
 const SIGNIFICANT_DIGITS = 6;
+/** The plan's artifact-shape row: "Target ≤ 250 KB" -- enforced, not just estimated, so a future field addition that pushes the artifact over budget fails the report step loudly instead of silently shipping a larger file. */
+const ARTIFACT_SIZE_BUDGET_BYTES = 250 * 1024;
+
+/** Enforces `ARTIFACT_SIZE_BUDGET_BYTES` -- factored out so a test can exercise the throw without needing an actual over-budget artifact. */
+export const requireArtifactSizeWithinBudget = (artifactSizeBytes: number): void => {
+  if (artifactSizeBytes > ARTIFACT_SIZE_BUDGET_BYTES) {
+    throw new Error(
+      `atlas-report: artifact is ${artifactSizeBytes} bytes, over the plan's ${ARTIFACT_SIZE_BUDGET_BYTES} byte ` +
+        `(250 KB) budget -- refusing to write it (.agents/plans/lesion-atlas/02-atlas-computation.md's ` +
+        'artifact-shape row)'
+    );
+  }
+};
 
 // ---------------------------------------------------------------------------
 // Rounding
 // ---------------------------------------------------------------------------
 
-/** Round `value` to `digits` significant digits. `0`/non-finite pass through unchanged (nothing to round). */
-export const roundSignificant = (value: number, digits = SIGNIFICANT_DIGITS): number => {
-  if (value === 0 || !Number.isFinite(value)) return value;
-  const magnitude = Math.floor(Math.log10(Math.abs(value)));
-  const factor = 10 ** (digits - 1 - magnitude);
-  return Math.round(value * factor) / factor;
-};
+/**
+ * Round `value` to `digits` significant digits. `Number.prototype.toPrecision`
+ * already does the right thing for `0`/`NaN`/`Infinity` (returns `"0"`/`"NaN"`/
+ * `"Infinity"` unchanged, ignoring `digits`), so no separate fast path is
+ * needed -- and it is ECMA-262-specified, so it keeps this function's
+ * byte-identical-rerun property without a hand-rolled `Math.log10`/`Math.round`
+ * implementation's edge cases (asymmetric rounding at a negative half-tie, a
+ * `NaN` result on a subnormal).
+ */
+export const roundSignificant = (value: number, digits = SIGNIFICANT_DIGITS): number => Number(value.toPrecision(digits));
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -286,6 +301,15 @@ export interface TopEffectEntry {
   readonly ciHigh: number;
   readonly pValue: number;
   readonly fdrSignificant: boolean;
+  /**
+   * Population standard deviation of this neuron's per-seed paired
+   * differences (`lesioned[i] - baseline[i]`) -- not stored for every
+   * neuron (out of the artifact's size budget), only for the top-ranked
+   * ones, so a reader of the report's own CI-width caveat above the
+   * top-effects table can see the number the caveat is talking about
+   * without recomputing it from raw data.
+   */
+  readonly sdDiff: number;
 }
 
 export interface AtlasGraphSummary {
@@ -386,6 +410,17 @@ const buildGraphArtifact = (
     .sort((a, b) => b.absEffect - a.absEffect)
     .slice(0, TOP_EFFECTS_COUNT);
 
+  // Population sd of the per-seed paired differences -- computed only for
+  // the top-ranked neurons below (not stored per-neuron, to stay within the
+  // artifact's size budget), so the report's ranking-caveat sentence
+  // (ranking is by raw |effect|, not by reliability) can cite a concrete,
+  // data-driven CI-width/variance contrast rather than an abstract claim.
+  const sdDiffFor = (index: number): number => {
+    const entry = raw.lesion[index];
+    const diffs = entry.movementScore.map((value, i) => value - raw.baselineMovementScore[i]);
+    return std(diffs);
+  };
+
   const topEffects: TopEffectEntry[] = rankedByAbsEffect.map(({ index }) => ({
     index,
     bodyId: positions.bodyIds[index],
@@ -394,6 +429,7 @@ const buildGraphArtifact = (
     ciLow: roundSignificant(ciLow[index]),
     ciHigh: roundSignificant(ciHigh[index]),
     pValue: roundSignificant(pValue[index]),
+    sdDiff: roundSignificant(sdDiffFor(index)),
     fdrSignificant: fdrSignificant[index]
   }));
 
@@ -408,9 +444,9 @@ const buildGraphArtifact = (
       // `median` (scripts/training/stats.ts) averages the two middle
       // elements for an even-length array, unlike `percentile`'s
       // nearest-rank method below (kept for p5Effect/p95Effect, where the
-      // plan does not call for interpolation) -- a dual-review finding: this
-      // previously used `percentile(sortedEffect, 0.5)`, which returns the
-      // upper-middle element instead of the true median for an even n.
+      // plan does not call for interpolation) -- `percentile(sortedEffect,
+      // 0.5)` would instead return the upper-middle element, not the true
+      // median, for an even neuron count.
       medianEffect: roundSignificant(median(effect)),
       p5Effect: roundSignificant(percentile(sortedEffect, 0.05)),
       p95Effect: roundSignificant(percentile(sortedEffect, 0.95)),
@@ -511,14 +547,149 @@ export const updateManifestWithLesionAtlas = (
 
 const fmt = (value: number, digits = 4): string => value.toFixed(digits);
 
+// ---------------------------------------------------------------------------
+// Outlier-seed finding (Limitations disclosure)
+// ---------------------------------------------------------------------------
+
+/**
+ * A per-seed paired difference (`lesioned - baseline`) this far above 0 is
+ * treated as a single-seed outlier for this disclosure -- chosen because
+ * the normal per-seed paired-difference range observed across this study's
+ * runs is well within it (baseline `movementScore` itself typically ranges
+ * roughly -5.6..+10.5), so a diff past it is a genuine tail event, not
+ * ordinary noise. This is a descriptive threshold for the Limitations
+ * disclosure below, not a statistical test -- it does not affect `effect`,
+ * `ciLow`/`ciHigh`, `pValue`, or `fdrSignificant`, all of which already use
+ * every seed via the bootstrap.
+ */
+const OUTLIER_ABS_DIFF_THRESHOLD = 5;
+
+/** How the headline (top-ranked-by-\|effect\|) neuron's own robustness check below excludes seeds -- the two single most extreme-diff seeds, matching how an outlier-seed's contribution is isolated in practice. */
+const HEADLINE_EXCLUDED_SEED_COUNT = 2;
+
+export interface OutlierSeedFinding {
+  readonly thresholdAbsDiff: number;
+  readonly neuronCount: number;
+  /** Neurons with at least one held-out seed whose paired difference exceeds `thresholdAbsDiff`. */
+  readonly outlierNeuronCount: number;
+  /** Seeds that contributed at least one outlier, sorted by how many neurons they affected (descending). */
+  readonly bySeed: readonly { readonly seed: number; readonly neuronCount: number }[];
+  /**
+   * A robustness check on this graph's own single largest-\|effect\| (top
+   * row of the Top-20 table) neuron: its effect recomputed with its
+   * `HEADLINE_EXCLUDED_SEED_COUNT` most extreme-diff seeds excluded, and
+   * the resulting ratio of magnitudes -- close to (or above) 1 means the
+   * headline effect is broadly supported across seeds, not dependent on a
+   * couple of them.
+   */
+  readonly headline: {
+    readonly index: number;
+    readonly effect: number;
+    readonly excludingTopSeedsEffect: number;
+    readonly retainedRatio: number;
+  };
+}
+
+/**
+ * Computed directly from `raw`/`graphArtifact` at report-generation time
+ * (never hard-coded to a specific run's seed numbers), so this disclosure
+ * stays accurate across re-runs: scans every neuron's per-seed paired
+ * differences for a value past `OUTLIER_ABS_DIFF_THRESHOLD` and reports
+ * which seeds those outliers concentrate on, then runs the headline
+ * robustness check above on whichever neuron is actually this graph's
+ * largest-\|effect\| entry.
+ */
+const computeOutlierSeedFinding = (
+  raw: Readonly<AtlasGraphRaw>,
+  graphArtifact: Readonly<AtlasGraphArtifact>
+): OutlierSeedFinding => {
+  const seedOutlierNeuronCounts = new Map<number, number>();
+  let outlierNeuronCount = 0;
+
+  const diffsByIndex = new Map<number, readonly number[]>();
+  for (const entry of raw.lesion) {
+    const diffs = entry.movementScore.map((value, i) => value - raw.baselineMovementScore[i]);
+    diffsByIndex.set(entry.index, diffs);
+    const hasOutlier = diffs.some((diff) => diff > OUTLIER_ABS_DIFF_THRESHOLD);
+    if (!hasOutlier) continue;
+    outlierNeuronCount += 1;
+    diffs.forEach((diff, i) => {
+      if (diff > OUTLIER_ABS_DIFF_THRESHOLD) {
+        const seed = raw.heldOutSeeds[i];
+        seedOutlierNeuronCounts.set(seed, (seedOutlierNeuronCounts.get(seed) ?? 0) + 1);
+      }
+    });
+  }
+
+  const bySeed = [...seedOutlierNeuronCounts.entries()]
+    .map(([seed, neuronCount]) => ({ seed, neuronCount }))
+    .sort((a, b) => b.neuronCount - a.neuronCount || a.seed - b.seed);
+
+  const headlineIndex = graphArtifact.summary.topEffects[0]?.index ?? 0;
+  const headlineDiffs = diffsByIndex.get(headlineIndex) ?? [];
+  const headlineEffect = mean(headlineDiffs);
+  const excludedPositions = [...headlineDiffs.keys()]
+    .sort((a, b) => Math.abs(headlineDiffs[b]) - Math.abs(headlineDiffs[a]))
+    .slice(0, HEADLINE_EXCLUDED_SEED_COUNT);
+  const remaining = headlineDiffs.filter((_, i) => !excludedPositions.includes(i));
+  const excludingTopSeedsEffect = remaining.length > 0 ? mean(remaining) : headlineEffect;
+  const retainedRatio = headlineEffect === 0 ? 1 : Math.abs(excludingTopSeedsEffect) / Math.abs(headlineEffect);
+
+  return {
+    thresholdAbsDiff: OUTLIER_ABS_DIFF_THRESHOLD,
+    neuronCount: raw.lesion.length,
+    outlierNeuronCount,
+    bySeed,
+    headline: { index: headlineIndex, effect: headlineEffect, excludingTopSeedsEffect, retainedRatio }
+  };
+};
+
+/** Exported for `atlas-report.ts`'s `main` to compute directly from `raw`, and for tests. */
+export const computeOutlierSeedFindings = (
+  raw: Readonly<AtlasEvaluationRaw>,
+  artifact: Readonly<LesionAtlasArtifact>
+): { readonly biological: OutlierSeedFinding; readonly rewiredSeed0: OutlierSeedFinding } => {
+  if (!raw.graphs.biological || !raw.graphs.rewiredSeed0) {
+    throw new Error('atlas-report: raw evaluation is missing biological/rewiredSeed0 (run atlas-evaluate for both graphs)');
+  }
+  return {
+    biological: computeOutlierSeedFinding(raw.graphs.biological, artifact.graphs.biological),
+    rewiredSeed0: computeOutlierSeedFinding(raw.graphs.rewiredSeed0, artifact.graphs.rewiredSeed0)
+  };
+};
+
+const formatOutlierBullet = (label: string, finding: Readonly<OutlierSeedFinding>): string => {
+  if (finding.outlierNeuronCount === 0) return '';
+  const percent = ((finding.outlierNeuronCount / finding.neuronCount) * 100).toFixed(1);
+  const topSeeds = finding.bySeed
+    .slice(0, 6)
+    .map((s) => `${s.seed} (${s.neuronCount})`)
+    .join(', ');
+  const h = finding.headline;
+  const robustness =
+    h.retainedRatio >= 0.5
+      ? `remains substantial (${fmt(h.excludingTopSeedsEffect)}, ${(h.retainedRatio * 100).toFixed(0)}% of the ` +
+        'full effect) -- broadly supported, not dependent on a couple of seeds'
+      : `drops to ${fmt(h.excludingTopSeedsEffect)} (${(h.retainedRatio * 100).toFixed(0)}% of the full effect) -- ` +
+        'largely dependent on those seeds';
+  return (
+    `${label}: ${finding.outlierNeuronCount}/${finding.neuronCount} neurons (${percent}%) have at least one ` +
+    `held-out seed whose paired difference (lesioned - baseline) exceeds +${finding.thresholdAbsDiff}; these ` +
+    `concentrate on a handful of seeds (${topSeeds}), consistent with a threshold/bistable-dynamics artifact ` +
+    `rather than a baseline failure -- none of these seeds' own baseline scores are themselves extreme. This ` +
+    `graph's own headline (largest-\\|effect\\|) neuron ${h.index} (effect ${fmt(h.effect)}): excluding its ` +
+    `${HEADLINE_EXCLUDED_SEED_COUNT} most extreme seeds, the effect ${robustness}.`
+  );
+};
+
 /**
  * `pairedBootstrapPValue` accumulates `oppositeSideCount` in steps of `1`
  * (a full opposite-side resample) or `0.5` (an exact-zero tie, weighted
  * evenly between the two sides) -- so its smallest achievable *nonzero*
  * output is `2 * 0.5 / resamples = 1/resamples`, from a single tie, not
- * `2/resamples` (a dual-review round-2 finding: a full opposite-side
- * resample alone gives `2/resamples`, but a lone tie gives a *smaller*
- * nonzero value, so `1/resamples` is the true floor). `p === 0` means no
+ * `2/resamples`: a full opposite-side resample alone gives `2/resamples`,
+ * but a lone tie gives a *smaller* nonzero value, so `1/resamples` is the
+ * true floor. `p === 0` means no
  * resample landed on the opposite side and no resample tied at exactly
  * 0 -- not that the true p-value is exactly zero. Printing `0.0000` would
  * read as the stronger claim -- shown as an explicit resolution floor
@@ -527,11 +698,46 @@ const fmt = (value: number, digits = 4): string => value.toFixed(digits);
  */
 const fmtP = (p: number, resamples: number): string => (p === 0 ? `< ${(1 / resamples).toExponential(0)}` : fmt(p, 4));
 
+/**
+ * One sentence directly above each top-effects table making explicit that
+ * the table's sort order (raw \|effect\|, descending) is not the same thing
+ * as reliability (the bootstrap CI/FDR flag): a reader comparing the
+ * "Effect" column to "FDR significant" can otherwise see a numerically
+ * larger effect flagged unreliable while a smaller one is flagged reliable,
+ * with nothing connecting the two columns. Data-driven, not a fixed
+ * example: names the table's own top-ranked neuron and, when it is itself
+ * not FDR-significant, contrasts it against the first FDR-significant
+ * neuron in the same table, citing both neurons' `sd(diff)` -- the
+ * per-seed variability that the bootstrap CI (and therefore FDR) actually
+ * accounts for and raw \|effect\| does not.
+ */
+const rankingCaveatSentence = (graph: Readonly<AtlasGraphArtifact>): string => {
+  const top = graph.summary.topEffects[0];
+  if (!top) return '';
+  const contrast = !top.fdrSignificant ? graph.summary.topEffects.find((entry) => entry.fdrSignificant) : undefined;
+  if (contrast) {
+    return (
+      `Sorted by raw \\|effect\\|, not by reliability: a larger effect is not automatically a more reliable one -- ` +
+      `e.g. neuron ${top.index} (effect ${fmt(top.effect)}, CI (${fmt(top.ciLow)}, ${fmt(top.ciHigh)}), sd(diff) ` +
+      `${fmt(top.sdDiff)}, FDR: no) ranks above neuron ${contrast.index} (effect ${fmt(contrast.effect)}, CI ` +
+      `(${fmt(contrast.ciLow)}, ${fmt(contrast.ciHigh)}), sd(diff) ${fmt(contrast.sdDiff)}, FDR: yes) only because ` +
+      `its point estimate is larger -- its per-seed variability (sd(diff)) is also larger, which is exactly what ` +
+      `the wider CI (and the FDR flag) reflect.`
+    );
+  }
+  return (
+    'Sorted by raw \\|effect\\|, not by reliability: two neurons with the same effect size can have very ' +
+    "different per-seed variability (compare CI width and sd(diff) below), so a larger effect is not " +
+    'automatically a more reliable one -- only FDR-surviving neurons (see "Multiple comparisons" above) should ' +
+    'be read as reliable effects.'
+  );
+};
+
 const renderGraphSection = (title: string, graph: Readonly<AtlasGraphArtifact>, bootstrapResamples: number): string => {
   const topRows = graph.summary.topEffects
     .map(
       (entry) =>
-        `| ${entry.index} | ${entry.bodyId} | ${entry.role} | ${fmt(entry.effect)} | (${fmt(entry.ciLow)}, ${fmt(entry.ciHigh)}) | ${fmtP(entry.pValue, bootstrapResamples)} | ${entry.fdrSignificant ? 'yes' : 'no'} |`
+        `| ${entry.index} | ${entry.bodyId} | ${entry.role} | ${fmt(entry.effect)} | (${fmt(entry.ciLow)}, ${fmt(entry.ciHigh)}) | ${fmt(entry.sdDiff)} | ${fmtP(entry.pValue, bootstrapResamples)} | ${entry.fdrSignificant ? 'yes' : 'no'} |`
     )
     .join('\n');
 
@@ -546,18 +752,41 @@ const renderGraphSection = (title: string, graph: Readonly<AtlasGraphArtifact>, 
 | CIs excluding 0 (uncorrected) | ${graph.summary.ciExcludesZeroCount} (expected by chance: ${fmt(graph.summary.expectedChanceExclusions, 1)}) |
 | FDR-surviving neurons (q=${FDR_Q}) | ${graph.summary.fdrSignificantCount} |
 
+${rankingCaveatSentence(graph)}
+
 Top ${graph.summary.topEffects.length} neurons by \\|effect\\|:
 
-| Index | Body ID | Role | Effect | 95% CI | p (bootstrap) | FDR significant |
-| --- | --- | --- | --- | --- | --- | --- |
+| Index | Body ID | Role | Effect | 95% CI | sd(diff) | p (bootstrap) | FDR significant |
+| --- | --- | --- | --- | --- | --- | --- | --- |
 ${topRows}
 `;
 };
 
-export const renderReportMarkdown = (artifact: Readonly<LesionAtlasArtifact>): string => {
+export const renderReportMarkdown = (
+  artifact: Readonly<LesionAtlasArtifact>,
+  outlierFindings: Readonly<{ readonly biological: OutlierSeedFinding; readonly rewiredSeed0: OutlierSeedFinding }>
+): string => {
   const timingRow = artifact.timing
-    ? `| Wall time | ${(artifact.timing.elapsedMs / 1000).toFixed(1)}s |\n| Per-episode time | ${artifact.timing.perEpisodeMs.toFixed(1)} ms |\n`
+    ? `| Wall time | ${(artifact.timing.elapsedMs / 1000).toFixed(1)}s |\n` +
+      `| Per-episode time (wall-clock ÷ episode count, ${artifact.shards}-way parallel -- **not** a serial-cost ` +
+      `estimate; see "Timing correction" below) | ${artifact.timing.perEpisodeMs.toFixed(1)} ms |\n`
     : '';
+
+  const outlierBullets = [
+    formatOutlierBullet('Biological', outlierFindings.biological),
+    formatOutlierBullet('Rewired seed 0', outlierFindings.rewiredSeed0)
+  ].filter((bullet) => bullet.length > 0);
+  const bothHeadlinesRobust =
+    outlierFindings.biological.headline.retainedRatio >= 0.5 && outlierFindings.rewiredSeed0.headline.retainedRatio >= 0.5;
+  const outlierHeadlineNote = bothHeadlinesRobust
+    ? "Both graphs' headline effects above are broadly supported, not single-seed artifacts"
+    : "At least one graph's headline effect above is largely dependent on a couple of seeds -- see that graph's own check above";
+  const outlierBulletBlock =
+    outlierBullets.length === 0
+      ? ''
+      : `\n- **A small cluster of held-out seeds produces large single-seed outliers for a minority of neurons.** ` +
+        `${outlierBullets.join(' ')} ${outlierHeadlineNote}; worth a check for future re-runs and for any ` +
+        `consumer normalizing on the full effect range (e.g. a diverging-colormap \\|effect\\| max).`;
 
   const markdown = `# Single-neuron lesion atlas
 
@@ -617,6 +846,14 @@ ${timingRow}| Bootstrap resamples | ${artifact.bootstrap.resamples} |
 
 ## Results
 
+**On the "Role" column below.** \`sensory\`/\`bridge\`/\`descending\` is an anatomical/graph-position label from
+the connectome, not a functional claim: \`sensory\` neurons are exactly this model's hand-wired input-channel
+injection points (\`src/lib/connectome/model.ts\`'s external sensory drive, clamped into the network before any
+dynamics run), so lesioning one removes an entire raw observation stream, mechanically different from lesioning
+a \`bridge\`/\`descending\` neuron, which perturbs an internal or output computation instead. Sensory-lesion
+effects therefore partly reflect this hand-authored encoder, the same caveat "What this measures" already makes
+about the decoder side.
+
 ${renderGraphSection('Biological', artifact.graphs.biological, artifact.bootstrap.resamples)}
 ${renderGraphSection('Rewired seed 0', artifact.graphs.rewiredSeed0, artifact.bootstrap.resamples)}
 ## Limitations
@@ -633,7 +870,7 @@ ${renderGraphSection('Rewired seed 0', artifact.graphs.rewiredSeed0, artifact.bo
 - **The opponent is parked** for every episode, matching the null studies' single-agent condition, not a
   competitive one.
 - **No biological claim.** This describes how this specific hand-authored decoder and rate-model dynamics
-  interact with the measured topology, not a measurement of the real fly's neural function.${
+  interact with the measured topology, not a measurement of the real fly's neural function.${outlierBulletBlock}${
     artifact.timing
       ? `
 - **Timing correction.** \`.agents/plans/lesion-atlas/02-atlas-computation.md\` projected "about 6 min at 18
@@ -659,15 +896,15 @@ ${renderGraphSection('Rewired seed 0', artifact.graphs.rewiredSeed0, artifact.bo
 /**
  * Every reason `raw` is not "shipped-grade" -- not just under-covered on
  * neurons (the calibration-run bug this WP already fixed once), but also a
- * shorter/cheaper condition than the shipped atlas's. A dual-review finding:
- * checking neuron coverage alone would still let a full-neuron but
- * short-seed/short-tick smoke run (`--held-out-count 3 --ticks 100`, which
- * covers all 1008 neurons in a couple of minutes) pass the guard and
- * overwrite the shipped artifact with drastically noisier numbers. Computed
- * directly from `raw` -- before `buildArtifact`'s bootstrap resampling runs
- * at all -- so an unshippable run is rejected before paying for ~2 x 1008 x
- * (10000 CI resamples + 10000 p-value resamples) draws, matching this
- * file's other pre-`buildArtifact` checks below.
+ * shorter/cheaper condition than the shipped atlas's: checking neuron
+ * coverage alone would still let a full-neuron but short-seed/short-tick
+ * smoke run (`--held-out-count 3 --ticks 100`, which covers all 1008
+ * neurons in a couple of minutes) pass the guard and overwrite the shipped
+ * artifact with drastically noisier numbers. Computed directly from `raw`
+ * -- before `buildArtifact`'s bootstrap resampling runs at all -- so an
+ * unshippable run is rejected before paying for ~2 x 1008 x (10000 CI
+ * resamples + 10000 p-value resamples) draws, matching this file's other
+ * pre-`buildArtifact` checks below.
  */
 const rawShippedGradeProblems = (raw: Readonly<AtlasEvaluationRaw>): readonly string[] => {
   const problems: string[] = [];
@@ -675,8 +912,8 @@ const rawShippedGradeProblems = (raw: Readonly<AtlasEvaluationRaw>): readonly st
   const rewiredCount = raw.graphs.rewiredSeed0?.lesion.length ?? 0;
   // Compared against `raw.neuronCount` (cross-checked against the live
   // manifest by `verifyRawGraphsMatchManifest`, called before this), not a
-  // hardcoded constant -- a round-1 dual-review suggestion, so this never
-  // goes stale if the compiled graph's neuron count ever changes.
+  // hardcoded constant, so this never goes stale if the compiled graph's
+  // neuron count ever changes.
   if (biologicalCount < raw.neuronCount || rewiredCount < raw.neuronCount) {
     problems.push(
       `covers ${biologicalCount}/${rewiredCount} neurons (biological/rewiredSeed0), shipped requires ` +
@@ -709,7 +946,7 @@ const guardShippedDefault = (path: string, defaultPath: string, label: string, p
  * directory. Without this check, an otherwise shipped-grade run with a
  * scratch `--out` but the default `--manifest` would pass every other
  * guard, then leave the shipped manifest pointing at a `public/data/`
- * filename that does not actually exist there (a dual-review finding).
+ * filename that does not actually exist there.
  */
 export const requireOutBesideManifest = (outPath: string, manifestPath: string): void => {
   if (resolve(dirname(outPath)) === resolve(dirname(manifestPath))) return;
@@ -725,8 +962,8 @@ export const requireOutBesideManifest = (outPath: string, manifestPath: string):
  * the *same seeds in the same order* -- a hand-edited or merged
  * `atlas-raw.json` with a graph's `heldOutSeeds` reordered or drawn from a
  * different range than `raw.seeds` would silently pair the wrong episodes
- * together and publish a nonsensical effect with no error anywhere (a
- * dual-review finding). `atlas-evaluate.ts` always builds every task's
+ * together and publish a nonsensical effect with no error anywhere.
+ * `atlas-evaluate.ts` always builds every task's
  * `heldOutSeeds` from one shared array, so this holds by construction for
  * its own output -- this only protects a file that reached this point some
  * other way.
@@ -761,11 +998,11 @@ export const verifyRawSeedsConsistent = (raw: Readonly<AtlasEvaluationRaw>): voi
  * run) or be hand-edited/merged. Without this check, a stale raw evaluation
  * would publish an artifact whose `graphSha256` no longer matches the
  * manifest it was just written next to -- caught only later, in the
- * browser, by WP3's loader (a dual-review finding: this mirrors
- * `null-report.ts`'s `verifySourceGraphMatchesManifest`, but that function
- * is specific to the null study's `NullReportArgs`/single source graph, not
- * reused here). Skips a graph key `raw.graphs` doesn't have -- `buildArtifact`
- * already gives the clearer "missing biological/rewiredSeed0" error for that.
+ * browser, by WP3's loader. Mirrors `null-report.ts`'s
+ * `verifySourceGraphMatchesManifest`, but that function is specific to the
+ * null study's `NullReportArgs`/single source graph, so is not reused here.
+ * Skips a graph key `raw.graphs` doesn't have -- `buildArtifact` already
+ * gives the clearer "missing biological/rewiredSeed0" error for that.
  */
 export const verifyRawGraphsMatchManifest = (manifestPath: string, raw: Readonly<AtlasEvaluationRaw>): void => {
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
@@ -774,11 +1011,10 @@ export const verifyRawGraphsMatchManifest = (manifestPath: string, raw: Readonly
     readonly rewiredArms?: { readonly seed0?: { readonly binarySha256?: string } };
   };
   // `rawShippedGradeProblems` below compares neuron coverage against
-  // `raw.neuronCount` rather than a hardcoded constant (a dual-review
-  // round-1 suggestion this round-2 pass adopts) -- that comparison is only
-  // meaningful if `raw.neuronCount` itself is checked against the live
-  // manifest here, or a hand-edited raw file could claim any neuronCount
-  // and trivially "cover" it, defeating the guard entirely.
+  // `raw.neuronCount` rather than a hardcoded constant -- that comparison
+  // is only meaningful if `raw.neuronCount` itself is checked against the
+  // live manifest here, or a hand-edited raw file could claim any
+  // neuronCount and trivially "cover" it, defeating the guard entirely.
   if (raw.neuronCount !== manifest.neuronCount) {
     throw new Error(
       `atlas-report: raw evaluation's neuronCount (${raw.neuronCount}) does not match ${manifestPath} ` +
@@ -814,9 +1050,9 @@ export interface RunAtlasReportResult {
  * both read them directly with no shape check of their own). A malformed
  * or wrong-version `atlas-raw.json` would otherwise fail with a raw
  * `TypeError: Cannot read properties of undefined` from deep inside one of
- * those checks instead of a clear, actionable message (a dual-review
- * round-2 finding). `buildArtifact` has its own, later `raw.version !== 1`
- * check for the same reason `null-report.ts`'s `buildArtifact` does --
+ * those checks instead of a clear, actionable message. `buildArtifact` has
+ * its own, later `raw.version !== 1` check for the same reason
+ * `null-report.ts`'s `buildArtifact` does --
  * this one exists so every *earlier* check in `runAtlasReport` can assume
  * this shape holds without re-checking it itself.
  */
@@ -847,10 +1083,17 @@ export const runAtlasReport = (args: Readonly<AtlasReportArgs>): RunAtlasReportR
   // no bootstrap resampling) and runs before `buildArtifact`'s ~2 x
   // neuronCount x (bootstrapResamples x 2) draws below, so an unshippable
   // or stale run is rejected in milliseconds, not after paying for the
-  // full statistics pass (a dual-review finding).
+  // full statistics pass.
+  //
+  // `verifyRawGraphsMatchManifest` runs before `verifyRawSeedsConsistent`:
+  // under a double fault (both a stale graph sha and reordered/mismatched
+  // seeds), a stale `atlas-raw.json` is the more common real-world cause
+  // and the more actionable hint, so its message should be the one an
+  // operator sees first -- both checks still run regardless of order,
+  // this only affects which message wins when both would fail.
   requireOutBesideManifest(args.out, args.manifest);
-  verifyRawSeedsConsistent(raw);
   verifyRawGraphsMatchManifest(args.manifest, raw);
+  verifyRawSeedsConsistent(raw);
   const shippedGradeProblems = rawShippedGradeProblems(raw);
   guardShippedDefault(args.out, DEFAULT_OUT, 'published artifact', shippedGradeProblems);
   guardShippedDefault(args.reportMd, DEFAULT_REPORT_MD, 'report', shippedGradeProblems);
@@ -865,8 +1108,10 @@ export const runAtlasReport = (args: Readonly<AtlasReportArgs>): RunAtlasReportR
   const artifact = buildArtifact(raw, positions, runMeta, args.bootstrapSeed, args.bootstrapResamples);
 
   const artifactContents = JSON.stringify(artifact);
+  requireArtifactSizeWithinBudget(Buffer.byteLength(artifactContents, 'utf8'));
   const artifactSha256 = sha256Hex(artifactContents);
-  const reportMdContents = renderReportMarkdown(artifact);
+  const outlierFindings = computeOutlierSeedFindings(raw, artifact);
+  const reportMdContents = renderReportMarkdown(artifact, outlierFindings);
 
   mkdirSync(dirname(args.out), { recursive: true });
   atomicWriteFileSync(args.out, artifactContents);

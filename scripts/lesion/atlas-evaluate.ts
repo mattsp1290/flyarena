@@ -7,7 +7,6 @@ import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import { parseGraphBinary } from '../../src/lib/connectome/format';
 import { requireNonNegativeInt, requirePositiveInt, requireValue } from '../training/cli';
 import { atomicWriteFileSync, sha256Hex } from '../training/fsio';
-import type { NullSeedResult, NullTaskMode, NullWorkerMessage, NullWorkerTask } from '../null/null-worker';
 import { runShardedEvaluation } from '../null/null-evaluate';
 
 /**
@@ -18,46 +17,17 @@ import { runShardedEvaluation } from '../null/null-evaluate';
  * parked, seeds `30001..30100`, `T=1800`, `K=NEURAL_SUBSTEPS_PER_TICK`),
  * sharded across `node:child_process.fork`ed copies of `atlas-worker.ts`.
  *
- * Reuse, not reimplementation, of the fork/IPC sharding mechanism: the plan
- * calls for reusing `scripts/null/null-evaluate.ts`'s `runShardedEvaluation`
- * "rather than writing a new one". That function is not written against a
- * generic task/result/message type (no `<T>`), only against the concrete
- * `NullWorkerTask`/`NullSeedResult`/`NullWorkerMessage` from
- * `scripts/null/null-worker.ts` -- a generic version is a separate,
- * not-yet-landed refactor. Rather than duplicating its ~150 lines of
- * fork/kill/error-aggregation logic here, this file adapts to its existing
- * (non-generic) shape: `AtlasWorkerTask`/`AtlasSeedResult`/`AtlasWorkerMessage`
- * below are structurally compatible supersets of the `Null*` types, so
- * `tasks` below type-checks directly as `readonly NullWorkerTask[]`.
- *
- * What `runShardedEvaluation` actually reads at runtime (verified against
- * `null-evaluate.ts:306-423`, not merely assumed): on a task, only
- * `graphId` and `heldOutSeeds`; on a worker message, only `type`, `graphId`,
- * `results.length`, `results[i].seed`, and `message`. `mode`/`path`/
- * `expectedSha256`/`ticks`/`lesionIndex` are never read there -- they exist
- * only so `AtlasWorkerTask` satisfies `NullWorkerTask`'s TypeScript shape
- * (`mode` in particular carries no meaning for this study; `atlas-worker.ts`
- * ignores it) and so `atlas-worker.ts` itself has what it needs to load the
- * right graph and run the right lesion. `runShardedEvaluation` threads the
- * whole task object opaquely to `child.send(task)`, so this adapter changes
- * no behavior of the reused function, only supplies it a different worker
- * and a different task list.
- *
- * The compiler only checks this compatibility in the direction tasks flow
- * (`AtlasWorkerTask[]` into a `readonly NullWorkerTask[]` parameter); the
- * assertions right below `AtlasWorkerMessage` check the reverse and lateral
- * directions too, so a future `Null*` shape change that this adapter no
- * longer actually matches fails to compile here instead of silently
- * mis-happening in atlas-worker.ts's real IPC traffic. `atlas-worker.ts`
- * also refuses to run a task with no `lesionIndex` field -- see its own
- * `process.on('message', ...)` handler's doc comment for exactly what that
- * guards against (a real `NullWorkerTask` reaching this file's handler) and
- * what it does *not* guard against (`workerPath` pointed at the wrong
- * worker file entirely, which never reaches this file's code at all). If a
- * generic
- * `runShardedEvaluation<Task, Result>` lands later, this file's
- * `tasks`/`workerPath` can be handed to it directly and this whole adapter
- * note (and the assertions/guard above) can be deleted.
+ * Reuse, not reimplementation, of the fork/IPC sharding mechanism: this
+ * calls `scripts/null/null-evaluate.ts`'s generic
+ * `runShardedEvaluation<Task, Result, Message>` directly, the same way
+ * `null-trained-evaluate.ts` does, pinning `AtlasWorkerTask`/
+ * `AtlasSeedResult`/`AtlasWorkerMessage` (this file's own task/result/
+ * message shapes -- redeclared rather than imported from
+ * `scripts/null/null-worker.ts`, since an atlas task has no decoder-variant
+ * or graph-mode concept, only a `lesionIndex`) as its three type
+ * parameters. `runShardedEvaluation`'s own thrown errors are still
+ * hardcoded with a `null-evaluate:` prefix (it is, after all, that
+ * module's function), re-prefixed below.
  */
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -68,20 +38,15 @@ const DEFAULT_MANIFEST = resolve(repoRoot, 'public/data/malecns-arena-v1.manifes
 // actually match this condition (not merely cover every neuron) before
 // letting it overwrite the shipped public/data/lesion-atlas-v1.json -- the
 // two files would otherwise be free to drift apart on what "shipped-grade"
-// means (a dual-review finding).
+// means.
 export const DEFAULT_HELD_OUT_START = 30001;
 export const DEFAULT_HELD_OUT_COUNT = 100;
 export const DEFAULT_TICKS = 1800;
 const DEFAULT_SHARDS = 18;
 const DEFAULT_OUT = resolve(repoRoot, 'training/runs/lesion/atlas-raw.json');
 
-/** The atlas's two graphs. `biological` reuses `mode: 'biological'` and `rewiredSeed0` reuses `mode: 'rewired'` purely so `AtlasWorkerTask` satisfies `NullTaskMode` -- see this module's doc comment. */
+/** The atlas's two graphs. */
 export type AtlasGraphKey = 'biological' | 'rewiredSeed0';
-
-const GRAPH_MODE: Readonly<Record<AtlasGraphKey, NullTaskMode>> = {
-  biological: 'biological',
-  rewiredSeed0: 'rewired'
-};
 
 /** CLI spelling (`--graphs biological,rewired-seed0`, the plan's own wording) for each `AtlasGraphKey`. */
 const CLI_GRAPH_NAME: Readonly<Record<AtlasGraphKey, string>> = {
@@ -107,15 +72,12 @@ const parseGraphKeys = (raw: string): readonly AtlasGraphKey[] => {
 };
 
 // ---------------------------------------------------------------------------
-// Task/result/message shapes -- structurally compatible with
-// scripts/null/null-worker.ts's NullWorkerTask/NullSeedResult/NullWorkerMessage
-// (see this module's doc comment on why).
+// Task/result/message shapes -- this module's own, independent of
+// scripts/null/null-worker.ts's Null* types (see this module's doc comment).
 // ---------------------------------------------------------------------------
 
 export interface AtlasWorkerTask {
   readonly graphId: string;
-  /** Unused by `atlas-worker.ts`; present only for `NullWorkerTask` shape compatibility. */
-  readonly mode: NullTaskMode;
   readonly path: string;
   readonly expectedSha256: string;
   readonly heldOutSeeds: readonly number[];
@@ -144,36 +106,6 @@ export interface AtlasWorkerErrorMessage {
 }
 
 export type AtlasWorkerMessage = AtlasWorkerResultMessage | AtlasWorkerErrorMessage;
-
-// The message shapes above are structurally identical to NullWorkerResultMessage/NullWorkerErrorMessage
-// (re-declared, not imported, because atlas-worker.ts should not depend on scripts/null/, which owns a
-// separate, unrelated study) -- `runShardedEvaluation` only ever reads `type`/`graphId`/`results[].seed`
-// off whatever a worker sends back, so this shape is all it needs.
-
-/**
- * Compile-time proof that this adapter's shapes stay compatible with the
- * reused (non-generic) `runShardedEvaluation` in every direction data
- * actually flows: tasks go from this file into it (`_AtlasTaskCompat`,
- * already relied on implicitly by passing `AtlasWorkerTask[]` where
- * `readonly NullWorkerTask[]` is expected -- made an explicit, named
- * assertion here too); messages go from `atlas-worker.ts`'s real IPC
- * traffic into its own message handler (`_AtlasMessageCompat`); the
- * results it returns (typed `Map<string, readonly NullSeedResult[]>`,
- * fixed by its own non-generic signature) are what `runAtlasEvaluate`
- * assigns into `assembleRaw`'s `ReadonlyMap<string, readonly
- * AtlasSeedResult[]>` parameter (`_AtlasResultCompat` -- note the
- * direction: `NullSeedResult extends AtlasSeedResult`, not the reverse,
- * since that assignment is what needs `NullSeedResult`'s fields to cover
- * `AtlasSeedResult`'s, a round-2 dual-review correction of an earlier,
- * backwards version of this assertion). A type here that fails to satisfy
- * its `extends` bound does not compile, which is the point: catch the
- * drift here, not in `atlas-worker.ts`'s real IPC traffic or in
- * `runAtlasEvaluate`'s call site.
- */
-type AssertExtends<T extends U, U> = T;
-export type _AtlasTaskCompat = AssertExtends<AtlasWorkerTask, NullWorkerTask>;
-export type _AtlasMessageCompat = AssertExtends<AtlasWorkerMessage, NullWorkerMessage>;
-export type _AtlasResultCompat = AssertExtends<NullSeedResult, AtlasSeedResult>;
 
 // ---------------------------------------------------------------------------
 // Manifest
@@ -228,14 +160,13 @@ const graphSpecFor = (key: AtlasGraphKey, manifest: ArenaManifestShape, graphsDi
 /**
  * Verify every requested graph's decompressed sha256 against the manifest
  * before any shard is forked -- mirrors `null-evaluate.ts`'s
- * `verifyRewiredFiles`/`verifyBiologicalSource` up-front check -- and, now,
- * also that each graph's own
- * `neuronCount` agrees with the manifest's -- both graphs feed the same
- * lesion-index range (`buildTasks` below, sized off `manifest.neuronCount`
- * alone) and the same `positions.json` body-ID/role lookup at report time,
- * so a rewired-seed-0 artifact with a different neuron count would silently
- * mis-lesion or mis-label neurons rather than fail loudly (a dual-review
- * finding). Parses each graph once here specifically to check this; the
+ * `verifyRewiredFiles`/`verifyBiologicalSource` up-front check -- and also
+ * that each graph's own `neuronCount` agrees with the manifest's -- both
+ * graphs feed the same lesion-index range (`buildTasks` below, sized off
+ * `manifest.neuronCount` alone) and the same `positions.json` body-ID/role
+ * lookup at report time, so a rewired-seed-0 artifact with a different
+ * neuron count would silently mis-lesion or mis-label neurons rather than
+ * fail loudly. Parses each graph once here specifically to check this; the
  * bytes are re-read and re-parsed independently by whichever worker later
  * scores that graph (`atlas-worker.ts`'s own `loadVerifiedGraphBinary`),
  * matching `null-evaluate.ts`'s existing "verify up front, workers verify
@@ -360,7 +291,6 @@ export const buildTasks = (
     const spec = specs.get(key);
     if (!spec) throw new Error(`atlas-evaluate: no graph spec for "${key}"`);
     const common = {
-      mode: GRAPH_MODE[key],
       path: spec.path,
       expectedSha256: spec.expectedSha256,
       heldOutSeeds,
@@ -408,8 +338,7 @@ export interface AtlasEvaluationRaw {
    * calibration `atlas-raw.json` self-describing as one, on top of (not
    * instead of) `atlas-report.ts`'s own `rawShippedGradeProblems` check,
    * which derives the same fact independently from the actual per-graph
-   * lesion-array length rather than trusting this field (a dual-review
-   * suggestion).
+   * lesion-array length rather than trusting this field.
    */
   readonly maxLesions?: number;
 }
@@ -488,17 +417,20 @@ export const runAtlasEvaluate = async (
   const workerPath = fileURLToPath(new URL('./atlas-worker.ts', import.meta.url));
 
   const started = performance.now();
-  let results: Awaited<ReturnType<typeof runShardedEvaluation>>;
+  let results: Map<string, readonly AtlasSeedResult[]>;
   try {
-    results = await runShardedEvaluation(tasks, args.shards, workerPath);
+    results = await runShardedEvaluation<AtlasWorkerTask, AtlasSeedResult, AtlasWorkerMessage>(
+      tasks,
+      args.shards,
+      workerPath
+    );
   } catch (error) {
     // `runShardedEvaluation`'s own thrown messages are prefixed
     // "null-evaluate: ..." (it is, after all, that module's function) --
     // re-prefixed here so an atlas-run failure points an operator at this
     // script, not at the unrelated null study. `cause` preserves the
     // original error (and its stack) for anyone inspecting it
-    // programmatically, even though the top-level message is rewritten (a
-    // round-2 dual-review suggestion).
+    // programmatically, even though the top-level message is rewritten.
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(message.replace(/^null-evaluate:/, 'atlas-evaluate:'), { cause: error });
   }

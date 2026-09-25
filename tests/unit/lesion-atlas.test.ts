@@ -28,8 +28,10 @@ import {
   DEFAULT_REPORT_MD,
   benjaminiHochbergSignificant,
   buildArtifact,
+  computeOutlierSeedFindings,
   pairedBootstrapPValue,
   parseAtlasReportArgs,
+  requireArtifactSizeWithinBudget,
   requireOutBesideManifest,
   resolveRunMeta,
   roundSignificant,
@@ -363,6 +365,26 @@ describe('roundSignificant', () => {
     expect(roundSignificant(Number.NaN)).toBeNaN();
     expect(roundSignificant(Number.POSITIVE_INFINITY)).toBe(Number.POSITIVE_INFINITY);
   });
+
+  it('rounds negative values symmetrically', () => {
+    expect(roundSignificant(-1.23456789)).toBeCloseTo(-1.23457, 5);
+    expect(roundSignificant(Number.NEGATIVE_INFINITY)).toBe(Number.NEGATIVE_INFINITY);
+  });
+});
+
+describe('requireArtifactSizeWithinBudget', () => {
+  // scripts/lesion/atlas-report.ts's ARTIFACT_SIZE_BUDGET_BYTES is 250 KB
+  // (the plan's artifact-shape row) -- exercised directly here rather than
+  // only through an actual over-budget artifact (the real 1008-neuron
+  // artifact is ~99 KB, so no realistic test fixture would exceed it).
+  it('does not throw at or under the 250 KB budget', () => {
+    expect(() => requireArtifactSizeWithinBudget(0)).not.toThrow();
+    expect(() => requireArtifactSizeWithinBudget(250 * 1024)).not.toThrow();
+  });
+
+  it('throws when the artifact exceeds the 250 KB budget', () => {
+    expect(() => requireArtifactSizeWithinBudget(250 * 1024 + 1)).toThrow(/over the plan's 256000 byte \(250 KB\) budget/);
+  });
 });
 
 describe('benjaminiHochbergSignificant', () => {
@@ -540,6 +562,53 @@ describe('buildArtifact', () => {
     expect(top.map((e) => e.index)).toEqual([1, 2, 3, 0]); // |−9| > |2| > |0.5| > |0.1|
     expect(top[0].bodyId).toBe(positions.bodyIds[1]);
     expect(top[0].role).toBe('sensory');
+  });
+
+  it('medianEffect averages the two middle elements for an even neuron count', () => {
+    // Regression coverage for the round-1 median fix (S1 of the thermo
+    // review's suggestions): the old `percentile(sortedEffect, 0.5)`
+    // returns the upper-middle element for an even n (here, 3), not the
+    // true median (2.5) -- `buildRaw`'s zero-variance fixture makes each
+    // neuron's computed effect exactly equal to its requested value, so
+    // this pins the fix directly rather than merely exercising `median()`
+    // in isolation (already covered by scripts/training/stats.ts's own
+    // tests).
+    const effects = [1, 2, 3, 4];
+    const raw = buildRaw(effects.length, effects);
+    const positions = buildPositions(effects.length);
+    const artifact = buildArtifact(raw, positions, runMeta, 42, 500);
+
+    expect(artifact.graphs.biological.summary.medianEffect).toBe(2.5);
+  });
+
+  it("topEffects exposes sd(diff), the population sd of each neuron's per-seed paired differences", () => {
+    const effects = [0, 0, 0, 0];
+    const raw = buildRaw(effects.length, effects);
+    // Neuron 0 gets a non-constant per-seed diff (buildRaw's own fixtures
+    // are all zero-variance) so sd(diff) is non-trivial and hand-computable.
+    const diffs = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18]; // matches buildRaw's fixed 10-seed heldOutSeeds
+    const biological = raw.graphs.biological!;
+    const patchedRaw: AtlasEvaluationRaw = {
+      ...raw,
+      graphs: {
+        ...raw.graphs,
+        biological: {
+          ...biological,
+          lesion: biological.lesion.map((entry) =>
+            entry.index === 0
+              ? { ...entry, movementScore: biological.baselineMovementScore.map((score, i) => score + diffs[i]) }
+              : entry
+          )
+        }
+      }
+    };
+    const positions = buildPositions(effects.length);
+    const artifact = buildArtifact(patchedRaw, positions, runMeta, 42, 500);
+
+    // Population sd of [0,2,...,18]: mean=9, variance=33, sd=sqrt(33).
+    const expectedSd = Math.sqrt(33);
+    const entry = artifact.graphs.biological.summary.topEffects.find((e) => e.index === 0);
+    expect(entry?.sdDiff).toBeCloseTo(expectedSd, 4);
   });
 
   it('a non-zero, non-degenerate effect is FDR-significant; a zero effect is not', () => {
@@ -762,6 +831,104 @@ describe('runAtlasReport: positions gzip-sha cross-check (regression)', () => {
   });
 });
 
+describe('runAtlasReport: guard message ordering under a double fault', () => {
+  // S7 of the thermo review's suggestions: `verifyRawGraphsMatchManifest`
+  // now runs before `verifyRawSeedsConsistent` in `runAtlasReport`, so a raw
+  // file with *both* a stale graph sha and reordered/mismatched seeds
+  // surfaces the more diagnostic "stale atlas-raw.json?" message first --
+  // both checks still run regardless of order (neither is skipped), this
+  // only pins which message wins when both would fail.
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'atlas-report-guard-order-'));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it('reports the stale-graph-sha message, not the seeds-mismatch message, when both fail at once', () => {
+    const raw = buildRaw(2, [3, -1]);
+    const doubleFault: AtlasEvaluationRaw = {
+      ...raw,
+      graphs: {
+        // Stale sha: does not match writeTestManifest's default HEX64('a').
+        biological: { ...raw.graphs.biological!, graphSha256: HEX64('f') },
+        // Reordered seeds: also fails verifyRawSeedsConsistent independently.
+        rewiredSeed0: { ...raw.graphs.rewiredSeed0!, heldOutSeeds: [...raw.graphs.rewiredSeed0!.heldOutSeeds].reverse() }
+      }
+    };
+    const rawPath = join(root, 'atlas-raw.json');
+    writeFileSync(rawPath, JSON.stringify(doubleFault));
+    writeFileSync(`${rawPath.slice(0, -'.json'.length)}.run.json`, JSON.stringify({ shards: 1 }));
+    writeFileSync(join(root, 'positions.json'), JSON.stringify(buildPositions(2)));
+    writeTestManifest(join(root, 'manifest.json'));
+
+    const args: AtlasReportArgs = {
+      raw: rawPath,
+      out: join(root, 'atlas.json'),
+      reportMd: join(root, 'atlas-report.md'),
+      manifest: join(root, 'manifest.json'),
+      positions: join(root, 'positions.json'),
+      bootstrapSeed: 1,
+      bootstrapResamples: 50
+    };
+
+    expect(() => runAtlasReport(args)).toThrow(/biological graphSha256.*stale atlas-raw\.json\?/s);
+    expect(() => runAtlasReport(args)).not.toThrow(/heldOutSeeds do not match/);
+  });
+});
+
+describe('computeOutlierSeedFindings', () => {
+  // Data-driven Limitations disclosure (thermo-methodology review item d):
+  // computed directly from atlas-raw.json-shaped input, not hard-coded.
+  const runMeta = { shards: 1, elapsedMs: 1, perEpisodeMs: 1 };
+
+  it('flags a neuron with an outlier seed, names the seed, and checks headline robustness', () => {
+    const effects = [0, 0];
+    const raw = buildRaw(effects.length, effects);
+    const biological = raw.graphs.biological!;
+    const heldOutSeeds = biological.heldOutSeeds;
+    // Neuron 0: every seed but one is a small, constant diff (+0.2); the
+    // held-out seed at index 3 gets a single large positive outlier
+    // (diff=+7, past OUTLIER_ABS_DIFF_THRESHOLD=5) -- this becomes both
+    // graphs' largest-|effect| neuron (used for the headline check below)
+    // since neuron 1 stays at exactly 0.
+    const outlierSeedIndex = 3;
+    const movementScore = biological.baselineMovementScore.map((score, i) => score + (i === outlierSeedIndex ? 7 : 0.2));
+    const patchedRaw: AtlasEvaluationRaw = {
+      ...raw,
+      graphs: {
+        biological: {
+          ...biological,
+          lesion: biological.lesion.map((entry) => (entry.index === 0 ? { ...entry, movementScore } : entry))
+        },
+        rewiredSeed0: raw.graphs.rewiredSeed0!
+      }
+    };
+    const positions = buildPositions(effects.length);
+    const artifact = buildArtifact(patchedRaw, positions, runMeta, 1, 100);
+
+    const findings = computeOutlierSeedFindings(patchedRaw, artifact);
+    expect(findings.biological.outlierNeuronCount).toBe(1);
+    expect(findings.biological.bySeed).toEqual([{ seed: heldOutSeeds[outlierSeedIndex], neuronCount: 1 }]);
+    // Neuron 0 is this graph's headline (largest |effect|) neuron: excluding
+    // its own most extreme seed(s) should shrink its effect, since almost
+    // all of its magnitude comes from the single +7 outlier seed among
+    // otherwise-uniform +0.2 diffs.
+    expect(findings.biological.headline.index).toBe(0);
+    expect(findings.biological.headline.retainedRatio).toBeLessThan(1);
+  });
+
+  it('reports zero outlier neurons when no diff exceeds the threshold', () => {
+    const raw = buildRaw(2, [0.1, -0.2]);
+    const positions = buildPositions(2);
+    const artifact = buildArtifact(raw, positions, runMeta, 1, 100);
+
+    const findings = computeOutlierSeedFindings(raw, artifact);
+    expect(findings.biological.outlierNeuronCount).toBe(0);
+    expect(findings.biological.bySeed).toEqual([]);
+    expect(findings.rewiredSeed0.outlierNeuronCount).toBe(0);
+  });
+});
+
 describe('runAtlasReport: guardShippedDefault (regression)', () => {
   // Direct coverage for I-1/I-4b of the dual review: guardShippedDefault
   // must refuse to overwrite the shipped defaults not only when a run is
@@ -809,11 +976,26 @@ describe('runAtlasReport: guardShippedDefault (regression)', () => {
    * check) never rejects these guard-focused fixtures for an unrelated
    * reason. `graphSha256` values match the real, committed manifest -- see
    * the describe block's comment.
+   *
+   * The positions sidecar written alongside is *deliberately mismatched*
+   * (`positionsGraphSha256` defaults to a value that never matches the
+   * fixture's own `graphGzipSha256`) -- a tripwire, not an oversight: every
+   * case below that expects `guardShippedDefault` to throw uses the
+   * default, so if that guard's own check ever regressed and failed to
+   * throw, execution would still stop at `readPositions`'s independent
+   * "stale positions artifact" check a few lines later in `runAtlasReport`
+   * -- *before* `buildArtifact` or any file write -- rather than silently
+   * falling through to overwrite the real, committed
+   * `public/data/lesion-atlas-v1.json`/manifest/`docs/lesion-atlas-report.md`.
+   * The one test that expects success (`writeFixture`'s only caller passing
+   * `validPositions: true`) supplies a correctly-matching positions sidecar
+   * instead, so it still exercises a real, complete `runAtlasReport` run.
    */
   const writeFixture = (
     rawPath: string,
     seeds: { readonly start: number; readonly count: number },
-    ticks: number
+    ticks: number,
+    opts: { readonly validPositions?: boolean } = {}
   ): void => {
     const heldOutSeeds = Array.from({ length: seeds.count }, (_, i) => seeds.start + i);
     const baselineMovementScore = heldOutSeeds.map((_, i) => 10 + i * 0.1);
@@ -841,7 +1023,9 @@ describe('runAtlasReport: guardShippedDefault (regression)', () => {
     };
     writeFileSync(rawPath, JSON.stringify(raw));
     writeFileSync(`${rawPath.slice(0, -'.json'.length)}.run.json`, JSON.stringify({ shards: 1 }));
-    writeFileSync(join(root, 'positions.json'), JSON.stringify(buildPositions(FULL_NEURON_COUNT)));
+    const positions = buildPositions(FULL_NEURON_COUNT);
+    const positionsToWrite = opts.validPositions ? positions : { ...positions, graphSha256: HEX64('z') };
+    writeFileSync(join(root, 'positions.json'), JSON.stringify(positionsToWrite));
   };
 
   const guardedArgs = (rawPath: string, out: string, reportMd: string, manifest: string): AtlasReportArgs => ({
@@ -860,10 +1044,18 @@ describe('runAtlasReport: guardShippedDefault (regression)', () => {
     // out+manifest must share a directory (I-2); DEFAULT_OUT and
     // DEFAULT_MANIFEST both live in public/data, so this is the one
     // combination that can use the real DEFAULT_OUT without writing a
-    // scratch file into public/data itself.
+    // scratch file into public/data itself. Belt-and-suspenders on top of
+    // the positions tripwire above: read the real shipped bytes before and
+    // after, so even a double regression (guardShippedDefault *and* the
+    // positions check) would be caught by an unexpected byte change here,
+    // rather than silently passing.
+    const outBefore = readFileSync(DEFAULT_OUT);
+    const manifestBefore = readFileSync(DEFAULT_MANIFEST);
     expect(() =>
       runAtlasReport(guardedArgs(rawPath, DEFAULT_OUT, join(root, 'r.md'), DEFAULT_MANIFEST))
     ).toThrow(/refusing to overwrite the shipped/);
+    expect(readFileSync(DEFAULT_OUT).equals(outBefore)).toBe(true);
+    expect(readFileSync(DEFAULT_MANIFEST).equals(manifestBefore)).toBe(true);
   });
 
   it('refuses the same smoke run at DEFAULT_REPORT_MD, independent of --out/--manifest', () => {
@@ -875,9 +1067,11 @@ describe('runAtlasReport: guardShippedDefault (regression)', () => {
       rewiredSeed0Sha256: realManifest.rewiredArms.seed0.binarySha256,
       neuronCount: FULL_NEURON_COUNT
     });
+    const reportMdBefore = readFileSync(DEFAULT_REPORT_MD);
     expect(() =>
       runAtlasReport(guardedArgs(rawPath, join(root, 'o.json'), DEFAULT_REPORT_MD, manifestPath))
     ).toThrow(/refusing to overwrite the shipped/);
+    expect(readFileSync(DEFAULT_REPORT_MD).equals(reportMdBefore)).toBe(true);
   });
 
   it('refuses a run with the shipped neuron/seed count but the wrong tick count', () => {
@@ -887,18 +1081,20 @@ describe('runAtlasReport: guardShippedDefault (regression)', () => {
     // independently of neuron coverage, not merely as a side effect of a
     // smoke run also being short on seeds.
     writeFixture(rawPath, { start: DEFAULT_HELD_OUT_START, count: DEFAULT_HELD_OUT_COUNT }, DEFAULT_TICKS - 1);
+    const outBefore = readFileSync(DEFAULT_OUT);
     // Matches on "ticks" specifically (not just "refusing to overwrite the
     // shipped"), so this test cannot pass for the wrong reason -- e.g. if a
     // future change broke the neuron-coverage or seeds check instead and
-    // masked a broken ticks check behind it (a round-2 dual-review finding).
+    // masked a broken ticks check behind it.
     expect(() =>
       runAtlasReport(guardedArgs(rawPath, DEFAULT_OUT, join(root, 'r.md'), DEFAULT_MANIFEST))
     ).toThrow(/refusing to overwrite the shipped.*ticks \d+ \(shipped: \d+\)/s);
+    expect(readFileSync(DEFAULT_OUT).equals(outBefore)).toBe(true);
   });
 
   it('does not guard a scratch path: a short run still writes when none of out/report-md/manifest is a shipped default', () => {
     const rawPath = join(root, 'atlas-raw.json');
-    writeFixture(rawPath, { start: 30001, count: 3 }, 100);
+    writeFixture(rawPath, { start: 30001, count: 3 }, 100, { validPositions: true });
     const manifestPath = join(root, 'manifest.json');
     writeTestManifest(manifestPath, {
       biologicalSha256: realManifest.binarySha256,
