@@ -148,9 +148,16 @@ export const runWorkerMain = <
   process.on('message', (task: Task) => {
     try {
       const results = runTask(task);
+      // `Message` is a generic type parameter, so TS can't structurally
+      // verify this literal against it even though the literal matches the
+      // `type: 'result'` arm of `Message`'s own default constraint above --
+      // the cast asserts what every real caller's `Message` type parameter
+      // is structurally guaranteed to accept.
       const message = { type: 'result', graphId: task.graphId, results } as Message;
       process.send?.(message);
     } catch (error) {
+      // Same reasoning as the `as Message` cast above, for the `type:
+      // 'error'` arm.
       const message = {
         type: 'error',
         graphId: task.graphId,

@@ -197,12 +197,14 @@ def write_canonical_json(path: Path, payload: object) -> None:
 # ---------------------------------------------------------------------------
 
 
-def base_arg_parser(description: str | None) -> argparse.ArgumentParser:
+def base_arg_parser(description: str | None, out_help: str = "combined output JSON path") -> argparse.ArgumentParser:
     """The `--index`/`--graphs-dir`/`--biological`/`--skip-biological`/
     `--out`/`--workers` flags every analysis CLI takes, identically named
     and defaulted. Callers call `parser.add_argument(...)` for any
     tool-specific flags (e.g. `transfer.py`'s `--steady-state-dir`) after
-    this returns, then `parser.parse_args(argv)`."""
+    this returns, then `parser.parse_args(argv)`. `out_help` lets each CLI
+    show its own `--out` default (e.g. `"combined transfer.json output
+    path"`) instead of this generic fallback."""
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--index", type=Path, required=True, help="rewire_batch.py index.json")
     parser.add_argument("--graphs-dir", type=Path, required=True, help="directory holding rewired .bin.gz files")
@@ -218,7 +220,7 @@ def base_arg_parser(description: str | None) -> argparse.ArgumentParser:
         action="store_true",
         help="omit biological/disconnected entirely (rewired graphs only)",
     )
-    parser.add_argument("--out", type=Path, required=True, help="combined output JSON path")
+    parser.add_argument("--out", type=Path, required=True, help=out_help)
     parser.add_argument(
         "--workers",
         type=int,

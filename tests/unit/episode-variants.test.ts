@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { decodeAction, OUTPUT_POPULATION } from '../../src/lib/arena/actions';
 import { observeAgent } from '../../src/lib/arena/sensors';
 import { createWorld, stepWorld } from '../../src/lib/arena/world';
-import type { AgentScore } from '../../src/lib/arena/types';
+import type { AgentScore, DecodedAction } from '../../src/lib/arena/types';
 import {
   createModelState,
   createOutputBuffer,
@@ -141,6 +141,58 @@ describe('runEpisode: authored-flip-* decoder variants', () => {
     for (const decoder of ['authored-flip-thrust', 'authored-flip-yaw', 'authored-flip-both'] as const) {
       expect(decodedBrakeAtTickZero(decoder)).toBe(authoredBrake);
     }
+  });
+
+  it('onSubstep is supported for a flip decoder and observes the unflipped rate while the decoded action is flipped', () => {
+    // `AgentEpisodeConfig.onSubstep`'s doc comment: it is threaded straight
+    // through to `runLesionedSubsteps`, which calls it with the live
+    // `state.rate` -- before `createNeuralRunner`'s post-substep-loop flip
+    // step (`outputs[OUTPUT_POPULATION.thrust] *= -1`, applied to the
+    // aggregated `outputs` buffer, never to `state.rate`). So an
+    // `authored-flip-*` decoder must feed the hook the exact same
+    // per-substep rates an unflipped `authored` run would, while still
+    // producing a flipped decoded action. Both runs share a seed and start
+    // from the same zero-filled `createModelState` (per this file's tick-0
+    // parity reasoning above), so their tick-0 rate sequences are only
+    // guaranteed identical for a single tick -- hence `ticks: 1`.
+    const graph = createTraceGraph();
+    const seed = 7;
+
+    const runAndCapture = (
+      decoder: EpisodeDecoderKind
+    ): { rates: Float32Array[]; action: DecodedAction } => {
+      const rates: Float32Array[] = [];
+      let action: DecodedAction | undefined;
+      runEpisode({
+        seed,
+        ticks: 1,
+        substeps: TRACE_SUBSTEPS,
+        left: { decoder, graph, onSubstep: (rate) => rates.push(Float32Array.from(rate)) },
+        right: { decoder: 'parked' },
+        onTick: (_tick, actions) => {
+          action = actions.left;
+        }
+      });
+      if (!action) throw new Error('onTick never fired');
+      return { rates, action };
+    };
+
+    const authored = runAndCapture('authored');
+    const flipped = runAndCapture('authored-flip-both');
+
+    expect(flipped.rates.length).toBe(TRACE_SUBSTEPS);
+    expect(flipped.rates.length).toBe(authored.rates.length);
+    for (let i = 0; i < authored.rates.length; i += 1) {
+      expect(flipped.rates[i]).toEqual(authored.rates[i]);
+    }
+
+    // Nontriviality guard, matching this file's other flip tests: a flip
+    // that never actually flipped anything would pass the equality checks
+    // above vacuously.
+    expect(authored.action.thrust).not.toBe(0);
+    expect(authored.action.yaw).not.toBe(0);
+    expect(flipped.action.thrust).toBe(-authored.action.thrust);
+    expect(flipped.action.yaw).toBe(-authored.action.yaw);
   });
 
   it('lesion is still supported for a flip decoder (part of the authored family)', () => {

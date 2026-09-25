@@ -312,6 +312,49 @@ describe('runEpisode lesion: decoder gating', () => {
   });
 });
 
+describe('runEpisode onSubstep: decoder gating', () => {
+  // Structural twin of the "runEpisode lesion: decoder gating" block above:
+  // `onSubstep` is guarded the same way `lesion` is
+  // (`scripts/training/episode.ts`'s `createAgentRunner`, immediately below
+  // the `lesion` guard), and that guard runs before any decoder-specific
+  // "requires a graph/weights" check, so these throw without needing to
+  // supply a graph or weights either -- see the lesion version of this block
+  // for why that's true of the guard's position, not an oversight here.
+
+  it('throws when combined with trained', () => {
+    expect(() =>
+      runEpisode({
+        seed: 1,
+        ticks: 1,
+        left: { decoder: 'trained', onSubstep: () => {} },
+        right: { decoder: 'parked' }
+      })
+    ).toThrow(/does not support onSubstep/);
+  });
+
+  it('throws when combined with silenced', () => {
+    expect(() =>
+      runEpisode({
+        seed: 1,
+        ticks: 1,
+        left: { decoder: 'silenced', onSubstep: () => {} },
+        right: { decoder: 'parked' }
+      })
+    ).toThrow(/does not support onSubstep/);
+  });
+
+  it('throws when combined with parked', () => {
+    expect(() =>
+      runEpisode({
+        seed: 1,
+        ticks: 1,
+        left: { decoder: 'parked', onSubstep: () => {} },
+        right: { decoder: 'parked' }
+      })
+    ).toThrow(/does not support onSubstep/);
+  });
+});
+
 describe('runEpisode lesion: no-op and full-population edge cases (trace graph)', () => {
   const graph = createTraceGraph();
 

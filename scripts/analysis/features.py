@@ -360,7 +360,7 @@ def _one_disconnected(graph_id: str, path: Path, expected_sha256: str) -> tuple[
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
-    return graph_io.base_arg_parser(__doc__).parse_args(argv)
+    return graph_io.base_arg_parser(__doc__, out_help="combined features.json output path").parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> None:

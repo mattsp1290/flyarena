@@ -349,7 +349,7 @@ def _one_disconnected(graph_id: str, path: Path, expected_sha256: str) -> tuple[
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = graph_io.base_arg_parser(__doc__)
+    parser = graph_io.base_arg_parser(__doc__, out_help="combined transfer.json output path")
     parser.add_argument(
         "--steady-state-dir",
         type=Path,
