@@ -56,6 +56,26 @@ export interface TrainedBiologicalEntry extends ScoredEntry {
 }
 
 /**
+ * One biological replica's empirical percentile among the 20 rewired trained
+ * scores, using the same tie rule `rankStatistics` (`null-stats.ts`) applies
+ * everywhere else in this study. Computed for EVERY biological replica, not
+ * only the one at `replicaSeed` (`TrainedSection.bioPercentile`'s "headline"
+ * value) -- a thermo-methodology review finding: publishing only the
+ * headline number let a reader believe "biological scores at the 0th
+ * percentile" is a property of the topology, when in fact it depends on
+ * which trainer-seed replica is used (trainer seed 202 can land inside the
+ * null's interquartile range while 101/303 sit at the extreme low end). See
+ * `renderTrainedSection`'s "Trainer-seed variance context" section, which
+ * states this explicitly next to the headline number.
+ */
+export interface TrainedBiologicalReplicaPercentile {
+  readonly trainerSeed: number;
+  readonly percentile: number;
+  readonly pLow: number;
+  readonly pHigh: number;
+}
+
+/**
  * The trained-readout sample: 20 rewired graphs, each CEM-trained with the
  * exact production config `flyarena-bigq` used for its biological replicas
  * (`replicaSeed`, one trainer seed shared by every rewired run -- "isolates
@@ -87,10 +107,20 @@ export interface TrainedSection {
   readonly biological: readonly TrainedBiologicalEntry[];
   /** Statistics over the 20 rewired trained scores. */
   readonly null: NullSummary;
-  /** Biological trainer-seed-101's empirical percentile among the 20 rewired trained scores. */
+  /**
+   * The headline number: biological at `replicaSeed`'s (the trainer seed
+   * every rewired readout was also trained at) empirical percentile among
+   * the 20 rewired trained scores. This is ONE sample from a noisy
+   * trainer-seed-dependent quantity, not a stable property of the biological
+   * topology -- see `bioReplicaPercentiles` (every replica's own percentile)
+   * and `renderTrainedSection`'s "Trainer-seed variance context", which
+   * states this explicitly.
+   */
   readonly bioPercentile: number;
   readonly pLow: number;
   readonly pHigh: number;
+  /** Every biological replica's own percentile (same tie rule), sorted by trainerSeed ascending -- see this field's own interface doc comment. */
+  readonly bioReplicaPercentiles: readonly TrainedBiologicalReplicaPercentile[];
   /** `1/|rewired|` -- 5% at n=20. See `null-stats.ts`'s `percentileResolution`. */
   readonly percentileResolution: number;
   readonly bioTrainerSeedSpread: TrainerSeedSpread & { readonly label: string };
@@ -225,6 +255,21 @@ export const buildTrainedSection = (
   }
   const rank = rankStatistics(nullValues, shippedBio.stats.mean);
 
+  // Every biological replica's own percentile (same tie rule), not only the
+  // headline one at `raw.replicaSeed` -- see `TrainedBiologicalReplicaPercentile`'s
+  // doc comment. `biologicalStats` is already trainerSeed-ascending
+  // (`raw.biological` is built that way by `null-trained-evaluate.ts`'s
+  // `assembleRaw`), so this list inherits that order for free.
+  const bioReplicaPercentiles: TrainedBiologicalReplicaPercentile[] = biologicalStats.map(({ entry, stats }) => {
+    const replicaRank = rankStatistics(nullValues, stats.mean);
+    return {
+      trainerSeed: entry.trainerSeed,
+      percentile: replicaRank.bioPercentile,
+      pLow: replicaRank.pLow,
+      pHigh: replicaRank.pHigh
+    };
+  });
+
   const spread = trainerSeedSpread(biologicalStats.map(({ stats }) => stats.mean));
 
   const timing = resolveTrainedTiming(trainedJsonPath);
@@ -242,6 +287,7 @@ export const buildTrainedSection = (
     bioPercentile: rank.bioPercentile,
     pLow: rank.pLow,
     pHigh: rank.pHigh,
+    bioReplicaPercentiles,
     percentileResolution: percentileResolution(nullValues.length),
     bioTrainerSeedSpread: { ...spread, label: BIO_TRAINER_SEED_SPREAD_LABEL },
     bigqGpuRerunFitnessDelta,
@@ -401,8 +447,8 @@ distinguishable at this sample size.
 Biological trained scores across the ${trained.biological.length} \`flyarena-bigq\` replicas (trainer seeds
 ${[...trained.biological].map((e) => e.trainerSeed).sort((a, b) => a - b).join('/')}) span
 \`${fmt(trained.bioTrainerSeedSpread.min)}\` to \`${fmt(trained.bioTrainerSeedSpread.max)}\`
-(range \`${fmt(trained.bioTrainerSeedSpread.range)}\`) — **${trained.bioTrainerSeedSpread.label}** — at the
-*same* biological topology. For context on how large this kind of noise alone can be: the merged
+(range \`${fmt(trained.bioTrainerSeedSpread.range)}\`). This is **${trained.bioTrainerSeedSpread.label}**
+For context on how large this kind of noise alone can be: the merged
 [\`trained-readout-v1.manifest.json\`](../public/data/trained-readout-v1.manifest.json)'s recorded CUDA
 rerun of the shipped biological replica moved TS held-out \`trained\` fitness by
 \`${fmt(trained.bigqGpuRerunFitnessDelta)}\` (rerun minus original, that report's sign convention) —
@@ -415,8 +461,23 @@ ${
 a claim that the two numbers should match. **This spread is not comparable to the ${pct(trained.bioPercentile)}
 percentile above**: the spread measures trainer-seed/run-to-run noise at *fixed* topology; the percentile
 measures where one topology (biological, at trainer seed ${trained.replicaSeed}) falls among
-${trained.rewired.length} different topologies, each at the *same* one trainer seed. Whether these two
-numbers happen to overlap, and neither's size relative to the other, supports any conclusion about topology
-"mattering more or less" than trainer-seed noise.
+${trained.rewired.length} different topologies, each at the *same* one trainer seed. Neither whether these
+two numbers happen to overlap, nor either's size relative to the other, supports any conclusion about
+topology "mattering more or less" than trainer-seed noise.
+
+**Robustness of the headline percentile to which replica is used.** Ranking each of the
+${trained.bioReplicaPercentiles.length} biological replicas separately against the same
+${trained.rewired.length} rewired trained scores (same tie rule as above): ${trained.bioReplicaPercentiles
+    .map(
+      (r) =>
+        `trainer seed ${r.trainerSeed}${r.trainerSeed === trained.replicaSeed ? ' (the headline above, and the seed the rewired runs were matched to)' : ''} ranks at ${pct(r.percentile)}`
+    )
+    .join(', ')}. The headline ${pct(trained.bioPercentile)} percentile above is therefore one sample from
+this trainer-seed-noise distribution, not a stable property of the biological topology: because
+trainer-seed variation at fixed topology (the \`${fmt(trained.bioTrainerSeedSpread.range)}\` spread above)
+is comparable in magnitude to the spread across the ${trained.rewired.length} rewirings (null IQR
+\`${fmt(trained.null.iqr)}\`, std \`${fmt(trained.null.std)}\`), this trained-readout comparison is **not
+robust to the choice of trainer-seed replica** and should not be read as biological reliably scoring lowest
+among the rewirings — no causal or superiority claim is made.
 `;
 };

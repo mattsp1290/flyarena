@@ -687,6 +687,36 @@ const guardShippedDefault = (path: string, defaultPath: string, label: string, r
 };
 
 /**
+ * A shipped published artifact must never silently lose its wall-time
+ * provenance -- `resolveRunMeta` treats `elapsedMs`/`perEpisodeMs` as
+ * optional (tolerant of an older/scratch `authored.json` with no sidecar at
+ * all), but that tolerance must not extend to the real publish path: a
+ * republish that happens to run against a `training/runs/` tree missing
+ * `<authored>.run.json` would otherwise silently drop the "Wall time"/
+ * "Per-episode time" rows from `docs/rewiring-null-report.md`'s Parameters
+ * table with no error anywhere (a thermo-methodology review finding: this
+ * happened for real in a prior republish of this exact artifact). Scoped to
+ * the shipped default `--out` only, mirroring `guardShippedDefault`'s own
+ * scope -- an explicit scratch `--out` (a dev/test run, or one deliberately
+ * regenerating without timing) is unaffected.
+ */
+/** Exported (like `guardVariantOutPath`/`resolveRunMeta`) so tests can exercise this guard directly, without needing a 500-rewired-graph fixture just to get past `guardShippedDefault` first. */
+export const guardShippedTimingProvenance = (
+  outPath: string,
+  defaultOutPath: string,
+  runMeta: Readonly<RunMeta>
+): void => {
+  if (resolve(outPath) !== resolve(defaultOutPath)) return;
+  if (runMeta.elapsedMs !== undefined && runMeta.perEpisodeMs !== undefined) return;
+  throw new Error(
+    `null-report: refusing to publish to the shipped artifact (${defaultOutPath}) without wall-time provenance -- ` +
+      'the authored.run.json sidecar has no elapsedMs/perEpisodeMs (or does not exist). Restore the sidecar so ' +
+      'the published report keeps its "Wall time"/"Per-episode time" rows, or pass an explicit --out scratch ' +
+      'path if this is intentionally a timing-less regeneration.'
+  );
+};
+
+/**
  * The manifest being updated must describe the same biological graph (and,
  * where recorded, the same shipped rewired-seed-0 control) that
  * `authored.json` was actually scored against — otherwise a stale
@@ -809,6 +839,7 @@ export const runNullReport = (args: Readonly<NullReportArgs>): RunNullReportResu
   guardShippedDefault(args.out, DEFAULT_OUT, 'published artifact', artifact.rewired.length);
   guardShippedDefault(args.reportMd, DEFAULT_REPORT_MD, 'report', artifact.rewired.length);
   guardShippedDefault(args.manifest, DEFAULT_MANIFEST, 'manifest', artifact.rewired.length);
+  guardShippedTimingProvenance(args.out, DEFAULT_OUT, runMeta);
   verifySourceGraphMatchesManifest(args.manifest, artifact, args.authored);
   verifyManifestRoundTrips(args.manifest);
 

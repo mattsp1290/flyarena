@@ -11,6 +11,7 @@ import {
   DEFAULT_OUT,
   DEFAULT_REPORT_MD,
   buildArtifact,
+  guardShippedTimingProvenance,
   parseNullReportArgs,
   resolveRunMeta,
   runNullReport,
@@ -165,6 +166,43 @@ describe('resolveRunMeta', () => {
     writeFileSync(join(root, 'authored.run.json'), JSON.stringify({ shards: 7, elapsedMs: 1234, perEpisodeMs: 5.6 }));
     const meta = resolveRunMeta(baseArgs(authored, 3));
     expect(meta).toEqual({ shards: 3, elapsedMs: 1234, perEpisodeMs: 5.6 });
+  });
+});
+
+/**
+ * `.agents/plans/rewiring-null/00-overview.md`'s WP2 acceptance criterion
+ * ("running null:report again gives byte-identical output") was silently
+ * violated by a prior republish whose `training/runs/` tree had lost
+ * `authored.run.json` -- `resolveRunMeta` tolerated the missing sidecar
+ * (it's legitimately optional for a scratch/dev run) and the published
+ * artifact quietly lost its "Wall time"/"Per-episode time" rows (a
+ * thermo-methodology review finding, I1). `guardShippedTimingProvenance`
+ * closes that gap for the one path where it actually matters: publishing to
+ * the shipped default artifact.
+ */
+describe('guardShippedTimingProvenance', () => {
+  const DEFAULT = '/repo/public/data/rewiring-null-v1.json';
+
+  it('throws when publishing to the shipped default with no timing in runMeta', () => {
+    expect(() => guardShippedTimingProvenance(DEFAULT, DEFAULT, { shards: 18 })).toThrow(
+      /refusing to publish to the shipped artifact/
+    );
+  });
+
+  it('throws when only one of elapsedMs/perEpisodeMs is present (a malformed sidecar)', () => {
+    expect(() =>
+      guardShippedTimingProvenance(DEFAULT, DEFAULT, { shards: 18, elapsedMs: 1234 })
+    ).toThrow(/refusing to publish to the shipped artifact/);
+  });
+
+  it('does not throw when publishing to the shipped default WITH timing present', () => {
+    expect(() =>
+      guardShippedTimingProvenance(DEFAULT, DEFAULT, { shards: 18, elapsedMs: 1234, perEpisodeMs: 5.6 })
+    ).not.toThrow();
+  });
+
+  it('does not throw for a scratch (non-default) --out, even with no timing', () => {
+    expect(() => guardShippedTimingProvenance('/tmp/scratch-out.json', DEFAULT, { shards: 18 })).not.toThrow();
   });
 });
 
@@ -379,6 +417,64 @@ describe('runNullReport', () => {
       const reportMd = readFileSync(reportMdPath, 'utf8');
       expect(reportMd).toContain('## Trained-readout sample');
       expect(reportMd).toContain('69b610d4a9da11b12a7ac180997e702cf9fd2a4f');
+    });
+
+    it('computes a per-replica percentile for every biological trainer seed, not just the headline one (thermo-methodology C1)', () => {
+      const result = runNullReport(trainedArgs);
+      const trained = result.artifact.trained!;
+
+      // Fixture: nullValues (rewired means, seeds 0..3) = [1, 2, 3, 4];
+      // biological means are ~2.01 (101), ~3.02 (202), ~4.03 (303) ->
+      // percentiles 50%, 75%, 100% respectively (hand-computed, same tie
+      // rule rankStatistics uses elsewhere).
+      expect(trained.bioReplicaPercentiles).toHaveLength(3);
+      expect(trained.bioReplicaPercentiles.map((r) => r.trainerSeed)).toEqual([101, 202, 303]); // sorted, matches `biological`'s own order
+      expect(trained.bioReplicaPercentiles.find((r) => r.trainerSeed === 101)!.percentile).toBeCloseTo(0.5, 10);
+      expect(trained.bioReplicaPercentiles.find((r) => r.trainerSeed === 202)!.percentile).toBeCloseTo(0.75, 10);
+      expect(trained.bioReplicaPercentiles.find((r) => r.trainerSeed === 303)!.percentile).toBeCloseTo(1.0, 10);
+      // The headline `bioPercentile` (replicaSeed=101) must equal that
+      // same replica's own entry in bioReplicaPercentiles -- one shared
+      // computation, not two that could drift apart.
+      expect(trained.bioReplicaPercentiles.find((r) => r.trainerSeed === trained.replicaSeed)!.percentile).toBeCloseTo(
+        trained.bioPercentile,
+        12
+      );
+    });
+
+    it('states the per-replica robustness caveat in the report, naming the headline seed and every other replica\'s percentile', () => {
+      const result = runNullReport(trainedArgs);
+      const reportMd = readFileSync(reportMdPath, 'utf8');
+      expect(reportMd).toContain('Robustness of the headline percentile to which replica is used');
+      // The headline replica (101) is named as such; the other two replicas'
+      // own percentiles (75.0%, 100.0%) both appear in the prose.
+      expect(reportMd).toMatch(/trainer seed 101 \(the headline above/);
+      expect(reportMd).toContain('trainer seed 202 ranks at 75.0%');
+      expect(reportMd).toContain('trainer seed 303 ranks at 100.0%');
+      expect(reportMd).toMatch(/not\s+robust to the choice of trainer-seed replica/);
+      expect(reportMd).toMatch(/should not be read as biological reliably scoring lowest/);
+      expect(reportMd).toContain('no causal or superiority claim is made');
+    });
+
+    it('the trainer-seed-variance sentence is grammatically a negation (thermo-methodology I2): "Neither ... nor ... supports"', () => {
+      runNullReport(trainedArgs);
+      const reportMd = readFileSync(reportMdPath, 'utf8');
+      expect(reportMd).toMatch(/Neither whether these\s+two numbers happen to overlap, nor either's size relative to the other, supports/);
+      // The old, meaning-inverting phrasing must be gone.
+      expect(reportMd).not.toMatch(/Whether these two\s+numbers happen to overlap, and neither's size/);
+    });
+
+    it('bioTrainerSeedSpread.label renders as its own sentence, not a mid-sentence appositive with a dangling clause (thermo-methodology I3)', () => {
+      const result = runNullReport(trainedArgs);
+      const range = result.artifact.trained!.bioTrainerSeedSpread.range;
+      const reportMd = readFileSync(reportMdPath, 'utf8');
+      expect(reportMd).toContain(`(range \`${range.toFixed(4)}\`). This is **trainer-noise variance`);
+      // The old rendering wrapped the label in em dashes and appended a
+      // redundant "at the *same* biological topology" fragment right after
+      // it, immediately before "For context" -- that specific dangling
+      // fragment must be gone (not a blanket ban on the phrase, which
+      // legitimately appears elsewhere, e.g. "at the *same* one trainer
+      // seed" in the paired-comparison sentence).
+      expect(reportMd).not.toContain('*same* biological topology. For context');
     });
 
     it('running it twice with --trained present is still byte-identical', () => {
