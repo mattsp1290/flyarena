@@ -197,7 +197,7 @@ def _remove_edges(graph: "binfmt.GraphArrays", remove_indices: "set[int]") -> "b
     neuron_count = int(graph.metadata["neuronCount"])
     edges = swap_ops.edge_set_from_graph(graph)
     keep_mask = np.ones(len(edges.pre), dtype=bool)
-    keep_mask[sorted(remove_indices)] = False
+    keep_mask[list(remove_indices)] = False  # order is not load-bearing for a boolean-mask assignment
 
     new_pre = edges.pre[keep_mask]
     new_post = edges.post[keep_mask]
@@ -264,8 +264,19 @@ def _r_premise_check(bio_graph: "binfmt.GraphArrays") -> "tuple[dict, binfmt.Gra
     global_gain = float(bio_graph.metadata["globalGain"])
     n = matrices.adjacency.shape[0]
     system_matrix = leak_rate * np.eye(n) - global_gain * matrices.adjacency
-    steady_state_map = np.linalg.solve(system_matrix, matrices.input_matrix)
-    L = np.linalg.solve(system_matrix.T, matrices.output_matrix[THRUST_IDX, :])
+    try:
+        steady_state_map = np.linalg.solve(system_matrix, matrices.input_matrix)
+        L = np.linalg.solve(system_matrix.T, matrices.output_matrix[THRUST_IDX, :])
+    except np.linalg.LinAlgError as error:
+        # Matches `transfer.py`'s own `_compute_transfer` policy (flag and
+        # fail loudly rather than silently propagate a NaN/inf-laced
+        # solution -- see that module's `_finite_or_none` doc comment for
+        # the two dual-review rounds that established this convention).
+        # `main()` already verifies `bio_graph` itself is non-singular
+        # (`bio_transfer["singular"]`) before ever calling this function, so
+        # this can only fire when `_r_premise_check` is called directly
+        # against an untested graph.
+        raise RuntimeError(f"interventions: R premise check's biological graph is singular: {error}") from error
     R = steady_state_map[:, RIGHT_CLEARANCE_IDX] + steady_state_map[:, FORWARD_CLEARANCE_IDX]
     sign = bio_graph.presynaptic_signs.astype(np.float64)
 
@@ -277,6 +288,24 @@ def _r_premise_check(bio_graph: "binfmt.GraphArrays") -> "tuple[dict, binfmt.Gra
         contribution = sign[pre] * weight * global_gain * L[post] * R[pre]
         contributions.append((e, contribution))
     total = sum(c for _, c in contributions)
+    # "At least 50% of the total first-order target transfer" is only a
+    # well-defined stopping rule when `total > 0`: for `total == 0`
+    # (contributions cancel), `cumulative >= 0.5 * total == 0` is satisfied
+    # by the very first (possibly tiny) contribution only if that
+    # contribution alone is already >= 0, which is not "the smallest set
+    # carrying >= 50%" in any meaningful sense, and for `total < 0` the
+    # comparison's sense flips (a highly negative `0.5 * total` makes the
+    # loop stop almost immediately). Both are real dual-review findings
+    # (round 1) on a branch this study's real biological graph never
+    # reaches (it has zero input-labeled->thrust edges) -- raising loudly
+    # here means a future graph that *does* reach this branch gets an
+    # explicit policy decision instead of a silently wrong edge set.
+    if total <= 0:
+        raise RuntimeError(
+            f"interventions: R premise check's total first-order target contribution is {total!r} "
+            "(<= 0); the 'remove edges carrying >= 50% of the total' rule is not well-defined for a "
+            "non-positive total and needs an explicit policy decision"
+        )
     contributions.sort(key=lambda item: -item[1])
 
     remove_indices: set[int] = set()
@@ -284,7 +313,7 @@ def _r_premise_check(bio_graph: "binfmt.GraphArrays") -> "tuple[dict, binfmt.Gra
     for e, c in contributions:
         remove_indices.add(e)
         cumulative += c
-        if total != 0 and cumulative >= 0.5 * total:
+        if cumulative >= 0.5 * total:
             break
 
     removed_graph = _remove_edges(bio_graph, remove_indices)
@@ -453,7 +482,15 @@ def _greedy_targeted_swaps(
     current_graph = bio_graph
     matrices = graph_io.build_dense_matrices(current_graph)
     system_matrix = leak_rate * identity - global_gain * matrices.adjacency
-    steady_state_map = np.linalg.solve(system_matrix, matrices.input_matrix)
+    try:
+        steady_state_map = np.linalg.solve(system_matrix, matrices.input_matrix)
+    except np.linalg.LinAlgError as error:
+        # `main()` already verifies `bio_graph` is non-singular
+        # (`bio_transfer["singular"]`) before calling this function, so this
+        # can only fire when `_greedy_targeted_swaps` is called directly
+        # against an untested graph -- matches `transfer.py`'s own
+        # fail-loud-rather-than-propagate-garbage policy.
+        raise RuntimeError(f"interventions: {label}'s starting graph is singular: {error}") from error
     T = matrices.output_matrix @ steady_state_map
     current_target_sum = float(T[THRUST_IDX, RIGHT_CLEARANCE_IDX] + T[THRUST_IDX, FORWARD_CLEARANCE_IDX])
 
@@ -475,7 +512,17 @@ def _greedy_targeted_swaps(
             break
 
         system_matrix = leak_rate * identity - global_gain * matrices.adjacency
-        L = np.linalg.solve(system_matrix.T, matrices.output_matrix[THRUST_IDX, :])
+        try:
+            L = np.linalg.solve(system_matrix.T, matrices.output_matrix[THRUST_IDX, :])
+        except np.linalg.LinAlgError as error:
+            # `current_graph` only ever becomes the accepted candidate whose
+            # own `candidate_steady_state` solve (below) already succeeded,
+            # so this is provably unreachable given this function's own
+            # control flow -- guarded anyway for the same fail-loud policy
+            # as every other solve in this module.
+            raise RuntimeError(
+                f"interventions: {label}'s current graph became singular after {swaps_applied} swaps: {error}"
+            ) from error
         R = steady_state_map[:, RIGHT_CLEARANCE_IDX] + steady_state_map[:, FORWARD_CLEARANCE_IDX]
 
         candidate_class = swap_ops.candidate_targeted_swaps(current_graph, source_mask, thrust_mask)
@@ -535,7 +582,30 @@ def _greedy_targeted_swaps(
             candidate_graph = swap_ops.apply_swap(current_graph, ei1, ei2)
             candidate_matrices = graph_io.build_dense_matrices(candidate_graph)
             candidate_system_matrix = leak_rate * identity - global_gain * candidate_matrices.adjacency
-            candidate_steady_state = np.linalg.solve(candidate_system_matrix, candidate_matrices.input_matrix)
+            try:
+                candidate_steady_state = np.linalg.solve(candidate_system_matrix, candidate_matrices.input_matrix)
+            except np.linalg.LinAlgError:
+                # A singular candidate cannot be scored, so by definition it
+                # cannot be an "improvement" -- reject it exactly like a
+                # candidate whose exact target sum did not increase (this
+                # still consumes one of the `MAX_EXACT_RECHECKS_PER_STEP`
+                # slots: an exact recheck really was attempted and failed),
+                # rather than crashing the whole run over one bad candidate
+                # among up to 50,000 sampled per step.
+                steps.append(
+                    {
+                        "step": swaps_applied,
+                        "recheck": rechecks,
+                        "removedEdge": {"pre": pre_i, "post": post_i},
+                        "addedEdge": {"pre": pre_i, "post": post_j},
+                        "removedEdge2": {"pre": pre_j, "post": post_j},
+                        "addedEdge2": {"pre": pre_j, "post": post_i},
+                        "predictedDelta": float(delta[idx]),
+                        "singular": True,
+                        "accepted": False,
+                    }
+                )
+                continue
             candidate_T = candidate_matrices.output_matrix @ candidate_steady_state
             candidate_target_sum = float(
                 candidate_T[THRUST_IDX, RIGHT_CLEARANCE_IDX] + candidate_T[THRUST_IDX, FORWARD_CLEARANCE_IDX]
@@ -553,6 +623,7 @@ def _greedy_targeted_swaps(
                     "predictedDelta": float(delta[idx]),
                     "exactTargetSumBefore": current_target_sum,
                     "exactTargetSumAfter": candidate_target_sum,
+                    "singular": False,
                     "accepted": improved,
                 }
             )
@@ -641,7 +712,12 @@ def _parse_args(argv: "list[str]") -> argparse.Namespace:
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--control-count", type=int, default=100)
     parser.add_argument("--max-swaps", type=int, default=200)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.control_count < 0:
+        parser.error(f"--control-count must be >= 0, got {args.control_count}")
+    if args.max_swaps < 0:
+        parser.error(f"--max-swaps must be >= 0, got {args.max_swaps}")
+    return args
 
 
 def main(argv: "list[str] | None" = None) -> None:
@@ -651,6 +727,15 @@ def main(argv: "list[str] | None" = None) -> None:
     graphs_dir = out_dir / "graphs"
     null_regen_dir = out_dir / "null-500"
     graphs_dir.mkdir(parents=True, exist_ok=True)
+    # Removed up front, before any graph is written: mirrors
+    # `rewire_batch.py`'s own "a run interrupted partway through leaves the
+    # directory with no index (detectable), not the previous run's stale
+    # index describing files this run may have partially overwritten"
+    # convention (`write_gzip_deterministic` is not an atomic write, unlike
+    # `fsutil.atomic_write_text`, so a killed rerun really can leave a
+    # graph's bytes not matching either run's recorded hash).
+    (out_dir / "index.json").unlink(missing_ok=True)
+    (out_dir / "attribution.json").unlink(missing_ok=True)
 
     # Mirrors `rewire_batch._load_source_graph` exactly (a private helper of
     # that module; inlined here rather than reached into, so this module
@@ -697,7 +782,14 @@ def main(argv: "list[str] | None" = None) -> None:
         f"stopReason={p_result['stopReason']}"
     )
     if p_result["swaps"] > args.max_swaps:
-        raise RuntimeError(f"interventions: P used {p_result['swaps']} swaps, exceeding --max-swaps {args.max_swaps}")
+        # Structural invariant, not live `--max-swaps` validation (that
+        # happens in `_parse_args`): `_greedy_targeted_swaps`'s own loop
+        # already stops the instant `swaps_applied >= max_swaps`, so this
+        # can only fire if a future refactor breaks that loop invariant.
+        raise RuntimeError(
+            f"interventions: internal invariant violated -- P applied {p_result['swaps']} swaps, "
+            f"more than --max-swaps {args.max_swaps}"
+        )
     bio_target_sum = float(
         bio_transfer["T"][THRUST_IDX][RIGHT_CLEARANCE_IDX] + bio_transfer["T"][THRUST_IDX][FORWARD_CLEARANCE_IDX]
     )
@@ -726,7 +818,10 @@ def main(argv: "list[str] | None" = None) -> None:
         f"stopReason={q_result['stopReason']}"
     )
     if q_result["swaps"] > args.max_swaps:
-        raise RuntimeError(f"interventions: Q used {q_result['swaps']} swaps, exceeding --max-swaps {args.max_swaps}")
+        raise RuntimeError(
+            f"interventions: internal invariant violated -- Q applied {q_result['swaps']} swaps, "
+            f"more than --max-swaps {args.max_swaps}"
+        )
 
     k = p_result["swaps"]
     k_q = q_result["swaps"]
@@ -740,6 +835,10 @@ def main(argv: "list[str] | None" = None) -> None:
     entries.append(_write_graph_entry(graphs_dir, "P", "P", p_graph, k, p_result["targetReached"]))
     entries.append(_write_graph_entry(graphs_dir, "Q", "Q", q_graph, k_q, q_result["targetReached"]))
     if r_graph is not None:
+        # R removes edges rather than swapping them: its `swaps` field is
+        # reused to carry `removedEdgeCount` (there is no swap count to
+        # report), unlike every other entry where `swaps` really is an
+        # accepted-double-edge-swap count.
         entries.append(_write_graph_entry(graphs_dir, "R", "R", r_graph, r_result["removedEdgeCount"], None))
 
     print(f"interventions: building {args.control_count} C (anywhere) control graphs, k={k} ...")

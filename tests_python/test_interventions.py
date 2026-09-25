@@ -389,8 +389,12 @@ def _make_direct_input_to_thrust_graph() -> "binfmt.GraphArrays":
     production shape (8/3, `transfer.py`'s `OBSERVATION_CHANNEL_INDEX`/
     `OUTPUT_POPULATION_INDEX`) so `_r_premise_check`'s fixed
     `RIGHT_CLEARANCE_IDX`/`FORWARD_CLEARANCE_IDX`/`THRUST_IDX` column/row
-    indices are in range -- which channel neuron 0 itself is on (0, not a
-    clearance channel) is irrelevant to the check."""
+    indices are in range. Neuron 0 is on channel 6 (`rightClearance`), not
+    channel 0: `_r_premise_check`'s `R` vector only sums the
+    `rightClearance`/`forwardClearance` columns of the steady-state map, so
+    a neuron on any *other* channel would make every edge's first-order
+    contribution trivially zero (`R[pre] == 0`) -- not a meaningful exercise
+    of the non-empty branch's cumulative-removal logic."""
     metadata = {
         "formatVersion": 1,
         "neuronCount": 3,
@@ -412,7 +416,7 @@ def _make_direct_input_to_thrust_graph() -> "binfmt.GraphArrays":
         postsynaptic_indices=np.array([1, 2], dtype=np.uint32),
         contact_magnitudes=np.array([1.0, 2.0], dtype=np.float32),
         presynaptic_signs=np.array([1, 1, 1], dtype=np.int8),
-        input_channel_index=np.array([0, -1, -1], dtype=np.int32),
+        input_channel_index=np.array([6, -1, -1], dtype=np.int32),  # 6 = rightClearance
         input_weight=np.array([1.0, 0.0, 0.0], dtype=np.float32),
         output_population_index=np.array([-1, -1, 0], dtype=np.int32),
         output_weight=np.array([0.0, 0.0, 1.0], dtype=np.float32),
@@ -430,8 +434,55 @@ def test_r_premise_check_removes_edges_when_direct_input_to_thrust_exists():
     assert int(removed_graph.metadata["edgeCount"]) == int(graph.metadata["edgeCount"]) - 1
     interventions.check_invariants(graph, removed_graph, exempt_degree=True)
     # The removed edge is really gone: neuron 0's row no longer contains neuron 2.
-    edges = swap_ops.edge_set_from_graph(removed_graph)
-    assert not np.any((edges.pre == 0) & (edges.post == 2))
+    edges_check = swap_ops.edge_set_from_graph(removed_graph)
+    assert not np.any((edges_check.pre == 0) & (edges_check.post == 2))
+
+
+def _make_cancelling_input_to_thrust_graph() -> "binfmt.GraphArrays":
+    """Two input neurons (both `rightClearance`, channel 6), opposite
+    `presynapticSigns`, each with a direct edge of equal weight to the same
+    thrust neuron: since neither neuron has any *incoming* edge, the
+    steady-state map's rows for them are `inputWeight / leakRate`
+    independent of sign (sign only enters through `A`, which only affects a
+    neuron's own *outgoing* contribution, not `B`'s mapping into it) -- so
+    the two edges' first-order contributions to the summed target transfer
+    are exactly `+x` and `-x`, giving `total == 0` exactly. Exercises
+    `_r_premise_check`'s `total <= 0` guard (a real dual-review finding:
+    the original 50%-of-total stopping rule was unsound for a non-positive
+    total)."""
+    metadata = {
+        "formatVersion": 1,
+        "neuronCount": 3,
+        "edgeCount": 2,
+        "inputChannelCount": 8,
+        "outputPopulationCount": 3,
+        "timestepSeconds": 1.0 / 30.0,
+        "leakRate": 0.35,
+        "rateMin": -2.0,
+        "rateMax": 2.0,
+        "inputClampMin": -1.0,
+        "inputClampMax": 1.0,
+        "globalGain": 0.5,
+    }
+    graph = binfmt.GraphArrays(
+        metadata=metadata,
+        biological_ids=np.array([1, 2, 3], dtype=np.uint64),
+        presynaptic_offsets=np.array([0, 1, 2, 2], dtype=np.uint32),
+        postsynaptic_indices=np.array([2, 2], dtype=np.uint32),
+        contact_magnitudes=np.array([1.0, 1.0], dtype=np.float32),
+        presynaptic_signs=np.array([1, -1, 1], dtype=np.int8),
+        input_channel_index=np.array([6, 6, -1], dtype=np.int32),  # both rightClearance
+        input_weight=np.array([1.0, 1.0, 0.0], dtype=np.float32),
+        output_population_index=np.array([-1, -1, 0], dtype=np.int32),
+        output_weight=np.array([0.0, 0.0, 1.0], dtype=np.float32),
+    )
+    return binfmt.validate_graph(graph)
+
+
+def test_r_premise_check_raises_on_non_positive_total_contribution():
+    graph = _make_cancelling_input_to_thrust_graph()
+    with pytest.raises(RuntimeError, match="non-positive total"):
+        interventions._r_premise_check(graph)
 
 
 # ---------------------------------------------------------------------------
@@ -451,6 +502,13 @@ def test_greedy_targeted_swaps_increases_target_sum_on_trace_fixture(trace_graph
     assert result["swaps"] >= 1
     assert result["swaps"] <= 5
     assert result["targetReached"] is False  # target deliberately unreachable (1e9)
+    # On the trace fixture's small (~200-candidate) class, this search
+    # naturally exhausts `MAX_EXACT_RECHECKS_PER_STEP` on its second step --
+    # asserted explicitly (not just incidentally true) so this is a real
+    # regression test for the "recheck_cap" stop reason, per
+    # `02-intervention-graphs.md`'s "After 20 failures, stop the search...
+    # with targetReached: false".
+    assert result["stopReason"] == "recheck_cap"
     final_target = result["finalRightClearanceThrust"] + result["finalForwardClearanceThrust"]
     assert final_target > bio_target
     _assert_swap_invariants(trace_graph, final_graph)
@@ -481,6 +539,72 @@ def test_greedy_targeted_swaps_stops_immediately_when_target_already_met(trace_g
     assert result["swaps"] == 0
     assert result["targetReached"] is True
     assert binfmt.encode_graph_binary(final_graph) == binfmt.encode_graph_binary(trace_graph)
+
+
+def test_greedy_targeted_swaps_exercises_candidate_sampling_branch(monkeypatch, trace_graph, trace_graph_masks):
+    """On the real ~3.5M-candidate production graph, `total_pairs >
+    MAX_CANDIDATES_PER_STEP` (50,000) is true on *every* step -- the
+    `rng.choice(..., replace=False)` sampling branch is the only candidate-
+    selection code path a real run ever exercises. The trace fixture's
+    candidate class (~200 pairs) never reaches the real threshold, so this
+    monkeypatches it down to force the same branch here: still deterministic
+    across two runs with the same seed, and the sampled index set has no
+    duplicate `(e1, e2)` pairs."""
+    monkeypatch.setattr(interventions, "MAX_CANDIDATES_PER_STEP", 3)
+    input_mask, thrust_mask, _bridge_mask, _clearance_mask = trace_graph_masks
+
+    candidates = swap_ops.candidate_targeted_swaps(trace_graph, input_mask, thrust_mask)
+    assert len(candidates.in_edges) * len(candidates.out_edges) > 3  # the sampling branch really is exercised
+
+    graph_a, result_a = interventions._greedy_targeted_swaps(
+        trace_graph, input_mask, thrust_mask, right_target=1e9, forward_target=1e9,
+        max_swaps=5, rng_seed=20260925, label="P",
+    )
+    graph_b, result_b = interventions._greedy_targeted_swaps(
+        trace_graph, input_mask, thrust_mask, right_target=1e9, forward_target=1e9,
+        max_swaps=5, rng_seed=20260925, label="P",
+    )
+    assert binfmt.encode_graph_binary(graph_a) == binfmt.encode_graph_binary(graph_b)
+    assert result_a["steps"] == result_b["steps"]
+    interventions.check_invariants(trace_graph, graph_a)
+
+
+def test_vectorized_delta_matches_scalar_first_order_delta(trace_graph, trace_graph_masks):
+    """Direct regression test for the closed-form `delta` formula
+    `_greedy_targeted_swaps` actually evaluates (`interventions.py`'s
+    `delta = global_gain * (L[d] - L[b]) * (...)`), cross-checked against
+    `swap_ops.first_order_delta`'s two-call sum for the same candidates --
+    the exact-recompute acceptance gate in the greedy search would mask a
+    magnitude/sign regression in `delta` (a worse-ranked but still-accepted
+    candidate), so this exercises the vectorized formula on its own."""
+    input_mask, thrust_mask, _bridge_mask, _clearance_mask = trace_graph_masks
+
+    matrices = build_dense_matrices(trace_graph)
+    leak_rate = float(trace_graph.metadata["leakRate"])
+    global_gain = float(trace_graph.metadata["globalGain"])
+    n = matrices.adjacency.shape[0]
+    system_matrix = leak_rate * np.eye(n) - global_gain * matrices.adjacency
+    steady_state_map = np.linalg.solve(system_matrix, matrices.input_matrix)
+    L = np.linalg.solve(system_matrix.T, matrices.output_matrix[THRUST_IDX, :])
+    R = steady_state_map[:, RIGHT_IDX] + steady_state_map[:, FORWARD_IDX]
+    sens = swap_ops.SwapSensitivity(global_gain=global_gain, L=L, R=R)
+
+    candidates = swap_ops.candidate_targeted_swaps(trace_graph, input_mask, thrust_mask)
+    edges = swap_ops.edge_set_from_graph(trace_graph)
+    sign = trace_graph.presynaptic_signs.astype(np.float64)
+
+    tested = 0
+    for i in candidates.in_edges.tolist():
+        for j in candidates.out_edges.tolist():
+            a, b, w1 = int(edges.pre[i]), int(edges.post[i]), float(edges.weight[i])
+            c, d, w2 = int(edges.pre[j]), int(edges.post[j]), float(edges.weight[j])
+            scalar_delta = swap_ops.first_order_delta(
+                sens, (a, b, w1, sign[a]), (a, d, w1, sign[a])
+            ) + swap_ops.first_order_delta(sens, (c, d, w2, sign[c]), (c, b, w2, sign[c]))
+            vectorized_delta = global_gain * (L[d] - L[b]) * (sign[a] * w1 * R[a] - sign[c] * w2 * R[c])
+            assert vectorized_delta == pytest.approx(scalar_delta, rel=1e-9, abs=1e-12)
+            tested += 1
+    assert tested > 50  # sanity floor: this fixture's P class has ~200 pairs
 
 
 # ---------------------------------------------------------------------------
@@ -663,12 +787,23 @@ def test_cli_end_to_end_gates_and_ts_roundtrip(cli_fixture_dir):
         decoded = rewire.decode_graph_binary(binary)
         interventions.check_invariants(bio_arrays, decoded, exempt_degree=(entry["kind"] == "R"))
 
+    bio_out_degree, bio_in_degree = _degree_vectors(bio_arrays)
     ts_paths = [out_dir / e["path"] for e in index["entries"]]
     ts_summaries = _run_ts_roundtrip(ts_paths)
     for entry, summary in zip(index["entries"], ts_summaries):
         assert summary["neuronCount"] == int(bio_arrays.metadata["neuronCount"])
         if entry["kind"] != "R":
+            # The real degree-preservation invariant, independently recomputed
+            # from the TS-side `parseGraphBinary` decode (not the Python
+            # decode already checked above via `check_invariants`) -- closes
+            # the gap where `graph_binary_roundtrip.ts` computed these fields
+            # but nothing asserted on them.
             assert summary["edgeCount"] == int(bio_arrays.metadata["edgeCount"])
+            assert summary["outDegree"] == bio_out_degree.tolist()
+            assert summary["inDegree"] == bio_in_degree.tolist()
+            assert summary["sortedContactMagnitudes"] == pytest.approx(
+                sorted(bio_arrays.contact_magnitudes.tolist())
+            )
         assert summary["presynapticSigns"] == bio_arrays.presynaptic_signs.tolist()
         assert summary["inputChannelIndex"] == bio_arrays.input_channel_index.tolist()
         assert summary["outputPopulationIndex"] == bio_arrays.output_population_index.tolist()
