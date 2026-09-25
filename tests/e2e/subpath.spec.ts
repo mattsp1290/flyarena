@@ -20,7 +20,12 @@ test('all views work beneath /fly/ with root asset routes deliberately unavailab
   await page.locator('section.activity button').click();
   await expect(page.getByLabel('Neural activity at soma positions')).toBeVisible();
   await page.getByRole('radio',{name:/lesion effect \(offline\)/i}).click();
-  await expect(page.getByText(/Computed \(offline\)/).first()).toBeVisible({timeout:20000});
+  // Scoped to the activity panel: "Computed (offline)" alone also matches
+  // the always-visible ledger rows regardless of whether lesion mode ever
+  // actually activated (round-2 dual review) — `.legend-bar.diverging`
+  // below is what actually proves activation either way, but scoping this
+  // check too keeps it honest on its own.
+  await expect(page.locator('section.activity').getByText(/Computed \(offline\)/).first()).toBeVisible({timeout:20000});
   await expect(page.locator('.legend-bar.diverging')).toBeVisible();
   await page.getByRole('button',{name:/^collapse$/i}).click();
   await page.getByRole('link',{name:'02 Counterfactual workbench',exact:true}).click();

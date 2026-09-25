@@ -148,3 +148,7 @@ export const downloadReplay = async (page: Page): Promise<DownloadedReplay> => {
 /** `ExperimentPanel`'s decoder radio group, located by accessible name (`Decoder`'s two native `<input type="radio">`s). */
 export const decoderRadio = (page: Page, decoder: 'authored' | 'trained'): ReturnType<Page['getByRole']> =>
   page.getByRole('radio', { name: decoder === 'trained' ? /trained \(offline\)/i : /^authored$/i });
+
+/** `ActivityPanel`'s color-mode radio group (WP3, "Live rate" / "Lesion effect (offline)") — same locator-helper precedent as `decoderRadio` above. */
+export const activityColorModeRadio = (page: Page, mode: 'live' | 'lesion'): ReturnType<Page['getByRole']> =>
+  page.getByRole('radio', { name: mode === 'lesion' ? /lesion effect \(offline\)/i : /^live rate$/i });

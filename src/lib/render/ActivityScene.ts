@@ -455,7 +455,22 @@ export class ActivityScene {
       positions[destination + 2] = this.basePositions[source + 2];
       writeIndex += 1;
     }
-    arm.outline.points.geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    // Round-2 dual review (Suggestion, latent-bug class): `setAttribute`
+    // alone only reassigns `geometry.attributes.position` — it neither frees
+    // the *previous* attribute's underlying GL buffer (three's
+    // `WebGLAttributes` only releases it on the geometry's own `dispose()`)
+    // nor recomputes `geometry.boundingSphere` (computed once, lazily, on
+    // first visible render, then cached) — so a later topology switch in
+    // lesion mode, which changes this arm's non-significant subset size,
+    // would otherwise leave a stale culling sphere and an orphaned GPU
+    // buffer waiting on garbage collection. `geometry.dispose()` here frees
+    // only the geometry's own GPU-owned buffers (not the shared
+    // `outlineMaterial`/`outlineTexture`, which are never touched by a
+    // geometry's own `dispose()`), so this is safe to call on every paint.
+    const geometry = arm.outline.points.geometry;
+    geometry.dispose();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.computeBoundingSphere();
     arm.outline.points.visible = count > 0;
   }
 

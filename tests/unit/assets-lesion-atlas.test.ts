@@ -100,6 +100,25 @@ describe('loadLesionAtlas', () => {
     expect(result.status).toBe('missing');
   });
 
+  it('returns "unavailable" (retryable — never "missing") when the manifest has an entry but the fetch fails', async () => {
+    // Round-2 dual review (Suggestion/S9): the manifest entry is present
+    // (unlike the "missing" case above), but the request itself fails — a
+    // network hiccup, not a claim the artifact was never shipped or failed
+    // verification. Distinct from both `loadPositions` (which folds this
+    // into `'missing'`) and from this loader's own `'invalid'`.
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL): Promise<Response> => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('lesion-atlas-v1.json')) return new Response(null, { status: 404, statusText: 'Not Found' });
+      return createPublicDataFetch()(input);
+    });
+
+    const result = await loadLesionAtlas(manifest, '/data', biologicalGraph);
+
+    expect(result.status).toBe('unavailable');
+    if (result.status !== 'unavailable') throw new Error('expected unavailable');
+    expect(result.reason).toMatch(/404|Failed to fetch/i);
+  });
+
   it('returns "invalid" when the fetched lesion atlas fails its sha256 check', async () => {
     vi.stubGlobal('fetch', createPublicDataFetch({ corrupt: 'lesion-atlas-v1.json' }));
 
@@ -222,6 +241,13 @@ describe('loadLesionAtlas', () => {
 
     expect(result.status).toBe('invalid');
     if (result.status !== 'invalid') throw new Error('expected invalid');
-    expect(result.reason).toMatch(/neuronCount/);
+    // Round-2 dual review (Important, test integrity — confirmed by
+    // mutation): a bare `/neuronCount/` regex also matches the *later*
+    // `biologicalIds` cross-check's own reason text ("...does not match
+    // lesion-atlas neuronCount N"), so this assertion would still pass even
+    // with the manifest-neuronCount cross-check (`lesionAtlas.ts`'s
+    // `data.neuronCount !== manifest.neuronCount` check) deleted entirely.
+    // Anchored on the specific wording only that check's own message uses.
+    expect(result.reason).toMatch(/does not match the manifest's own declared neuronCount/);
   });
 });

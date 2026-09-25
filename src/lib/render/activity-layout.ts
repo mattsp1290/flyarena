@@ -12,7 +12,7 @@
  * `xyz`/`positionSource`/`role` arrays (degree-preserving rewiring keeps the
  * node set; only connections differ), so one layout/partition serves both.
  */
-import { effectToLutIndex, rateToLutIndex } from './colormap';
+import { DIVERGING_FADE_TARGET, effectToLutIndex, rateToLutIndex } from './colormap';
 import { POINT_SIZE } from './activity-constants';
 
 export type PositionSource = 'soma' | 'tosoma' | 'none';
@@ -220,9 +220,8 @@ export const writeColors = (
  * the lesion-effect mode's honesty requirement that a merely larger point
  * estimate must not read as more reliable than a smaller, FDR-surviving one
  * (`docs/lesion-atlas-report.md`'s "Multiple comparisons" section). `60%`
- * toward neutral is visually distinct from both "significant, full color"
- * and "exactly zero effect, LUT center" without erasing the sign/magnitude
- * entirely.
+ * toward neutral is visually distinct from "significant, full color" without
+ * erasing the sign/magnitude entirely.
  */
 const NON_SIGNIFICANT_BLEND = 0.6;
 
@@ -239,15 +238,23 @@ const NON_SIGNIFICANT_BLEND = 0.6;
  * A neuron whose `emphasize[i]` is `false` (did not survive Benjamini-
  * Hochberg FDR correction, per graph, at `q = 0.05` — see
  * `docs/lesion-atlas-report.md`'s "Multiple comparisons" section) is blended
- * toward the LUT's own center (zero-effect) color at `NON_SIGNIFICANT_BLEND`
- * — a real, distinct color change (not merely a labeling choice), so a
- * larger raw effect never reads as visually "stronger" than a smaller,
- * FDR-surviving one just because its point estimate happens to be bigger.
- * This is one of two non-color-only-adjacent honesty signals for FDR
- * significance the lesion-effect mode draws — `render/ActivityScene.ts`'s
- * `setStaticColors` also draws a separate outline-ring marker (shape, not
- * hue) at every non-significant neuron's position, so significance is never
- * encoded by color/saturation alone.
+ * toward `colormap.ts#DIVERGING_FADE_TARGET` — a dim, low-saturation neutral,
+ * not the LUT's own bright white zero-effect color — at `NON_SIGNIFICANT_BLEND`.
+ * Round-2 dual review (Important): blending toward the LUT's literal center
+ * (white) made a "not reliable" neuron the *highest*-contrast, most visually
+ * prominent point against the activity view's near-black canvas — exactly
+ * backwards from the intended de-emphasis, and especially severe for the
+ * biological graph (see `DIVERGING_FADE_TARGET`'s own doc comment for the
+ * concrete numbers). This blend is a real, distinct color change (not merely
+ * a labeling choice), so a larger raw effect never reads as visually
+ * "stronger" than a smaller, FDR-surviving one just because its point
+ * estimate happens to be bigger — and now also reads as genuinely
+ * de-emphasized, not merely differently-hued. This is one of two non-color-
+ * only-adjacent honesty signals for FDR significance the lesion-effect mode
+ * draws — `render/ActivityScene.ts`'s `setStaticColors` also draws a
+ * separate outline-ring marker (shape, not hue) at every non-significant
+ * neuron's position, so significance is never encoded by color/saturation
+ * alone.
  */
 export const writeEffectColors = (
   effect: ArrayLike<number>,
@@ -258,11 +265,6 @@ export const writeEffectColors = (
   out: Float32Array
 ): void => {
   const lutSteps = lut.length / 3;
-  // The LUT's own zero-effect color, derived the same way `effectToLutIndex`
-  // itself maps zero (rather than hardcoding a second "center index" that
-  // could silently drift from the real one — see `colormap.ts#DIVERGING_LUT_CENTER_INDEX`'s
-  // own doc comment for why that constant exists at all).
-  const centerIndex = effectToLutIndex(0, 1, lutSteps) * 3;
   for (let k = 0; k < indices.length; k += 1) {
     const neuron = indices[k];
     const lutIndex = effectToLutIndex(effect[neuron], absMax, lutSteps) * 3;
@@ -272,9 +274,9 @@ export const writeEffectColors = (
       out[outOffset + 1] = lut[lutIndex + 1];
       out[outOffset + 2] = lut[lutIndex + 2];
     } else {
-      out[outOffset] = lut[lutIndex] * (1 - NON_SIGNIFICANT_BLEND) + lut[centerIndex] * NON_SIGNIFICANT_BLEND;
-      out[outOffset + 1] = lut[lutIndex + 1] * (1 - NON_SIGNIFICANT_BLEND) + lut[centerIndex + 1] * NON_SIGNIFICANT_BLEND;
-      out[outOffset + 2] = lut[lutIndex + 2] * (1 - NON_SIGNIFICANT_BLEND) + lut[centerIndex + 2] * NON_SIGNIFICANT_BLEND;
+      out[outOffset] = lut[lutIndex] * (1 - NON_SIGNIFICANT_BLEND) + DIVERGING_FADE_TARGET[0] * NON_SIGNIFICANT_BLEND;
+      out[outOffset + 1] = lut[lutIndex + 1] * (1 - NON_SIGNIFICANT_BLEND) + DIVERGING_FADE_TARGET[1] * NON_SIGNIFICANT_BLEND;
+      out[outOffset + 2] = lut[lutIndex + 2] * (1 - NON_SIGNIFICANT_BLEND) + DIVERGING_FADE_TARGET[2] * NON_SIGNIFICANT_BLEND;
     }
   }
 };

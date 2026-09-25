@@ -246,11 +246,14 @@ export interface SidecarManifestEntry {
 
 /**
  * One step short of a caller-specific `status`: names exactly which step
- * failed, so `loadPositions` and `loadRewiringNull` (`./rewiringNull.ts`) can
- * each map these onto their own vocabulary — e.g. `loadPositions` folds
- * `'no-entry'`/`'fetch-error'` into `'missing'`, while `loadRewiringNull`
- * keeps them apart as `'absent'`/`'unavailable'` (a fetch/network failure is
- * not the same claim as "verification failed").
+ * failed, so `loadPositions`, `loadRewiringNull` (`./rewiringNull.ts`), and
+ * `loadLesionAtlas` (`./lesionAtlas.ts`) can each map these onto their own
+ * vocabulary — e.g. `loadPositions` folds `'no-entry'`/`'fetch-error'` into
+ * `'missing'`, `loadRewiringNull` keeps them apart as `'absent'`/`'unavailable'`,
+ * and `loadLesionAtlas` maps `'no-entry'` to `'missing'` but `'fetch-error'`
+ * to its own `'unavailable'` (a fetch/network failure is not the same claim
+ * as "verification failed", and — unlike a `'missing'` manifest entry — is
+ * retryable).
  */
 export type SidecarFetchResult =
   | { status: 'ok'; parsed: unknown }
@@ -262,9 +265,9 @@ export type SidecarFetchResult =
 /**
  * Fetch→sha256-verify→JSON.parse for an optional sidecar artifact named by
  * `entry` (hash-verified before anything is parsed) — the skeleton
- * `loadPositions` and `loadRewiringNull` both need, extracted here so
- * neither hand-rolls its own copy (thermo-maintainability review,
- * Important). `label` is folded into every failure reason (e.g.
+ * `loadPositions`, `loadRewiringNull`, and `loadLesionAtlas` all need,
+ * extracted here so none hand-rolls its own copy (thermo-maintainability
+ * review, Important). `label` is folded into every failure reason (e.g.
  * `"positions artifact"`) so callers' messages read the same as before.
  */
 export const fetchAndVerifySidecarJson = async (

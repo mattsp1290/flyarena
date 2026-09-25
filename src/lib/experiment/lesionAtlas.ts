@@ -144,7 +144,19 @@ const validateLesionAtlasShape = (
  */
 export type LesionAtlasLoadResult =
   | { status: 'ok'; data: LesionAtlasArtifact; absMax: number }
+  /** No `manifest.lesionAtlas` entry at all — nothing was ever shipped. Never retried (there is nothing to retry). */
   | { status: 'missing'; reason: string }
+  /**
+   * A fetch/network failure — not a claim about the artifact's integrity.
+   * Distinct from `'missing'`/`'invalid'` for the same reason
+   * `rewiringNull.ts#RewiringNullLoadResult` keeps its own `'unavailable'`
+   * apart from `'absent'`/`'invalid'` (round-2 dual review, Important): a
+   * dropped request or a transient 5xx is retryable, unlike a genuinely
+   * missing manifest entry or a hash/shape failure, so
+   * `ActivityPanel.svelte#ensureLesionAtlasLoaded` deliberately does not
+   * memoize this outcome — selecting the mode again retries the fetch.
+   */
+  | { status: 'unavailable'; reason: string }
   | { status: 'invalid'; reason: string };
 
 /**
@@ -156,8 +168,9 @@ export type LesionAtlasLoadResult =
  * atlas only ever disables the lesion-effect color mode with an honest
  * reason, never the rest of the activity view or the experiment.
  *
- * Deliberately **not** called from `App.svelte`'s `onManifest` handler the
- * way `loadPositions`/`loadRewiringNull` are: the lesion atlas is loaded
+ * Deliberately **not** loaded eagerly the way `loadPositions`
+ * (`App.svelte#onManifest`) and `loadRewiringNull`
+ * (`ExperimentController#initialize`) are: the lesion atlas is loaded
  * lazily, only when `ActivityPanel.svelte` first selects the lesion-effect
  * color mode (see that component's `ensureLesionAtlasLoaded`), so a session
  * that never opens the mode never pays its fetch/verify cost.
@@ -181,7 +194,7 @@ export const loadLesionAtlas = async (
     return { status: 'missing', reason: 'The manifest has no lesionAtlas artifact entry.' };
   }
   if (fetched.status === 'fetch-error') {
-    return { status: 'missing', reason: fetched.reason };
+    return { status: 'unavailable', reason: fetched.reason };
   }
   if (fetched.status === 'hash-mismatch' || fetched.status === 'parse-error') {
     return { status: 'invalid', reason: fetched.reason };
@@ -194,7 +207,7 @@ export const loadLesionAtlas = async (
   if (data.neuronCount !== manifest.neuronCount) {
     return {
       status: 'invalid',
-      reason: `lesion-atlas neuronCount ${data.neuronCount} does not match the manifest's (${manifest.neuronCount})`
+      reason: `lesion-atlas neuronCount ${data.neuronCount} does not match the manifest's own declared neuronCount (${manifest.neuronCount})`
     };
   }
 
@@ -207,8 +220,12 @@ export const loadLesionAtlas = async (
   // `loadArenaArtifacts` already throws if the manifest is missing its
   // seed0 rewired arm entirely, so by the time this loader ever runs in
   // production that field exists — this still fails closed rather than
-  // silently skipping the cross-check for a hand-built/stale manifest
-  // (same discipline as `loadRewiringNull`'s `swapStats.edgeCount` guard).
+  // silently skipping the cross-check for a hand-built/stale manifest (same
+  // fail-closed discipline as `assets.ts#loadArenaArtifacts`'s own
+  // `swapStats.edgeCount` guard — round-2 dual review corrected a wrong
+  // cross-reference here: `loadRewiringNull` actually does the *opposite*
+  // for its own seed-0 check, skipping it when the manifest field is
+  // absent; see that function's `shippedSeed0GzipSha256 &&` guard).
   const shippedSeed0BinarySha256 = manifest.rewiredArms.seed0?.binarySha256;
   if (!shippedSeed0BinarySha256) {
     return {

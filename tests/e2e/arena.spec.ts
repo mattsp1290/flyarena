@@ -3,6 +3,7 @@ import { resolve } from 'node:path';
 import { expect, test } from '@playwright/test';
 import {
   activityCanvas,
+  activityColorModeRadio,
   activityToggle,
   armMetric,
   armPanel,
@@ -577,8 +578,8 @@ test.describe('anatomical activity view', () => {
 });
 
 test.describe('lesion-effect color mode (WP3)', () => {
-  const lesionRadio = (page: import('@playwright/test').Page) => page.getByRole('radio', { name: /lesion effect \(offline\)/i });
-  const liveRadio = (page: import('@playwright/test').Page) => page.getByRole('radio', { name: /^live rate$/i });
+  const lesionRadio = (page: import('@playwright/test').Page) => activityColorModeRadio(page, 'lesion');
+  const liveRadio = (page: import('@playwright/test').Page) => activityColorModeRadio(page, 'live');
 
   test('choosing Lesion effect (offline) shows the diverging legend/label and stops rate streaming', async ({ page }) => {
     await page.goto('/');
@@ -623,14 +624,27 @@ test.describe('lesion-effect color mode (WP3)', () => {
   });
 
   test('data-color-source stays "lesion" across many animation frames (no live repaint sneaks through)', async ({ page }) => {
+    // Round-2 dual review (Important, test integrity): start the run and
+    // populate `lastRatesSeen` with real ticks *before* switching to
+    // Lesion. Entering lesion mode before any rates ever arrived means
+    // `getLatestRates()` and `lastRatesSeen[agentId]` are both already
+    // `undefined` — `frame()`'s live-mode `update()`/`clear()` branches
+    // both require one of those to be truthy, so neither could ever fire
+    // regardless of whether the `colorMode === 'live'` gate exists. Ticking
+    // first means a regression that deleted that gate would hit the
+    // `!rates && lastRatesSeen[agentId]` branch and call `scene.clear()`,
+    // which this test's assertions below would then actually catch.
     await page.goto('/');
     await waitForReady(page);
     await expandActivityPanel(page);
+    await startOrResumeButton(page).click();
+    await waitForActivityUpdateTick(page, 'left', 1);
+    await waitForActivityUpdateTick(page, 'right', 1);
+
     await lesionRadio(page).click();
     await expect(activityCanvas(page)).toHaveAttribute('data-color-source-left', 'lesion');
     await expect(activityCanvas(page)).toHaveAttribute('data-color-source-right', 'lesion');
 
-    await startOrResumeButton(page).click();
     // ~30+ animation frames' worth of real time at a 30Hz/60fps refresh —
     // long enough that a regression letting `update()`/`clear()` repaint
     // over the static colors would flip these back to "live".
@@ -689,7 +703,13 @@ test.describe('lesion-effect color mode (WP3)', () => {
   });
 
   test('the lesion option is disabled with an honest reason when the atlas is missing entirely', async ({ page }) => {
-    await page.route('**/data/lesion-atlas-v1.json', (route) => route.fulfill({ status: 404 }));
+    // With the manifest entry itself deleted, `loadLesionAtlas` returns
+    // `no-entry` before ever fetching the artifact — no route stub for
+    // `lesion-atlas-v1.json` is needed here (a prior version routed it to
+    // 404 too, which round-2 dual review flagged as dead code: the fetch
+    // never happens on this path). The distinct "manifest entry present but
+    // the fetch itself fails" path is covered by
+    // `tests/unit/assets-lesion-atlas.test.ts`'s own `'unavailable'` test.
     await page.route('**/data/malecns-arena-v1.manifest.json', async (route) => {
       const response = await route.fetch();
       const json = (await response.json()) as { lesionAtlas?: unknown };
@@ -727,7 +747,7 @@ test.describe('lesion-atlas hash-mismatch integrity check', () => {
     await waitForReady(page);
     await expandActivityPanel(page);
 
-    const lesionRadio = page.getByRole('radio', { name: /lesion effect \(offline\)/i });
+    const lesionRadio = activityColorModeRadio(page, 'lesion');
     await lesionRadio.click();
 
     // Scoped to the "unavailable" hint paragraph — "sha256" alone also
@@ -838,8 +858,8 @@ test.describe('performance gates with the activity panel open', () => {
     await page.goto('/');
     await waitForReady(page);
     await expandActivityPanel(page);
-    await page.getByRole('radio', { name: /lesion effect \(offline\)/i }).click();
-    await expect(page.getByRole('radio', { name: /lesion effect \(offline\)/i })).toBeChecked();
+    await activityColorModeRadio(page, 'lesion').click();
+    await expect(activityColorModeRadio(page, 'lesion')).toBeChecked();
 
     await startOrResumeButton(page).click();
     await waitForTick(page, 60);

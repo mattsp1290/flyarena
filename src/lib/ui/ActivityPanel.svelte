@@ -92,10 +92,19 @@
 
   /** `'live'` (default): per-tick computed rate colors, as before. `'lesion'`: static diverging colors from the offline lesion atlas — see `switchColorMode`. */
   let colorMode = $state<'live' | 'lesion'>('live');
-  /** `undefined` until the lesion-effect mode is first selected (lazy load — see `ensureLesionAtlasLoaded`). */
+  /** `undefined` until the lesion-effect mode is first selected (lazy load — see `ensureLesionAtlasLoaded`). Never set to an `'unavailable'` result — see `lesionAtlasTransientReason` below. */
   let lesionAtlasStatus = $state<LesionAtlasLoadResult | undefined>(undefined);
-  /** Memoizes the in-flight/completed load so a second mode switch (or a second arm) never re-fetches — plain (non-reactive): only `lesionAtlasStatus` above needs to drive the UI. */
+  /** Memoizes the in-flight/completed load so a second mode switch (or a second arm) never re-fetches — plain (non-reactive): only `lesionAtlasStatus` above needs to drive the UI. Cleared (not left memoized) after an `'unavailable'` outcome so the next selection retries the fetch. */
   let lesionAtlasLoadPromise: Promise<LesionAtlasLoadResult> | undefined;
+  /**
+   * The reason from the most recent `'unavailable'` (fetch/network failure)
+   * outcome, shown as a non-blocking hint — round-2 dual review (Important):
+   * unlike `lesionAtlasStatus`, a fetch failure is retryable, so it must
+   * never disable the radio the way `lesionOptionDisabledReason` does for a
+   * genuinely missing entry or a hash/shape failure. Cleared on any
+   * subsequent load attempt or a later non-`'unavailable'` outcome.
+   */
+  let lesionAtlasTransientReason = $state<string | undefined>(undefined);
   /**
    * True once the current `scene` has finished constructing (set at the end
    * of `expand()`, cleared in `teardown()`). Gates the color-mode radio
@@ -404,6 +413,7 @@
     if (lesionAtlasStatus) return lesionAtlasStatus;
     if (!manifest || !biologicalGraph) return undefined;
     if (!lesionAtlasLoadPromise) {
+      lesionAtlasTransientReason = undefined; // a fresh attempt supersedes any earlier transient failure hint
       lesionAtlasLoadPromise = loadLesionAtlas(manifest, `${import.meta.env.BASE_URL}data`, biologicalGraph).catch(
         (error: unknown): LesionAtlasLoadResult => ({
           status: 'invalid',
@@ -412,7 +422,19 @@
       );
     }
     const result = await lesionAtlasLoadPromise;
-    if (!destroyed) lesionAtlasStatus = result;
+    if (destroyed) return result;
+    if (result.status === 'unavailable') {
+      // Round-2 dual review (Important): a fetch/network failure is
+      // retryable, unlike a genuinely missing manifest entry or a hash/
+      // shape failure — clearing the memoized promise (but not returning
+      // the result as-is) lets the *next* mode selection try the fetch
+      // again instead of permanently disabling the mode for the rest of
+      // the session over one dropped request.
+      lesionAtlasLoadPromise = undefined;
+      lesionAtlasTransientReason = result.reason;
+    } else {
+      lesionAtlasStatus = result;
+    }
     return result;
   };
 
@@ -444,12 +466,14 @@
    * active, the scene is ready, and either arm's topology changes — the
    * plan's "a topology switch while in lesion mode re-applies the static
    * colors for that arm". Every dependency (`colorMode`, `sceneReady`,
-   * `topology.left`, `topology.right`) is read unconditionally, *before*
-   * the early-return branch, so this effect reliably reruns when any one of
-   * them changes — including `sceneReady` flipping true after `expand()`
-   * finishes constructing a scene while `colorMode` is already `'lesion'`
-   * (a short-circuited `a || b` read would silently skip subscribing to
-   * `b` on the run where `a` alone was enough to return early).
+   * `topology.left`, `topology.right`) is read up front, before the
+   * early-return branch — clearer to read at a glance than relying on
+   * Svelte 5's own per-run dependency tracking (which, for the record, does
+   * still correctly resubscribe on a short-circuited `if (a || b) return`
+   * whenever `a` — the value that caused *that* run's early return — later
+   * changes; the failure mode this structure guards against would only be a
+   * *later* dependency read inside a branch that never executes, not the
+   * short-circuit itself).
    */
   $effect(() => {
     const mode = colorMode;
@@ -485,25 +509,58 @@
   };
 
   /**
+   * Bumped on every `switchColorMode` call and captured as `request` at its
+   * start; checked again after the one `await` inside it. Round-2 dual
+   * review (Important, race condition): switching to Lesion awaits the lazy
+   * atlas load (`ensureLesionAtlasLoaded`, a real network round trip on
+   * first selection) — without this guard, a *second* switch attempt that
+   * lands while the first is still pending (e.g. a double-click on Lesion —
+   * `handleColorModeInputChange`'s own DOM "unstick" reset means a plain
+   * second click on the already-visually-checked Live radio does not
+   * re-fire a native `change` event mid-load, so this specific window is
+   * reached by a re-entrant/duplicate switch request more than by a literal
+   * second click on the other radio) would see the earlier call's stale
+   * resume silently overwrite whatever the later call decided, once it
+   * finally resumes: `switchColorMode('live')` (or a second
+   * `switchColorMode('lesion')`) started while the first is still pending
+   * has no way to mark that first call's eventual resume as superseded
+   * without this counter. Same discipline as `openGeneration`/
+   * `isStaleExpand` above, for the same class of "an awaited call resumes
+   * after a newer one already changed what the user wants" bug.
+   */
+  let colorModeRequest = 0;
+
+  /**
    * Switches the activity view's color mode. Switching to lesion effect
    * lazily loads the atlas (`ensureLesionAtlasLoaded`) if needed; if that
    * load doesn't succeed, the mode stays on Live and `lesionOptionDisabledReason`
    * (derived above) now explains why. Switching either direction disables
-   * live rate streaming while lesion mode is active (`setActivityStreaming(false)`)
-   * and resets `lastRatesSeen` on the way back to Live so the very next
-   * frame repaints from a genuinely fresh rate rather than skipping a
-   * repaint because the last-seen array reference happens to be unchanged.
+   * live rate streaming while lesion mode is active (`setActivityStreaming(false)`).
+   * Returning to Live also repaints both arms to the neutral "no data" color
+   * (`scene.clear()`) *before* resetting `lastRatesSeen` — round-2 dual
+   * review (Important): without an explicit `clear()` here, an experiment
+   * that is `ready`/`paused` (no ticks arriving) would never call
+   * `frame()`'s own `update()`/`clear()` branches again, leaving the lesion
+   * mode's static diverging colors on screen indefinitely under the "Color:
+   * Computed rate" label and viridis legend — a real mislabeled-provenance
+   * state. Resetting `lastRatesSeen` after `clear()` still ensures the very
+   * next frame that *does* have fresh rates repaints from them rather than
+   * skipping a repaint because the last-seen array reference happens to be
+   * unchanged.
    */
   const switchColorMode = async (next: 'live' | 'lesion'): Promise<void> => {
+    const request = ++colorModeRequest;
     if (colorMode === next) return;
     if (next === 'lesion') {
       const result = await ensureLesionAtlasLoaded();
-      if (destroyed) return;
+      if (destroyed || request !== colorModeRequest) return; // superseded by a later color-mode choice
       if (!result || result.status !== 'ok') return; // stays on Live; lesionOptionDisabledReason now explains why
     }
     colorMode = next;
     scene?.setMode(next);
     if (next === 'live') {
+      scene?.clear('left');
+      scene?.clear('right');
       lastRatesSeen.left = undefined;
       lastRatesSeen.right = undefined;
       colorSource.left = 'live';
@@ -574,6 +631,11 @@
              unavailable to assistive tech, not just sighted users reading
              the fieldset's visible hint text. -->
         <p class="hint" aria-live="polite">Lesion effect (offline) unavailable: {lesionOptionDisabledReason}</p>
+      {:else if colorMode === 'live' && lesionAtlasTransientReason}
+        <!-- A fetch/network failure, not a verification failure — the radio
+             stays enabled (see `lesionAtlasTransientReason`'s own doc
+             comment) since selecting the mode again retries the fetch. -->
+        <p class="hint" aria-live="polite">Lesion effect (offline) could not be loaded (retrying is available): {lesionAtlasTransientReason}</p>
       {/if}
     </fieldset>
 

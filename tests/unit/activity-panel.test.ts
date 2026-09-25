@@ -100,6 +100,11 @@ const fakeManifest = (withLesionAtlas = true): ArenaManifest =>
 
 const fakeBiologicalGraph = { biologicalIds: BigUint64Array.of(1000n, 1001n, 1002n) } as unknown as ConnectomeGraph;
 
+// Round-2 dual review (Suggestion): `biological` and `rewiredSeed0` must
+// carry *different* effect/fdrSignificant data — with identical data, a
+// `setStaticColors('right', ...)` assertion would pass even if the right
+// (`rewired`) arm were painted from the wrong (`biological`) graph, exactly
+// the bug `lesionAtlasGraphKeyForTopology` exists to prevent.
 const fakeLesionAtlasOk = (): LesionAtlasLoadResult => ({
   status: 'ok',
   absMax: 1,
@@ -119,10 +124,10 @@ const fakeLesionAtlasOk = (): LesionAtlasLoadResult => ({
       rewiredSeed0: {
         graphSha256: 'y',
         baseline: 0,
-        effect: [0.1, -0.2, 0.3],
+        effect: [-0.4, 0.5, 0.0],
         ciLow: [0, 0, 0],
         ciHigh: [0, 0, 0],
-        fdrSignificant: [true, false, true]
+        fdrSignificant: [false, true, true]
       }
     }
   }
@@ -575,9 +580,13 @@ describe('ActivityPanel lesion-effect color mode (WP3)', () => {
 
     await waitFor(() => expect(loadLesionAtlas).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(instances[0].setMode).toHaveBeenCalledWith('lesion'));
+    // Each arm is painted from its OWN mapped graph — the fixture's
+    // biological/rewiredSeed0 data is deliberately distinct (see
+    // `fakeLesionAtlasOk`'s own comment), so this also proves the left arm
+    // was never accidentally painted from the rewired graph or vice versa.
     await waitFor(() => expect(instances[0].setStaticColors).toHaveBeenCalledWith('left', [0.1, -0.2, 0.3], [true, false, true], 1));
     await waitFor(() =>
-      expect(instances[0].setStaticColors).toHaveBeenCalledWith('right', [0.1, -0.2, 0.3], [true, false, true], 1)
+      expect(instances[0].setStaticColors).toHaveBeenCalledWith('right', [-0.4, 0.5, 0.0], [false, true, true], 1)
     );
     expect(runner.setActivityStreaming).toHaveBeenLastCalledWith(false);
 
@@ -698,5 +707,122 @@ describe('ActivityPanel lesion-effect color mode (WP3)', () => {
 
     await waitFor(() => expect(instances[0].setMode).toHaveBeenLastCalledWith('live'));
     expect(runner.setActivityStreaming).toHaveBeenLastCalledWith(true);
+  });
+
+  it('switching back to Live repaints both arms to neutral immediately, so lesion colors never linger under the Live label when no fresh tick arrives (round-2 dual review regression)', async () => {
+    // Regression coverage: `switchColorMode('live')` used to only reset
+    // `lastRatesSeen`/`colorSource` and re-enable streaming, never
+    // repainting the scene itself. On an experiment that is ready/paused
+    // (no ticks arriving), `frame()`'s own `update()`/`clear()` branches
+    // then never fire, and the lesion-effect mode's static diverging colors
+    // stayed on screen indefinitely under the "Color: Computed rate" label.
+    vi.mocked(loadLesionAtlas).mockResolvedValue(fakeLesionAtlasOk());
+    const runner = makeRunner(); // getLatestRates always returns undefined — no run in progress
+    render(ActivityPanel, {
+      runner,
+      positionsStatus: okPositionsStatus,
+      telemetry: undefined,
+      topologySwitchPending: false,
+      manifest: fakeManifest(),
+      biologicalGraph: fakeBiologicalGraph,
+      topology: { left: 'biological', right: 'rewired' }
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    await waitFor(() => expect(instances).toHaveLength(1));
+    await fireEvent.click(screen.getByRole('radio', { name: /lesion effect \(offline\)/i }));
+    await waitFor(() => expect(instances[0].setStaticColors).toHaveBeenCalled());
+
+    await fireEvent.click(screen.getByRole('radio', { name: /^live rate$/i }));
+
+    await waitFor(() => expect(instances[0].clear).toHaveBeenCalledWith('left'));
+    expect(instances[0].clear).toHaveBeenCalledWith('right');
+  });
+
+  it('a topology change while lesion mode is active re-applies static colors for the changed arm (plan requirement)', async () => {
+    vi.mocked(loadLesionAtlas).mockResolvedValue(fakeLesionAtlasOk());
+    const runner = makeRunner();
+    const { rerender } = render(ActivityPanel, {
+      runner,
+      positionsStatus: okPositionsStatus,
+      telemetry: undefined,
+      topologySwitchPending: false,
+      manifest: fakeManifest(),
+      biologicalGraph: fakeBiologicalGraph,
+      topology: { left: 'biological', right: 'rewired' }
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    await waitFor(() => expect(instances).toHaveLength(1));
+    await fireEvent.click(screen.getByRole('radio', { name: /lesion effect \(offline\)/i }));
+    await waitFor(() =>
+      expect(instances[0].setStaticColors).toHaveBeenCalledWith('right', [-0.4, 0.5, 0.0], [false, true, true], 1)
+    );
+    instances[0].setStaticColors.mockClear();
+    instances[0].setNoLesionData.mockClear();
+
+    await rerender({
+      runner,
+      positionsStatus: okPositionsStatus,
+      telemetry: undefined,
+      topologySwitchPending: false,
+      manifest: fakeManifest(),
+      biologicalGraph: fakeBiologicalGraph,
+      topology: { left: 'biological', right: 'disconnected' }
+    });
+
+    await waitFor(() => expect(instances[0].setNoLesionData).toHaveBeenCalledWith('right'));
+    // The left arm's topology did not change — it must not be repainted
+    // with the biological effect (and if it were, it would still use the
+    // right effect data on a bug that ignored `agentId`); asserting the
+    // right arm's own call proves the effect actually re-ran per-arm.
+    expect(instances[0].setStaticColors).not.toHaveBeenCalledWith('right', expect.anything(), expect.anything(), expect.anything());
+  });
+
+  it('a slow lazy atlas load never overrides a later "Live" selection (stale-intent race, round-2 dual review regression)', async () => {
+    const load = deferred<LesionAtlasLoadResult>();
+    vi.mocked(loadLesionAtlas).mockReturnValue(load.promise);
+    const runner = makeRunner();
+    render(ActivityPanel, {
+      runner,
+      positionsStatus: okPositionsStatus,
+      telemetry: undefined,
+      topologySwitchPending: false,
+      manifest: fakeManifest(),
+      biologicalGraph: fakeBiologicalGraph,
+      topology: { left: 'biological', right: 'rewired' }
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    await waitFor(() => expect(instances).toHaveLength(1));
+
+    // Click Lesion — the load is now in flight and unresolved.
+    await fireEvent.click(screen.getByRole('radio', { name: /lesion effect \(offline\)/i }));
+    await waitFor(() => expect(loadLesionAtlas).toHaveBeenCalledTimes(1));
+
+    // Before it resolves, the user selects Live again. A plain second
+    // `fireEvent.click` on the Live radio would not actually fire a native
+    // `change` event here — `handleColorModeInputChange`'s own DOM
+    // "unstick" logic (see its doc comment) already force-reset the Live
+    // radio's `checked` back to `true` as soon as the Lesion click was
+    // handled, and browsers never fire `change` for a click on an
+    // already-checked radio. `fireEvent.change` invokes the same `onchange`
+    // handler directly, the same way a re-render race or an assistive-tech
+    // "activate" action could, without depending on that native-radio
+    // quirk.
+    await fireEvent.change(screen.getByRole('radio', { name: /^live rate$/i }));
+
+    // The stale Lesion switch's load now finally resolves successfully.
+    load.resolve(fakeLesionAtlasOk());
+    // Flush a real macrotask boundary (not just a microtask `Promise.resolve()`
+    // hop), so `switchColorMode`'s `await ensureLesionAtlasLoaded()` continuation
+    // — and any reactive updates it triggers — has definitely had a chance to
+    // run before the assertions below, whichever way the guard resolves.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // The user's later, explicit "Live" choice must win — the stale switch
+    // must never flip the mode to lesion behind their back.
+    expect(instances[0].setMode).not.toHaveBeenCalledWith('lesion');
+    expect(screen.getByRole('radio', { name: /^live rate$/i })).toBeChecked();
   });
 });

@@ -92,16 +92,37 @@ export const rateToLutIndex = (rate: number, min: number, max: number, lutSteps:
  * generate-once-at-module-load way as `VIRIDIS_LUT` above.
  *
  * This is a *sequential-looking* table read divergingly by `effectToLutIndex`
- * below: index 0 is the most-negative effect, the center index is exactly
- * zero effect, and the last index is the most-positive effect — the same
- * "caller-supplied LUT, shared clamp/index math" shape `VIRIDIS_LUT`/
- * `rateToLutIndex` already establish for `writeColors`, so `writeEffectColors`
- * (`activity-layout.ts`) can reuse that pattern rather than inventing a
- * second one.
+ * below: index 0 is the most-negative effect, the entry nearest the middle is
+ * (almost exactly — see `DIVERGING_LUT_CENTER_INDEX`'s own doc comment on the
+ * one-index discretization gap an even `COLORMAP_SIZE` leaves) zero effect,
+ * and the last index is the most-positive effect — the same "caller-supplied
+ * LUT, shared clamp/index math" shape `VIRIDIS_LUT`/`rateToLutIndex` already
+ * establish for `writeColors`, so `writeEffectColors` (`activity-layout.ts`)
+ * can reuse that pattern rather than inventing a second one.
  */
 const DIVERGING_LOW: readonly [number, number, number] = [0 / 255, 114 / 255, 178 / 255]; // Okabe-Ito blue, #0072B2
 const DIVERGING_MID: readonly [number, number, number] = [1, 1, 1]; // white: exactly zero effect
 const DIVERGING_HIGH: readonly [number, number, number] = [213 / 255, 94 / 255, 0 / 255]; // Okabe-Ito vermillion, #D55E00
+
+/**
+ * The neutral color non-FDR-significant neurons are blended toward
+ * (`activity-layout.ts#writeEffectColors`) — deliberately *not* `DIVERGING_MID`
+ * (pure white). Round-2 dual review (Important): the activity view's canvas
+ * background is near-black (`ActivityScene.ts`'s `#05070c`), so blending
+ * toward white makes an "unreliable, de-emphasized" neuron the *highest*-
+ * contrast, most visually prominent point on screen — the opposite of the
+ * intended effect, and especially severe for the biological graph, where the
+ * shared `absMax` (dominated by the rewired graph's larger effects) leaves
+ * even FDR-significant biological neurons only faintly tinted to begin with.
+ * This dim, low-saturation neutral instead reads as visually quiet against
+ * the dark canvas, the same way `ActivityScene.ts#NO_DATA_COLOR` is a muted
+ * (not bright) grey for the same reason — but deliberately a different,
+ * darker value than `NO_DATA_COLOR` so "unreliable effect, still has atlas
+ * coverage" is never visually confused with "no lesion data at all" (a real
+ * risk a review pass flagged: the two states mean different things and must
+ * stay visually distinguishable).
+ */
+export const DIVERGING_FADE_TARGET: readonly [number, number, number] = [0.14, 0.15, 0.17];
 
 const buildDivergingLut = (): Float32Array => {
   const lut = new Float32Array(COLORMAP_SIZE * 3);
@@ -136,11 +157,14 @@ export const effectToLutIndex = (effect: number, absMax: number, lutSteps: numbe
 };
 
 /**
- * The LUT index `effectToLutIndex` maps exactly-zero effect to, for
- * `DIVERGING_LUT`'s own `COLORMAP_SIZE` step count — `activity-layout.ts#writeEffectColors`
- * uses the RGB triple at this index as the neutral color it blends
- * non-FDR-significant neurons toward, rather than hardcoding a second,
- * independently-authored "neutral gray" that could silently drift from the
- * LUT's actual center color.
+ * The LUT index `effectToLutIndex` maps zero effect to, for `DIVERGING_LUT`'s
+ * own `COLORMAP_SIZE` step count. Reference/test constant only — no
+ * production caller reads this index at runtime (`writeEffectColors` blends
+ * non-FDR-significant neurons toward `DIVERGING_FADE_TARGET` above, not
+ * toward this index's own LUT color; see that constant's doc comment for
+ * why). `COLORMAP_SIZE` (256) is even, so there is no single index whose `t`
+ * is exactly `0.5`: `effectToLutIndex(0, ...)` rounds `127.5` up to `128`,
+ * which is why the exported value below (and the LUT's color at that index)
+ * is the entry *nearest* zero effect, not a mathematically exact center.
  */
 export const DIVERGING_LUT_CENTER_INDEX = effectToLutIndex(0, 1, COLORMAP_SIZE);
