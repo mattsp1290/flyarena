@@ -553,24 +553,30 @@ const fmt = (value: number, digits = 4): string => value.toFixed(digits);
 
 /**
  * A per-seed paired difference (`lesioned - baseline`) this far above 0 is
- * treated as a single-seed outlier for this disclosure -- chosen because
- * the normal per-seed paired-difference range observed across this study's
- * runs is well within it (baseline `movementScore` itself typically ranges
- * roughly -5.6..+10.5), so a diff past it is a genuine tail event, not
- * ordinary noise. This is a descriptive threshold for the Limitations
- * disclosure below, not a statistical test -- it does not affect `effect`,
- * `ciLow`/`ciHigh`, `pValue`, or `fdrSignificant`, all of which already use
- * every seed via the bootstrap.
+ * treated as a single-seed outlier for this disclosure. Deliberately
+ * one-sided (compared against the raw signed diff, not `Math.abs(diff)`):
+ * the reviewed finding this disclosure reproduces is specifically about
+ * seeds that push a trajectory into a much *higher*-scoring outcome (a
+ * threshold/bistable-dynamics artifact), not a symmetric noise-outlier
+ * definition -- chosen because the normal per-seed paired-difference range
+ * observed across this study's runs is well within it (baseline
+ * `movementScore` itself typically ranges roughly -5.6..+10.5), so a diff
+ * past it is a genuine tail event, not ordinary noise. This is a
+ * descriptive threshold for the Limitations disclosure below, not a
+ * statistical test -- it does not affect `effect`, `ciLow`/`ciHigh`,
+ * `pValue`, or `fdrSignificant`, all of which already use every seed via
+ * the bootstrap.
  */
-const OUTLIER_ABS_DIFF_THRESHOLD = 5;
+const OUTLIER_POSITIVE_DIFF_THRESHOLD = 5;
 
 /** How the headline (top-ranked-by-\|effect\|) neuron's own robustness check below excludes seeds -- the two single most extreme-diff seeds, matching how an outlier-seed's contribution is isolated in practice. */
 const HEADLINE_EXCLUDED_SEED_COUNT = 2;
 
 export interface OutlierSeedFinding {
-  readonly thresholdAbsDiff: number;
+  /** One-sided: a neuron is flagged when a raw signed diff exceeds `+thresholdDiff`, not `Math.abs(diff)`. */
+  readonly thresholdDiff: number;
   readonly neuronCount: number;
-  /** Neurons with at least one held-out seed whose paired difference exceeds `thresholdAbsDiff`. */
+  /** Neurons with at least one held-out seed whose paired difference exceeds `+thresholdDiff`. */
   readonly outlierNeuronCount: number;
   /** Seeds that contributed at least one outlier, sorted by how many neurons they affected (descending). */
   readonly bySeed: readonly { readonly seed: number; readonly neuronCount: number }[];
@@ -594,10 +600,10 @@ export interface OutlierSeedFinding {
  * Computed directly from `raw`/`graphArtifact` at report-generation time
  * (never hard-coded to a specific run's seed numbers), so this disclosure
  * stays accurate across re-runs: scans every neuron's per-seed paired
- * differences for a value past `OUTLIER_ABS_DIFF_THRESHOLD` and reports
- * which seeds those outliers concentrate on, then runs the headline
- * robustness check above on whichever neuron is actually this graph's
- * largest-\|effect\| entry.
+ * differences for a value past `+OUTLIER_POSITIVE_DIFF_THRESHOLD` (one-sided
+ * -- see that constant's doc comment) and reports which seeds those
+ * outliers concentrate on, then runs the headline robustness check above on
+ * whichever neuron is actually this graph's largest-\|effect\| entry.
  */
 const computeOutlierSeedFinding = (
   raw: Readonly<AtlasGraphRaw>,
@@ -610,11 +616,11 @@ const computeOutlierSeedFinding = (
   for (const entry of raw.lesion) {
     const diffs = entry.movementScore.map((value, i) => value - raw.baselineMovementScore[i]);
     diffsByIndex.set(entry.index, diffs);
-    const hasOutlier = diffs.some((diff) => diff > OUTLIER_ABS_DIFF_THRESHOLD);
+    const hasOutlier = diffs.some((diff) => diff > OUTLIER_POSITIVE_DIFF_THRESHOLD);
     if (!hasOutlier) continue;
     outlierNeuronCount += 1;
     diffs.forEach((diff, i) => {
-      if (diff > OUTLIER_ABS_DIFF_THRESHOLD) {
+      if (diff > OUTLIER_POSITIVE_DIFF_THRESHOLD) {
         const seed = raw.heldOutSeeds[i];
         seedOutlierNeuronCounts.set(seed, (seedOutlierNeuronCounts.get(seed) ?? 0) + 1);
       }
@@ -636,7 +642,7 @@ const computeOutlierSeedFinding = (
   const retainedRatio = headlineEffect === 0 ? 1 : Math.abs(excludingTopSeedsEffect) / Math.abs(headlineEffect);
 
   return {
-    thresholdAbsDiff: OUTLIER_ABS_DIFF_THRESHOLD,
+    thresholdDiff: OUTLIER_POSITIVE_DIFF_THRESHOLD,
     neuronCount: raw.lesion.length,
     outlierNeuronCount,
     bySeed,
@@ -674,7 +680,7 @@ const formatOutlierBullet = (label: string, finding: Readonly<OutlierSeedFinding
         'largely dependent on those seeds';
   return (
     `${label}: ${finding.outlierNeuronCount}/${finding.neuronCount} neurons (${percent}%) have at least one ` +
-    `held-out seed whose paired difference (lesioned - baseline) exceeds +${finding.thresholdAbsDiff}; these ` +
+    `held-out seed whose paired difference (lesioned - baseline) exceeds +${finding.thresholdDiff}; these ` +
     `concentrate on a handful of seeds (${topSeeds}), consistent with a threshold/bistable-dynamics artifact ` +
     `rather than a baseline failure -- none of these seeds' own baseline scores are themselves extreme. This ` +
     `graph's own headline (largest-\\|effect\\|) neuron ${h.index} (effect ${fmt(h.effect)}): excluding its ` +

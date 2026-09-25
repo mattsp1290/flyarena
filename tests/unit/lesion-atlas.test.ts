@@ -888,7 +888,7 @@ describe('computeOutlierSeedFindings', () => {
     const heldOutSeeds = biological.heldOutSeeds;
     // Neuron 0: every seed but one is a small, constant diff (+0.2); the
     // held-out seed at index 3 gets a single large positive outlier
-    // (diff=+7, past OUTLIER_ABS_DIFF_THRESHOLD=5) -- this becomes both
+    // (diff=+7, past OUTLIER_POSITIVE_DIFF_THRESHOLD=5) -- this becomes both
     // graphs' largest-|effect| neuron (used for the headline check below)
     // since neuron 1 stays at exactly 0.
     const outlierSeedIndex = 3;
@@ -915,6 +915,35 @@ describe('computeOutlierSeedFindings', () => {
     // otherwise-uniform +0.2 diffs.
     expect(findings.biological.headline.index).toBe(0);
     expect(findings.biological.headline.retainedRatio).toBeLessThan(1);
+  });
+
+  it('is one-sided: a large NEGATIVE diff is not flagged as an outlier', () => {
+    // Deliberate design choice, not an oversight (see OUTLIER_POSITIVE_DIFF_THRESHOLD's
+    // doc comment in atlas-report.ts): the disclosure reproduces a specific
+    // reviewed finding about seeds that push a trajectory into a much
+    // *higher*-scoring outcome, so it compares the raw signed diff against
+    // `+threshold`, never `Math.abs(diff)` against it.
+    const effects = [0, 0];
+    const raw = buildRaw(effects.length, effects);
+    const biological = raw.graphs.biological!;
+    const outlierSeedIndex = 3;
+    const movementScore = biological.baselineMovementScore.map((score, i) => (i === outlierSeedIndex ? score - 7 : score));
+    const patchedRaw: AtlasEvaluationRaw = {
+      ...raw,
+      graphs: {
+        biological: {
+          ...biological,
+          lesion: biological.lesion.map((entry) => (entry.index === 0 ? { ...entry, movementScore } : entry))
+        },
+        rewiredSeed0: raw.graphs.rewiredSeed0!
+      }
+    };
+    const positions = buildPositions(effects.length);
+    const artifact = buildArtifact(patchedRaw, positions, runMeta, 1, 100);
+
+    const findings = computeOutlierSeedFindings(patchedRaw, artifact);
+    expect(findings.biological.outlierNeuronCount).toBe(0);
+    expect(findings.biological.bySeed).toEqual([]);
   });
 
   it('reports zero outlier neurons when no diff exceeds the threshold', () => {
