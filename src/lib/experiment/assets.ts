@@ -172,6 +172,17 @@ export interface ArenaManifest {
   /** WP1's soma-position sidecar entry; see `PositionsManifestEntry`. */
   positions?: PositionsManifestEntry;
   /**
+   * The single-neuron lesion atlas's manifest entry
+   * (`.agents/plans/lesion-atlas/02-atlas-computation.md`,
+   * `public/data/lesion-atlas-v1.json`) — `experiment/lesionAtlas.ts#loadLesionAtlas`
+   * fetches and sha256-verifies this. Optional: a manifest produced before
+   * that WP (or a hand-built test fixture) simply has no lesion-effect color
+   * mode to offer — `loadLesionAtlas` reports that as `status: 'missing'`
+   * rather than throwing, and `ActivityPanel.svelte` disables the mode with
+   * an honest reason instead of pretending it exists.
+   */
+  lesionAtlas?: SidecarManifestEntry;
+  /**
    * WP4's rewiring-null-distribution ledger entry: `null-report.ts`
    * (`.agents/plans/rewiring-null/02-authored-null-evaluation.md`) writes
    * this once `rewiring-null-v1.json` exists. Optional: a manifest produced

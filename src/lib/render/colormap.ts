@@ -81,3 +81,66 @@ export const rateToLutIndex = (rate: number, min: number, max: number, lutSteps:
   const clamped = t < 0 ? 0 : t > 1 ? 1 : t;
   return Math.round(clamped * (lutSteps - 1));
 };
+
+/**
+ * Diverging colormap for the anatomical activity view's lesion-effect color
+ * mode (WP3, `.agents/plans/lesion-atlas/03-activity-lesion-mode.md`):
+ * colorblind-safe blue (negative effect) -> white (zero effect) -> vermillion
+ * (positive effect), the two endpoint hues taken from the Okabe-Ito
+ * colorblind-safe palette (`#0072B2`/`#D55E00`) rather than the red/green
+ * pair a diverging map would naively reach for. Built the same
+ * generate-once-at-module-load way as `VIRIDIS_LUT` above.
+ *
+ * This is a *sequential-looking* table read divergingly by `effectToLutIndex`
+ * below: index 0 is the most-negative effect, the center index is exactly
+ * zero effect, and the last index is the most-positive effect — the same
+ * "caller-supplied LUT, shared clamp/index math" shape `VIRIDIS_LUT`/
+ * `rateToLutIndex` already establish for `writeColors`, so `writeEffectColors`
+ * (`activity-layout.ts`) can reuse that pattern rather than inventing a
+ * second one.
+ */
+const DIVERGING_LOW: readonly [number, number, number] = [0 / 255, 114 / 255, 178 / 255]; // Okabe-Ito blue, #0072B2
+const DIVERGING_MID: readonly [number, number, number] = [1, 1, 1]; // white: exactly zero effect
+const DIVERGING_HIGH: readonly [number, number, number] = [213 / 255, 94 / 255, 0 / 255]; // Okabe-Ito vermillion, #D55E00
+
+const buildDivergingLut = (): Float32Array => {
+  const lut = new Float32Array(COLORMAP_SIZE * 3);
+  for (let index = 0; index < COLORMAP_SIZE; index += 1) {
+    const t = index / (COLORMAP_SIZE - 1);
+    const [from, to, localT] =
+      t < 0.5 ? ([DIVERGING_LOW, DIVERGING_MID, t / 0.5] as const) : ([DIVERGING_MID, DIVERGING_HIGH, (t - 0.5) / 0.5] as const);
+    lut[index * 3] = from[0] + (to[0] - from[0]) * localT;
+    lut[index * 3 + 1] = from[1] + (to[1] - from[1]) * localT;
+    lut[index * 3 + 2] = from[2] + (to[2] - from[2]) * localT;
+  }
+  return lut;
+};
+
+/** `256 x 3` RGB lookup table, values in `[0, 1]`, centered at zero effect. Built once at module load; never mutated. */
+export const DIVERGING_LUT: Float32Array = buildDivergingLut();
+
+/**
+ * Map a signed `effect` (clamped to `[-absMax, absMax]`) to an index into a
+ * diverging LUT with `lutSteps` entries, centered at zero. Mirrors
+ * `rateToLutIndex`'s shape/degenerate-input handling exactly (a
+ * non-positive `absMax`, or a non-finite `effect`, both map to the LUT's
+ * own center — never NaN, never a division by zero) so a caller can reuse
+ * the same "shared clamp/round math, real color-write path" testing
+ * discipline this module already established for the sequential viridis
+ * path.
+ */
+export const effectToLutIndex = (effect: number, absMax: number, lutSteps: number): number => {
+  const t = absMax > 0 && Number.isFinite(effect) ? effect / absMax : 0;
+  const clamped = t < -1 ? -1 : t > 1 ? 1 : t;
+  return Math.round(((clamped + 1) / 2) * (lutSteps - 1));
+};
+
+/**
+ * The LUT index `effectToLutIndex` maps exactly-zero effect to, for
+ * `DIVERGING_LUT`'s own `COLORMAP_SIZE` step count — `activity-layout.ts#writeEffectColors`
+ * uses the RGB triple at this index as the neutral color it blends
+ * non-FDR-significant neurons toward, rather than hardcoding a second,
+ * independently-authored "neutral gray" that could silently drift from the
+ * LUT's actual center color.
+ */
+export const DIVERGING_LUT_CENTER_INDEX = effectToLutIndex(0, 1, COLORMAP_SIZE);

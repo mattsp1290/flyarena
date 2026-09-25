@@ -12,7 +12,7 @@
  * `xyz`/`positionSource`/`role` arrays (degree-preserving rewiring keeps the
  * node set; only connections differ), so one layout/partition serves both.
  */
-import { rateToLutIndex } from './colormap';
+import { effectToLutIndex, rateToLutIndex } from './colormap';
 import { POINT_SIZE } from './activity-constants';
 
 export type PositionSource = 'soma' | 'tosoma' | 'none';
@@ -211,5 +211,70 @@ export const writeColors = (
     out[outOffset] = lut[lutIndex];
     out[outOffset + 1] = lut[lutIndex + 1];
     out[outOffset + 2] = lut[lutIndex + 2];
+  }
+};
+
+/**
+ * Non-FDR-significant neurons are blended toward the LUT's own neutral
+ * (zero-effect) color at this weight, rather than shown at full saturation —
+ * the lesion-effect mode's honesty requirement that a merely larger point
+ * estimate must not read as more reliable than a smaller, FDR-surviving one
+ * (`docs/lesion-atlas-report.md`'s "Multiple comparisons" section). `60%`
+ * toward neutral is visually distinct from both "significant, full color"
+ * and "exactly zero effect, LUT center" without erasing the sign/magnitude
+ * entirely.
+ */
+const NON_SIGNIFICANT_BLEND = 0.6;
+
+/**
+ * Write RGB colors for `indices` from a static per-neuron `effect` array
+ * (the shipped lesion atlas's `effect`/`fdrSignificant` — see
+ * `experiment/lesionAtlas.ts#loadLesionAtlas`) into `out`, the lesion-effect
+ * color mode's counterpart to `writeColors` above. Same no-allocation,
+ * caller-owned-buffer contract; `lut` is expected to be a diverging table
+ * (`colormap.ts#DIVERGING_LUT`) but, like `writeColors`, is accepted as a
+ * parameter rather than hardcoded so this stays testable against a synthetic
+ * table.
+ *
+ * A neuron whose `emphasize[i]` is `false` (did not survive Benjamini-
+ * Hochberg FDR correction, per graph, at `q = 0.05` — see
+ * `docs/lesion-atlas-report.md`'s "Multiple comparisons" section) is blended
+ * toward the LUT's own center (zero-effect) color at `NON_SIGNIFICANT_BLEND`
+ * — a real, distinct color change (not merely a labeling choice), so a
+ * larger raw effect never reads as visually "stronger" than a smaller,
+ * FDR-surviving one just because its point estimate happens to be bigger.
+ * This is one of two non-color-only-adjacent honesty signals for FDR
+ * significance the lesion-effect mode draws — `render/ActivityScene.ts`'s
+ * `setStaticColors` also draws a separate outline-ring marker (shape, not
+ * hue) at every non-significant neuron's position, so significance is never
+ * encoded by color/saturation alone.
+ */
+export const writeEffectColors = (
+  effect: ArrayLike<number>,
+  emphasize: ArrayLike<boolean>,
+  indices: Int32Array,
+  absMax: number,
+  lut: Float32Array,
+  out: Float32Array
+): void => {
+  const lutSteps = lut.length / 3;
+  // The LUT's own zero-effect color, derived the same way `effectToLutIndex`
+  // itself maps zero (rather than hardcoding a second "center index" that
+  // could silently drift from the real one — see `colormap.ts#DIVERGING_LUT_CENTER_INDEX`'s
+  // own doc comment for why that constant exists at all).
+  const centerIndex = effectToLutIndex(0, 1, lutSteps) * 3;
+  for (let k = 0; k < indices.length; k += 1) {
+    const neuron = indices[k];
+    const lutIndex = effectToLutIndex(effect[neuron], absMax, lutSteps) * 3;
+    const outOffset = k * 3;
+    if (emphasize[neuron]) {
+      out[outOffset] = lut[lutIndex];
+      out[outOffset + 1] = lut[lutIndex + 1];
+      out[outOffset + 2] = lut[lutIndex + 2];
+    } else {
+      out[outOffset] = lut[lutIndex] * (1 - NON_SIGNIFICANT_BLEND) + lut[centerIndex] * NON_SIGNIFICANT_BLEND;
+      out[outOffset + 1] = lut[lutIndex + 1] * (1 - NON_SIGNIFICANT_BLEND) + lut[centerIndex + 1] * NON_SIGNIFICANT_BLEND;
+      out[outOffset + 2] = lut[lutIndex + 2] * (1 - NON_SIGNIFICANT_BLEND) + lut[centerIndex + 2] * NON_SIGNIFICANT_BLEND;
+    }
   }
 };

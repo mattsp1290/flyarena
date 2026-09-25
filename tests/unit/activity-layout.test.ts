@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { layoutPositions, partitionByRole, writeColors, type NeuronRole, type PositionSource } from '../../src/lib/render/activity-layout';
+import {
+  layoutPositions,
+  partitionByRole,
+  writeColors,
+  writeEffectColors,
+  type NeuronRole,
+  type PositionSource
+} from '../../src/lib/render/activity-layout';
+import { COLORMAP_SIZE, DIVERGING_LUT, DIVERGING_LUT_CENTER_INDEX, effectToLutIndex } from '../../src/lib/render/colormap';
 import { POINT_SIZE } from '../../src/lib/render/activity-constants';
 
 describe('layoutPositions', () => {
@@ -173,5 +181,88 @@ describe('writeColors', () => {
     expect(out[0]).toBeCloseTo(lut[255 * 3]);
     // k=1 -> neuron 0, rate 1 == min
     expect(out[3]).toBeCloseTo(lut[0]);
+  });
+});
+
+describe('writeEffectColors (WP3 lesion-effect color mode)', () => {
+  it('maps -absMax/0/+absMax to DIVERGING_LUT[0]/center/last for an FDR-significant (emphasized) neuron', () => {
+    const effect = Float32Array.from([-10, 0, 10]);
+    const emphasize = [true, true, true];
+    const indices = Int32Array.from([0, 1, 2]);
+    const out = new Float32Array(9);
+
+    writeEffectColors(effect, emphasize, indices, 10, DIVERGING_LUT, out);
+
+    expect(Array.from(out.subarray(0, 3))).toEqual([DIVERGING_LUT[0], DIVERGING_LUT[1], DIVERGING_LUT[2]]);
+    const centerOffset = DIVERGING_LUT_CENTER_INDEX * 3;
+    expect(Array.from(out.subarray(3, 6))).toEqual([
+      DIVERGING_LUT[centerOffset],
+      DIVERGING_LUT[centerOffset + 1],
+      DIVERGING_LUT[centerOffset + 2]
+    ]);
+    const lastOffset = (COLORMAP_SIZE - 1) * 3;
+    expect(Array.from(out.subarray(6, 9))).toEqual([
+      DIVERGING_LUT[lastOffset],
+      DIVERGING_LUT[lastOffset + 1],
+      DIVERGING_LUT[lastOffset + 2]
+    ]);
+  });
+
+  it('blends a non-FDR-significant neuron 60% toward the LUT center rather than showing it at full saturation', () => {
+    const effect = Float32Array.from([10]);
+    const emphasize = [false];
+    const indices = Int32Array.from([0]);
+    const out = new Float32Array(3);
+
+    writeEffectColors(effect, emphasize, indices, 10, DIVERGING_LUT, out);
+
+    const lutIndex = effectToLutIndex(10, 10, COLORMAP_SIZE) * 3; // the raw (unblended) color this neuron would have gotten
+    const centerOffset = DIVERGING_LUT_CENTER_INDEX * 3;
+    const expected = [0, 1, 2].map((c) => DIVERGING_LUT[lutIndex + c] * 0.4 + DIVERGING_LUT[centerOffset + c] * 0.6);
+    expect(out[0]).toBeCloseTo(expected[0], 5);
+    expect(out[1]).toBeCloseTo(expected[1], 5);
+    expect(out[2]).toBeCloseTo(expected[2], 5);
+    // Not the full-saturation color a significant neuron with the same
+    // effect would have gotten (the whole point of the blend).
+    expect(out[0]).not.toBeCloseTo(DIVERGING_LUT[lutIndex], 5);
+  });
+
+  it('a non-significant neuron with exactly zero effect is unchanged by the blend (already the center color)', () => {
+    const effect = Float32Array.from([0]);
+    const emphasize = [false];
+    const indices = Int32Array.from([0]);
+    const out = new Float32Array(3);
+
+    writeEffectColors(effect, emphasize, indices, 10, DIVERGING_LUT, out);
+
+    const centerOffset = DIVERGING_LUT_CENTER_INDEX * 3;
+    expect(out[0]).toBeCloseTo(DIVERGING_LUT[centerOffset], 5);
+    expect(out[1]).toBeCloseTo(DIVERGING_LUT[centerOffset + 1], 5);
+    expect(out[2]).toBeCloseTo(DIVERGING_LUT[centerOffset + 2], 5);
+  });
+
+  it('writes only the requested indices, into the caller-owned buffer, never allocating', () => {
+    const effect = Float32Array.from([-5, 0, 5]);
+    const emphasize = [true, true, true];
+    // Only neuron 1 is requested — neurons 0 and 2 must be left untouched.
+    const indices = Int32Array.from([1]);
+    const out = new Float32Array(3).fill(-1);
+
+    writeEffectColors(effect, emphasize, indices, 10, DIVERGING_LUT, out);
+
+    expect(out[0]).not.toBe(-1);
+    expect(out[1]).not.toBe(-1);
+    expect(out[2]).not.toBe(-1);
+  });
+
+  it('significant and non-significant neurons with the same effect get visibly different colors', () => {
+    const effect = Float32Array.from([10, 10]);
+    const emphasize = [true, false];
+    const indices = Int32Array.from([0, 1]);
+    const out = new Float32Array(6);
+
+    writeEffectColors(effect, emphasize, indices, 10, DIVERGING_LUT, out);
+
+    expect(out[0]).not.toBeCloseTo(out[3], 5);
   });
 });

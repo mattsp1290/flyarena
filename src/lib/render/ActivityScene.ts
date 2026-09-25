@@ -3,8 +3,8 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import type { AgentId } from '../arena/types';
 import type { PositionsArtifact } from '../experiment/assets';
 import { createCanvasResizeObserver, createContextLossHandler, resizeRendererAndCamera, teardownWebglScene } from './lifecycle';
-import { layoutPositions, partitionByRole, writeColors, type NeuronRole } from './activity-layout';
-import { VIRIDIS_LUT } from './colormap';
+import { layoutPositions, partitionByRole, writeColors, writeEffectColors, type NeuronRole } from './activity-layout';
+import { DIVERGING_LUT, VIRIDIS_LUT } from './colormap';
 import { POINT_SIZE } from './activity-constants';
 
 /**
@@ -73,6 +73,35 @@ const ROLE_SHAPE: Record<NeuronRole, PointShape> = {
   descending: 'triangle'
 };
 
+/**
+ * Lesion-effect mode's FDR-significance marker (WP3): a hollow ring drawn at
+ * every neuron whose effect did NOT survive Benjamini-Hochberg FDR
+ * correction (`emphasize[i] === false` — see `activity-layout.ts#writeEffectColors`'s
+ * own doc comment). Shape, not hue — a non-color-only signal alongside (not
+ * instead of) that function's color-blend-toward-neutral, so significance is
+ * never encoded by color/saturation alone. Slightly larger than the base
+ * point sprite so it reads as an outline/halo around the underlying role
+ * shape rather than occluding it.
+ */
+const OUTLINE_RING_COLOR = '#ffe08a';
+const OUTLINE_RING_SIZE_FACTOR = 1.7;
+
+/** Draw a hollow ring into a small offscreen canvas, once — the lesion-effect mode's "not FDR-significant" marker texture (see `OUTLINE_RING_COLOR`'s doc comment). */
+const buildOutlineRingTexture = (): THREE.CanvasTexture => {
+  const canvas = document.createElement('canvas');
+  canvas.width = 32;
+  canvas.height = 32;
+  const context = canvas.getContext('2d');
+  if (context) {
+    context.strokeStyle = '#ffffff';
+    context.lineWidth = 3;
+    context.beginPath();
+    context.arc(16, 16, 12, 0, Math.PI * 2);
+    context.stroke();
+  }
+  return new THREE.CanvasTexture(canvas);
+};
+
 /** Draw one filled shape into a small offscreen canvas, once, for use as a `THREE.PointsMaterial#map`. No per-frame allocation — built only at construction. */
 const buildShapeTexture = (shape: PointShape): THREE.CanvasTexture => {
   const canvas = document.createElement('canvas');
@@ -105,9 +134,15 @@ interface ArmRoleGroup {
   indices: Int32Array;
 }
 
+/** Lesion-effect mode's per-arm "not FDR-significant" ring overlay (see `OUTLINE_RING_COLOR`'s doc comment) — one `THREE.Points` per arm, spanning every role, rebuilt (not preallocated) each time `setStaticColors`/`setNoLesionData` runs, since that only happens on mode entry or a topology switch while in lesion mode, never per animation frame. */
+interface ArmOutline {
+  points: THREE.Points;
+}
+
 interface ArmVisual {
   group: THREE.Group;
   roles: Record<NeuronRole, ArmRoleGroup>;
+  outline: ArmOutline;
 }
 
 export class ActivityScene {
@@ -122,9 +157,15 @@ export class ActivityScene {
   private readonly rateMax: number;
   private readonly shapeTextures: Record<PointShape, THREE.CanvasTexture>;
   private readonly materials: Record<NeuronRole, THREE.PointsMaterial>;
+  private readonly outlineTexture: THREE.CanvasTexture;
+  private readonly outlineMaterial: THREE.PointsMaterial;
   private readonly arms: Record<AgentId, ArmVisual>;
+  /** The shared, arm-agnostic centered/scaled position array `layoutPositions` produced (`ActivitySceneOptions.positions` in, once, at construction) — kept so `setStaticColors`/`setNoLesionData` can (re)build each arm's outline-ring overlay (`ArmOutline`) from arbitrary neuron-index subsets without re-running `layoutPositions`. Both arms share this same array (their `group.position.x` offsets, not separate coordinates, are what make the arms visually distinct — see `buildArm`). */
+  private readonly basePositions: Float32Array;
 
   private reducedMotion: boolean;
+  /** `'live'` (the default): `update()`/`clear()` write per-tick colors as usual. `'lesion'`: both become no-ops so `setStaticColors`'s static colors persist untouched, and both arms' outline overlays are hidden on entry — see `setMode`'s own doc comment. */
+  private mode: 'live' | 'lesion' = 'live';
   private resizeObserver: ResizeObserver | undefined;
   private contextLost = false;
   private disposed = false;
@@ -179,8 +220,19 @@ export class ActivityScene {
         bridge: this.buildMaterial('bridge'),
         descending: this.buildMaterial('descending')
       };
+      this.outlineTexture = buildOutlineRingTexture();
+      this.outlineMaterial = new THREE.PointsMaterial({
+        size: POINT_SIZE * OUTLINE_RING_SIZE_FACTOR,
+        map: this.outlineTexture,
+        color: new THREE.Color(OUTLINE_RING_COLOR),
+        transparent: true,
+        alphaTest: 0.2,
+        depthWrite: false,
+        sizeAttenuation: true
+      });
 
       const layout = layoutPositions(options.positions.xyz, options.positions.positionSource);
+      this.basePositions = layout.points;
       const partition = partitionByRole(options.positions.role);
       const roleIndices: Record<NeuronRole, Int32Array> = {
         sensory: partition.sensoryIdx,
@@ -259,7 +311,17 @@ export class ActivityScene {
       group.add(points);
       roles[role] = { points, colorAttribute, indices };
     }
-    return { group, roles };
+
+    // Lesion-effect mode's "not FDR-significant" ring overlay (see
+    // `OUTLINE_RING_COLOR`'s doc comment) — starts empty/invisible; only
+    // `setStaticColors`/`setNoLesionData` ever populate or show it.
+    const outlineGeometry = new THREE.BufferGeometry();
+    outlineGeometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(0), 3));
+    const outlinePoints = new THREE.Points(outlineGeometry, this.outlineMaterial);
+    outlinePoints.visible = false;
+    group.add(outlinePoints);
+
+    return { group, roles, outline: { points: outlinePoints } };
   }
 
   /** Mirror a live `prefers-reduced-motion` change: toggles camera damping immediately. */
@@ -281,7 +343,13 @@ export class ActivityScene {
    * a fresh array for that arm.
    */
   update(agentId: AgentId, rates: Float32Array): void {
-    if (this.disposed || this.contextLost) return;
+    // No-op while in lesion mode (WP3): the lesion-effect color mode's
+    // static colors (`setStaticColors` below) must persist untouched across
+    // frames — `ActivityPanel.svelte`'s `frame()` already skips its whole
+    // rates-polling block while `mode === 'lesion'` (so this branch is
+    // normally never reached then), but gating here too is defense in depth
+    // against any other future caller.
+    if (this.disposed || this.contextLost || this.mode === 'lesion') return;
     const arm = this.arms[agentId];
     for (const role of ROLES) {
       const group = arm.roles[role];
@@ -298,7 +366,18 @@ export class ActivityScene {
    * run's final colors on screen — see `ActivityPanel.svelte`'s `frame()`).
    */
   clear(agentId: AgentId): void {
-    if (this.disposed || this.contextLost) return;
+    // No-op while in lesion mode — same reasoning as `update()` above: this
+    // repaint-to-neutral is a *live*-mode concept ("no fresh rate this
+    // frame"), and must never overwrite the lesion-effect mode's static
+    // colors. `setNoLesionData` below is the lesion-mode counterpart for an
+    // arm with no atlas coverage (e.g. disconnected), and paints the same
+    // neutral color but is never gated on `mode`.
+    if (this.disposed || this.contextLost || this.mode === 'lesion') return;
+    this.paintNeutral(agentId);
+  }
+
+  /** Shared neutral-repaint body for `clear()` (live mode only) and `setNoLesionData()` (lesion mode, always) — see each method's own doc comment. */
+  private paintNeutral(agentId: AgentId): void {
     const arm = this.arms[agentId];
     for (const role of ROLES) {
       const array = arm.roles[role].colorAttribute.array as Float32Array;
@@ -308,6 +387,94 @@ export class ActivityScene {
         array[component + 2] = NO_DATA_COLOR[2];
       }
       arm.roles[role].colorAttribute.needsUpdate = true;
+    }
+  }
+
+  /**
+   * Lesion-effect mode: paint `agentId`'s points from a static per-neuron
+   * `effect`/`emphasize` (FDR-significant) pair — the shipped lesion atlas's
+   * data for whichever graph key `agentId`'s current topology maps to (see
+   * `experiment/lesionAtlas.ts#lesionAtlasGraphKeyForTopology`). Always
+   * writes (not gated on `mode`, unlike `update()`/`clear()`): the host
+   * (`ActivityPanel.svelte`) only calls this while `mode === 'lesion'`, and
+   * gating here too would just make a caller bug silently do nothing instead
+   * of writing wrong-looking colors, which is worse to debug. Also (re)builds
+   * this arm's "not FDR-significant" outline-ring overlay (see
+   * `OUTLINE_RING_COLOR`'s doc comment) from `emphasize`.
+   */
+  setStaticColors(agentId: AgentId, effect: ArrayLike<number>, emphasize: ArrayLike<boolean>, absMax: number): void {
+    if (this.disposed || this.contextLost) return;
+    const arm = this.arms[agentId];
+    for (const role of ROLES) {
+      const group = arm.roles[role];
+      writeEffectColors(effect, emphasize, group.indices, absMax, DIVERGING_LUT, group.colorAttribute.array as Float32Array);
+      group.colorAttribute.needsUpdate = true;
+    }
+    this.paintOutline(agentId, emphasize);
+  }
+
+  /**
+   * Lesion-effect mode's honest "no data" state for an arm whose current
+   * topology the atlas does not cover (disconnected — see
+   * `lesionAtlasGraphKeyForTopology`'s doc comment). Paints the same neutral
+   * grey `clear()` uses (never a fabricated effect color) and hides that
+   * arm's outline overlay (there is no per-neuron significance to show).
+   */
+  setNoLesionData(agentId: AgentId): void {
+    if (this.disposed || this.contextLost) return;
+    this.paintNeutral(agentId);
+    const arm = this.arms[agentId];
+    arm.outline.points.visible = false;
+  }
+
+  /**
+   * (Re)build `agentId`'s outline-ring overlay from `emphasize` — one point
+   * per neuron whose effect did *not* survive FDR correction, in the same
+   * shared/arm-agnostic centered coordinate space `this.basePositions`
+   * already holds (the overlay is a child of this arm's own `group`, which
+   * carries the arm's `offsetX` transform — see `buildArm` — so no manual
+   * offset is needed here). A fresh `Float32Array`/`BufferAttribute` each
+   * call rather than a preallocated, `setDrawRange`-trimmed buffer: this
+   * only ever runs on lesion-mode entry or a topology switch while lesion
+   * mode is active, never per animation frame, so the allocation is outside
+   * this scene's actual "no allocation" hot path (`update()`/`render()`).
+   */
+  private paintOutline(agentId: AgentId, emphasize: ArrayLike<boolean>): void {
+    const arm = this.arms[agentId];
+    const neuronCount = this.basePositions.length / 3;
+    let count = 0;
+    for (let neuron = 0; neuron < neuronCount; neuron += 1) if (!emphasize[neuron]) count += 1;
+    const positions = new Float32Array(count * 3);
+    let writeIndex = 0;
+    for (let neuron = 0; neuron < neuronCount; neuron += 1) {
+      if (emphasize[neuron]) continue;
+      const source = neuron * 3;
+      const destination = writeIndex * 3;
+      positions[destination] = this.basePositions[source];
+      positions[destination + 1] = this.basePositions[source + 1];
+      positions[destination + 2] = this.basePositions[source + 2];
+      writeIndex += 1;
+    }
+    arm.outline.points.geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    arm.outline.points.visible = count > 0;
+  }
+
+  /**
+   * Switch between `'live'` (default: `update()`/`clear()` write per-tick
+   * colors as usual) and `'lesion'` (both become no-ops, so whatever
+   * `setStaticColors`/`setNoLesionData` last painted persists untouched
+   * across frames — see those methods and `update()`/`clear()`'s own doc
+   * comments). Switching back to `'live'` also hides both arms' outline
+   * overlays (a lesion-mode-only marker) so a subsequent Live-mode frame
+   * never shows a stale "not FDR-significant" ring over live rate colors.
+   */
+  setMode(mode: 'live' | 'lesion'): void {
+    if (this.disposed || this.mode === mode) return;
+    this.mode = mode;
+    if (mode === 'live') {
+      for (const agentId of Object.keys(this.arms) as AgentId[]) {
+        this.arms[agentId].outline.points.visible = false;
+      }
     }
   }
 

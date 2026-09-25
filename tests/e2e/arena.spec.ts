@@ -576,6 +576,177 @@ test.describe('anatomical activity view', () => {
   });
 });
 
+test.describe('lesion-effect color mode (WP3)', () => {
+  const lesionRadio = (page: import('@playwright/test').Page) => page.getByRole('radio', { name: /lesion effect \(offline\)/i });
+  const liveRadio = (page: import('@playwright/test').Page) => page.getByRole('radio', { name: /^live rate$/i });
+
+  test('choosing Lesion effect (offline) shows the diverging legend/label and stops rate streaming', async ({ page }) => {
+    await page.goto('/');
+    await waitForReady(page);
+    await expandActivityPanel(page);
+    await startOrResumeButton(page).click();
+    await waitForActivityUpdateTick(page, 'left', 1);
+    await waitForActivityUpdateTick(page, 'right', 1);
+
+    await lesionRadio(page).click();
+    await expect(lesionRadio(page)).toBeChecked();
+
+    // Scoped to the activity panel — "Computed (offline)"/"sha256" etc. also
+    // appear in unrelated ledger rows elsewhere on the page.
+    const activitySection = page.locator('section.activity');
+
+    // Honest, in-product labels (the plan's non-negotiables).
+    await expect(activitySection.getByText(/Computed \(offline\)/)).toBeVisible();
+    await expect(activitySection.getByText(/effect on this model's score when this neuron's rate is/i)).toBeVisible();
+    await expect(activitySection.getByText(/FDR q\s*=\s*0\.05/)).toBeVisible();
+    await expect(activitySection.getByText(/not a claim about the real fly/i)).toBeVisible();
+    await expect(activitySection.getByText(/hand-wired encoder inputs/i)).toBeVisible();
+    await expect(activitySection.getByRole('link', { name: /full report/i })).toHaveAttribute(
+      'href',
+      'https://github.com/mattsp1290/flyarena/blob/main/docs/lesion-atlas-report.md'
+    );
+    // Diverging legend with a non-color-only FDR-significance marker.
+    await expect(activitySection.locator('.legend-bar.diverging')).toBeVisible();
+    await expect(activitySection.getByText(/not FDR-significant/i)).toBeVisible();
+
+    // Streaming stopped: the tick debug attributes must not advance further,
+    // even though the run is still going (the simulation keeps ticking —
+    // only the activity view's own rate polling is paused).
+    const tickLeftBefore = await activityCanvas(page).getAttribute('data-last-update-tick-left');
+    const tickRightBefore = await activityCanvas(page).getAttribute('data-last-update-tick-right');
+    await page.waitForTimeout(700);
+    await expect(activityCanvas(page)).toHaveAttribute('data-last-update-tick-left', tickLeftBefore ?? '0');
+    await expect(activityCanvas(page)).toHaveAttribute('data-last-update-tick-right', tickRightBefore ?? '0');
+
+    await pauseButton(page).click();
+    await expect(statusRegion(page)).toHaveText('paused');
+  });
+
+  test('data-color-source stays "lesion" across many animation frames (no live repaint sneaks through)', async ({ page }) => {
+    await page.goto('/');
+    await waitForReady(page);
+    await expandActivityPanel(page);
+    await lesionRadio(page).click();
+    await expect(activityCanvas(page)).toHaveAttribute('data-color-source-left', 'lesion');
+    await expect(activityCanvas(page)).toHaveAttribute('data-color-source-right', 'lesion');
+
+    await startOrResumeButton(page).click();
+    // ~30+ animation frames' worth of real time at a 30Hz/60fps refresh —
+    // long enough that a regression letting `update()`/`clear()` repaint
+    // over the static colors would flip these back to "live".
+    await page.waitForTimeout(700);
+
+    await expect(activityCanvas(page)).toHaveAttribute('data-color-source-left', 'lesion');
+    await expect(activityCanvas(page)).toHaveAttribute('data-color-source-right', 'lesion');
+
+    await pauseButton(page).click();
+    await expect(statusRegion(page)).toHaveText('paused');
+  });
+
+  test('switching topology while in lesion mode re-maps the atlas source per arm, including the disconnected no-data state', async ({
+    page
+  }) => {
+    await page.goto('/');
+    await waitForReady(page);
+    await expandActivityPanel(page);
+    await lesionRadio(page).click();
+
+    // Defaults: left biological, right rewired (seed 0, the one shipped arm).
+    await expect(activityCanvas(page)).toHaveAttribute('data-lesion-source-left', 'biological');
+    await expect(activityCanvas(page)).toHaveAttribute('data-lesion-source-right', 'rewiredSeed0');
+
+    await page.getByLabel('Right arm topology').selectOption('biological');
+    await expect(activityCanvas(page)).toHaveAttribute('data-lesion-source-right', 'biological', { timeout: 10_000 });
+
+    await page.getByLabel('Right arm topology').selectOption('disconnected');
+    await expect(activityCanvas(page)).toHaveAttribute('data-lesion-source-right', 'none', { timeout: 10_000 });
+    // Scoped to the dedicated `.streaming-unavailable` paragraph — the same
+    // sentence also appears inside the sr-only FDR-significance summary
+    // paragraph just below it (both are real elements; `getByText` alone
+    // would hit Playwright's strict-mode "resolved to 2 elements" error).
+    await expect(page.locator('p.streaming-unavailable')).toContainText(/right arm: no lesion data \(disconnected\)/i);
+    // The left arm is unaffected by the right arm's switch.
+    await expect(activityCanvas(page)).toHaveAttribute('data-lesion-source-left', 'biological');
+  });
+
+  test('switching back to Live re-enables rate streaming', async ({ page }) => {
+    await page.goto('/');
+    await waitForReady(page);
+    await expandActivityPanel(page);
+    await startOrResumeButton(page).click();
+    await waitForActivityUpdateTick(page, 'left', 1);
+
+    await lesionRadio(page).click();
+    await expect(lesionRadio(page)).toBeChecked();
+    const tickBeforeReturningLive = Number(await activityCanvas(page).getAttribute('data-last-update-tick-left'));
+
+    await liveRadio(page).click();
+    await expect(liveRadio(page)).toBeChecked();
+    await waitForActivityUpdateTick(page, 'left', tickBeforeReturningLive + 1);
+
+    await pauseButton(page).click();
+    await expect(statusRegion(page)).toHaveText('paused');
+  });
+
+  test('the lesion option is disabled with an honest reason when the atlas is missing entirely', async ({ page }) => {
+    await page.route('**/data/lesion-atlas-v1.json', (route) => route.fulfill({ status: 404 }));
+    await page.route('**/data/malecns-arena-v1.manifest.json', async (route) => {
+      const response = await route.fetch();
+      const json = (await response.json()) as { lesionAtlas?: unknown };
+      delete json.lesionAtlas;
+      await route.fulfill({ response, json });
+    });
+
+    await page.goto('/');
+    await waitForReady(page);
+    await expandActivityPanel(page);
+
+    await expect(lesionRadio(page)).toBeDisabled();
+    await expect(page.getByText(/no lesion atlas was shipped/i)).toBeVisible();
+
+    // The rest of the experiment (and the Live color mode) is unaffected.
+    await startOrResumeButton(page).click();
+    await waitForTick(page, 10);
+    await expect(statusRegion(page)).toHaveText('running');
+  });
+});
+
+test.describe('lesion-atlas hash-mismatch integrity check', () => {
+  test('a tampered lesion-atlas-v1.json disables the mode with an honest verification-failure message, while the rest of the app keeps working', async ({
+    page
+  }) => {
+    const original = readFileSync(resolve(publicDataDir, 'lesion-atlas-v1.json'));
+    const tampered = Buffer.from(original);
+    tampered[10] ^= 0xff;
+
+    await page.route('**/data/lesion-atlas-v1.json', (route) =>
+      route.fulfill({ status: 200, contentType: 'application/json', body: tampered })
+    );
+
+    await page.goto('/');
+    await waitForReady(page);
+    await expandActivityPanel(page);
+
+    const lesionRadio = page.getByRole('radio', { name: /lesion effect \(offline\)/i });
+    await lesionRadio.click();
+
+    // Scoped to the "unavailable" hint paragraph — "sha256" alone also
+    // matches an unrelated trained-readout ledger row elsewhere on the page.
+    const hint = page.getByText(/lesion effect \(offline\) unavailable/i);
+    await expect(hint).toBeVisible({ timeout: 10_000 });
+    await expect(hint).toContainText(/sha256/i);
+    await expect(lesionRadio).not.toBeChecked();
+    await expect(lesionRadio).toBeDisabled();
+
+    // The required arena graph artifacts (and Live color mode) are
+    // untouched — the experiment keeps working exactly as if the lesion
+    // atlas route were never tampered with.
+    await startOrResumeButton(page).click();
+    await waitForTick(page, 10);
+    await expect(statusRegion(page)).toHaveText('running');
+  });
+});
+
 test.describe('performance gates with the activity panel open', () => {
   test('median neural step latency stays under the 33ms control budget with the activity panel expanded and streaming', async ({
     page
@@ -654,6 +825,40 @@ test.describe('performance gates with the activity panel open', () => {
     for (const task of longTasks) {
       expect(task.duration).toBeLessThan(200);
     }
+  });
+
+  test('median neural step latency stays under the 33ms control budget with the activity panel open in lesion-effect color mode', async ({
+    page
+  }) => {
+    // WP3's own "run the performance gates with lesion mode open" item: the
+    // static color mode disables rate streaming and polling entirely (see
+    // `ActivityPanel.svelte#frame`), so this also stands as a sanity check
+    // that neural stepping itself (in its dedicated Worker) is unaffected
+    // either way — same budget, same metric as the live-mode gate above.
+    await page.goto('/');
+    await waitForReady(page);
+    await expandActivityPanel(page);
+    await page.getByRole('radio', { name: /lesion effect \(offline\)/i }).click();
+    await expect(page.getByRole('radio', { name: /lesion effect \(offline\)/i })).toBeChecked();
+
+    await startOrResumeButton(page).click();
+    await waitForTick(page, 60);
+    await pauseButton(page).click();
+    await expect(statusRegion(page)).toHaveText('paused');
+
+    const readLatencyMs = async (agent: 'left' | 'right'): Promise<number> => {
+      const text = await armMetric(armPanel(page, agent), 'Neural step latency (median)').innerText();
+      const match = text.match(/^(\d+(?:\.\d+)?) ms$/);
+      if (!match) throw new Error(`Unexpected latency text for ${agent}: "${text}"`);
+      const value = Number(match[1]);
+      if (!Number.isFinite(value) || value < 0) throw new Error(`Non-finite/negative latency for ${agent}: "${text}"`);
+      return value;
+    };
+    const [leftMs, rightMs] = await Promise.all([readLatencyMs('left'), readLatencyMs('right')]);
+    // eslint-disable-next-line no-console -- perf-gate visibility.
+    console.log(`[perf] (activity panel open, lesion mode) median neural step latency: left=${leftMs}ms right=${rightMs}ms (budget < 33ms)`);
+    expect(leftMs).toBeLessThan(33);
+    expect(rightMs).toBeLessThan(33);
   });
 });
 

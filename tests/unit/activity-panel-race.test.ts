@@ -32,6 +32,9 @@ interface MockActivitySceneInstance {
   dispose: ReturnType<typeof vi.fn>;
   render: ReturnType<typeof vi.fn>;
   setReducedMotion: ReturnType<typeof vi.fn>;
+  setMode: ReturnType<typeof vi.fn>;
+  setStaticColors: ReturnType<typeof vi.fn>;
+  setNoLesionData: ReturnType<typeof vi.fn>;
 }
 
 const instances: MockActivitySceneInstance[] = [];
@@ -54,6 +57,9 @@ vi.mock('../../src/lib/render/ActivityScene', async () => {
     dispose = vi.fn();
     render = vi.fn();
     setReducedMotion = vi.fn();
+    setMode = vi.fn();
+    setStaticColors = vi.fn();
+    setNoLesionData = vi.fn();
     constructor(options: MockActivitySceneOptions) {
       this.options = options;
       instances.push(this);

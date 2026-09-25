@@ -4,8 +4,19 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 // pattern as `tests/App.lifecycle.test.ts`'s `ArenaScene` mock) — jsdom has
 // no WebGL, so a real `ActivityScene` can never be constructed under test.
 import ActivityPanel from '../../src/lib/ui/ActivityPanel.svelte';
-import type { PositionsArtifact, PositionsLoadResult } from '../../src/lib/experiment/assets';
+import type { ArenaManifest, PositionsArtifact, PositionsLoadResult } from '../../src/lib/experiment/assets';
 import type { ExperimentRunner } from '../../src/lib/experiment/runner';
+import type { ConnectomeGraph } from '../../src/lib/connectome/format';
+import { loadLesionAtlas, type LesionAtlasLoadResult } from '../../src/lib/experiment/lesionAtlas';
+
+// Only `loadLesionAtlas` (the async fetch/verify path) is mocked — the real
+// `lesionAtlasGraphKeyForTopology` pure function is kept, so the panel's own
+// topology-mapping logic (disconnected -> 'none', etc.) is exercised for
+// real, not re-guessed by a second, independently-authored test double.
+vi.mock('../../src/lib/experiment/lesionAtlas', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/lib/experiment/lesionAtlas')>();
+  return { ...actual, loadLesionAtlas: vi.fn() };
+});
 
 interface MockActivitySceneOptions {
   onContextLost?: (info: { reason: string }) => void;
@@ -18,6 +29,9 @@ interface MockActivitySceneInstance {
   dispose: ReturnType<typeof vi.fn>;
   render: ReturnType<typeof vi.fn>;
   setReducedMotion: ReturnType<typeof vi.fn>;
+  setMode: ReturnType<typeof vi.fn>;
+  setStaticColors: ReturnType<typeof vi.fn>;
+  setNoLesionData: ReturnType<typeof vi.fn>;
 }
 
 const instances: MockActivitySceneInstance[] = [];
@@ -31,6 +45,9 @@ vi.mock('../../src/lib/render/ActivityScene', () => {
     dispose = vi.fn();
     render = vi.fn();
     setReducedMotion = vi.fn();
+    setMode = vi.fn();
+    setStaticColors = vi.fn();
+    setNoLesionData = vi.fn();
     constructor(options: MockActivitySceneOptions) {
       this.options = options;
       instances.push(this);
@@ -59,6 +76,57 @@ const okPositionsStatus: PositionsLoadResult = {
   rateMin: -1,
   rateMax: 1
 };
+
+/** Minimal `ArenaManifest` fixture — only the fields `ActivityPanel`/`loadLesionAtlas`'s call site actually reads; `loadLesionAtlas` itself is mocked, so this never needs to satisfy real sha256/cross-checks. */
+const fakeManifest = (withLesionAtlas = true): ArenaManifest =>
+  ({
+    artifact: 'malecns-arena-v1.bin.gz',
+    binaryBytes: 1,
+    binarySha256: 'a'.repeat(64),
+    edgeCount: 1,
+    formatVersion: 1,
+    gzipBytes: 1,
+    gzipSha256: 'b'.repeat(64),
+    inputChannelCount: 8,
+    license: 'CC-BY-4.0',
+    neuronCount: 3,
+    outputPopulationCount: 3,
+    rewiredArms: {
+      seed0: { artifact: 'x', binaryBytes: 1, binarySha256: 'c'.repeat(64), gzipBytes: 1, gzipSha256: 'd'.repeat(64), swapStats: { edgeCount: 1 } }
+    },
+    sourceDataset: 'test',
+    ...(withLesionAtlas ? { lesionAtlas: { artifact: 'lesion-atlas-v1.json', sha256: 'e'.repeat(64) } } : {})
+  }) as ArenaManifest;
+
+const fakeBiologicalGraph = { biologicalIds: BigUint64Array.of(1000n, 1001n, 1002n) } as unknown as ConnectomeGraph;
+
+const fakeLesionAtlasOk = (): LesionAtlasLoadResult => ({
+  status: 'ok',
+  absMax: 1,
+  data: {
+    version: 1,
+    neuronCount: 3,
+    bodyIds: ['1000', '1001', '1002'],
+    graphs: {
+      biological: {
+        graphSha256: 'x',
+        baseline: 0,
+        effect: [0.1, -0.2, 0.3],
+        ciLow: [0, 0, 0],
+        ciHigh: [0, 0, 0],
+        fdrSignificant: [true, false, true]
+      },
+      rewiredSeed0: {
+        graphSha256: 'y',
+        baseline: 0,
+        effect: [0.1, -0.2, 0.3],
+        ciLow: [0, 0, 0],
+        ciHigh: [0, 0, 0],
+        fdrSignificant: [true, false, true]
+      }
+    }
+  }
+});
 
 type MockRunner = ExperimentRunner & {
   setActivityStreaming: ReturnType<typeof vi.fn>;
@@ -441,5 +509,194 @@ describe('ActivityPanel positions-status gating', () => {
     });
 
     expect(screen.getByRole('button', { name: /^expand$/i })).toBeDisabled();
+  });
+});
+
+describe('ActivityPanel lesion-effect color mode (WP3)', () => {
+  it('disables the lesion radio, with an honest reason, when the manifest has no lesionAtlas entry', async () => {
+    const runner = makeRunner();
+    render(ActivityPanel, {
+      runner,
+      positionsStatus: okPositionsStatus,
+      telemetry: undefined,
+      topologySwitchPending: false,
+      manifest: fakeManifest(false),
+      biologicalGraph: fakeBiologicalGraph
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    await waitFor(() => expect(instances).toHaveLength(1));
+
+    const lesionRadio = screen.getByRole('radio', { name: /lesion effect \(offline\)/i });
+    expect(lesionRadio).toBeDisabled();
+    expect(screen.getByText(/no lesion atlas was shipped/i)).toBeInTheDocument();
+    expect(loadLesionAtlas).not.toHaveBeenCalled();
+  });
+
+  it('does not load the lesion atlas until the mode is actually selected (lazy load)', async () => {
+    vi.mocked(loadLesionAtlas).mockResolvedValue(fakeLesionAtlasOk());
+    const runner = makeRunner();
+    render(ActivityPanel, {
+      runner,
+      positionsStatus: okPositionsStatus,
+      telemetry: undefined,
+      topologySwitchPending: false,
+      manifest: fakeManifest(),
+      biologicalGraph: fakeBiologicalGraph
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    await waitFor(() => expect(instances).toHaveLength(1));
+
+    // Merely expanding the panel (with the mode still on Live) must not
+    // trigger the atlas fetch — only selecting the radio does.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(loadLesionAtlas).not.toHaveBeenCalled();
+  });
+
+  it('selecting Lesion effect loads the atlas once, disables streaming, and paints static colors for both arms', async () => {
+    vi.mocked(loadLesionAtlas).mockResolvedValue(fakeLesionAtlasOk());
+    const runner = makeRunner();
+    render(ActivityPanel, {
+      runner,
+      positionsStatus: okPositionsStatus,
+      telemetry: undefined,
+      topologySwitchPending: false,
+      manifest: fakeManifest(),
+      biologicalGraph: fakeBiologicalGraph,
+      topology: { left: 'biological', right: 'rewired' }
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    await waitFor(() => expect(instances).toHaveLength(1));
+
+    const lesionRadio = screen.getByRole('radio', { name: /lesion effect \(offline\)/i });
+    await fireEvent.click(lesionRadio);
+
+    await waitFor(() => expect(loadLesionAtlas).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(instances[0].setMode).toHaveBeenCalledWith('lesion'));
+    await waitFor(() => expect(instances[0].setStaticColors).toHaveBeenCalledWith('left', [0.1, -0.2, 0.3], [true, false, true], 1));
+    await waitFor(() =>
+      expect(instances[0].setStaticColors).toHaveBeenCalledWith('right', [0.1, -0.2, 0.3], [true, false, true], 1)
+    );
+    expect(runner.setActivityStreaming).toHaveBeenLastCalledWith(false);
+
+    // Selecting Live and back to Lesion must not re-fetch — the load is
+    // memoized (WP3's "load the atlas only when the mode is first selected").
+    await fireEvent.click(screen.getByRole('radio', { name: /^live rate$/i }));
+    await fireEvent.click(lesionRadio);
+    expect(loadLesionAtlas).toHaveBeenCalledTimes(1);
+  });
+
+  it("frame() never calls update()/clear() while lesion mode is active, even with fresh rates available", async () => {
+    vi.mocked(loadLesionAtlas).mockResolvedValue(fakeLesionAtlasOk());
+    const runner = makeRunner();
+    const rates = new Float32Array([0.1, 0.2, 0.3]);
+    runner.getLatestRates.mockReturnValue(rates);
+
+    let rafCallback: FrameRequestCallback | undefined;
+    const rafSpy = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb) => {
+      rafCallback = cb;
+      return 1;
+    });
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => {});
+
+    render(ActivityPanel, {
+      runner,
+      positionsStatus: okPositionsStatus,
+      telemetry: undefined,
+      topologySwitchPending: false,
+      manifest: fakeManifest(),
+      biologicalGraph: fakeBiologicalGraph,
+      topology: { left: 'biological', right: 'rewired' }
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    await waitFor(() => expect(instances).toHaveLength(1));
+    await waitFor(() => expect(rafCallback).toBeTypeOf('function'));
+
+    await fireEvent.click(screen.getByRole('radio', { name: /lesion effect \(offline\)/i }));
+    await waitFor(() => expect(instances[0].setStaticColors).toHaveBeenCalled());
+
+    instances[0].update.mockClear();
+    instances[0].clear.mockClear();
+
+    // Pump several frames with fresh rates available every time — in live
+    // mode this would call `update()` on every one.
+    for (let frameIndex = 0; frameIndex < 5; frameIndex += 1) {
+      const callback = rafCallback;
+      rafCallback = undefined;
+      callback?.(1000 + frameIndex * 16);
+      await waitFor(() => expect(rafCallback).toBeTypeOf('function'));
+    }
+
+    expect(instances[0].update).not.toHaveBeenCalled();
+    expect(instances[0].clear).not.toHaveBeenCalled();
+    expect(instances[0].render).toHaveBeenCalled();
+
+    // The debug `data-color-source-*` proof this e2e also checks: still
+    // 'lesion' after repeated frames, never flipped back to 'live'.
+    const canvas = screen.getByLabelText('Neural activity at soma positions');
+    expect(canvas).toHaveAttribute('data-color-source-left', 'lesion');
+    expect(canvas).toHaveAttribute('data-color-source-right', 'lesion');
+
+    rafSpy.mockRestore();
+  });
+
+  it('a disconnected arm shows "no lesion data" and the scene paints it with setNoLesionData, not a fabricated color', async () => {
+    vi.mocked(loadLesionAtlas).mockResolvedValue(fakeLesionAtlasOk());
+    const runner = makeRunner();
+    const { container } = render(ActivityPanel, {
+      runner,
+      positionsStatus: okPositionsStatus,
+      telemetry: undefined,
+      topologySwitchPending: false,
+      manifest: fakeManifest(),
+      biologicalGraph: fakeBiologicalGraph,
+      topology: { left: 'biological', right: 'disconnected' }
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    await waitFor(() => expect(instances).toHaveLength(1));
+
+    await fireEvent.click(screen.getByRole('radio', { name: /lesion effect \(offline\)/i }));
+
+    await waitFor(() => expect(instances[0].setNoLesionData).toHaveBeenCalledWith('right'));
+    expect(instances[0].setStaticColors).toHaveBeenCalledWith('left', expect.anything(), expect.anything(), expect.anything());
+    expect(instances[0].setStaticColors).not.toHaveBeenCalledWith('right', expect.anything(), expect.anything(), expect.anything());
+    // Scoped to the dedicated `.streaming-unavailable` paragraph via
+    // `querySelector` rather than `getByText` — the same sentence also
+    // appears (for a different, accessibility reason) inside the sr-only
+    // FDR-significance summary paragraph just below it.
+    const noDataParagraph = container.querySelector('p.streaming-unavailable');
+    expect(noDataParagraph?.textContent).toMatch(/right arm: no lesion data \(disconnected\)/i);
+
+    const canvas = screen.getByLabelText('Neural activity at soma positions');
+    expect(canvas).toHaveAttribute('data-lesion-source-left', 'biological');
+    expect(canvas).toHaveAttribute('data-lesion-source-right', 'none');
+  });
+
+  it('switching back to Live re-enables streaming and resets lastRatesSeen so the next frame repaints', async () => {
+    vi.mocked(loadLesionAtlas).mockResolvedValue(fakeLesionAtlasOk());
+    const runner = makeRunner();
+    render(ActivityPanel, {
+      runner,
+      positionsStatus: okPositionsStatus,
+      telemetry: undefined,
+      topologySwitchPending: false,
+      manifest: fakeManifest(),
+      biologicalGraph: fakeBiologicalGraph,
+      topology: { left: 'biological', right: 'rewired' }
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    await waitFor(() => expect(instances).toHaveLength(1));
+    await fireEvent.click(screen.getByRole('radio', { name: /lesion effect \(offline\)/i }));
+    await waitFor(() => expect(instances[0].setMode).toHaveBeenCalledWith('lesion'));
+
+    await fireEvent.click(screen.getByRole('radio', { name: /^live rate$/i }));
+
+    await waitFor(() => expect(instances[0].setMode).toHaveBeenLastCalledWith('live'));
+    expect(runner.setActivityStreaming).toHaveBeenLastCalledWith(true);
   });
 });

@@ -12,6 +12,17 @@ test('all views work beneath /fly/ with root asset routes deliberately unavailab
   // /data/ path instead, the toggle would stay disabled forever and
   // `failed` below would catch the 404s.
   await expect(page.locator('section.activity button')).toBeEnabled({timeout:20000});
+  // WP3: `loadLesionAtlas` also fetches under this same /fly/ base path —
+  // the same deliberately-404ing root-/data/ tripwire as the positions
+  // check above (a base-path bug here would either leave the lesion radio
+  // disabled forever, or show up in the `failed` 4xx/5xx log asserted at
+  // the end of this test).
+  await page.locator('section.activity button').click();
+  await expect(page.getByLabel('Neural activity at soma positions')).toBeVisible();
+  await page.getByRole('radio',{name:/lesion effect \(offline\)/i}).click();
+  await expect(page.getByText(/Computed \(offline\)/).first()).toBeVisible({timeout:20000});
+  await expect(page.locator('.legend-bar.diverging')).toBeVisible();
+  await page.getByRole('button',{name:/^collapse$/i}).click();
   await page.getByRole('link',{name:'02 Counterfactual workbench',exact:true}).click();
   await expect(page.getByRole('status')).toHaveText('ready');
   await page.getByRole('button',{name:'Use quick probe settings'}).click();

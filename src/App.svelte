@@ -13,7 +13,7 @@
   import { ExperimentController } from './lib/experiment/controller';
   import type { ExperimentRunner, ExperimentTelemetry } from './lib/experiment/runner';
   import type { ExperimentStatus } from './lib/experiment/state';
-  import type { GraphMode } from './lib/connectome/format';
+  import type { ConnectomeGraph, GraphMode } from './lib/connectome/format';
   import type { DecoderKind } from './lib/worker/protocol';
   import ExperimentPanel from './lib/ui/ExperimentPanel.svelte';
   import TelemetryPanel from './lib/ui/TelemetryPanel.svelte';
@@ -49,6 +49,17 @@
   let manifest = $state<ArenaManifest | undefined>(undefined);
   /** The anatomical activity view's soma-position sidecar, loaded independently of the graph artifacts (positions are optional presentation, not a Start gate — see `ActivityPanel.svelte`'s doc comment). `undefined` until `onManifest` fires and this load kicks off. */
   let positionsStatus = $state<PositionsLoadResult | undefined>(undefined);
+  /**
+   * The already-verified, already-parsed biological graph `onManifest`
+   * receives (see that callback below) — mirrored into `$state` so
+   * `ActivityPanel` can thread it into `loadLesionAtlas` (WP3's lesion-effect
+   * color mode) when a user first selects that mode, without this component
+   * re-fetching/re-parsing anything itself. The lesion atlas is loaded
+   * lazily by `ActivityPanel`, not eagerly here (unlike `positionsStatus`
+   * above) — see `experiment/lesionAtlas.ts#loadLesionAtlas`'s own doc
+   * comment for why.
+   */
+  let biologicalGraph = $state<ConnectomeGraph | undefined>(undefined);
   /** Mirrors `controller.getRunner()` into `$state` once `initialize()` resolves, so `ActivityPanel` (a reactive consumer) can be handed the runner without polling a plain, non-reactive handle. */
   let runner = $state<ExperimentRunner | undefined>(undefined);
   let seed = $state(DEFAULT_SEED);
@@ -261,19 +272,23 @@
         onError: (message) => {
           if (!destroyed) errorMessage = message;
         },
-        onManifest: (nextManifest, biologicalGraph) => {
+        onManifest: (nextManifest, parsedBiologicalGraph) => {
           if (destroyed) return;
           manifest = nextManifest;
+          // Mirrored into `$state` so `ActivityPanel` can thread it into
+          // `loadLesionAtlas` on demand — see `biologicalGraph`'s own doc
+          // comment above.
+          biologicalGraph = parsedBiologicalGraph;
           // Independent of graph-artifact loading/Worker construction below:
           // the activity view's positions are optional presentation, not a
           // Start gate, so this proceeds even if the rest of `initialize()`
           // goes on to fail.
           //
-          // `biologicalGraph` is the already-verified, already-parsed graph
-          // `controller.initialize()` just produced for this same manifest —
-          // threading it through here (thermo-architecture I1 fix) is what
-          // lets `loadPositions` skip re-fetching/re-verifying/re-parsing the
-          // graph artifact a second time.
+          // `parsedBiologicalGraph` is the already-verified, already-parsed
+          // graph `controller.initialize()` just produced for this same
+          // manifest — threading it through here (thermo-architecture I1
+          // fix) is what lets `loadPositions` skip re-fetching/re-verifying/
+          // re-parsing the graph artifact a second time.
           //
           // `loadPositions` documents itself as "never throws", but this
           // `.catch` enforces that contract at the call site too (dual
@@ -282,7 +297,7 @@
           // would become an unhandled rejection and leave `positionsStatus`
           // `undefined` forever, showing "Loading soma positions…" with no
           // way to recover short of a reload.
-          void loadPositions(nextManifest, `${import.meta.env.BASE_URL}data`, biologicalGraph)
+          void loadPositions(nextManifest, `${import.meta.env.BASE_URL}data`, parsedBiologicalGraph)
             .catch(
               (error: unknown): PositionsLoadResult => ({
                 status: 'invalid',
@@ -443,7 +458,7 @@
     </div>
   </section>
 
-  <ActivityPanel {runner} {positionsStatus} {telemetry} {topologySwitchPending} />
+  <ActivityPanel {runner} {positionsStatus} {telemetry} {topologySwitchPending} {manifest} {biologicalGraph} {topology} />
 
   <aside class="sidebar" aria-label="Experiment information">
     <ExperimentPanel

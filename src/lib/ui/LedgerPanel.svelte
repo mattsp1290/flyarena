@@ -57,6 +57,15 @@
     // from them are the authored dynamics' live output, not a measurement.
     { term: 'Neuron positions', label: 'Measured' },
     { term: 'Displayed neural activity', label: 'Computed' },
+    // WP3 of `.agents/plans/lesion-atlas`: the activity view's optional
+    // "Lesion effect (offline)" color mode paints static per-neuron colors
+    // from the offline-computed single-neuron lesion atlas
+    // (`docs/lesion-atlas-report.md`) — always offline/static regardless of
+    // whether this particular session happens to load it successfully (the
+    // per-session load status is instead disclosed in-place by
+    // `ActivityPanel.svelte`'s own disabled-reason hint, the same pattern
+    // `loadPositions`'s toggle-disable already uses).
+    { term: 'Lesion effect map', label: 'Computed (offline)' },
     {
       term: 'Readout (trained mode)',
       label:
