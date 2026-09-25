@@ -1078,6 +1078,20 @@
     "nullSampleMedian": {
       "clampFraction": 0.010440951554232804,
       "steadyStateDistance": 0.15157044835381617
+    },
+    "stability": {
+      "bio": {
+        "discretizedSpectralRadius": 0.9931631547800001,
+        "discretizedStable": true,
+        "leakRate": 0.3499999940395355,
+        "spectralAbscissa": 0.14489464813661584,
+        "stable": true
+      },
+      "nullMedian": {
+        "discretizedSpectralRadius": 0.9905961467455926,
+        "spectralAbscissa": 0.06788236123838365
+      },
+      "unstableNullCount": 0
     }
   },
   "sources": {

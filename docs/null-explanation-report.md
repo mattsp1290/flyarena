@@ -110,9 +110,11 @@ Authored episodes on 10 held-out seeds (`30001..30010`) for biological, disconne
 
 The aggregate regime gate **passed**: biological's steady-state distance (0.1371) and the null median's (0.1516) are both at or below the 0.5 threshold; biological's rate-clamp fraction (0.63%) and the null median's (1.04%) are both at or below 20%; and biological's transfer solve is not singular, ill-conditioned, or unstable. This licenses treating the linear analysis as applicable to both biological and the null sample under this model; it does not by itself certify that any single transfer entry explains the score -- that still requires the outside-range-and-\|rho\|-threshold test above.
 
+**Stability** (`T`'s own docstring: both numbers reported side by side, never `stable` alone). Biological's continuous-time spectral abscissa is 0.1449 against a leak rate of 0.3500 (stable); its per-substep discretized spectral radius is 0.9932 (stable -- must be < 1). Null medians: spectral abscissa 0.0679, discretized spectral radius 0.9906. 0 of 500 rewirings are unstable (continuous-time or discretized).
+
 ## Structural features
 
-40 predeclared graph features (fixed before any analysis ran; the frozen list is not edited after the first *production* run against it -- see the feature-6 disclosure below for what happened before that).
+40 predeclared graph features. The plan's stop/go gate 3 (`00-overview.md`: "The feature list is not edited after the first run") was **not met for feature 6**: its definition changed after a full production run against the original (unrestricted) reading, as disclosed below. The other 39 features were never edited.
 
 **Feature 6 adjudication.** `weightedInDegree` (mean weighted in-degree per output population) was first implemented and run **unrestricted** (counting edges from any presynaptic neuron), matching one reading of the plan's ambiguous "input->output weighted in-degree" wording. A review flagged that wording as ambiguous against features 1/2's own restrictive use of "input" (channel-mapped neurons only); the resulting adjudication computed **both** readings' full statistics -- including each reading's rank correlation with score across all 500 rewirings -- before the input-restricted reading was adopted on plan-text grounds (bean `flyarena-r37r`'s log). Because both readings' outcomes were visible before the decision, this was not a fully outcome-blind pre-registration, and the `structuralFeature` finding below should be read with that limitation in mind, not as a clean, one-shot predeclared test.
 
