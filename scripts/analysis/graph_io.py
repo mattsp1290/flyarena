@@ -13,9 +13,11 @@ importers.
 
 from __future__ import annotations
 
+import argparse
 import gzip
 import hashlib
 import json
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -175,3 +177,115 @@ def canonical_json_text(payload: object) -> str:
 def write_canonical_json(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fsutil.atomic_write_text(path, canonical_json_text(payload))
+
+
+# ---------------------------------------------------------------------------
+# CLI plumbing shared by `transfer.py` and `features.py`
+#
+# Both CLIs read the same `rewire_batch.py` index.json, build the same
+# (biological, disconnected, rewired-<seed>...) job list against it, and
+# pre-flight-verify every job's graph file's sha256 before submitting any
+# work to a process pool -- extracted here (a thermo-maintainability review
+# finding on the WP2 diff: both files are new in the same PR, so there is no
+# cross-PR ownership reason to have duplicated this ~70 lines of identical
+# logic instead of sharing it from the start). Each CLI still owns its own
+# `_parse_args` (via `base_arg_parser`, extended with any tool-specific
+# flags such as `transfer.py`'s `--steady-state-dir`) and its own `main()`
+# job-dispatch loop, since what happens *to* each job (a transfer solve vs a
+# feature computation, and what gets written out) is genuinely different
+# between the two tools.
+# ---------------------------------------------------------------------------
+
+
+def base_arg_parser(description: str | None) -> argparse.ArgumentParser:
+    """The `--index`/`--graphs-dir`/`--biological`/`--skip-biological`/
+    `--out`/`--workers` flags every analysis CLI takes, identically named
+    and defaulted. Callers call `parser.add_argument(...)` for any
+    tool-specific flags (e.g. `transfer.py`'s `--steady-state-dir`) after
+    this returns, then `parser.parse_args(argv)`."""
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument("--index", type=Path, required=True, help="rewire_batch.py index.json")
+    parser.add_argument("--graphs-dir", type=Path, required=True, help="directory holding rewired .bin.gz files")
+    parser.add_argument(
+        "--biological",
+        type=Path,
+        default=None,
+        help="biological source .bin.gz (default: public/data/<index.sourceArtifact>); "
+        "also computes the disconnected control",
+    )
+    parser.add_argument(
+        "--skip-biological",
+        action="store_true",
+        help="omit biological/disconnected entirely (rewired graphs only)",
+    )
+    parser.add_argument("--out", type=Path, required=True, help="combined output JSON path")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=min(8, os.cpu_count() or 1),
+        help="process-pool workers (each pinned to single-threaded BLAS); default min(8, cpu_count)",
+    )
+    return parser
+
+
+def read_rewire_index(path: Path, tool_name: str) -> dict:
+    """Load and shallow-validate a `rewire_batch.py` `index.json`. `tool_name`
+    (e.g. `"transfer"`/`"features"`) prefixes the error message, matching
+    each CLI's own error-message convention."""
+    with path.open("r") as fh:
+        index = json.load(fh)
+    for required in ("sourceArtifact", "sourceSha256", "rewireSourceSha256", "seeds"):
+        if required not in index:
+            raise ValueError(f"{tool_name}: {path} is missing '{required}'")
+    return index
+
+
+def build_jobs(args: argparse.Namespace, index: dict, tool_name: str) -> list[tuple[str, Path, str, bool]]:
+    """The (graphId, path, expectedSha256, isDisconnected) job list every
+    analysis CLI submits to its process pool: the biological source and its
+    disconnected control (unless `--skip-biological`), then every rewiring
+    in `index["seeds"]`, sorted by seed for deterministic job order (and
+    therefore deterministic output across `--workers` settings, since the
+    dict each CLI's `main()` populates from these jobs is keyed by
+    `graphId`, not insertion order). Does *not* check
+    `args.biological`/`args.skip_biological` mutual exclusion -- each
+    caller's `main()` does that before calling `read_rewire_index`, so the
+    error fires before the (potentially slow) index read rather than after
+    it, matching this repo's existing CLI behavior."""
+    jobs: list[tuple[str, Path, str, bool]] = []
+    if not args.skip_biological:
+        # Default matches `regime-check.ts --biological`'s own resolution
+        # (`resolve(PUBLIC_DATA_DIR, index.sourceArtifact)`).
+        biological_path = args.biological if args.biological is not None else PUBLIC_DATA_DIR / index["sourceArtifact"]
+        if not biological_path.exists():
+            raise SystemExit(f"{tool_name}: biological source {biological_path} does not exist")
+        jobs.append(("biological", biological_path, index["sourceSha256"], False))
+        jobs.append(("disconnected", biological_path, index["sourceSha256"], True))
+
+    seeds = sorted(index["seeds"], key=lambda entry: entry["seed"])
+    for entry in seeds:
+        jobs.append((f"rewired-{entry['seed']}", args.graphs_dir / entry["artifact"], entry["binarySha256"], False))
+    return jobs
+
+
+def verify_jobs(jobs: list[tuple[str, Path, str, bool]], tool_name: str) -> None:
+    """Pre-flight decompressed-sha256 verification for every job, before any
+    pool worker is submitted -- mirrors `null-evaluate.ts`'s
+    `verifyRewiredFiles`'s "fails in seconds rather than after however much
+    of a multi-hour run has already completed" up-front check. Aggregates
+    every mismatch into one error, the same "report everything wrong at
+    once" convention `verifyRewiredFiles` uses."""
+    mismatches: list[str] = []
+    checked: set[Path] = set()
+    for graph_id, path, expected_sha256, _is_disconnected in jobs:
+        if path in checked:
+            continue  # biological and disconnected share the same source file
+        checked.add(path)
+        try:
+            load_verified_graph(path, expected_sha256)
+        except (OSError, GraphVerificationError, binfmt.InvalidGraphError) as error:
+            mismatches.append(f"{graph_id}: {error}")
+    if mismatches:
+        raise GraphVerificationError(
+            f"{tool_name}: {len(mismatches)} graph file(s) failed pre-flight verification:\n" + "\n".join(mismatches)
+        )

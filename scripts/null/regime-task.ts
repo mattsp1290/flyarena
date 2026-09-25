@@ -1,11 +1,10 @@
 import { readFileSync } from 'node:fs';
-import { gunzipSync } from 'node:zlib';
 
-import { buildGraphBufferForMode } from '../../src/lib/experiment/bindings';
-import { parseGraphBinary, type ConnectomeGraph, type GraphMode } from '../../src/lib/connectome/format';
+import type { GraphMode } from '../../src/lib/connectome/format';
 import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import { runEpisode } from '../training/episode';
 import { sha256Hex } from '../training/fsio';
+import { graphFromTaskMode, loadVerifiedGraphBinary } from './null-worker-shared';
 
 /**
  * Side-effect-free implementation of the WP2 regime-check task
@@ -24,20 +23,30 @@ import { sha256Hex } from '../training/fsio';
  * Deliberately a **separate, new** file rather than an edit to
  * `null-worker.ts`: `.agents/plans/null-explanation/02-transfer-and-features.md`'s
  * WP2 (this file) and a concurrent bean (`null-worker.ts`/`null-evaluate.ts`/
- * `null-report.ts`'s owner) are both in flight against `main`, so this module
- * owns its own worker/task/result/message protocol instead of touching those
- * files. It duplicates a small amount of logic that exists in the protected
- * files only as private (non-exported) helpers -- `null-worker.ts`'s
- * `loadVerifiedGraphBinary`/`graphFromTask`, `null-worker-shared.ts`'s
- * `runWorkerMain` IPC wrapper (reproduced in `regime-worker.ts`, not here),
- * and `null-evaluate.ts`'s `verifyBiologicalSource` (reproduced in
- * `regime-check.ts`) -- four copies in total, not importable without either
- * exporting them (editing another bean's file) or forking the whole module.
- * All four copies delegate to the same underlying primitives
- * (`buildGraphBufferForMode`/`parseGraphBinary`/`sha256Hex`), so the drift
- * risk is low; a follow-up after the null-worker bean merges could move the
- * generic pieces into the already-unprotected `null-worker-shared.ts` and
- * delete these copies.
+ * `null-report.ts`'s owner) were both in flight against `main`, so this
+ * module owns its own worker/task/result/message protocol instead of
+ * touching those files directly. It originally duplicated four small pieces
+ * of logic that existed in the (then in-flight) protected files only as
+ * private helpers -- `null-worker.ts`'s `loadVerifiedGraphBinary`/
+ * `graphFromTask`, `null-worker-shared.ts`'s `runWorkerMain` IPC wrapper
+ * (used by `regime-worker.ts`, not here), and `null-evaluate.ts`'s
+ * `verifyBiologicalSource` (used by `regime-check.ts`). Now that the
+ * concurrent bean has merged, those four have been de-duplicated (a
+ * thermo-maintainability review finding): `loadVerifiedGraphBinary`/
+ * `graphFromTaskMode` moved into the already-side-effect-free
+ * `null-worker-shared.ts` and are imported from there below;
+ * `runWorkerMain` was generalized to be generic over the `Result`/`Message`
+ * types too (see that file), so `regime-worker.ts` now reuses it instead of
+ * hand-rolling its own IPC wiring; and `null-evaluate.ts`'s
+ * `verifyBiologicalSource` was exported and is imported directly by
+ * `regime-check.ts`. Deliberately *not* importing `null-worker.ts` itself
+ * here or in `regime-worker.ts`: that module's own body calls
+ * `runWorkerMain(runTask)` at top level, registering a real
+ * `process.on('message', ...)` listener as a side effect of merely being
+ * imported -- exactly what this file's own split from `regime-worker.ts`
+ * (described below) exists to avoid on the *test* process's IPC channel.
+ * `null-worker-shared.ts` has no such top-level side effects, so importing
+ * from it is safe here.
  *
  * Computes, per held-out seed, per the plan's "Regime check" section:
  * - `clampFraction`: the fraction of neuron-substeps (`neuronCount *
@@ -118,29 +127,6 @@ export type RegimeWorkerMessage = RegimeWorkerResultMessage | RegimeWorkerErrorM
 const clamp = (value: number, minimum: number, maximum: number): number =>
   value < minimum ? minimum : value > maximum ? maximum : value;
 
-/** Mirrors `null-worker.ts`'s private `loadVerifiedGraphBinary` (not importable -- see this file's module doc comment). */
-const loadVerifiedGraphBinary = (path: string, expectedSha256: string): ArrayBuffer => {
-  const gzipBytes = readFileSync(path);
-  const binary = gunzipSync(gzipBytes);
-  const actualSha256 = sha256Hex(binary);
-  if (actualSha256 !== expectedSha256) {
-    throw new Error(
-      `regime-worker: ${path} decompressed sha256 ${actualSha256} does not match expected ${expectedSha256}`
-    );
-  }
-  return binary.buffer.slice(binary.byteOffset, binary.byteOffset + binary.byteLength);
-};
-
-const EMPTY_BUFFER = new ArrayBuffer(0);
-
-/** Mirrors `null-worker.ts`'s private `graphFromTask` (not importable -- see this file's module doc comment). */
-const graphFromTask = (task: RegimeWorkerTask, graphBinary: ArrayBuffer): ConnectomeGraph => {
-  const baseBuffer = task.mode === 'biological' || task.mode === 'disconnected' ? graphBinary : EMPTY_BUFFER;
-  const rewiredBuffer = task.mode === 'rewired' ? graphBinary : EMPTY_BUFFER;
-  const modeBuffer = buildGraphBufferForMode(baseBuffer, rewiredBuffer, task.mode);
-  return parseGraphBinary(modeBuffer);
-};
-
 /**
  * Load a `transfer.py`-written steady-state sidecar as a `Float64Array`,
  * verifying its sha256 against `expectedSha256` first (the sidecar's own
@@ -167,8 +153,8 @@ const loadSteadyStateMap = (path: string, expectedSha256: string): Float64Array 
 
 /** The pure regime-check task, run once per graph per shard. Exported for `tests/unit/regime-check.test.ts` and `scripts/null/regime-worker.ts` alike -- see this module's own doc comment for why the two are split. */
 export const runTask = (task: RegimeWorkerTask): readonly RegimeSeedResult[] => {
-  const graphBinary = loadVerifiedGraphBinary(task.path, task.expectedSha256);
-  const graph = graphFromTask(task, graphBinary);
+  const graphBinary = loadVerifiedGraphBinary('regime-worker', task.path, task.expectedSha256);
+  const graph = graphFromTaskMode(task.mode, graphBinary);
   const steadyStateMap = loadSteadyStateMap(task.steadyStatePath, task.steadyStateSha256);
 
   const { neuronCount, inputChannelCount, rateMin, rateMax, inputClampMin, inputClampMax } = graph.metadata;

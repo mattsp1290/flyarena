@@ -1,11 +1,6 @@
-import { readFileSync } from 'node:fs';
-import { gunzipSync } from 'node:zlib';
-
-import { buildGraphBufferForMode } from '../../src/lib/experiment/bindings';
-import { parseGraphBinary, type GraphMode } from '../../src/lib/connectome/format';
+import type { GraphMode } from '../../src/lib/connectome/format';
 import { runEpisode } from '../training/episode';
-import { sha256Hex } from '../training/fsio';
-import { assertFiniteScores, runWorkerMain } from './null-worker-shared';
+import { assertFiniteScores, graphFromTaskMode, loadVerifiedGraphBinary, runWorkerMain } from './null-worker-shared';
 
 /**
  * `null-evaluate.ts`'s child process: `node:child_process.fork`s this file
@@ -89,49 +84,6 @@ export interface NullWorkerErrorMessage {
 export type NullWorkerMessage = NullWorkerResultMessage | NullWorkerErrorMessage;
 
 /**
- * Read, decompress, and sha256-verify a graph binary against `expectedSha256`
- * before it is ever fed into an episode — "it verifies each rewired file's
- * sha256 against index.json before scoring" (the plan's own wording). This
- * is a second, independent check: `null-evaluate.ts` already verifies every
- * rewired file's gzip sha256 against `index.json` up front, before forking
- * any shard, so a corrupted batch fails fast without spending shard time.
- * This check instead guards the exact bytes actually handed to
- * `parseGraphBinary` in *this* process.
- */
-const loadVerifiedGraphBinary = (path: string, expectedSha256: string): ArrayBuffer => {
-  const gzipBytes = readFileSync(path);
-  const binary = gunzipSync(gzipBytes);
-  const actualSha256 = sha256Hex(binary);
-  if (actualSha256 !== expectedSha256) {
-    throw new Error(
-      `null-worker: ${path} decompressed sha256 ${actualSha256} does not match expected ${expectedSha256}`
-    );
-  }
-  return binary.buffer.slice(binary.byteOffset, binary.byteOffset + binary.byteLength);
-};
-
-const EMPTY_BUFFER = new ArrayBuffer(0);
-
-/**
- * Build the `ConnectomeGraph` for one task, going through
- * `buildGraphBufferForMode` (`src/lib/experiment/bindings.ts`) exactly as
- * the browser does, per the plan's "reuse the same buffer builder ... so it
- * matches the browser exactly". For `biological`/`rewired`, `graphBinary`
- * is the loaded artifact bytes and passes straight through (a `.slice(0)`
- * inside `buildGraphBufferForMode`); for `disconnected`, `graphBinary` is
- * the *biological* source and `buildGraphBufferForMode` derives the
- * disconnected control from it at runtime (`createDisconnectedGraph`,
- * re-encoded to the wire format), then this re-parses that encoded buffer
- * — the same round trip the browser's Worker `init` path takes.
- */
-const graphFromTask = (task: NullWorkerTask, graphBinary: ArrayBuffer) => {
-  const baseBuffer = task.mode === 'biological' || task.mode === 'disconnected' ? graphBinary : EMPTY_BUFFER;
-  const rewiredBuffer = task.mode === 'rewired' ? graphBinary : EMPTY_BUFFER;
-  const modeBuffer = buildGraphBufferForMode(baseBuffer, rewiredBuffer, task.mode);
-  return parseGraphBinary(modeBuffer);
-};
-
-/**
  * `NullWorkerTask` crosses a `fork`/IPC boundary (`JSON.stringify`/
  * `process.send`, per this file's own header comment) where TypeScript's
  * compile-time typing doesn't protect the runtime value -- an IPC payload
@@ -155,8 +107,8 @@ const validateTaskDecoder = (decoder: unknown): NullDecoderKind | undefined => {
 };
 
 const runTask = (task: NullWorkerTask): readonly NullSeedResult[] => {
-  const graphBinary = loadVerifiedGraphBinary(task.path, task.expectedSha256);
-  const graph = graphFromTask(task, graphBinary);
+  const graphBinary = loadVerifiedGraphBinary('null-worker', task.path, task.expectedSha256);
+  const graph = graphFromTaskMode(task.mode, graphBinary);
   const decoder = validateTaskDecoder(task.decoder) ?? 'authored';
 
   return task.heldOutSeeds.map((seed) => {

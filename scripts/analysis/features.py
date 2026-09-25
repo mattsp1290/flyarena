@@ -41,9 +41,29 @@ first):
    definition, needs 3 distinct nodes; see `motif_counts`'s doc comment for
    why zeroing the adjacency diagonal is sufficient to exclude them
    correctly, not just approximately).
-6. Mean unsigned weighted in-degree for each output population: the mean,
-   over the neurons in that population, of `sum(magnitude)` over every edge
-   terminating at that neuron (3 values).
+6. Mean **input-restricted** weighted in-degree for each output population:
+   the mean, over the neurons in that population, of `sum(magnitude)` over
+   only the edges terminating at that neuron whose *presynaptic* neuron is
+   input-labeled (`input_channel_index >= 0`, the same `input_mask`
+   `_signed_path_counts` already computes for feature 2 above) -- not every
+   presynaptic neuron in the graph, unsigned or otherwise.
+
+   ADJUDICATION NOTE (owner-delegated decision, feature list frozen before
+   the first production run): the plan's wording, "Mean input->output
+   weighted in-degree", is ambiguous against item 4 ("Signed-weight balance
+   of edges into output neurons", unqualified, i.e. *every* presynaptic
+   neuron) -- a thermo-architecture review flagged this and recommended
+   confirming with the plan owner before running the full batch. The plan
+   owner confirmed the input-restricted reading on the plan-text grounds
+   that item 6's "input->" qualifier, like items 1/2's explicit "from any
+   input neuron" restriction, is meaningless unless it restricts the
+   *source* of the counted edges -- item 4's parallel, unqualified "edges
+   into output neurons" phrasing is what an unrestricted reading of item 6
+   would instead look like. An unrestricted ("any presynaptic neuron")
+   variant was also computed during adjudication for comparison; it is
+   *not* a predeclared feature, must never be added as one after this
+   decision, and if reported at all must be labeled exploratory, not
+   part of the frozen feature list.
 
 Total: 25 (24 pair path lengths + their mean) + 6 + 1 + 3 + 2 + 3 = 40
 features, matching this study's overview's "about 66 metrics" tally (the
@@ -63,8 +83,6 @@ they were).
 from __future__ import annotations
 
 import argparse
-import json
-import os
 import sys
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor
@@ -77,9 +95,8 @@ assert_single_threaded_blas()
 
 import numpy as np  # noqa: E402
 
+import graph_io  # noqa: E402
 from graph_io import (  # noqa: E402
-    GraphVerificationError,
-    PUBLIC_DATA_DIR,
     build_dense_matrices,
     disconnected_graph_arrays,
     load_verified_graph,
@@ -273,9 +290,17 @@ def motif_counts(edge_bool: np.ndarray) -> dict:
     return {"twoCycleCount": two_cycle_count, "feedForwardTriangleCount": feed_forward_triangle_count}
 
 
-def _weighted_in_degree(adjacency: np.ndarray, population_index: np.ndarray) -> dict:
+def _weighted_in_degree(adjacency: np.ndarray, population_index: np.ndarray, input_mask: np.ndarray) -> dict:
+    """Input-restricted (see this module's docstring, feature 6's
+    adjudication note): only edges whose presynaptic neuron is
+    input-labeled (`input_mask`, `graph.input_channel_index >= 0`) count
+    toward a neuron's in-degree -- `unsigned[:, input_mask]` keeps only
+    those columns before summing, mirroring `_signed_path_counts`'s own
+    `input_mask`-restricted column slice for the same reason (propagating
+    only the input columns, not the full `n x n` matrix)."""
     unsigned = np.abs(adjacency)
-    in_degree = np.sum(unsigned, axis=1)  # per-neuron, sum over pre
+    restricted = unsigned[:, input_mask]  # keep only input-labeled presynaptic columns
+    in_degree = np.sum(restricted, axis=1)  # per-neuron, sum over input-labeled pre only
     result = {}
     for p, population_name in enumerate(OUTPUT_POPULATIONS):
         rows = population_index == p
@@ -293,13 +318,14 @@ def graph_features(graph: "binfmt.GraphArrays") -> dict:
     positive_pre = signs == 1
     edge_pos = edge_bool & positive_pre[np.newaxis, :]
     edge_neg = edge_bool & (~positive_pre)[np.newaxis, :]
+    input_mask = graph.input_channel_index >= 0
 
     path = _path_length_features(edge_bool, graph)
     signed_paths = _signed_path_counts(edge_pos, edge_neg, graph)
     reciprocity = _reciprocity(edge_bool, edge_count)
     weight_balance = _weight_balance(adjacency, graph.output_population_index)
     motifs = motif_counts(edge_bool)
-    in_degree = _weighted_in_degree(adjacency, graph.output_population_index)
+    in_degree = _weighted_in_degree(adjacency, graph.output_population_index, input_mask)
 
     return {
         "pathLengths": path["pathLengths"],
@@ -323,15 +349,6 @@ def graph_features(graph: "binfmt.GraphArrays") -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _read_rewire_index(path: Path) -> dict:
-    with path.open("r") as fh:
-        index = json.load(fh)
-    for required in ("sourceArtifact", "sourceSha256", "rewireSourceSha256", "seeds"):
-        if required not in index:
-            raise ValueError(f"features: {path} is missing '{required}'")
-    return index
-
-
 def _one_graph(graph_id: str, path: Path, expected_sha256: str) -> tuple[str, dict]:
     graph = load_verified_graph(path, expected_sha256)
     return graph_id, graph_features(graph)
@@ -342,71 +359,18 @@ def _one_disconnected(graph_id: str, path: Path, expected_sha256: str) -> tuple[
     return graph_id, graph_features(disconnected_graph_arrays(graph))
 
 
-def _verify_jobs(jobs: list[tuple[str, Path, str, bool]]) -> None:
-    """Pre-flight decompressed-sha256 verification for every job, before any
-    pool worker is submitted -- see `transfer.py`'s identical helper's doc
-    comment (a dual-review finding, applied to both CLIs)."""
-    mismatches: list[str] = []
-    checked: set[Path] = set()
-    for graph_id, path, expected_sha256, _is_disconnected in jobs:
-        if path in checked:
-            continue
-        checked.add(path)
-        try:
-            load_verified_graph(path, expected_sha256)
-        except (OSError, GraphVerificationError, binfmt.InvalidGraphError) as error:
-            mismatches.append(f"{graph_id}: {error}")
-    if mismatches:
-        raise GraphVerificationError(
-            f"features: {len(mismatches)} graph file(s) failed pre-flight verification:\n" + "\n".join(mismatches)
-        )
-
-
 def _parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--index", type=Path, required=True, help="rewire_batch.py index.json")
-    parser.add_argument("--graphs-dir", type=Path, required=True, help="directory holding rewired .bin.gz files")
-    parser.add_argument(
-        "--biological",
-        type=Path,
-        default=None,
-        help="biological source .bin.gz (default: public/data/<index.sourceArtifact>); "
-        "also computes the disconnected control",
-    )
-    parser.add_argument(
-        "--skip-biological",
-        action="store_true",
-        help="omit biological/disconnected entirely (rewired graphs only)",
-    )
-    parser.add_argument("--out", type=Path, required=True, help="combined features.json output path")
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=min(8, os.cpu_count() or 1),
-        help="process-pool workers (each pinned to single-threaded BLAS); default min(8, cpu_count)",
-    )
-    return parser.parse_args(argv)
+    return graph_io.base_arg_parser(__doc__).parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     if args.biological is not None and args.skip_biological:
         raise SystemExit("features: --biological and --skip-biological are mutually exclusive")
-    index = _read_rewire_index(args.index)
+    index = graph_io.read_rewire_index(args.index, "features")
 
-    jobs: list[tuple[str, Path, str, bool]] = []  # (graphId, path, expectedSha256, isDisconnected)
-    if not args.skip_biological:
-        biological_path = args.biological if args.biological is not None else PUBLIC_DATA_DIR / index["sourceArtifact"]
-        if not biological_path.exists():
-            raise SystemExit(f"features: biological source {biological_path} does not exist")
-        jobs.append(("biological", biological_path, index["sourceSha256"], False))
-        jobs.append(("disconnected", biological_path, index["sourceSha256"], True))
-
-    seeds = sorted(index["seeds"], key=lambda entry: entry["seed"])
-    for entry in seeds:
-        jobs.append((f"rewired-{entry['seed']}", args.graphs_dir / entry["artifact"], entry["binarySha256"], False))
-
-    _verify_jobs(jobs)
+    jobs = graph_io.build_jobs(args, index, "features")
+    graph_io.verify_jobs(jobs, "features")
 
     results: dict[str, dict] = {}
     with ProcessPoolExecutor(max_workers=max(1, args.workers)) as pool:

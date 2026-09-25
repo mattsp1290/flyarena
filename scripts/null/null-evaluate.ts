@@ -176,13 +176,22 @@ export const verifyRewiredFiles = (index: Readonly<RewireIndex>, graphsDir: stri
   }
 };
 
-/** Verify the biological source graph's decompressed sha256 against `index.json`'s own `sourceSha256`. */
-const verifyBiologicalSource = (path: string, expectedSha256: string): void => {
+/**
+ * Verify the biological source graph's decompressed sha256 against
+ * `index.json`'s own `sourceSha256`. Exported (a thermo-maintainability
+ * review finding): `regime-check.ts` (WP2) needs the exact same check and
+ * previously carried a hand-duplicated copy because this was private.
+ * `source` is the calling CLI's own name (`"null-evaluate"`/
+ * `"regime-check"`), matching `null-worker-shared.ts`'s
+ * `assertFiniteScores`/`loadVerifiedGraphBinary` `source`-prefixed-message
+ * convention, so the thrown message still identifies which CLI raised it.
+ */
+export const verifyBiologicalSource = (source: string, path: string, expectedSha256: string): void => {
   const gzipBytes = readFileSync(path);
   const binary = gunzipSync(gzipBytes);
   const actual = sha256Hex(binary);
   if (actual !== expectedSha256) {
-    throw new Error(`null-evaluate: ${path} decompressed sha256 ${actual} does not match index.json's sourceSha256 (${expectedSha256})`);
+    throw new Error(`${source}: ${path} decompressed sha256 ${actual} does not match index.json's sourceSha256 (${expectedSha256})`);
   }
 };
 
@@ -727,7 +736,7 @@ export const runNullEvaluate = async (
   verifyRewiredFiles(index, args.graphsDir);
 
   const biologicalPath = args.biological ? args.graph ?? resolve(PUBLIC_DATA_DIR, index.sourceArtifact) : '';
-  if (args.biological) verifyBiologicalSource(biologicalPath, index.sourceSha256);
+  if (args.biological) verifyBiologicalSource('null-evaluate', biologicalPath, index.sourceSha256);
 
   const tasks = buildTasks(index, args, biologicalPath);
   const workerPath = fileURLToPath(new URL('./null-worker.ts', import.meta.url));

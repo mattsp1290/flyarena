@@ -28,7 +28,20 @@ A)^-1 B`. Also reports (per the plan's "Linear transfer" section):
   `max |eig(I + dt(-lambda I + g A))| = max |1 - dt*lambda + dt*g*eig(A)|`
   (an affine function of `eig(A)`, since `-lambda I` is a scalar multiple of
   the identity and therefore shares every eigenvector of `A`), which must be
-  `< 1` for the per-substep Euler integration itself to be stable;
+  `< 1` for the per-substep Euler integration itself to be stable, reported
+  as `discretizedStable` alongside (never instead of) `stable`. The two are
+  conceptually different claims -- `stable` is the continuous-time fixed-
+  point criterion `T` itself represents; `discretizedStable` is whether the
+  real, simulated (discrete Euler) trajectory actually converges toward it
+  -- and are correctly kept distinct here rather than conflated (a
+  thermo-architecture review note, hand-off for WP3's
+  `03-explanation-report.md`, not yet implemented): when WP3 writes the
+  report's stability prose, it must present both numbers side by side (or
+  fold both into one sentence, e.g. "stable in continuous time (abscissa
+  0.1449 < lambda=0.35) and in the discretized update (spectral radius
+  0.99xx < 1)"), not report `stable` alone under a bare "stable" label that
+  a reader could reasonably (but wrongly) take to already certify the
+  discrete trajectory;
 - the derived predictors `turnGain = T[yaw, foodBearing] - T[yaw,
   hazardBearing]` and `approachGain = T[thrust, foodDistance]`
   (`src/lib/arena/actions.ts`'s `OUTPUT_POPULATION` and
@@ -55,8 +68,6 @@ they were).
 from __future__ import annotations
 
 import argparse
-import json
-import os
 import sys
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -69,10 +80,9 @@ assert_single_threaded_blas()
 
 import numpy as np  # noqa: E402
 
+import graph_io  # noqa: E402
 from graph_io import (  # noqa: E402
     DenseGraphMatrices,
-    GraphVerificationError,
-    PUBLIC_DATA_DIR,
     build_dense_matrices,
     load_verified_graph,
     sha256_hex,
@@ -310,15 +320,6 @@ def write_steady_state_sidecar(path: Path, steady_state_map: np.ndarray) -> None
 # ---------------------------------------------------------------------------
 
 
-def _read_rewire_index(path: Path) -> dict:
-    with path.open("r") as fh:
-        index = json.load(fh)
-    for required in ("sourceArtifact", "sourceSha256", "rewireSourceSha256", "seeds"):
-        if required not in index:
-            raise ValueError(f"transfer: {path} is missing '{required}'")
-    return index
-
-
 def _one_graph(graph_id: str, path: Path, expected_sha256: str) -> tuple[str, dict, np.ndarray]:
     graph = load_verified_graph(path, expected_sha256)
     meta = graph.metadata
@@ -347,59 +348,13 @@ def _one_disconnected(graph_id: str, path: Path, expected_sha256: str) -> tuple[
     return graph_id, computation.result, computation.steady_state_map
 
 
-def _verify_jobs(jobs: list[tuple[str, Path, str, bool]]) -> None:
-    """Pre-flight decompressed-sha256 verification for every job, before any
-    pool worker is submitted -- mirrors `null-evaluate.ts`'s
-    `verifyRewiredFiles`'s "fails in seconds rather than after however much
-    of a multi-hour run has already completed" up-front check (a dual-review
-    finding: neither CLI previously verified anything before starting work,
-    unlike the TS side). Aggregates every mismatch into one error, the same
-    "report everything wrong at once" convention `verifyRewiredFiles` uses.
-    """
-    mismatches: list[str] = []
-    checked: set[Path] = set()
-    for graph_id, path, expected_sha256, _is_disconnected in jobs:
-        if path in checked:
-            continue  # biological and disconnected share the same source file
-        checked.add(path)
-        try:
-            load_verified_graph(path, expected_sha256)
-        except (OSError, GraphVerificationError, binfmt.InvalidGraphError) as error:
-            mismatches.append(f"{graph_id}: {error}")
-    if mismatches:
-        raise GraphVerificationError(
-            f"transfer: {len(mismatches)} graph file(s) failed pre-flight verification:\n" + "\n".join(mismatches)
-        )
-
-
 def _parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--index", type=Path, required=True, help="rewire_batch.py index.json")
-    parser.add_argument("--graphs-dir", type=Path, required=True, help="directory holding rewired .bin.gz files")
-    parser.add_argument(
-        "--biological",
-        type=Path,
-        default=None,
-        help="biological source .bin.gz (default: public/data/<index.sourceArtifact>); "
-        "also computes the disconnected control",
-    )
-    parser.add_argument(
-        "--skip-biological",
-        action="store_true",
-        help="omit biological/disconnected entirely (rewired graphs only)",
-    )
-    parser.add_argument("--out", type=Path, required=True, help="combined transfer.json output path")
+    parser = graph_io.base_arg_parser(__doc__)
     parser.add_argument(
         "--steady-state-dir",
         type=Path,
         default=None,
         help="directory for per-graph steady-state binary sidecars (default: <out's parent>/steady-state)",
-    )
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=min(8, os.cpu_count() or 1),
-        help="process-pool workers (each pinned to single-threaded BLAS); default min(8, cpu_count)",
     )
     return parser.parse_args(argv)
 
@@ -408,27 +363,11 @@ def main(argv: list[str] | None = None) -> None:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     if args.biological is not None and args.skip_biological:
         raise SystemExit("transfer: --biological and --skip-biological are mutually exclusive")
-    index = _read_rewire_index(args.index)
+    index = graph_io.read_rewire_index(args.index, "transfer")
     steady_state_dir = args.steady_state_dir or (args.out.parent / "steady-state")
 
-    jobs: list[tuple[str, Path, str, bool]] = []  # (graphId, path, expectedSha256, isDisconnected)
-    if not args.skip_biological:
-        # Default matches `regime-check.ts --biological`'s own resolution
-        # (`resolve(PUBLIC_DATA_DIR, index.sourceArtifact)`) -- previously
-        # this help text claimed the same default but the code silently
-        # skipped biological/disconnected instead (a dual-review finding).
-        biological_path = args.biological if args.biological is not None else PUBLIC_DATA_DIR / index["sourceArtifact"]
-        if not biological_path.exists():
-            raise SystemExit(f"transfer: biological source {biological_path} does not exist")
-        jobs.append(("biological", biological_path, index["sourceSha256"], False))
-        jobs.append(("disconnected", biological_path, index["sourceSha256"], True))
-
-    seeds = sorted(index["seeds"], key=lambda entry: entry["seed"])
-    for entry in seeds:
-        graph_path = args.graphs_dir / entry["artifact"]
-        jobs.append((f"rewired-{entry['seed']}", graph_path, entry["binarySha256"], False))
-
-    _verify_jobs(jobs)
+    jobs = graph_io.build_jobs(args, index, "transfer")
+    graph_io.verify_jobs(jobs, "transfer")
 
     # Delete any manifest left over from a previous run into this same
     # `--steady-state-dir` *before* writing anything new: without this, a
@@ -473,8 +412,8 @@ def main(argv: list[str] | None = None) -> None:
             # not yet dispatched to a worker) running to completion before
             # the error is even raised, wasting the rest of a multi-hour
             # batch (a dual-review finding: `ProcessPoolExecutor.__exit__`
-            # calls `shutdown(wait=True)` by default). `_verify_jobs` above
-            # already rules out the common cause (a bad graph file); this
+            # calls `shutdown(wait=True)` by default). `graph_io.verify_jobs`
+            # above already rules out the common cause (a bad graph file); this
             # guards against everything else (a `LinAlgError` `_compute_transfer`
             # doesn't itself catch, an `OSError` writing a sidecar, `Ctrl-C`).
             pool.shutdown(wait=False, cancel_futures=True)

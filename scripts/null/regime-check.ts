@@ -1,15 +1,15 @@
 import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { gunzipSync } from 'node:zlib';
 
 import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import { requireNonNegativeInt, requirePositiveInt, requireValue } from '../training/cli';
-import { atomicWriteFileSync, sha256Hex } from '../training/fsio';
+import { atomicWriteFileSync } from '../training/fsio';
 import {
   readRewireIndex,
   runCliMain,
   runShardedEvaluation,
+  verifyBiologicalSource,
   verifyRewiredFiles,
   type CliRunResult,
   type RewireIndex
@@ -24,15 +24,18 @@ import type { RegimeSeedResult, RegimeWorkerMessage, RegimeWorkerTask } from './
  * steady-state distance (`scripts/null/regime-task.ts`'s doc comment has
  * the exact metrics and the algebra behind them).
  *
- * Deliberately its own driver, not an edit to `null-evaluate.ts` (owned by
- * a concurrent bean -- see `regime-task.ts`'s module doc comment). Reuses
- * `null-evaluate.ts`'s already-generic, already-exported
+ * Deliberately its own driver, not an edit to `null-evaluate.ts` (originally
+ * owned by a concurrent, in-flight bean -- see `regime-task.ts`'s module doc
+ * comment). Reuses `null-evaluate.ts`'s already-generic, already-exported
  * `runShardedEvaluation<Task, Result, Message>` (per the plan's "Make
  * `runShardedEvaluation` generic" instruction -- it was already generic on
  * `main` before this bean started, so no edit to that file was needed to
  * satisfy it) and its exported `readRewireIndex`/`verifyRewiredFiles`/
- * `runCliMain`, so this file adds no second copy of index parsing, gzip
- * sha256 verification, or the parse-args/run/log-summary CLI shape.
+ * `verifyBiologicalSource`/`runCliMain` (the last of these exported after
+ * the concurrent bean merged -- a thermo-maintainability review finding;
+ * this file previously carried its own hand-duplicated copy), so this file
+ * adds no second copy of index parsing, gzip sha256 verification, or the
+ * parse-args/run/log-summary CLI shape.
  *
  * Requires `scripts/analysis/transfer.py` to have already run (with the
  * same `--graphs-dir`/rewired index) and written its per-graph steady-state
@@ -247,17 +250,6 @@ export const verifySteadyStateManifest = (
   return sidecarShaByGraphId;
 };
 
-const verifyBiologicalSource = (path: string, expectedSha256: string): void => {
-  const gzipBytes = readFileSync(path);
-  const binary = gunzipSync(gzipBytes);
-  const actual = sha256Hex(binary);
-  if (actual !== expectedSha256) {
-    throw new Error(
-      `regime-check: ${path} decompressed sha256 ${actual} does not match index.json's sourceSha256 (${expectedSha256})`
-    );
-  }
-};
-
 /**
  * Builds every task with `steadyStateSha256: ''` -- a placeholder, not yet
  * verified. `runRegimeCheck` passes this list straight to
@@ -396,7 +388,7 @@ export const runRegimeCheck = async (args: Readonly<RegimeCheckArgs>): Promise<C
   verifyRewiredFiles(index, args.graphsDir);
 
   const biologicalPath = args.biological ? args.graph ?? resolve(PUBLIC_DATA_DIR, index.sourceArtifact) : '';
-  if (args.biological) verifyBiologicalSource(biologicalPath, index.sourceSha256);
+  if (args.biological) verifyBiologicalSource('regime-check', biologicalPath, index.sourceSha256);
 
   const tasksPendingSteadyStateSha = buildRegimeTasks(index, args, biologicalPath);
   const sidecarShaByGraphId = verifySteadyStateManifest(

@@ -29,7 +29,7 @@ import { sha256Hex } from '../../scripts/training/fsio';
  * A separate `describe` block below exercises `regime-check.ts`'s real CLI
  * end to end via `node:child_process.spawnSync` (the actual `fork`/IPC path,
  * the manifest-based steady-state verification, and the `disconnected`/
- * `rewired` branches of `graphFromTask` -- none of which the in-process
+ * `rewired` branches of `graphFromTaskMode` -- none of which the in-process
  * `runTask` tests above cover, since they only ever use `mode: 'biological'`
  * with a hand-written sidecar; also a dual-review finding).
  */
@@ -366,7 +366,7 @@ describe('regime-check.ts CLI: end to end via a real forked worker', () => {
     const indexPath = join(root, 'index.json');
     writeFileSync(indexPath, JSON.stringify(index));
 
-    // The disconnected control (edgeCount forced to 0 by `graphFromTask`)
+    // The disconnected control (edgeCount forced to 0 by `graphFromTaskMode`)
     // has A = 0, so M = B / leakRate; biological/rewired's own single
     // recurrent edge means M = B / (leakRate - globalGain*magnitude).
     const analyticRow = (leakRate: number, globalGain: number, selfLoopMagnitude: number, inputWeight: number) => {

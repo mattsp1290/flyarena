@@ -131,9 +131,17 @@ def test_motif_counts(features):
 
 
 def test_weighted_in_degree(features):
-    # Neuron 3 (thrust): unsigned in-degree = |5| + |1| = 6, mean over 1
-    # neuron = 6.
-    assert features["weightedInDegree"]["thrust"] == pytest.approx(6.0)
+    # Feature 6 is input-restricted (`features.py`'s module docstring,
+    # feature 6's adjudication note): only edges whose *presynaptic* neuron
+    # is input-labeled count. Neuron 0 is this fixture's only input neuron
+    # (channel foodBearing); neuron 3 (thrust) has no *direct* edge from
+    # neuron 0 -- its only in-edges are (1,3, mag 5) and (2,3, mag 1), and
+    # neither 1 nor 2 is input-labeled -- so the input-restricted in-degree
+    # is 0, mean over 1 neuron = 0. (Before this feature was redefined as
+    # input-restricted, the unrestricted reading gave 6.0 = |5| + |1|; that
+    # unrestricted variant is not a predeclared feature and is not tested
+    # here -- see `features.py`'s docstring adjudication note.)
+    assert features["weightedInDegree"]["thrust"] == pytest.approx(0.0)
     assert features["weightedInDegree"]["yaw"] is None  # no neurons in this population
     assert features["weightedInDegree"]["brake"] is None
 
