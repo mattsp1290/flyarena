@@ -9,10 +9,12 @@
     type PositionsLoadResult,
     type TrainedReadoutLoadResult
   } from './lib/experiment/assets';
+  import type { RewiringNullLoadResult } from './lib/experiment/rewiringNull';
+  import type { NullExplanationLoadResult } from './lib/experiment/nullExplanation';
   import { ExperimentController } from './lib/experiment/controller';
   import type { ExperimentRunner, ExperimentTelemetry } from './lib/experiment/runner';
   import type { ExperimentStatus } from './lib/experiment/state';
-  import type { GraphMode } from './lib/connectome/format';
+  import type { ConnectomeGraph, GraphMode } from './lib/connectome/format';
   import type { DecoderKind } from './lib/worker/protocol';
   import ExperimentPanel from './lib/ui/ExperimentPanel.svelte';
   import TelemetryPanel from './lib/ui/TelemetryPanel.svelte';
@@ -48,6 +50,17 @@
   let manifest = $state<ArenaManifest | undefined>(undefined);
   /** The anatomical activity view's soma-position sidecar, loaded independently of the graph artifacts (positions are optional presentation, not a Start gate — see `ActivityPanel.svelte`'s doc comment). `undefined` until `onManifest` fires and this load kicks off. */
   let positionsStatus = $state<PositionsLoadResult | undefined>(undefined);
+  /**
+   * The already-verified, already-parsed biological graph `onManifest`
+   * receives (see that callback below) — mirrored into `$state` so
+   * `ActivityPanel` can thread it into `loadLesionAtlas` (WP3's lesion-effect
+   * color mode) when a user first selects that mode, without this component
+   * re-fetching/re-parsing anything itself. The lesion atlas is loaded
+   * lazily by `ActivityPanel`, not eagerly here (unlike `positionsStatus`
+   * above) — see `experiment/lesionAtlas.ts#loadLesionAtlas`'s own doc
+   * comment for why.
+   */
+  let biologicalGraph = $state<ConnectomeGraph | undefined>(undefined);
   /** Mirrors `controller.getRunner()` into `$state` once `initialize()` resolves, so `ActivityPanel` (a reactive consumer) can be handed the runner without polling a plain, non-reactive handle. */
   let runner = $state<ExperimentRunner | undefined>(undefined);
   let seed = $state(DEFAULT_SEED);
@@ -68,6 +81,10 @@
   let decoder = $state<DecoderKind>('authored');
   /** `undefined` until `initialize()`'s trained-readout load/validate step resolves; feeds the ledger's "Readout (trained mode)" row and gates the Trained radio option. */
   let trainedReadoutStatus = $state<TrainedReadoutLoadResult | undefined>(undefined);
+  /** `undefined` until `initialize()`'s rewiring-null load resolves (WP4); feeds the ledger's "Topology null distribution" section. Loading it never blocks Start — see `ExperimentController#initialize`'s doc comment. */
+  let rewiringNullStatus = $state<RewiringNullLoadResult | undefined>(undefined);
+  /** `undefined` until `initialize()`'s null-explanation load resolves (WP4 of `.agents/plans/null-explanation`); feeds the ledger's finding note next to the "Topology null distribution" histogram. Loading it never blocks Start, and never blocks reaching a settled `rewiringNullStatus` either — see `ExperimentController#initialize`'s doc comment. */
+  let nullExplanationStatus = $state<NullExplanationLoadResult | undefined>(undefined);
   /** True for the duration of an in-flight `controller.setDecoder()` call — set/cleared locally around that call (there is only ever one decoder shared by both arms, unlike per-arm topology switches, so a single flag suffices). */
   let decoderSwitchPending = $state(false);
 
@@ -258,19 +275,23 @@
         onError: (message) => {
           if (!destroyed) errorMessage = message;
         },
-        onManifest: (nextManifest, biologicalGraph) => {
+        onManifest: (nextManifest, parsedBiologicalGraph) => {
           if (destroyed) return;
           manifest = nextManifest;
+          // Mirrored into `$state` so `ActivityPanel` can thread it into
+          // `loadLesionAtlas` on demand — see `biologicalGraph`'s own doc
+          // comment above.
+          biologicalGraph = parsedBiologicalGraph;
           // Independent of graph-artifact loading/Worker construction below:
           // the activity view's positions are optional presentation, not a
           // Start gate, so this proceeds even if the rest of `initialize()`
           // goes on to fail.
           //
-          // `biologicalGraph` is the already-verified, already-parsed graph
-          // `controller.initialize()` just produced for this same manifest —
-          // threading it through here (thermo-architecture I1 fix) is what
-          // lets `loadPositions` skip re-fetching/re-verifying/re-parsing the
-          // graph artifact a second time.
+          // `parsedBiologicalGraph` is the already-verified, already-parsed
+          // graph `controller.initialize()` just produced for this same
+          // manifest — threading it through here (thermo-architecture I1
+          // fix) is what lets `loadPositions` skip re-fetching/re-verifying/
+          // re-parsing the graph artifact a second time.
           //
           // `loadPositions` documents itself as "never throws", but this
           // `.catch` enforces that contract at the call site too (dual
@@ -279,7 +300,7 @@
           // would become an unhandled rejection and leave `positionsStatus`
           // `undefined` forever, showing "Loading soma positions…" with no
           // way to recover short of a reload.
-          void loadPositions(nextManifest, `${import.meta.env.BASE_URL}data`, biologicalGraph)
+          void loadPositions(nextManifest, `${import.meta.env.BASE_URL}data`, parsedBiologicalGraph)
             .catch(
               (error: unknown): PositionsLoadResult => ({
                 status: 'invalid',
@@ -304,6 +325,12 @@
         },
         onTrainedReadoutStatus: (status) => {
           if (!destroyed) trainedReadoutStatus = status;
+        },
+        onRewiringNull: (result) => {
+          if (!destroyed) rewiringNullStatus = result;
+        },
+        onNullExplanation: (result) => {
+          if (!destroyed) nullExplanationStatus = result;
         },
         onDecoderApplied: (next) => {
           if (!destroyed) decoder = next;
@@ -437,7 +464,7 @@
     </div>
   </section>
 
-  <ActivityPanel {runner} {positionsStatus} {telemetry} {topologySwitchPending} />
+  <ActivityPanel {runner} {positionsStatus} {telemetry} {topologySwitchPending} {manifest} {biologicalGraph} {topology} />
 
   <aside class="sidebar" aria-label="Experiment information">
     <ExperimentPanel
@@ -465,7 +492,13 @@
       <TelemetryPanel {telemetry} />
     {/if}
 
-    <LedgerPanel {manifest} {decoder} trainedReadout={trainedReadoutStatus} />
+    <LedgerPanel
+      {manifest}
+      {decoder}
+      trainedReadout={trainedReadoutStatus}
+      rewiringNull={rewiringNullStatus}
+      nullExplanation={nullExplanationStatus}
+    />
   </aside>
 </main>
 

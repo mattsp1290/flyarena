@@ -4,40 +4,28 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 // pattern as `tests/App.lifecycle.test.ts`'s `ArenaScene` mock) — jsdom has
 // no WebGL, so a real `ActivityScene` can never be constructed under test.
 import ActivityPanel from '../../src/lib/ui/ActivityPanel.svelte';
-import type { PositionsArtifact, PositionsLoadResult } from '../../src/lib/experiment/assets';
+import type { ArenaManifest, PositionsArtifact, PositionsLoadResult } from '../../src/lib/experiment/assets';
 import type { ExperimentRunner } from '../../src/lib/experiment/runner';
+import type { ConnectomeGraph } from '../../src/lib/connectome/format';
+import { loadLesionAtlas, type LesionAtlasLoadResult } from '../../src/lib/experiment/lesionAtlas';
+import { buildActivitySceneMockModule, type MockActivitySceneInstance } from '../helpers/mock-activity-scene';
 
-interface MockActivitySceneOptions {
-  onContextLost?: (info: { reason: string }) => void;
-}
-
-interface MockActivitySceneInstance {
-  options: MockActivitySceneOptions;
-  update: ReturnType<typeof vi.fn>;
-  clear: ReturnType<typeof vi.fn>;
-  dispose: ReturnType<typeof vi.fn>;
-  render: ReturnType<typeof vi.fn>;
-  setReducedMotion: ReturnType<typeof vi.fn>;
-}
+// Only `loadLesionAtlas` (the async fetch/verify path) is mocked — the real
+// `lesionAtlasGraphKeyForTopology` pure function is kept, so the panel's own
+// topology-mapping logic (disconnected -> 'none', etc.) is exercised for
+// real, not re-guessed by a second, independently-authored test double.
+vi.mock('../../src/lib/experiment/lesionAtlas', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/lib/experiment/lesionAtlas')>();
+  return { ...actual, loadLesionAtlas: vi.fn() };
+});
 
 const instances: MockActivitySceneInstance[] = [];
 
-vi.mock('../../src/lib/render/ActivityScene', () => {
-  class ActivitySceneUnavailableError extends Error {}
-  class ActivityScene {
-    options: MockActivitySceneOptions;
-    update = vi.fn();
-    clear = vi.fn();
-    dispose = vi.fn();
-    render = vi.fn();
-    setReducedMotion = vi.fn();
-    constructor(options: MockActivitySceneOptions) {
-      this.options = options;
-      instances.push(this);
-    }
-  }
-  return { ActivityScene, ActivitySceneUnavailableError };
-});
+// Thermo-maintainability review S4: the mock `ActivityScene` class itself now
+// lives in one shared place (`tests/helpers/mock-activity-scene.ts`), used
+// here and by `activity-panel-race.test.ts` — previously hand-duplicated in
+// both files.
+vi.mock('../../src/lib/render/ActivityScene', () => buildActivitySceneMockModule(instances));
 
 const fakePositions = (neuronCount = 3): PositionsArtifact => ({
   version: 1,
@@ -59,6 +47,62 @@ const okPositionsStatus: PositionsLoadResult = {
   rateMin: -1,
   rateMax: 1
 };
+
+/** Minimal `ArenaManifest` fixture — only the fields `ActivityPanel`/`loadLesionAtlas`'s call site actually reads; `loadLesionAtlas` itself is mocked, so this never needs to satisfy real sha256/cross-checks. */
+const fakeManifest = (withLesionAtlas = true): ArenaManifest =>
+  ({
+    artifact: 'malecns-arena-v1.bin.gz',
+    binaryBytes: 1,
+    binarySha256: 'a'.repeat(64),
+    edgeCount: 1,
+    formatVersion: 1,
+    gzipBytes: 1,
+    gzipSha256: 'b'.repeat(64),
+    inputChannelCount: 8,
+    license: 'CC-BY-4.0',
+    neuronCount: 3,
+    outputPopulationCount: 3,
+    rewiredArms: {
+      seed0: { artifact: 'x', binaryBytes: 1, binarySha256: 'c'.repeat(64), gzipBytes: 1, gzipSha256: 'd'.repeat(64), swapStats: { edgeCount: 1 } }
+    },
+    sourceDataset: 'test',
+    ...(withLesionAtlas ? { lesionAtlas: { artifact: 'lesion-atlas-v1.json', sha256: 'e'.repeat(64) } } : {})
+  }) as ArenaManifest;
+
+const fakeBiologicalGraph = { biologicalIds: BigUint64Array.of(1000n, 1001n, 1002n) } as unknown as ConnectomeGraph;
+
+// Round-2 dual review (Suggestion): `biological` and `rewiredSeed0` must
+// carry *different* effect/fdrSignificant data — with identical data, a
+// `setStaticColors('right', ...)` assertion would pass even if the right
+// (`rewired`) arm were painted from the wrong (`biological`) graph, exactly
+// the bug `lesionAtlasGraphKeyForTopology` exists to prevent.
+const fakeLesionAtlasOk = (): LesionAtlasLoadResult => ({
+  status: 'ok',
+  absMax: 1,
+  data: {
+    version: 1,
+    neuronCount: 3,
+    bodyIds: ['1000', '1001', '1002'],
+    graphs: {
+      biological: {
+        graphSha256: 'x',
+        baseline: 0,
+        effect: [0.1, -0.2, 0.3],
+        ciLow: [0, 0, 0],
+        ciHigh: [0, 0, 0],
+        fdrSignificant: [true, false, true]
+      },
+      rewiredSeed0: {
+        graphSha256: 'y',
+        baseline: 0,
+        effect: [-0.4, 0.5, 0.0],
+        ciLow: [0, 0, 0],
+        ciHigh: [0, 0, 0],
+        fdrSignificant: [false, true, true]
+      }
+    }
+  }
+});
 
 type MockRunner = ExperimentRunner & {
   setActivityStreaming: ReturnType<typeof vi.fn>;
@@ -441,5 +485,495 @@ describe('ActivityPanel positions-status gating', () => {
     });
 
     expect(screen.getByRole('button', { name: /^expand$/i })).toBeDisabled();
+  });
+});
+
+describe('ActivityPanel lesion-effect color mode (WP3)', () => {
+  it('disables the lesion radio, with an honest reason, when the manifest has no lesionAtlas entry', async () => {
+    const runner = makeRunner();
+    render(ActivityPanel, {
+      runner,
+      positionsStatus: okPositionsStatus,
+      telemetry: undefined,
+      topologySwitchPending: false,
+      manifest: fakeManifest(false),
+      biologicalGraph: fakeBiologicalGraph
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    await waitFor(() => expect(instances).toHaveLength(1));
+
+    const lesionRadio = screen.getByRole('radio', { name: /lesion effect \(offline\)/i });
+    expect(lesionRadio).toBeDisabled();
+    expect(screen.getByText(/no lesion atlas was shipped/i)).toBeInTheDocument();
+    expect(loadLesionAtlas).not.toHaveBeenCalled();
+  });
+
+  it('does not load the lesion atlas until the mode is actually selected (lazy load)', async () => {
+    vi.mocked(loadLesionAtlas).mockResolvedValue(fakeLesionAtlasOk());
+    const runner = makeRunner();
+    render(ActivityPanel, {
+      runner,
+      positionsStatus: okPositionsStatus,
+      telemetry: undefined,
+      topologySwitchPending: false,
+      manifest: fakeManifest(),
+      biologicalGraph: fakeBiologicalGraph
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    await waitFor(() => expect(instances).toHaveLength(1));
+
+    // Merely expanding the panel (with the mode still on Live) must not
+    // trigger the atlas fetch — only selecting the radio does.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(loadLesionAtlas).not.toHaveBeenCalled();
+  });
+
+  it('a transient "unavailable" (fetch/network) failure shows a non-blocking hint and retries on the next selection, instead of permanently disabling the mode', async () => {
+    // Round-2 dual review (Important — both reviewers independently flagged
+    // this exact gap): this is the one behavior the whole point of adding
+    // `'unavailable'` (as distinct from `'missing'`/`'invalid'`) exists for,
+    // and it previously had no test — a regression reverting the "don't
+    // memoize an unavailable result" fix in `ensureLesionAtlasLoaded` would
+    // have passed the full suite undetected.
+    vi.mocked(loadLesionAtlas)
+      .mockResolvedValueOnce({ status: 'unavailable', reason: 'network hiccup (test)' })
+      .mockResolvedValueOnce(fakeLesionAtlasOk());
+    const runner = makeRunner();
+    render(ActivityPanel, {
+      runner,
+      positionsStatus: okPositionsStatus,
+      telemetry: undefined,
+      topologySwitchPending: false,
+      manifest: fakeManifest(),
+      biologicalGraph: fakeBiologicalGraph,
+      topology: { left: 'biological', right: 'rewired' }
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    await waitFor(() => expect(instances).toHaveLength(1));
+
+    const lesionRadio = screen.getByRole('radio', { name: /lesion effect \(offline\)/i });
+    await fireEvent.click(lesionRadio);
+
+    // First attempt fails transiently: the radio stays enabled (not the
+    // permanently-disabling path `lesionOptionDisabledReason` drives), a
+    // non-blocking hint names the reason, and the mode stays on Live.
+    await waitFor(() => expect(loadLesionAtlas).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByText(/could not be loaded \(retrying is available\)/i)).toBeInTheDocument());
+    expect(screen.getByText(/network hiccup \(test\)/i)).toBeInTheDocument();
+    expect(lesionRadio).toBeEnabled();
+    expect(lesionRadio).not.toBeChecked();
+    expect(instances[0].setMode).not.toHaveBeenCalledWith('lesion');
+
+    // Selecting Lesion again retries the fetch (not a cached failure) and
+    // this time succeeds.
+    await fireEvent.click(lesionRadio);
+    await waitFor(() => expect(loadLesionAtlas).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(instances[0].setMode).toHaveBeenCalledWith('lesion'));
+    expect(lesionRadio).toBeChecked();
+    // The transient hint from the earlier failed attempt is gone now that
+    // the mode is active.
+    expect(screen.queryByText(/could not be loaded \(retrying is available\)/i)).not.toBeInTheDocument();
+  });
+
+  it('selecting Lesion effect loads the atlas once, disables streaming, and paints static colors for both arms', async () => {
+    vi.mocked(loadLesionAtlas).mockResolvedValue(fakeLesionAtlasOk());
+    const runner = makeRunner();
+    render(ActivityPanel, {
+      runner,
+      positionsStatus: okPositionsStatus,
+      telemetry: undefined,
+      topologySwitchPending: false,
+      manifest: fakeManifest(),
+      biologicalGraph: fakeBiologicalGraph,
+      topology: { left: 'biological', right: 'rewired' }
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    await waitFor(() => expect(instances).toHaveLength(1));
+
+    const lesionRadio = screen.getByRole('radio', { name: /lesion effect \(offline\)/i });
+    await fireEvent.click(lesionRadio);
+
+    await waitFor(() => expect(loadLesionAtlas).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(instances[0].setMode).toHaveBeenCalledWith('lesion'));
+    // Each arm is painted from its OWN mapped graph — the fixture's
+    // biological/rewiredSeed0 data is deliberately distinct (see
+    // `fakeLesionAtlasOk`'s own comment), so this also proves the left arm
+    // was never accidentally painted from the rewired graph or vice versa.
+    await waitFor(() => expect(instances[0].setStaticColors).toHaveBeenCalledWith('left', [0.1, -0.2, 0.3], [true, false, true], 1));
+    await waitFor(() =>
+      expect(instances[0].setStaticColors).toHaveBeenCalledWith('right', [-0.4, 0.5, 0.0], [false, true, true], 1)
+    );
+    expect(runner.setActivityStreaming).toHaveBeenLastCalledWith(false);
+
+    // Selecting Live and back to Lesion must not re-fetch — the load is
+    // memoized (WP3's "load the atlas only when the mode is first selected").
+    await fireEvent.click(screen.getByRole('radio', { name: /^live rate$/i }));
+    await fireEvent.click(lesionRadio);
+    expect(loadLesionAtlas).toHaveBeenCalledTimes(1);
+  });
+
+  it('the label states the sign convention, and the legend states the shared scale with live per-graph max values (thermo-architecture I2, thermo-suggestion S1)', async () => {
+    vi.mocked(loadLesionAtlas).mockResolvedValue(fakeLesionAtlasOk());
+    const runner = makeRunner();
+    render(ActivityPanel, {
+      runner,
+      positionsStatus: okPositionsStatus,
+      telemetry: undefined,
+      topologySwitchPending: false,
+      manifest: fakeManifest(),
+      biologicalGraph: fakeBiologicalGraph,
+      topology: { left: 'biological', right: 'rewired' }
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    await waitFor(() => expect(instances).toHaveLength(1));
+    await fireEvent.click(screen.getByRole('radio', { name: /lesion effect \(offline\)/i }));
+    await waitFor(() => expect(instances[0].setStaticColors).toHaveBeenCalled());
+
+    // Sign convention, stated in words (thermo-suggestion S1) — screen-reader
+    // users get this from the label text, not just the legend's spatial
+    // blue/vermillion positioning (`aria-hidden` on the color bar itself).
+    expect(
+      screen.getByText(/negative = this model's score drops when the neuron is silenced, positive = it rises/i)
+    ).toBeInTheDocument();
+
+    // Shared-scale honesty caption (thermo-architecture I2), computed live
+    // from the loaded atlas data — `fakeLesionAtlasOk`'s biological graph has
+    // max |effect| 0.3 (from [0.1, -0.2, 0.3]) and rewiredSeed0 has 0.5 (from
+    // [-0.4, 0.5, 0.0]), deliberately different so this test would fail if
+    // the wrong graph's data (or the absMax fixture value, 1) were shown
+    // instead.
+    expect(screen.getByText(/one scale, shared across both graphs/i)).toBeInTheDocument();
+    expect(screen.getByText(/biological: 0\.300, rewired seed 0: 0\.500/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(/a mostly pale arm means its effects are small on this shared scale, not necessarily zero/i)
+    ).toBeInTheDocument();
+  });
+
+  it("frame() never calls update()/clear() while lesion mode is active, even with fresh rates available", async () => {
+    vi.mocked(loadLesionAtlas).mockResolvedValue(fakeLesionAtlasOk());
+    const runner = makeRunner();
+    const rates = new Float32Array([0.1, 0.2, 0.3]);
+    runner.getLatestRates.mockReturnValue(rates);
+
+    let rafCallback: FrameRequestCallback | undefined;
+    const rafSpy = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb) => {
+      rafCallback = cb;
+      return 1;
+    });
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => {});
+
+    render(ActivityPanel, {
+      runner,
+      positionsStatus: okPositionsStatus,
+      telemetry: undefined,
+      topologySwitchPending: false,
+      manifest: fakeManifest(),
+      biologicalGraph: fakeBiologicalGraph,
+      topology: { left: 'biological', right: 'rewired' }
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    await waitFor(() => expect(instances).toHaveLength(1));
+    await waitFor(() => expect(rafCallback).toBeTypeOf('function'));
+
+    await fireEvent.click(screen.getByRole('radio', { name: /lesion effect \(offline\)/i }));
+    await waitFor(() => expect(instances[0].setStaticColors).toHaveBeenCalled());
+
+    instances[0].update.mockClear();
+    instances[0].clear.mockClear();
+
+    // Pump several frames with fresh rates available every time — in live
+    // mode this would call `update()` on every one.
+    for (let frameIndex = 0; frameIndex < 5; frameIndex += 1) {
+      const callback = rafCallback;
+      rafCallback = undefined;
+      callback?.(1000 + frameIndex * 16);
+      await waitFor(() => expect(rafCallback).toBeTypeOf('function'));
+    }
+
+    expect(instances[0].update).not.toHaveBeenCalled();
+    expect(instances[0].clear).not.toHaveBeenCalled();
+    expect(instances[0].render).toHaveBeenCalled();
+
+    // The debug `data-color-source-*` proof this e2e also checks: still
+    // 'lesion' after repeated frames, never flipped back to 'live'.
+    const canvas = screen.getByLabelText('Neural activity at soma positions');
+    expect(canvas).toHaveAttribute('data-color-source-left', 'lesion');
+    expect(canvas).toHaveAttribute('data-color-source-right', 'lesion');
+
+    rafSpy.mockRestore();
+  });
+
+  it('a disconnected arm shows "no lesion data" and the scene paints it with setNoLesionData, not a fabricated color', async () => {
+    vi.mocked(loadLesionAtlas).mockResolvedValue(fakeLesionAtlasOk());
+    const runner = makeRunner();
+    const { container } = render(ActivityPanel, {
+      runner,
+      positionsStatus: okPositionsStatus,
+      telemetry: undefined,
+      topologySwitchPending: false,
+      manifest: fakeManifest(),
+      biologicalGraph: fakeBiologicalGraph,
+      topology: { left: 'biological', right: 'disconnected' }
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    await waitFor(() => expect(instances).toHaveLength(1));
+
+    await fireEvent.click(screen.getByRole('radio', { name: /lesion effect \(offline\)/i }));
+
+    await waitFor(() => expect(instances[0].setNoLesionData).toHaveBeenCalledWith('right'));
+    expect(instances[0].setStaticColors).toHaveBeenCalledWith('left', expect.anything(), expect.anything(), expect.anything());
+    expect(instances[0].setStaticColors).not.toHaveBeenCalledWith('right', expect.anything(), expect.anything(), expect.anything());
+    // Scoped to the dedicated `.streaming-unavailable` paragraph via
+    // `querySelector` rather than `getByText` — the same sentence also
+    // appears (for a different, accessibility reason) inside the sr-only
+    // FDR-significance summary paragraph just below it.
+    const noDataParagraph = container.querySelector('p.streaming-unavailable');
+    expect(noDataParagraph?.textContent).toMatch(/right arm: no lesion data \(disconnected\)/i);
+
+    const canvas = screen.getByLabelText('Neural activity at soma positions');
+    expect(canvas).toHaveAttribute('data-lesion-source-left', 'biological');
+    expect(canvas).toHaveAttribute('data-lesion-source-right', 'none');
+  });
+
+  it('switching back to Live re-enables streaming and resets lastRatesSeen so the next frame repaints', async () => {
+    vi.mocked(loadLesionAtlas).mockResolvedValue(fakeLesionAtlasOk());
+    const runner = makeRunner();
+    render(ActivityPanel, {
+      runner,
+      positionsStatus: okPositionsStatus,
+      telemetry: undefined,
+      topologySwitchPending: false,
+      manifest: fakeManifest(),
+      biologicalGraph: fakeBiologicalGraph,
+      topology: { left: 'biological', right: 'rewired' }
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    await waitFor(() => expect(instances).toHaveLength(1));
+    await fireEvent.click(screen.getByRole('radio', { name: /lesion effect \(offline\)/i }));
+    await waitFor(() => expect(instances[0].setMode).toHaveBeenCalledWith('lesion'));
+
+    await fireEvent.click(screen.getByRole('radio', { name: /^live rate$/i }));
+
+    await waitFor(() => expect(instances[0].setMode).toHaveBeenLastCalledWith('live'));
+    expect(runner.setActivityStreaming).toHaveBeenLastCalledWith(true);
+  });
+
+  it('switching back to Live repaints both arms to neutral immediately, so lesion colors never linger under the Live label when no fresh tick arrives (round-2 dual review regression)', async () => {
+    // Regression coverage: `switchColorMode('live')` used to only reset
+    // `lastRatesSeen`/`colorSource` and re-enable streaming, never
+    // repainting the scene itself. On an experiment that is ready/paused
+    // (no ticks arriving), `frame()`'s own `update()`/`clear()` branches
+    // then never fire, and the lesion-effect mode's static diverging colors
+    // stayed on screen indefinitely under the "Color: Computed rate" label.
+    vi.mocked(loadLesionAtlas).mockResolvedValue(fakeLesionAtlasOk());
+    const runner = makeRunner(); // getLatestRates always returns undefined — no run in progress
+    render(ActivityPanel, {
+      runner,
+      positionsStatus: okPositionsStatus,
+      telemetry: undefined,
+      topologySwitchPending: false,
+      manifest: fakeManifest(),
+      biologicalGraph: fakeBiologicalGraph,
+      topology: { left: 'biological', right: 'rewired' }
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    await waitFor(() => expect(instances).toHaveLength(1));
+    await fireEvent.click(screen.getByRole('radio', { name: /lesion effect \(offline\)/i }));
+    await waitFor(() => expect(instances[0].setStaticColors).toHaveBeenCalled());
+
+    await fireEvent.click(screen.getByRole('radio', { name: /^live rate$/i }));
+
+    await waitFor(() => expect(instances[0].clear).toHaveBeenCalledWith('left'));
+    expect(instances[0].clear).toHaveBeenCalledWith('right');
+
+    // Round-2, round-2 dual review (Important): the mocked `ActivityScene`
+    // is a plain spy that doesn't itself gate `clear()` on `mode` the way
+    // the real `ActivityScene.ts` does (`clear()` is a no-op there while
+    // `this.mode === 'lesion'`) — so the two assertions above alone would
+    // still pass even if `switchColorMode` called `scene.clear()` *before*
+    // `scene.setMode('live')`, which against the real scene would silently
+    // no-op and reproduce the original bug. Assert the real call order
+    // directly against both mocks' own `invocationCallOrder`.
+    //
+    // `setMode('live')` is called *twice* in this test: once from
+    // `expand()`'s own initial sync (`colorMode` starts `'live'`, before the
+    // user ever selects Lesion) and once from this test's actual switch
+    // back to Live at the end — `lastIndexOf`, not `findIndex`, to get the
+    // one this assertion actually cares about (an earlier version of this
+    // test used `findIndex` here, found the *first* `'live'` call from
+    // `expand()` instead, and passed for the wrong reason regardless of
+    // `switchColorMode`'s own call order — caught by mutation-testing this
+    // assertion itself, not just the source fix it guards).
+    const setModeCallArgs = instances[0].setMode.mock.calls.map((call) => call[0]);
+    const setModeLiveCallIndex = setModeCallArgs.lastIndexOf('live');
+    expect(setModeLiveCallIndex).toBeGreaterThanOrEqual(0);
+    const setModeLiveOrder = instances[0].setMode.mock.invocationCallOrder[setModeLiveCallIndex];
+    const clearLeftOrder = instances[0].clear.mock.invocationCallOrder[0];
+    expect(clearLeftOrder).toBeGreaterThan(setModeLiveOrder);
+  });
+
+  it('a topology change while lesion mode is active re-applies static colors for the changed arm (plan requirement)', async () => {
+    vi.mocked(loadLesionAtlas).mockResolvedValue(fakeLesionAtlasOk());
+    const runner = makeRunner();
+    const { rerender } = render(ActivityPanel, {
+      runner,
+      positionsStatus: okPositionsStatus,
+      telemetry: undefined,
+      topologySwitchPending: false,
+      manifest: fakeManifest(),
+      biologicalGraph: fakeBiologicalGraph,
+      topology: { left: 'biological', right: 'rewired' }
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    await waitFor(() => expect(instances).toHaveLength(1));
+    await fireEvent.click(screen.getByRole('radio', { name: /lesion effect \(offline\)/i }));
+    await waitFor(() =>
+      expect(instances[0].setStaticColors).toHaveBeenCalledWith('right', [-0.4, 0.5, 0.0], [false, true, true], 1)
+    );
+    instances[0].setStaticColors.mockClear();
+    instances[0].setNoLesionData.mockClear();
+
+    await rerender({
+      runner,
+      positionsStatus: okPositionsStatus,
+      telemetry: undefined,
+      topologySwitchPending: false,
+      manifest: fakeManifest(),
+      biologicalGraph: fakeBiologicalGraph,
+      topology: { left: 'biological', right: 'disconnected' }
+    });
+
+    await waitFor(() => expect(instances[0].setNoLesionData).toHaveBeenCalledWith('right'));
+    // Round-2 dual review (comment accuracy): the `$effect` re-applies
+    // colors for *both* arms on every rerun (including the left arm, whose
+    // topology did not change here) — this assertion is not about whether
+    // the left arm was repainted, but that the *right* arm, now
+    // disconnected, was correctly routed to `setNoLesionData` and never to
+    // `setStaticColors` (which would mean it kept showing stale rewired-arm
+    // colors, or worse, picked up the left arm's biological data on a bug
+    // that ignored `agentId`).
+    expect(instances[0].setStaticColors).not.toHaveBeenCalledWith('right', expect.anything(), expect.anything(), expect.anything());
+  });
+
+  it('a slow lazy atlas load never overrides a later "Live" selection (stale-intent race, round-2 dual review regression)', async () => {
+    const load = deferred<LesionAtlasLoadResult>();
+    vi.mocked(loadLesionAtlas).mockReturnValue(load.promise);
+    const runner = makeRunner();
+    render(ActivityPanel, {
+      runner,
+      positionsStatus: okPositionsStatus,
+      telemetry: undefined,
+      topologySwitchPending: false,
+      manifest: fakeManifest(),
+      biologicalGraph: fakeBiologicalGraph,
+      topology: { left: 'biological', right: 'rewired' }
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    await waitFor(() => expect(instances).toHaveLength(1));
+
+    // Click Lesion — the load is now in flight and unresolved.
+    await fireEvent.click(screen.getByRole('radio', { name: /lesion effect \(offline\)/i }));
+    await waitFor(() => expect(loadLesionAtlas).toHaveBeenCalledTimes(1));
+
+    // Before it resolves, the user selects Live again. A plain second
+    // `fireEvent.click` on the Live radio would not actually fire a native
+    // `change` event here — `handleColorModeInputChange`'s own DOM
+    // "unstick" logic (see its doc comment) already force-reset the Live
+    // radio's `checked` back to `true` as soon as the Lesion click was
+    // handled, and browsers never fire `change` for a click on an
+    // already-checked radio. `fireEvent.change` invokes the same `onchange`
+    // handler directly, the same way a re-render race or an assistive-tech
+    // "activate" action could, without depending on that native-radio
+    // quirk.
+    await fireEvent.change(screen.getByRole('radio', { name: /^live rate$/i }));
+
+    // The stale Lesion switch's load now finally resolves successfully.
+    load.resolve(fakeLesionAtlasOk());
+    // Flush a real macrotask boundary (not just a microtask `Promise.resolve()`
+    // hop), so `switchColorMode`'s `await ensureLesionAtlasLoaded()` continuation
+    // — and any reactive updates it triggers — has definitely had a chance to
+    // run before the assertions below, whichever way the guard resolves.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // The user's later, explicit "Live" choice must win — the stale switch
+    // must never flip the mode to lesion behind their back.
+    expect(instances[0].setMode).not.toHaveBeenCalledWith('lesion');
+    expect(screen.getByRole('radio', { name: /^live rate$/i })).toBeChecked();
+  });
+
+  it('the hint paragraph is an always-present aria-live region, not one only mounted once populated (thermo-maintainability I3)', async () => {
+    vi.mocked(loadLesionAtlas).mockResolvedValueOnce({ status: 'unavailable', reason: 'network hiccup (test)' });
+    const runner = makeRunner();
+    const { container } = render(ActivityPanel, {
+      runner,
+      positionsStatus: okPositionsStatus,
+      telemetry: undefined,
+      topologySwitchPending: false,
+      manifest: fakeManifest(),
+      biologicalGraph: fakeBiologicalGraph,
+      topology: { left: 'biological', right: 'rewired' }
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    await waitFor(() => expect(instances).toHaveLength(1));
+
+    // The live-region node exists from first paint, before any hint text has
+    // ever been set — a screen reader must already have this node in the
+    // accessibility tree to reliably announce a later *mutation* to it. The
+    // earlier version only mounted this element via its own nested `{#if}`,
+    // once text existed, which several screen readers (notably VoiceOver/
+    // Safari) do not reliably announce on first insertion.
+    const hint = container.querySelector('p.hint[aria-live="polite"]');
+    expect(hint).not.toBeNull();
+    expect(hint?.textContent).toBe('');
+
+    await fireEvent.click(screen.getByRole('radio', { name: /lesion effect \(offline\)/i }));
+    await waitFor(() => expect(screen.getByText(/could not be loaded \(retrying is available\)/i)).toBeInTheDocument());
+
+    // Same node (reference equality), now carrying the transient-failure
+    // text — a mutation to an already-present live region, not a freshly-
+    // inserted one.
+    const hintAfter = container.querySelector('p.hint[aria-live="polite"]');
+    expect(hintAfter).toBe(hint);
+    expect(hintAfter?.textContent).toMatch(/network hiccup \(test\)/i);
+  });
+
+  it('the sr-only FDR-significance summary is an always-present aria-live region (thermo-maintainability I3)', async () => {
+    vi.mocked(loadLesionAtlas).mockResolvedValue(fakeLesionAtlasOk());
+    const runner = makeRunner();
+    const { container } = render(ActivityPanel, {
+      runner,
+      positionsStatus: okPositionsStatus,
+      telemetry: undefined,
+      topologySwitchPending: false,
+      manifest: fakeManifest(),
+      biologicalGraph: fakeBiologicalGraph,
+      topology: { left: 'biological', right: 'rewired' }
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    await waitFor(() => expect(instances).toHaveLength(1));
+
+    const summary = container.querySelector('p.sr-only[aria-live="polite"]');
+    expect(summary).not.toBeNull();
+    expect(summary?.textContent).toBe('');
+
+    await fireEvent.click(screen.getByRole('radio', { name: /lesion effect \(offline\)/i }));
+    await waitFor(() => expect(instances[0].setStaticColors).toHaveBeenCalled());
+
+    const summaryAfter = container.querySelector('p.sr-only[aria-live="polite"]');
+    expect(summaryAfter).toBe(summary);
+    expect(summaryAfter?.textContent).toMatch(/lesion effect mode/i);
   });
 });

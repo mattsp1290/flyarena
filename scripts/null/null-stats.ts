@@ -120,6 +120,47 @@ export interface Histogram {
 }
 
 /**
+ * The finest percentile granularity an `n`-point null distribution can
+ * express: with `n = 20` rewired trained replicas
+ * (`.agents/plans/rewiring-null/03-trained-sample.md`'s "with n = 20 the
+ * percentile resolution is 5%"), each additional/fewer null point below the
+ * biological score shifts `bioPercentile` by exactly `1/n = 5%` -- a much
+ * coarser granularity than the authored null's `n = 500` (0.2%), which is
+ * why the trained section's percentile is reported alongside this value
+ * rather than read with the same implied precision.
+ */
+export const percentileResolution = (n: number): number => {
+  if (!Number.isInteger(n) || n <= 0) {
+    throw new Error(`null-stats: percentileResolution requires a positive integer n, got ${n}`);
+  }
+  return 1 / n;
+};
+
+export interface TrainerSeedSpread {
+  readonly min: number;
+  readonly max: number;
+  readonly range: number;
+}
+
+/**
+ * Min/max/range across a small set of same-topology, different-trainer-seed
+ * scores -- the trained section's `bioTrainerSeedSpread` (the plan's
+ * "trainer-seed variance context" line): **trainer-noise variance at fixed
+ * (biological) topology**, explicitly not comparable to the null's
+ * **topology variance at fixed trainer seed** (the 20 rewired scores, all
+ * trained at `replicaSeed`). No overlap-based conclusion between the two
+ * may be drawn from this value alone -- see `null-report.ts`'s
+ * `renderReportMarkdown` trained section, which states this in prose next
+ * to every place this number is printed.
+ */
+export const trainerSeedSpread = (values: readonly number[]): TrainerSeedSpread => {
+  if (values.length === 0) throw new Error('null-stats: trainerSeedSpread requires at least one value');
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  return { min, max, range: max - min };
+};
+
+/**
  * `binCount` equal-width bins spanning `[min(values), max(values)]`
  * (the plan's "30 equal-width histogram bins over
  * `[min(N ∪ {bio, disc}), max(N ∪ {bio, disc})]`" — the caller passes that

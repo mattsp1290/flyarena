@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { COLORMAP_SIZE, VIRIDIS_LUT, rateToLutIndex } from '../../src/lib/render/colormap';
+import {
+  COLORMAP_SIZE,
+  DIVERGING_LUT,
+  DIVERGING_LUT_CENTER_INDEX,
+  VIRIDIS_LUT,
+  effectToLutIndex,
+  rateToLutIndex
+} from '../../src/lib/render/colormap';
 import { writeColors } from '../../src/lib/render/activity-layout';
 
 /**
@@ -95,5 +102,66 @@ describe('writeColors against VIRIDIS_LUT (the real production color-write path:
 
     expect(Array.from(out)).toEqual([VIRIDIS_LUT[0], VIRIDIS_LUT[1], VIRIDIS_LUT[2]]);
     for (const value of out) expect(Number.isFinite(value)).toBe(true);
+  });
+});
+
+describe('DIVERGING_LUT (WP3 lesion-effect mode)', () => {
+  it('has 256 RGB entries, every channel in [0, 1]', () => {
+    expect(DIVERGING_LUT.length).toBe(COLORMAP_SIZE * 3);
+    for (let index = 0; index < DIVERGING_LUT.length; index += 1) {
+      expect(DIVERGING_LUT[index]).toBeGreaterThanOrEqual(0);
+      expect(DIVERGING_LUT[index]).toBeLessThanOrEqual(1);
+    }
+  });
+
+  it('is white (exactly zero effect) at its own center index', () => {
+    // A 256-entry (even) table has no exact middle index — index 128's `t`
+    // (128/255) is a hair past the true midpoint 0.5, so its color is
+    // *almost* exactly white, not bit-identical to it. `toBeCloseTo(1, 2)`
+    // (tolerance 0.005) comfortably covers that sub-percent discretization
+    // gap while still failing on a real off-by-a-lot regression.
+    const offset = DIVERGING_LUT_CENTER_INDEX * 3;
+    expect(DIVERGING_LUT[offset]).toBeCloseTo(1, 2);
+    expect(DIVERGING_LUT[offset + 1]).toBeCloseTo(1, 2);
+    expect(DIVERGING_LUT[offset + 2]).toBeCloseTo(1, 2);
+  });
+
+  it('endpoints are the colorblind-safe blue/vermillion pair, not viridis', () => {
+    expect(DIVERGING_LUT[0]).toBeCloseTo(0 / 255, 3);
+    expect(DIVERGING_LUT[1]).toBeCloseTo(114 / 255, 3);
+    expect(DIVERGING_LUT[2]).toBeCloseTo(178 / 255, 3);
+    const lastOffset = (COLORMAP_SIZE - 1) * 3;
+    expect(DIVERGING_LUT[lastOffset]).toBeCloseTo(213 / 255, 3);
+    expect(DIVERGING_LUT[lastOffset + 1]).toBeCloseTo(94 / 255, 3);
+    expect(DIVERGING_LUT[lastOffset + 2]).toBeCloseTo(0 / 255, 3);
+  });
+});
+
+describe('effectToLutIndex', () => {
+  it('maps -absMax -> 0, 0 -> the center, and +absMax -> lutSteps-1', () => {
+    expect(effectToLutIndex(-10, 10, COLORMAP_SIZE)).toBe(0);
+    expect(effectToLutIndex(0, 10, COLORMAP_SIZE)).toBe(DIVERGING_LUT_CENTER_INDEX);
+    expect(effectToLutIndex(10, 10, COLORMAP_SIZE)).toBe(COLORMAP_SIZE - 1);
+  });
+
+  it('clamps effects outside [-absMax, absMax] rather than extrapolating', () => {
+    expect(effectToLutIndex(-500, 10, COLORMAP_SIZE)).toBe(0);
+    expect(effectToLutIndex(500, 10, COLORMAP_SIZE)).toBe(COLORMAP_SIZE - 1);
+  });
+
+  it('maps a non-positive absMax to the center rather than dividing by zero', () => {
+    expect(effectToLutIndex(5, 0, COLORMAP_SIZE)).toBe(DIVERGING_LUT_CENTER_INDEX);
+    expect(effectToLutIndex(5, -1, COLORMAP_SIZE)).toBe(DIVERGING_LUT_CENTER_INDEX);
+  });
+
+  it('treats a non-finite effect the same as zero (maps to the center, never NaN)', () => {
+    expect(effectToLutIndex(Number.NaN, 10, COLORMAP_SIZE)).toBe(DIVERGING_LUT_CENTER_INDEX);
+    expect(effectToLutIndex(Number.POSITIVE_INFINITY, 10, COLORMAP_SIZE)).toBe(DIVERGING_LUT_CENTER_INDEX);
+    expect(Number.isFinite(effectToLutIndex(Number.NaN, 10, COLORMAP_SIZE))).toBe(true);
+  });
+
+  it('is monotonic: a larger signed effect never maps to a smaller LUT index', () => {
+    expect(effectToLutIndex(8, 10, COLORMAP_SIZE)).toBeGreaterThan(effectToLutIndex(2, 10, COLORMAP_SIZE));
+    expect(effectToLutIndex(-2, 10, COLORMAP_SIZE)).toBeGreaterThan(effectToLutIndex(-8, 10, COLORMAP_SIZE));
   });
 });

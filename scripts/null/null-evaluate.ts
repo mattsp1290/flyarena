@@ -7,7 +7,14 @@ import { gunzipSync } from 'node:zlib';
 import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import { requireNonNegativeInt, requirePositiveInt, requireValue } from '../training/cli';
 import { atomicWriteFileSync, sha256Hex } from '../training/fsio';
-import type { NullSeedResult, NullTaskMode, NullWorkerMessage, NullWorkerTask } from './null-worker';
+import {
+  NULL_DECODER_KINDS,
+  type NullDecoderKind,
+  type NullSeedResult,
+  type NullTaskMode,
+  type NullWorkerMessage,
+  type NullWorkerTask
+} from './null-worker';
 
 /**
  * `.agents/plans/rewiring-null/02-authored-null-evaluation.md`'s WP2 driver:
@@ -40,6 +47,18 @@ const DEFAULT_HELD_OUT_COUNT = 100;
 const DEFAULT_TICKS = 1800;
 const DEFAULT_SHARDS = 18;
 const DEFAULT_OUT = resolve(repoRoot, 'training/runs/null/authored.json');
+const DEFAULT_DECODER: NullDecoderKind = 'authored';
+
+/**
+ * The only values `--decoder` accepts — the authored decoder family
+ * (`.agents/plans/null-explanation/01-decoder-variants.md` WP1). `trained`/
+ * `silenced`/`parked` are never valid here: this evaluator always drives the
+ * left agent through the authored path (with an optional sign flip) against
+ * a parked opponent. Derived from `null-worker.ts`'s `NULL_DECODER_KINDS`,
+ * the single source of truth for the four kinds.
+ */
+const isNullDecoderKind = (value: string): value is NullDecoderKind =>
+  (NULL_DECODER_KINDS as readonly string[]).includes(value);
 
 // ---------------------------------------------------------------------------
 // rewire_batch.py index.json
@@ -157,13 +176,22 @@ export const verifyRewiredFiles = (index: Readonly<RewireIndex>, graphsDir: stri
   }
 };
 
-/** Verify the biological source graph's decompressed sha256 against `index.json`'s own `sourceSha256`. */
-const verifyBiologicalSource = (path: string, expectedSha256: string): void => {
+/**
+ * Verify the biological source graph's decompressed sha256 against
+ * `index.json`'s own `sourceSha256`. Exported (a thermo-maintainability
+ * review finding): `regime-check.ts` (WP2) needs the exact same check and
+ * previously carried a hand-duplicated copy because this was private.
+ * `source` is the calling CLI's own name (`"null-evaluate"`/
+ * `"regime-check"`), matching `null-worker-shared.ts`'s
+ * `assertFiniteScores`/`loadVerifiedGraphBinary` `source`-prefixed-message
+ * convention, so the thrown message still identifies which CLI raised it.
+ */
+export const verifyBiologicalSource = (source: string, path: string, expectedSha256: string): void => {
   const gzipBytes = readFileSync(path);
   const binary = gunzipSync(gzipBytes);
   const actual = sha256Hex(binary);
   if (actual !== expectedSha256) {
-    throw new Error(`null-evaluate: ${path} decompressed sha256 ${actual} does not match index.json's sourceSha256 (${expectedSha256})`);
+    throw new Error(`${source}: ${path} decompressed sha256 ${actual} does not match index.json's sourceSha256 (${expectedSha256})`);
   }
 };
 
@@ -181,6 +209,18 @@ export interface NullEvaluateArgs {
   readonly ticks: number;
   readonly shards: number;
   readonly out: string;
+  /** Left-agent decoder for every task this run builds. Defaults to `'authored'`. */
+  readonly decoder: NullDecoderKind;
+  /**
+   * Restricts `buildTasks`'s rewired-graph tasks to `index.json` seeds in
+   * `[start, end)` (half-open, matching `--rewired-seeds START:END`'s CLI
+   * spelling to Python slice semantics) — used by the WP1 reproduction gate
+   * (`--rewired-seeds 0:5` re-scores only seeds 0..4) so a full 500-graph
+   * rerun isn't needed just to check that the new code path reproduces a
+   * handful of published scores exactly. Leaving it unset evaluates every
+   * seed in the index, unchanged from before this flag existed.
+   */
+  readonly rewiredSeeds?: { readonly start: number; readonly end: number };
 }
 
 export const parseNullEvaluateArgs = (argv: readonly string[]): NullEvaluateArgs => {
@@ -193,6 +233,8 @@ export const parseNullEvaluateArgs = (argv: readonly string[]): NullEvaluateArgs
   let ticks = DEFAULT_TICKS;
   let shards = DEFAULT_SHARDS;
   let out = DEFAULT_OUT;
+  let decoder: NullDecoderKind = DEFAULT_DECODER;
+  let rewiredSeeds: { start: number; end: number } | undefined;
 
   let index = 0;
   while (index < argv.length) {
@@ -224,6 +266,26 @@ export const parseNullEvaluateArgs = (argv: readonly string[]): NullEvaluateArgs
     } else if (flag === '--out') {
       out = resolve(process.cwd(), requireValue(flag, argv[index + 1]));
       index += 2;
+    } else if (flag === '--decoder') {
+      const value = requireValue(flag, argv[index + 1]);
+      if (!isNullDecoderKind(value)) {
+        throw new Error(`--decoder must be one of ${NULL_DECODER_KINDS.join(', ')} (got "${value}")`);
+      }
+      decoder = value;
+      index += 2;
+    } else if (flag === '--rewired-seeds') {
+      const value = requireValue(flag, argv[index + 1]);
+      const match = /^(\d+):(\d+)$/.exec(value);
+      if (!match) {
+        throw new Error(`--rewired-seeds must be START:END (got "${value}")`);
+      }
+      const start = Number(match[1]);
+      const end = Number(match[2]);
+      if (end <= start) {
+        throw new Error(`--rewired-seeds end must be greater than start (got "${value}")`);
+      }
+      rewiredSeeds = { start, end };
+      index += 2;
     } else {
       throw new Error(`Unknown argument: ${flag}`);
     }
@@ -241,12 +303,67 @@ export const parseNullEvaluateArgs = (argv: readonly string[]): NullEvaluateArgs
   // comment, a dual-review finding).
   if (!out.endsWith('.json')) throw new Error(`--out must end with ".json" (got "${out}")`);
 
-  return { biological, graph, rewiredIndex, graphsDir, heldOutStart, heldOutCount, ticks, shards, out };
+  return {
+    biological,
+    graph,
+    rewiredIndex,
+    graphsDir,
+    heldOutStart,
+    heldOutCount,
+    ticks,
+    shards,
+    out,
+    decoder,
+    rewiredSeeds
+  };
 };
 
 // ---------------------------------------------------------------------------
 // Task list
 // ---------------------------------------------------------------------------
+
+/**
+ * `sortedRewireSeeds(index)` narrowed to `args.rewiredSeeds`'s half-open
+ * `[start, end)` range when given (see `NullEvaluateArgs.rewiredSeeds`'s doc
+ * comment), otherwise every seed in the index — unchanged from before the
+ * flag existed. Throws if any seed in the requested range is missing from
+ * the index (a typo'd range, or a range wider than the index actually
+ * contains, must fail loudly rather than silently scoring fewer seeds than
+ * requested -- a dual-review finding: an earlier version let an empty or
+ * partial match through silently, which for an empty match also drove
+ * `runCliMain`'s per-episode-ms summary to `Infinity`/`NaN`).
+ */
+const selectedRewireSeeds = (
+  index: Readonly<RewireIndex>,
+  args: Readonly<NullEvaluateArgs>
+): readonly RewireIndexSeedEntry[] => {
+  const seeds = sortedRewireSeeds(index);
+  if (!args.rewiredSeeds) return seeds;
+  const { start, end } = args.rewiredSeeds;
+  const selected = seeds.filter((entry) => entry.seed >= start && entry.seed < end);
+  const expectedCount = end - start;
+  if (selected.length !== expectedCount) {
+    // Sample-and-count rather than materializing every missing seed: a
+    // pathological range (e.g. a typo'd `--rewired-seeds 0:99999999999`)
+    // must fail fast, not hang or exhaust memory scanning billions of
+    // integers (a reviewer finding). `missingCount` is exact (arithmetic,
+    // not scan-dependent); the listed sample is capped and may be partial.
+    const foundSeeds = new Set(selected.map((entry) => entry.seed));
+    const missingCount = expectedCount - selected.length;
+    const SAMPLE_LIMIT = 10;
+    const SCAN_LIMIT = 1_000_000;
+    const sample: number[] = [];
+    for (let seed = start; seed < end && sample.length < SAMPLE_LIMIT && seed - start < SCAN_LIMIT; seed += 1) {
+      if (!foundSeeds.has(seed)) sample.push(seed);
+    }
+    const sampleText = sample.length < missingCount ? `${sample.join(', ')}, ...` : sample.join(', ');
+    throw new Error(
+      `null-evaluate: --rewired-seeds ${start}:${end} requested ${expectedCount} seed(s), but the index is ` +
+        `missing ${missingCount}: ${sampleText}`
+    );
+  }
+  return selected;
+};
 
 export const buildTasks = (
   index: Readonly<RewireIndex>,
@@ -257,19 +374,26 @@ export const buildTasks = (
   const tasks: NullWorkerTask[] = [];
 
   if (args.biological) {
-    const commonBio = { path: biologicalPath, expectedSha256: index.sourceSha256, heldOutSeeds, ticks: args.ticks };
+    const commonBio = {
+      path: biologicalPath,
+      expectedSha256: index.sourceSha256,
+      heldOutSeeds,
+      ticks: args.ticks,
+      decoder: args.decoder
+    };
     tasks.push({ graphId: 'biological', mode: 'biological' as NullTaskMode, ...commonBio });
     tasks.push({ graphId: 'disconnected', mode: 'disconnected' as NullTaskMode, ...commonBio });
   }
 
-  for (const entry of sortedRewireSeeds(index)) {
+  for (const entry of selectedRewireSeeds(index, args)) {
     tasks.push({
       graphId: `rewired-${entry.seed}`,
       mode: 'rewired' as NullTaskMode,
       path: resolve(args.graphsDir, entry.artifact),
       expectedSha256: entry.binarySha256,
       heldOutSeeds,
-      ticks: args.ticks
+      ticks: args.ticks,
+      decoder: args.decoder
     });
   }
   return tasks;
@@ -283,13 +407,31 @@ export const buildTasks = (
 const execArgvForChildren = (): string[] => process.execArgv.filter((flag) => !flag.startsWith('--inspect'));
 
 /**
- * Fork `shardCount` copies of `null-worker.ts`, hand each one tasks one at
- * a time (a worker that finishes gets the next queued task, so a slow
- * biological/disconnected task never blocks idle shards), and collect
- * every task's raw results keyed by `graphId`. Deterministic regardless of
- * which shard executes which task or in what order: the caller reassembles
- * output by iterating `tasks` (the canonical, seed-sorted order), not by
- * collection order.
+ * Fork `shardCount` copies of a worker script (`null-worker.ts` for this
+ * module's own callers; `null-trained-evaluate.ts` reuses this same
+ * function with `null-trained-worker.ts` — see that file), hand each one
+ * tasks one at a time (a worker that finishes gets the next queued task, so
+ * a slow biological/disconnected task never blocks idle shards), and
+ * collect every task's raw results keyed by `graphId`. Deterministic
+ * regardless of which shard executes which task or in what order: the
+ * caller reassembles output by iterating `tasks` (the canonical, seed-sorted
+ * order), not by collection order.
+ *
+ * Generic over the task/result/message shapes so `null-trained-evaluate.ts`
+ * (WP3) can reuse this exact sharding/failure-handling mechanism against its
+ * own worker protocol (weights-bearing tasks, not gzip-graph-bearing ones)
+ * without a second, drifting copy of it — the only structural requirements
+ * are that every task carries a `graphId` and the `heldOutSeeds` it was
+ * assigned, and every result carries the `seed` it was scored on, so this
+ * function can still verify a worker's reply matches what it was asked to
+ * do (see the self-checking protocol below). Every call site pins all three
+ * type parameters explicitly (TypeScript can't infer `Result`/`Message` from
+ * `tasks` alone, since neither appears in an argument position, and a
+ * default for `Message` can't itself reference `Result`'s default — TS
+ * checks default type-argument expressions against the *unsubstituted*
+ * constraint, not other parameters' defaults). This module's own
+ * `runNullEvaluate` pins `<NullWorkerTask, NullSeedResult, NullWorkerMessage>`;
+ * `null-trained-evaluate.ts` (WP3) pins its own equivalent types.
  *
  * Failure handling (a dual-review pass caught two real gaps in an earlier
  * version): the moment *any* task reports an error, or any child exits
@@ -303,12 +445,18 @@ const execArgvForChildren = (): string[] => process.execArgv.filter((flag) => !f
  * single source of truth for failure, so a killed sibling's own `exit`
  * event never itself throws — only the thing that caused the abort does.
  */
-export const runShardedEvaluation = async (
-  tasks: readonly NullWorkerTask[],
+export const runShardedEvaluation = async <
+  Task extends { readonly graphId: string; readonly heldOutSeeds: readonly number[] },
+  Result extends { readonly seed: number },
+  Message extends
+    | { readonly type: 'result'; readonly graphId: string; readonly results: readonly Result[] }
+    | { readonly type: 'error'; readonly graphId: string; readonly message: string }
+>(
+  tasks: readonly Task[],
   shardCount: number,
   workerPath: string
-): Promise<Map<string, readonly NullSeedResult[]>> => {
-  const results = new Map<string, readonly NullSeedResult[]>();
+): Promise<Map<string, readonly Result[]>> => {
+  const results = new Map<string, readonly Result[]>();
   const errors: string[] = [];
   const children = new Set<ReturnType<typeof fork>>();
   let nextTaskIndex = 0;
@@ -324,7 +472,7 @@ export const runShardedEvaluation = async (
       const child = fork(workerPath, [], { execArgv: execArgvForChildren() });
       children.add(child);
       let settled = false;
-      let inFlight: NullWorkerTask | undefined;
+      let inFlight: Task | undefined;
 
       const finish = (): void => {
         if (settled) return;
@@ -344,7 +492,7 @@ export const runShardedEvaluation = async (
         child.send(task);
       };
 
-      child.on('message', (message: NullWorkerMessage) => {
+      child.on('message', (message: Message) => {
         const expectedTask = inFlight;
         inFlight = undefined;
         // Self-checking protocol: a worker replying about a task this
@@ -460,13 +608,31 @@ export interface NullEvaluationRaw {
   readonly seeds: { readonly start: number; readonly count: number };
   readonly ticks: number;
   readonly substeps: number;
+  /**
+   * The left-agent decoder every task in this run used (`--decoder`,
+   * default `'authored'`). `null-report.ts` reads this to pick the
+   * published artifact's `condition` label and to enforce that a
+   * non-authored run is never written to a shipped path (see that file's
+   * `runNullReport`). Absent on any `authored.json` produced before this
+   * field existed — every reader treats a missing value as `'authored'`.
+   */
+  readonly decoder: NullDecoderKind;
   readonly biological?: NullGraphRaw;
   readonly disconnected?: NullGraphRaw;
   readonly rewired: readonly NullRewiredGraphRaw[];
   readonly host: { readonly arch: string; readonly node: string };
 }
 
-const toGraphRaw = (results: readonly NullSeedResult[]): NullGraphRaw => ({
+/**
+ * Reshape one task's raw per-seed worker results into its `NullGraphRaw`
+ * output shape. Shared with `null-trained-evaluate.ts` (WP3), whose own
+ * `NullTrainedGraphRaw` is a type alias for `NullGraphRaw` (the two scripts'
+ * per-graph output shape is identical — `heldOutSeeds`/`movementScore`/
+ * `foodPickups`/`hazardContacts` — only the *enclosing* raw-evaluation shape
+ * differs), rather than each redeclaring an identical function (a
+ * thermo-maintainability review finding).
+ */
+export const toGraphRaw = (results: readonly NullSeedResult[]): NullGraphRaw => ({
   heldOutSeeds: results.map((r) => r.seed),
   movementScore: results.map((r) => r.movementScore),
   foodPickups: results.map((r) => r.foodPickups),
@@ -484,7 +650,7 @@ export const assembleRaw = (
     return found;
   };
 
-  const rewired: NullRewiredGraphRaw[] = sortedRewireSeeds(index).map((entry) => ({
+  const rewired: NullRewiredGraphRaw[] = selectedRewireSeeds(index, args).map((entry) => ({
     seed: entry.seed,
     gzipSha256: entry.gzipSha256,
     acceptedSwaps: entry.stats.acceptedSwaps,
@@ -499,6 +665,7 @@ export const assembleRaw = (
     seeds: { start: args.heldOutStart, count: args.heldOutCount },
     ticks: args.ticks,
     substeps: NEURAL_SUBSTEPS_PER_TICK,
+    decoder: args.decoder,
     ...(args.biological
       ? { biological: toGraphRaw(require('biological')), disconnected: toGraphRaw(require('disconnected')) }
       : {}),
@@ -521,31 +688,65 @@ export const assembleRaw = (
  * finding), which would make this function return `outPath` itself —
  * so the very next `atomicWriteFileSync` below would silently overwrite the
  * multi-hour `authored.json` this function just wrote with the tiny
- * run-meta sidecar. `--out` is validated to end in `.json` at parse time
- * (`parseNullEvaluateArgs`), but this function stays self-checking for any
- * other caller (a test, a future script) that might not go through the CLI.
+ * run-meta sidecar. `--out` (both scripts' own, identically-named, flag) is
+ * validated to end in `.json` at parse time (`parseNullEvaluateArgs`/
+ * `parseNullTrainedEvaluateArgs`), but this function stays self-checking
+ * for any other caller (a test, a future
+ * script) that might not go through either CLI. `source` names the calling
+ * script (`"null-evaluate"`/`"null-trained-evaluate"`) so the thrown message
+ * still identifies which one raised it -- shared between the two rather
+ * than each redeclaring an identical function (a thermo-maintainability
+ * review finding).
  */
-const runMetaPathFor = (outPath: string): string => {
+export const runMetaPathFor = (source: string, outPath: string): string => {
   if (!outPath.endsWith('.json')) {
-    throw new Error(`null-evaluate: expected a ".json" output path, got "${outPath}"`);
+    throw new Error(`${source}: expected a ".json" output path, got "${outPath}"`);
   }
   return `${outPath.slice(0, -'.json'.length)}.run.json`;
+};
+
+/**
+ * `DEFAULT_OUT` (`training/runs/null/authored.json`) is the canonical,
+ * hours-long, full-index authored run -- not shipped, but still the single
+ * input every other WP1/WP2/WP3 script and the reproduction gate itself
+ * reads by default. A non-canonical run (a decoder variant, or a
+ * `--rewired-seeds`-restricted subset such as the reproduction gate's own
+ * `--rewired-seeds 0:5 --decoder authored`) must never silently overwrite it
+ * just because the caller forgot an explicit `--out` -- a dual-review
+ * finding: the plan's own reproduction-gate example command omits `--out`.
+ * Checked before any file is read or any shard forked.
+ */
+const guardCanonicalOutDefault = (args: Readonly<NullEvaluateArgs>): void => {
+  const isNonCanonical = args.decoder !== 'authored' || args.rewiredSeeds !== undefined;
+  if (isNonCanonical && resolve(args.out) === resolve(DEFAULT_OUT)) {
+    throw new Error(
+      `null-evaluate: refusing to write a non-canonical run (decoder="${args.decoder}"` +
+        `${args.rewiredSeeds ? `, --rewired-seeds ${args.rewiredSeeds.start}:${args.rewiredSeeds.end}` : ''}) ` +
+        `to the default --out (${DEFAULT_OUT}) -- that path is the canonical full-index authored run every other ` +
+        'script reads by default. Pass an explicit --out for this run.'
+    );
+  }
 };
 
 export const runNullEvaluate = async (
   args: Readonly<NullEvaluateArgs>
 ): Promise<{ out: string; runMetaOut: string; taskCount: number; elapsedMs: number }> => {
+  guardCanonicalOutDefault(args);
   const index = readRewireIndex(args.rewiredIndex);
   verifyRewiredFiles(index, args.graphsDir);
 
   const biologicalPath = args.biological ? args.graph ?? resolve(PUBLIC_DATA_DIR, index.sourceArtifact) : '';
-  if (args.biological) verifyBiologicalSource(biologicalPath, index.sourceSha256);
+  if (args.biological) verifyBiologicalSource('null-evaluate', biologicalPath, index.sourceSha256);
 
   const tasks = buildTasks(index, args, biologicalPath);
   const workerPath = fileURLToPath(new URL('./null-worker.ts', import.meta.url));
 
   const started = performance.now();
-  const results = await runShardedEvaluation(tasks, args.shards, workerPath);
+  const results = await runShardedEvaluation<NullWorkerTask, NullSeedResult, NullWorkerMessage>(
+    tasks,
+    args.shards,
+    workerPath
+  );
   const elapsedMs = performance.now() - started;
   const perEpisodeMs = elapsedMs / (tasks.length * args.heldOutCount);
 
@@ -566,30 +767,59 @@ export const runNullEvaluate = async (
   // treatment: a torn sidecar would otherwise look like "run never
   // finished" even though the (correctly, atomically written) multi-hour
   // `authored.json` right next to it is fine.
-  const runMetaOut = runMetaPathFor(args.out);
+  const runMetaOut = runMetaPathFor('null-evaluate', args.out);
   atomicWriteFileSync(runMetaOut, `${JSON.stringify({ shards: args.shards, elapsedMs, perEpisodeMs }, null, 2)}\n`);
 
   return { out: args.out, runMetaOut, taskCount: tasks.length, elapsedMs };
 };
 
-const main = async (): Promise<void> => {
-  try {
-    const args = parseNullEvaluateArgs(process.argv.slice(2));
-    const { out, runMetaOut, taskCount, elapsedMs } = await runNullEvaluate(args);
-    const totalEpisodes = taskCount * args.heldOutCount;
-    const perEpisodeMs = elapsedMs / totalEpisodes;
-    // eslint-disable-next-line no-console -- CLI tool: this is its user-facing output.
-    console.log(
-      `null-evaluate: wrote ${out} and ${runMetaOut} (${taskCount} graphs x ${args.heldOutCount} seeds = ` +
-        `${totalEpisodes} episodes) in ${(elapsedMs / 1000).toFixed(1)}s (${perEpisodeMs.toFixed(1)} ms/episode, ` +
-        `${args.shards} shards)`
-    );
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    // eslint-disable-next-line no-console -- CLI tool: this is its user-facing error output.
-    console.error(`null-evaluate failed: ${message}`);
-    process.exit(1);
-  }
+/** Every `runNullEvaluate`/`runNullTrainedEvaluate`-shaped CLI driver's return value: what `runCliMain` needs to log its summary line. */
+export interface CliRunResult {
+  readonly out: string;
+  readonly runMetaOut: string;
+  readonly taskCount: number;
+  readonly elapsedMs: number;
+}
+
+/**
+ * `main()`'s shared shape: parse argv, await `run`, log a one-line summary
+ * (`console.log`) on success, or log the error and `process.exit(1)` on
+ * failure — never throwing back out to the caller. `null-evaluate.ts` and
+ * `null-trained-evaluate.ts` previously hand-wrote near-identical copies of
+ * this (same try/catch/console.log/console.error/`process.exit(1)` shape,
+ * differing only in which functions they called and the log wording -- a
+ * thermo-maintainability review finding); both now build their own `main`
+ * from this generic instead. `taskNoun` fills in the one wording difference
+ * ("graphs" for the authored null, "runs" for the trained sample) so the
+ * summary line still reads naturally for each script.
+ */
+export const runCliMain = <Args extends { readonly heldOutCount: number; readonly shards: number }>(
+  scriptName: string,
+  taskNoun: string,
+  parseArgs: (argv: readonly string[]) => Args,
+  run: (args: Readonly<Args>) => Promise<CliRunResult>
+): (() => Promise<void>) => {
+  return async () => {
+    try {
+      const args = parseArgs(process.argv.slice(2));
+      const { out, runMetaOut, taskCount, elapsedMs } = await run(args);
+      const totalEpisodes = taskCount * args.heldOutCount;
+      const perEpisodeMs = elapsedMs / totalEpisodes;
+      // eslint-disable-next-line no-console -- CLI tool: this is its user-facing output.
+      console.log(
+        `${scriptName}: wrote ${out} and ${runMetaOut} (${taskCount} ${taskNoun} x ${args.heldOutCount} seeds = ` +
+          `${totalEpisodes} episodes) in ${(elapsedMs / 1000).toFixed(1)}s (${perEpisodeMs.toFixed(1)} ms/episode, ` +
+          `${args.shards} shards)`
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // eslint-disable-next-line no-console -- CLI tool: this is its user-facing error output.
+      console.error(`${scriptName} failed: ${message}`);
+      process.exit(1);
+    }
+  };
 };
+
+const main = runCliMain('null-evaluate', 'graphs', parseNullEvaluateArgs, runNullEvaluate);
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) void main();

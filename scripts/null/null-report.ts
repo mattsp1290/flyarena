@@ -16,6 +16,10 @@ import {
   type NullSummary
 } from './null-stats';
 import type { NullEvaluationRaw, NullGraphRaw } from './null-evaluate';
+import { buildTrainedSection, renderTrainedSection, type TrainedSection } from './null-report-trained';
+import { guardVariantOutPath, resolveCondition, type RewiringNullCondition } from './null-report-variant';
+import type { NullTrainedEvaluationRaw } from './null-trained-evaluate';
+import type { NullDecoderKind } from './null-worker';
 
 /**
  * `.agents/plans/rewiring-null/02-authored-null-evaluation.md`'s
@@ -40,6 +44,8 @@ const DEFAULT_TRAINED = resolve(repoRoot, 'training/runs/null/trained.json');
 export const DEFAULT_OUT = resolve(repoRoot, 'public/data/rewiring-null-v1.json');
 export const DEFAULT_REPORT_MD = resolve(repoRoot, 'docs/rewiring-null-report.md');
 export const DEFAULT_MANIFEST = resolve(repoRoot, 'public/data/malecns-arena-v1.manifest.json');
+/** The already-merged trained-readout study this report's trained section cites `gpuRerunFitnessDelta` from (see `buildTrainedSection`). */
+export const DEFAULT_TRAINED_READOUT_MANIFEST = resolve(repoRoot, 'public/data/trained-readout-v1.manifest.json');
 
 /** 'N','U','L','L' as a fixed default seed; arbitrary but stable across runs, matching `evaluate.ts`'s `DEFAULT_BOOTSTRAP_SEED` convention. */
 const DEFAULT_BOOTSTRAP_SEED = 0x4e554c4c;
@@ -55,6 +61,8 @@ const MIN_REWIRED_FOR_SHIPPED_DEFAULT = 500;
 export interface NullReportArgs {
   readonly authored: string;
   readonly trained: string;
+  /** `gpuRerunFitnessDelta`'s source (WP3's trained section cites it; see `buildTrainedSection`). Only read when `--trained`'s file exists. */
+  readonly trainedReadoutManifest: string;
   readonly out: string;
   readonly reportMd: string;
   readonly manifest: string;
@@ -69,11 +77,24 @@ export interface NullReportArgs {
    * guessed default. See that function and `RunMeta`'s doc comment.
    */
   readonly shards?: number;
+  /**
+   * `.agents/plans/null-explanation/01-decoder-variants.md` WP1's
+   * variant-JSON escape hatch: when set, `runNullReport` writes **only** the
+   * built artifact (the same statistics `buildArtifact` always computes) to
+   * this path, and never touches `--out`/`--report-md`/`--manifest` at all
+   * — no shipped-path write, no manifest update, no report markdown. Left
+   * unset, `runNullReport` follows its original authored-only publish path
+   * unchanged. `--authored`'s `decoder` (see `NullEvaluationRaw.decoder`)
+   * being anything other than `'authored'` *requires* this flag — see
+   * `runNullReport`'s own check, which throws before any write otherwise.
+   */
+  readonly variantOut?: string;
 }
 
 export const parseNullReportArgs = (argv: readonly string[]): NullReportArgs => {
   let authored = DEFAULT_AUTHORED;
   let trained = DEFAULT_TRAINED;
+  let trainedReadoutManifest = DEFAULT_TRAINED_READOUT_MANIFEST;
   let out = DEFAULT_OUT;
   let reportMd = DEFAULT_REPORT_MD;
   let manifest = DEFAULT_MANIFEST;
@@ -81,6 +102,7 @@ export const parseNullReportArgs = (argv: readonly string[]): NullReportArgs => 
   let bootstrapResamples = DEFAULT_BOOTSTRAP_RESAMPLES;
   let histogramBins = DEFAULT_HISTOGRAM_BINS;
   let shards: number | undefined;
+  let variantOut: string | undefined;
 
   let index = 0;
   while (index < argv.length) {
@@ -90,6 +112,9 @@ export const parseNullReportArgs = (argv: readonly string[]): NullReportArgs => 
       index += 2;
     } else if (flag === '--trained') {
       trained = resolve(process.cwd(), requireValue(flag, argv[index + 1]));
+      index += 2;
+    } else if (flag === '--trained-readout-manifest') {
+      trainedReadoutManifest = resolve(process.cwd(), requireValue(flag, argv[index + 1]));
       index += 2;
     } else if (flag === '--out') {
       out = resolve(process.cwd(), requireValue(flag, argv[index + 1]));
@@ -112,6 +137,9 @@ export const parseNullReportArgs = (argv: readonly string[]): NullReportArgs => 
     } else if (flag === '--shards') {
       shards = requirePositiveInt(flag, argv[index + 1]);
       index += 2;
+    } else if (flag === '--variant-out') {
+      variantOut = resolve(process.cwd(), requireValue(flag, argv[index + 1]));
+      index += 2;
     } else {
       throw new Error(`Unknown argument: ${flag}`);
     }
@@ -122,7 +150,19 @@ export const parseNullReportArgs = (argv: readonly string[]): NullReportArgs => 
   // enforces it on `--out` (a dual-review finding).
   if (!authored.endsWith('.json')) throw new Error(`--authored must end with ".json" (got "${authored}")`);
 
-  return { authored, trained, out, reportMd, manifest, bootstrapSeed, bootstrapResamples, histogramBins, shards };
+  return {
+    authored,
+    trained,
+    trainedReadoutManifest,
+    out,
+    reportMd,
+    manifest,
+    bootstrapSeed,
+    bootstrapResamples,
+    histogramBins,
+    shards,
+    variantOut
+  };
 };
 
 // ---------------------------------------------------------------------------
@@ -204,7 +244,7 @@ export interface RewiredEntry extends ScoredEntry {
 
 export interface RewiringNullArtifact {
   readonly version: 1;
-  readonly condition: 'authored, opponent parked';
+  readonly condition: RewiringNullCondition;
   readonly seeds: { readonly start: number; readonly count: number };
   readonly ticks: number;
   readonly substeps: number;
@@ -226,6 +266,8 @@ export interface RewiringNullArtifact {
   readonly host: { readonly arch: string; readonly node: string };
   /** Present only when `null-evaluate.ts`'s `.run.json` sidecar recorded it. */
   readonly timing?: { readonly elapsedMs: number; readonly perEpisodeMs: number };
+  /** Present only when `--trained`'s file exists (WP3's `null-trained-evaluate.ts` output) -- see `buildTrainedSection`. */
+  readonly trained?: TrainedSection;
 }
 
 const toScoredEntry = (stats: ConditionStats): ScoredEntry => ({
@@ -315,7 +357,8 @@ export const updateManifestWithRewiringNull = (
 
 export interface RunNullReportResult {
   readonly out: string;
-  readonly reportMdPath: string;
+  /** Undefined in variant mode (`args.variantOut` set) — no report markdown is written; see `runNullReport`. */
+  readonly reportMdPath?: string;
   readonly artifactSha256: string;
   readonly artifact: RewiringNullArtifact;
 }
@@ -332,6 +375,15 @@ export const buildArtifact = (
   if (raw.version !== 1) {
     throw new Error(`null-report: ${args.authored} has unsupported version ${String(raw.version)}, expected 1`);
   }
+  // Derived from raw.decoder itself (via null-report-variant.ts's
+  // resolveCondition), not threaded in by the caller -- a thermo-nuclear
+  // maintainability finding: an earlier version took `condition` as a
+  // separate parameter with a silently-wrong-if-forgotten default, so it
+  // could disagree with what `raw.decoder` actually says. Deriving it here
+  // makes that structurally impossible: a single source of truth instead of
+  // two places (this default and runNullReport's own validation) that had
+  // to agree.
+  const condition = resolveCondition(raw.decoder as NullDecoderKind | null | undefined, args.authored);
   if (!raw.biological || !raw.disconnected) {
     throw new Error(
       `null-report: ${args.authored} has no biological/disconnected section ` +
@@ -424,7 +476,7 @@ export const buildArtifact = (
 
   return {
     version: 1,
-    condition: 'authored, opponent parked',
+    condition,
     seeds: raw.seeds,
     ticks: raw.ticks,
     substeps: raw.substeps,
@@ -580,7 +632,7 @@ opponent parked, 100 seeds, \`T=${artifact.ticks}\`), agrees in direction — bi
 (mean diff ${fmt(artifact.pairedBiologicalVsRewiredSeed0.meanDifference)}, 95% CI ${fmt(artifact.pairedBiologicalVsRewiredSeed0.ci95[0])} to ${fmt(artifact.pairedBiologicalVsRewiredSeed0.ci95[1])}) —
 but the two studies differ in agent/opponent condition, tick count, and seed count (and seed set), so this
 is corroborating evidence under a related-but-distinct condition, not a replication of the same measurement.
-
+${renderTrainedSection(artifact.trained, artifact.rewired.length)}
 ## Limitations
 
 - Scores come from a **single-agent condition with the opponent parked**, on the same held-out seeds and
@@ -594,7 +646,15 @@ is corroborating evidence under a related-but-distinct condition, not a replicat
 - **No causal or superiority claim is made.** The percentile and rank statistics above are descriptive: they
   say where the biological graph's score falls among this null model's rewirings under this exact evaluation
   setup, not that biological topology causes or predicts any particular score.
-${artifact.null.degenerate ? '- The null distribution is **degenerate** (IQR below threshold) — see the note above.\n' : ''}`;
+${artifact.null.degenerate ? '- The null distribution is **degenerate** (IQR below threshold) — see the note above.\n' : ''}${
+    artifact.trained
+      ? `- The trained section above (n=${artifact.trained.rewired.length} rewired replicas) reports the same kind ` +
+        `of descriptive percentile/rank statistics as the authored null, at a much coarser ` +
+        `${pct(artifact.trained.percentileResolution)} resolution, and makes no causal or superiority claim either. ` +
+        `Its trainer-seed variance context (\`bioTrainerSeedSpread\`) is trainer-noise variance at fixed topology, ` +
+        `explicitly not comparable to its own topology-variance percentile — see that section's own caveats.\n`
+      : ''
+  }`;
 
   // A non-degenerate report otherwise ends with a trailing blank line (the
   // template's own newline before the closing backtick, doubled up with the
@@ -623,6 +683,36 @@ const guardShippedDefault = (path: string, defaultPath: string, label: string, r
       `${rewiredCount} rewired graph(s) (this study's committed methodology uses ` +
       `${MIN_REWIRED_FOR_SHIPPED_DEFAULT}). Pass an explicit --out/--report-md/--manifest scratch path for a ` +
       'dev/test run.'
+  );
+};
+
+/**
+ * A shipped published artifact must never silently lose its wall-time
+ * provenance -- `resolveRunMeta` treats `elapsedMs`/`perEpisodeMs` as
+ * optional (tolerant of an older/scratch `authored.json` with no sidecar at
+ * all), but that tolerance must not extend to the real publish path: a
+ * republish that happens to run against a `training/runs/` tree missing
+ * `<authored>.run.json` would otherwise silently drop the "Wall time"/
+ * "Per-episode time" rows from `docs/rewiring-null-report.md`'s Parameters
+ * table with no error anywhere (a thermo-methodology review finding: this
+ * happened for real in a prior republish of this exact artifact). Scoped to
+ * the shipped default `--out` only, mirroring `guardShippedDefault`'s own
+ * scope -- an explicit scratch `--out` (a dev/test run, or one deliberately
+ * regenerating without timing) is unaffected.
+ */
+/** Exported (like `guardVariantOutPath`/`resolveRunMeta`) so tests can exercise this guard directly, without needing a 500-rewired-graph fixture just to get past `guardShippedDefault` first. */
+export const guardShippedTimingProvenance = (
+  outPath: string,
+  defaultOutPath: string,
+  runMeta: Readonly<RunMeta>
+): void => {
+  if (resolve(outPath) !== resolve(defaultOutPath)) return;
+  if (runMeta.elapsedMs !== undefined && runMeta.perEpisodeMs !== undefined) return;
+  throw new Error(
+    `null-report: refusing to publish to the shipped artifact (${defaultOutPath}) without wall-time provenance -- ` +
+      'the authored.run.json sidecar has no elapsedMs/perEpisodeMs (or does not exist). Restore the sidecar so ' +
+      'the published report keeps its "Wall time"/"Per-episode time" rows, or pass an explicit --out scratch ' +
+      'path if this is intentionally a timing-less regeneration.'
   );
 };
 
@@ -664,26 +754,92 @@ const verifySourceGraphMatchesManifest = (
 };
 
 export const runNullReport = (args: Readonly<NullReportArgs>): RunNullReportResult => {
-  // --trained is plumbed for WP3 ("Reads authored.json (and trained.json
-  // from WP3 if present)", 02-authored-null-evaluation.md) but WP3 isn't
-  // implemented yet. Rather than silently ignoring a real file an operator
-  // pointed --trained at (the flag was dead code otherwise — a dual-review
-  // finding), fail loudly if one exists; the common case (no WP3 output
-  // yet) hits neither branch.
-  if (existsSync(args.trained)) {
+  const raw = JSON.parse(readFileSync(args.authored, 'utf8')) as NullEvaluationRaw;
+  // Missing (or explicitly null, from a hand-edited/corrupted file) on any
+  // authored.json produced before this field existed (see
+  // NullEvaluationRaw.decoder's doc comment) -- treated as 'authored', the
+  // only value every such file could ever have meant. Only read here for
+  // the shipped-path gate immediately below -- validating it is a
+  // recognized NullDecoderKind (and deriving the published `condition`
+  // label from it) is now buildArtifact's job, via
+  // null-report-variant.ts's resolveCondition (a thermo-nuclear
+  // maintainability finding: this used to be duplicated in both places).
+  const rawDecoder = raw.decoder as NullDecoderKind | null | undefined;
+  const decoder: NullDecoderKind = rawDecoder ?? 'authored';
+
+  // A new check alongside guardShippedDefault below (a dual-review-style
+  // finding this WP predeclares): guardShippedDefault only looks at the
+  // rewired count, so a non-authored run with a full 500-graph rewired
+  // count would otherwise sail past it and overwrite the shipped authored
+  // artifact with a decoder-variant condition. Checked before anything is
+  // read from `args.trained` or written anywhere. Deliberately permissive
+  // about *unrecognized* decoder values here (any non-'authored' value
+  // requires --variant-out, recognized or not) -- resolveCondition (via
+  // buildArtifact, below) is what actually rejects an unrecognized value,
+  // so a bogus decoder with no --variant-out gets this actionable message
+  // first, and a bogus decoder with --variant-out still throws before any
+  // write.
+  if (decoder !== 'authored' && !args.variantOut) {
     throw new Error(
-      `null-report: ${args.trained} exists, but merging a trained-readout section is not implemented yet (WP3). ` +
-        'Remove --trained or move/delete that file to publish the authored-only report.'
+      `null-report: ${args.authored} was scored with decoder "${decoder}", not "authored" -- pass ` +
+        '--variant-out <path> to write its summary JSON there. A non-authored condition must never be written ' +
+        'to a shipped path (public/data/rewiring-null-v1.json, docs/rewiring-null-report.md, or the manifest).'
     );
   }
+  if (args.variantOut) {
+    guardVariantOutPath(args.variantOut, args.authored, {
+      out: DEFAULT_OUT,
+      reportMd: DEFAULT_REPORT_MD,
+      manifest: DEFAULT_MANIFEST
+    });
+  }
 
-  const raw = JSON.parse(readFileSync(args.authored, 'utf8')) as NullEvaluationRaw;
   const runMeta = resolveRunMeta(args);
-  const artifact = buildArtifact(raw, args, runMeta);
+  const authoredArtifact = buildArtifact(raw, args, runMeta);
+
+  // Variant mode: write only the built artifact to --variant-out, and never
+  // merge in a --trained section -- that section describes the *trained*
+  // decoder condition (a completely different, unrelated evaluation from
+  // WP3), never the authored-flip-* condition this summary is labelled
+  // with; merging it here would silently contaminate a decoder-convention
+  // variant summary with unrelated trained-readout data whenever a local
+  // trained.json happens to exist (a dual-review finding). Never touches
+  // --out/--report-md/--manifest -- no guardShippedDefault check, no
+  // manifest preflight/update, no report markdown, regardless of `decoder`
+  // (including 'authored', if a caller passes --variant-out anyway; see
+  // NullReportArgs.variantOut's doc comment).
+  if (args.variantOut) {
+    const artifactContents = JSON.stringify(authoredArtifact);
+    const artifactSha256 = sha256Hex(artifactContents);
+    mkdirSync(dirname(args.variantOut), { recursive: true });
+    atomicWriteFileSync(args.variantOut, artifactContents);
+    return { out: args.variantOut, artifactSha256, artifact: authoredArtifact };
+  }
+
+  // `--trained` is optional: "Reads authored.json (and trained.json from
+  // WP3 if present)" (02-authored-null-evaluation.md). When present, its
+  // section is merged in; the common case (no WP3 output at `args.trained`)
+  // publishes the authored-only report exactly as before WP3 existed.
+  let artifact: RewiringNullArtifact = authoredArtifact;
+  if (existsSync(args.trained)) {
+    const trainedRaw = JSON.parse(readFileSync(args.trained, 'utf8')) as NullTrainedEvaluationRaw;
+    const trainedSection = buildTrainedSection(
+      trainedRaw,
+      args.bootstrapSeed,
+      args.bootstrapResamples,
+      args.trainedReadoutManifest,
+      args.trained,
+      raw.seeds,
+      raw.ticks,
+      raw.substeps
+    );
+    artifact = { ...authoredArtifact, trained: trainedSection };
+  }
 
   guardShippedDefault(args.out, DEFAULT_OUT, 'published artifact', artifact.rewired.length);
   guardShippedDefault(args.reportMd, DEFAULT_REPORT_MD, 'report', artifact.rewired.length);
   guardShippedDefault(args.manifest, DEFAULT_MANIFEST, 'manifest', artifact.rewired.length);
+  guardShippedTimingProvenance(args.out, DEFAULT_OUT, runMeta);
   verifySourceGraphMatchesManifest(args.manifest, artifact, args.authored);
   verifyManifestRoundTrips(args.manifest);
 
@@ -712,10 +868,14 @@ const main = (): void => {
       throw new Error(`${args.authored} does not exist; run "npm run null:evaluate" first`);
     }
     const result = runNullReport(args);
+    const wroteLine = result.reportMdPath
+      ? `wrote ${result.out} (sha256 ${result.artifactSha256}) and ${result.reportMdPath}`
+      : `wrote ${result.out} (sha256 ${result.artifactSha256}) [variant mode: --out/--report-md/--manifest untouched]`;
     // eslint-disable-next-line no-console -- CLI tool: this is its user-facing output.
     console.log(
-      `null-report: wrote ${result.out} (sha256 ${result.artifactSha256}) and ${result.reportMdPath}\n` +
-        `bioPercentile=${pct(result.artifact.bioPercentile)} null.degenerate=${result.artifact.null.degenerate}`
+      `null-report: ${wroteLine}\n` +
+        `condition=${result.artifact.condition} bioPercentile=${pct(result.artifact.bioPercentile)} ` +
+        `null.degenerate=${result.artifact.null.degenerate}`
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

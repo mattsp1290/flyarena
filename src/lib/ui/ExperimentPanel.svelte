@@ -200,7 +200,7 @@
     </select>
   </div>
 
-  <fieldset class="field decoder-field" disabled={decoderControlsLocked}>
+  <fieldset class="field fieldset-group" disabled={decoderControlsLocked}>
     <legend>Decoder</legend>
     <label class="radio-option">
       <input
@@ -261,55 +261,11 @@
 </section>
 
 <style>
-  .field {
-    display: flex;
-    flex-direction: column;
-    gap: 0.3rem;
-    margin-top: 0.75rem;
-  }
-
-  .field label {
-    color: #cbd8e7;
-    font-size: 0.82rem;
-  }
-
-  .field input,
-  .field select {
-    padding: 0.45rem 0.6rem;
-    border: 1px solid #304355;
-    border-radius: 0.4rem;
-    color: #edf4ff;
-    background: #0e1826;
-  }
-
-  .decoder-field {
-    border: 1px solid #304355;
-    border-radius: 0.4rem;
-    padding: 0.5rem 0.6rem 0.65rem;
-    display: flex;
-    flex-direction: column;
-    gap: 0.35rem;
-  }
-
-  .decoder-field legend {
-    padding: 0 0.3rem;
-    color: #cbd8e7;
-    font-size: 0.82rem;
-  }
-
-  .radio-option {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    color: #edf4ff;
-    font-size: 0.85rem;
-  }
-
-  .hint {
-    margin: 0.2rem 0 0;
-    color: #ffd7de;
-    font-size: 0.75rem;
-  }
+  /* `.field`/`.fieldset-group`/`.radio-option`/`.hint` moved to
+     `src/app.css` — shared, unscoped rules also used by
+     `LesionColorMode.svelte`'s color-mode fieldset (thermo-maintainability
+     review S1: these were previously duplicated verbatim in both
+     components). */
 
   .replay-download {
     width: 100%;

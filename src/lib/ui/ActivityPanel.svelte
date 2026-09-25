@@ -1,14 +1,17 @@
 <script lang="ts">
   import { onDestroy, tick } from 'svelte';
   import type { AgentId } from '../arena/types';
-  import type { PositionsLoadResult } from '../experiment/assets';
+  import type { ArenaManifest, PositionsLoadResult } from '../experiment/assets';
   import type { ExperimentRunner, ExperimentTelemetry } from '../experiment/runner';
+  import type { ConnectomeGraph, GraphMode } from '../connectome/format';
   // Type-only: `ActivityScene` pulls in the same `three`/OrbitControls chunk
   // `ArenaScene` does, so it is loaded via a dynamic `import()` inside
   // `toggle()` below, not statically here — this panel (and its collapsed
   // placeholder) must be cheap to mount even before the view is ever
   // expanded.
   import type { ActivityScene as ActivitySceneInstance, ActivitySceneUnavailableError as ActivitySceneUnavailableErrorType } from '../render/ActivityScene';
+  import { createLesionColorMode } from './activityLesionColorMode.svelte';
+  import LesionColorMode from './LesionColorMode.svelte';
 
   /**
    * Collapsible "Neural activity" panel (WP3): one WebGL canvas showing both
@@ -25,6 +28,13 @@
    * and streaming straight through a switch of either arm; only opening/
    * closing is locked, so a close can't race the switch's own re-apply of
    * streaming (`ExperimentController#changeTopology`).
+   *
+   * This component owns the WebGL scene lifecycle and the live-rate
+   * streaming loop only; the lesion-effect color mode's own load/retry state
+   * machine and its markup/CSS live in `activityLesionColorMode.svelte.ts`
+   * and `LesionColorMode.svelte` (thermo-architecture/thermo-maintainability
+   * review: this file had grown to 1023 lines by inlining that entire second
+   * concern — see those two files' own doc comments for the split).
    */
 
   interface Props {
@@ -32,9 +42,23 @@
     positionsStatus: PositionsLoadResult | undefined;
     telemetry: ExperimentTelemetry | undefined;
     topologySwitchPending: boolean;
+    /** `undefined` until `App.svelte`'s `onManifest` fires. Needed (with `biologicalGraph`) to lazily load the lesion atlas the first time the lesion-effect color mode is selected — see `activityLesionColorMode.svelte.ts`. */
+    manifest?: ArenaManifest;
+    /** The already-verified, already-parsed biological graph `App.svelte` mirrors from `onManifest` — threaded into `loadLesionAtlas` for its `bodyIds` cross-check, the same graph `loadPositions` already reuses. */
+    biologicalGraph?: ConnectomeGraph;
+    /** Each arm's current topology (`App.svelte`'s own `topology` state) — maps to which lesion-atlas graph (if any) an arm's static colors come from. Defaults match `App.svelte`'s own initial value so existing callers/tests that don't pass this prop keep working unchanged. */
+    topology?: Record<AgentId, GraphMode>;
   }
 
-  let { runner, positionsStatus, telemetry, topologySwitchPending }: Props = $props();
+  let {
+    runner,
+    positionsStatus,
+    telemetry,
+    topologySwitchPending,
+    manifest,
+    biologicalGraph,
+    topology = { left: 'biological', right: 'rewired' }
+  }: Props = $props();
 
   let expanded = $state(false);
   let canvasEl = $state<HTMLCanvasElement | undefined>(undefined);
@@ -70,6 +94,29 @@
    */
   let streamingSupported = $state<Record<AgentId, boolean>>({ left: true, right: true });
 
+  /**
+   * True once the current `scene` has finished constructing (set at the end
+   * of `expand()`, cleared in `teardown()`). Gates the color-mode radio
+   * group: switching mode before a scene exists would have nothing to paint
+   * — mirrors `toggleDisabled`'s own "don't offer a control whose action
+   * would silently no-op" discipline.
+   */
+  let sceneReady = $state(false);
+  /**
+   * Debug-only, mirrors which write path last painted each arm's colors —
+   * `data-color-source-{left,right}` below, read by
+   * `tests/e2e/arena.spec.ts` to prove that repeated animation frames in
+   * lesion mode never let a live-mode `update()`/`clear()` repaint over the
+   * static lesion colors (both are no-ops in lesion mode — see
+   * `ActivityScene.ts` — but this attribute is the *observable* proof of
+   * that, the same role `lastUpdateTick` plays for live-mode streaming).
+   * Mutated in place, never reassigned wholesale — same allocation
+   * discipline as `lastUpdateTick` above. Written both by `frame()` below
+   * (live mode) and by `activityLesionColorMode.svelte.ts`'s `onArmPainted`
+   * callback (lesion mode).
+   */
+  let colorSource = $state<Record<AgentId, 'live' | 'lesion'>>({ left: 'live', right: 'live' });
+
   let destroyed = false;
   let reducedMotion = false;
   let reducedMotionQuery: MediaQueryList | undefined;
@@ -90,6 +137,34 @@
   const isStaleExpand = (generation: number): boolean => destroyed || generation !== openGeneration;
   /** Reduced-motion color-update cadence cap (plan: "at most 5 times per second"). */
   const REDUCED_MOTION_UPDATE_INTERVAL_MS = 200;
+
+  /**
+   * Owns the lesion-effect color mode's load/retry/stale-guard state machine
+   * (`activityLesionColorMode.svelte.ts`). Every getter below closes over
+   * this component's own mutable bindings (`scene`, `sceneReady`, `topology`,
+   * etc.), so the controller always reads their *current* value, not a
+   * snapshot taken here at construction time. `onEnterLive`/`onArmPainted`
+   * hand back the two bits of live-mode bookkeeping (`lastRatesSeen`/
+   * `colorSource`) that stay owned by this component.
+   */
+  const lesionColorMode = createLesionColorMode({
+    scene: () => scene,
+    sceneReady: () => sceneReady,
+    runner: () => runner,
+    manifest: () => manifest,
+    biologicalGraph: () => biologicalGraph,
+    topology: () => topology,
+    destroyed: () => destroyed,
+    onEnterLive: () => {
+      lastRatesSeen.left = undefined;
+      lastRatesSeen.right = undefined;
+      colorSource.left = 'live';
+      colorSource.right = 'live';
+    },
+    onArmPainted: (agentId) => {
+      colorSource[agentId] = 'lesion';
+    }
+  });
 
   const canExpand = $derived(positionsStatus?.status === 'ok');
   const disabledReason = $derived.by(() => {
@@ -121,6 +196,7 @@
     reducedMotionQuery = undefined;
     const closing = scene;
     scene = undefined;
+    sceneReady = false;
     closing?.dispose();
     lastRatesSeen.left = undefined;
     lastRatesSeen.right = undefined;
@@ -129,34 +205,48 @@
   const frame = (nowMs: number): void => {
     if (destroyed || !scene) return;
     try {
-      if (runner) {
-        // Cheap boolean check (no allocation), independent of the
-        // reduced-motion color-update throttle below — support can change
-        // (e.g. across a topology switch) whether or not a fresh rate
-        // happens to be due this frame.
-        for (const agentId of ['left', 'right'] as const) {
-          const supported = runner.supportsActivityStreaming(agentId);
-          if (supported !== streamingSupported[agentId]) streamingSupported[agentId] = supported;
+      // Lesion mode is static (colors come from `setStaticColors`, applied
+      // by `activityLesionColorMode.svelte.ts`'s own `$effect` whenever
+      // `colorMode`/topology change) — the whole rates-polling block is
+      // skipped entirely while it's active, not merely left to no-op inside
+      // `scene.update()`/`scene.clear()` (both are no-ops in lesion mode too
+      // — see `ActivityScene.ts` — but relying on that alone would still
+      // call `setActivityStreaming`-adjacent bookkeeping like
+      // `lastRatesSeen`/`streamingSupported` every frame for no reason, and
+      // `scene.clear()` firing here would otherwise only be *coincidentally*
+      // harmless rather than structurally impossible).
+      if (lesionColorMode.colorMode === 'live') {
+        if (runner) {
+          // Cheap boolean check (no allocation), independent of the
+          // reduced-motion color-update throttle below — support can change
+          // (e.g. across a topology switch) whether or not a fresh rate
+          // happens to be due this frame.
+          for (const agentId of ['left', 'right'] as const) {
+            const supported = runner.supportsActivityStreaming(agentId);
+            if (supported !== streamingSupported[agentId]) streamingSupported[agentId] = supported;
+          }
         }
-      }
-      const throttled = reducedMotion && nowMs - lastColorUpdateMs < REDUCED_MOTION_UPDATE_INTERVAL_MS;
-      if (!throttled && runner) {
-        lastColorUpdateMs = nowMs;
-        for (const agentId of ['left', 'right'] as const) {
-          const rates = runner.getLatestRates(agentId);
-          if (rates && rates !== lastRatesSeen[agentId]) {
-            lastRatesSeen[agentId] = rates;
-            scene.update(agentId, rates);
-            lastUpdateTick[agentId] = telemetry?.tick ?? lastUpdateTick[agentId];
-          } else if (!rates && lastRatesSeen[agentId]) {
-            // The arm had rates and now doesn't (e.g. `runner.reset()`
-            // cleared `latestRates`, or this arm's binding stopped
-            // supporting streaming mid-topology-switch) — repaint it to the
-            // neutral "no data" color rather than leaving the previous
-            // run's final colors on screen under a "Computed rate" label
-            // that no longer describes them.
-            lastRatesSeen[agentId] = undefined;
-            scene.clear(agentId);
+        const throttled = reducedMotion && nowMs - lastColorUpdateMs < REDUCED_MOTION_UPDATE_INTERVAL_MS;
+        if (!throttled && runner) {
+          lastColorUpdateMs = nowMs;
+          for (const agentId of ['left', 'right'] as const) {
+            const rates = runner.getLatestRates(agentId);
+            if (rates && rates !== lastRatesSeen[agentId]) {
+              lastRatesSeen[agentId] = rates;
+              scene.update(agentId, rates);
+              colorSource[agentId] = 'live';
+              lastUpdateTick[agentId] = telemetry?.tick ?? lastUpdateTick[agentId];
+            } else if (!rates && lastRatesSeen[agentId]) {
+              // The arm had rates and now doesn't (e.g. `runner.reset()`
+              // cleared `latestRates`, or this arm's binding stopped
+              // supporting streaming mid-topology-switch) — repaint it to the
+              // neutral "no data" color rather than leaving the previous
+              // run's final colors on screen under a "Computed rate" label
+              // that no longer describes them.
+              lastRatesSeen[agentId] = undefined;
+              scene.clear(agentId);
+              colorSource[agentId] = 'live';
+            }
           }
         }
       }
@@ -240,6 +330,28 @@
 
     lastUpdateTick.left = 0;
     lastUpdateTick.right = 0;
+    // A fresh `ActivityScene` always starts in its own internal `'live'`
+    // mode (`ActivityScene.ts`'s own default) — sync it to whatever mode
+    // this panel is already in (colorMode persists across a collapse ->
+    // expand cycle, e.g. a user who chose Lesion effect, collapsed, then
+    // reopened). `activityLesionColorMode.svelte.ts`'s own re-apply effect
+    // (which reads `sceneReady` and `colorMode` unconditionally, so it
+    // reliably reacts to `sceneReady` flipping true here) re-applies static
+    // colors for both arms if `colorMode` is already `'lesion'`.
+    scene.setMode(lesionColorMode.colorMode);
+    sceneReady = true;
+    // Live-mode streaming is skipped entirely while already in lesion mode
+    // (this panel's own `frame()` never polls rates then either) — starting
+    // it here anyway would immediately be followed by a
+    // `setActivityStreaming(false)` the next time lesion-mode logic ran;
+    // simplest to just not enable it in the first place. The render loop
+    // itself still starts regardless of mode (`scene.render()` — camera
+    // responsiveness/damping must keep working in lesion mode too).
+    if (lesionColorMode.colorMode === 'lesion') {
+      if (isStaleExpand(generation)) return;
+      rafId = requestAnimationFrame(frame);
+      return;
+    }
     await runner.setActivityStreaming(true);
     if (isStaleExpand(generation)) {
       // Deliberately does NOT call `teardown()` here: whatever `collapse()`
@@ -295,6 +407,19 @@
       Roles: <strong>Annotated</strong>
     </p>
     <p class="labels">Both arms share neuron positions; only connections differ.</p>
+
+    <LesionColorMode
+      part="controls"
+      {sceneReady}
+      colorMode={lesionColorMode.colorMode}
+      lesionOptionDisabledReason={lesionColorMode.lesionOptionDisabledReason}
+      lesionAtlasTransientReason={lesionColorMode.lesionAtlasTransientReason}
+      lesionSourceLeft={lesionColorMode.lesionSourceLeft}
+      lesionSourceRight={lesionColorMode.lesionSourceRight}
+      lesionSignificantSummary={lesionColorMode.lesionSignificantSummary}
+      onSwitchColorMode={lesionColorMode.switchColorMode}
+    />
+
     {#if positionsStatus?.status === 'ok'}
       <p class="coverage">
         Positioned: {positionsStatus.positions.coverage.soma} soma, {positionsStatus.positions.coverage.tosoma} soma-tract,
@@ -324,6 +449,10 @@
         aria-label="Neural activity at soma positions"
         data-last-update-tick-left={lastUpdateTick.left}
         data-last-update-tick-right={lastUpdateTick.right}
+        data-color-source-left={colorSource.left}
+        data-color-source-right={colorSource.right}
+        data-lesion-source-left={lesionColorMode.lesionSourceLeft}
+        data-lesion-source-right={lesionColorMode.lesionSourceRight}
         style:visibility={sceneError ? 'hidden' : 'visible'}
       ></canvas>
       {#if sceneError}
@@ -347,7 +476,7 @@
       <p class="context-lost" role="alert">{contextLostMessage}</p>
     {/if}
 
-    {#if positionsStatus?.status === 'ok'}
+    {#if positionsStatus?.status === 'ok' && lesionColorMode.colorMode === 'live'}
       <div class="legend">
         <div class="legend-scale" aria-hidden="true">
           <span>{positionsStatus.rateMin.toFixed(2)}</span>
@@ -365,6 +494,8 @@
           <li><span class="shape triangle" aria-hidden="true"></span>Descending</li>
         </ul>
       </div>
+    {:else if lesionColorMode.colorMode === 'lesion'}
+      <LesionColorMode part="legend" colorMode={lesionColorMode.colorMode} lesionAtlasStatus={lesionColorMode.lesionAtlasStatus} />
     {/if}
   {/if}
 </section>

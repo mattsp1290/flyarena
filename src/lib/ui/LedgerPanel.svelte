@@ -1,6 +1,11 @@
 <script lang="ts">
   import type { ArenaManifest, TrainedReadoutLoadResult } from '../experiment/assets';
+  import type { RewiringNullLoadResult } from '../experiment/rewiringNull';
+  import type { NullExplanationLoadResult } from '../experiment/nullExplanation';
   import type { DecoderKind } from '../worker/protocol';
+  import NullHistogram from './NullHistogram.svelte';
+  import NullExplanationNote from './NullExplanationNote.svelte';
+  import { githubDocUrl } from './links';
 
   /**
    * The model ledger vocabulary (`docs/model-ledger.md`) plus provenance
@@ -20,9 +25,13 @@
     decoder: DecoderKind;
     /** `undefined` while `ExperimentController#initialize()`'s trained-readout step has not yet resolved. */
     trainedReadout: TrainedReadoutLoadResult | undefined;
+    /** `undefined` while `ExperimentController#initialize()`'s rewiring-null load (WP4) has not yet resolved. */
+    rewiringNull: RewiringNullLoadResult | undefined;
+    /** `undefined` while `ExperimentController#initialize()`'s null-explanation load (WP4 of `.agents/plans/null-explanation`) has not yet resolved. */
+    nullExplanation: NullExplanationLoadResult | undefined;
   }
 
-  let { manifest, decoder, trainedReadout }: Props = $props();
+  let { manifest, decoder, trainedReadout, rewiringNull, nullExplanation }: Props = $props();
 
   const LEDGER_ROWS = $derived<readonly { term: string; label: string }[]>([
     { term: 'Graph topology', label: 'Measured' },
@@ -36,7 +45,15 @@
     // encoder and decodeAction stay Authored and identical either way.
     {
       term: 'Sensory encoder and action decoder',
-      label: decoder === 'trained' ? 'Authored (encoder) + Trained (readout, per-arm)' : 'Authored'
+      // "(hand-written)" gloss (thermo review I1): "Authored" alone reads as
+      // a neutral engineering label, but readers over-interpret bare
+      // "authored" numbers elsewhere in the product (see `NullHistogram.svelte`'s
+      // `CAPTION_DISCLAIMER`) — this row is the one place that word is
+      // *defined* in-product, without leaving the app.
+      label:
+        decoder === 'trained'
+          ? 'Authored (hand-written, encoder) + Trained (readout, per-arm)'
+          : 'Authored (hand-written)'
     },
     { term: '3D presentation', label: 'Synthetic' },
     // WP3 (anatomical activity view): neuron positions come from the MaleCNS
@@ -44,6 +61,15 @@
     // from them are the authored dynamics' live output, not a measurement.
     { term: 'Neuron positions', label: 'Measured' },
     { term: 'Displayed neural activity', label: 'Computed' },
+    // WP3 of `.agents/plans/lesion-atlas`: the activity view's optional
+    // "Lesion effect (offline)" color mode paints static per-neuron colors
+    // from the offline-computed single-neuron lesion atlas
+    // (`docs/lesion-atlas-report.md`) — always offline/static regardless of
+    // whether this particular session happens to load it successfully (the
+    // per-session load status is instead disclosed in-place by
+    // `ActivityPanel.svelte`'s own disabled-reason hint, the same pattern
+    // `loadPositions`'s toggle-disable already uses).
+    { term: 'Lesion effect map', label: 'Computed (offline)' },
     {
       term: 'Readout (trained mode)',
       label:
@@ -52,7 +78,37 @@
           : trainedReadout.status === 'ok'
             ? 'Trained (offline)'
             : 'Trained (offline) — unavailable'
-    }
+    },
+    // WP4 (`docs/model-ledger.md`'s new row): descriptive scores of
+    // degree-preserving rewirings under the authored decoder, computed
+    // offline — never a biological measurement.
+    //
+    // `'absent'`/`'unavailable'`/`'invalid'` are worded differently (thermo
+    // review, Suggestion): "not shipped" is only true when the manifest has
+    // no entry at all; a fetch/network failure ("could not load") is not a
+    // claim about the artifact's integrity the way "failed verification"
+    // is, so this row (and the section below) must not conflate them.
+    {
+      term: 'Topology null distribution',
+      label:
+        rewiringNull === undefined
+          ? 'Loading…'
+          : rewiringNull.status === 'ok'
+            ? 'Computed (offline)'
+            : rewiringNull.status === 'absent'
+              ? 'Computed (offline) — not shipped'
+              : rewiringNull.status === 'unavailable'
+                ? 'Computed (offline) — could not be loaded'
+                : 'Computed (offline) — failed verification'
+    },
+    // WP4 of `.agents/plans/null-explanation`: a static label, like "Lesion
+    // effect map" above rather than "Topology null distribution"'s
+    // status-driven one — this row documents what the artifact *is*, not
+    // this session's load outcome; a missing/failed-verification note is
+    // instead disclosed in place, next to the histogram itself (see the
+    // section below), the same "row stays static, per-session status shown
+    // in place" split "Lesion effect map"'s own doc comment explains.
+    { term: 'Null-result explanation', label: 'Computed (offline)' }
   ]);
 
   const reportUrl = $derived(`${import.meta.env.BASE_URL}data/trained-readout-v1.report.json`);
@@ -62,9 +118,27 @@
    * not part of the deployed static site (only `public/` is served) — a
    * relative `docs/trained-readout-report.md` link would 404 under any base
    * path. The JSON links above are the base-path-safe, always-resolvable
-   * links; this is offered alongside them for the prose version.
+   * links; this is offered alongside them for the prose version. Built via
+   * `./links.ts#githubDocUrl`, shared with `NullHistogram.svelte`'s own
+   * report link (thermo-maintainability review S3).
    */
-  const GITHUB_REPORT_URL = 'https://github.com/mattsp1290/flyarena/blob/main/docs/trained-readout-report.md';
+  const GITHUB_REPORT_URL = githubDocUrl('trained-readout-report.md');
+
+  /**
+   * WP4's counterpart to `reportUrl` above, for the rewiring-null artifact's
+   * own JSON — `NullHistogram.svelte`'s figcaption links the human-readable
+   * report. Built from `manifest.rewiringNull.artifact` (the same field
+   * `rewiringNull.ts#loadRewiringNull` itself fetches), not a hardcoded filename
+   * (dual review, Suggestion) — the manifest is the single source of truth
+   * for this artifact's name, already available here as a prop. Falls back
+   * to the conventional filename only for the (impossible in practice) case
+   * where this section renders `rewiringNull.status === 'ok'` from a
+   * `manifest` that is somehow `undefined` at the same tick.
+   */
+  const rewiringNullJsonUrl = $derived(
+    `${import.meta.env.BASE_URL}data/${manifest?.rewiringNull?.artifact ?? 'rewiring-null-v1.json'}`
+  );
+
 </script>
 
 <section class="panel ledger" aria-labelledby="ledger-heading">
@@ -92,7 +166,7 @@
 
   {#if trainedReadout?.status === 'ok'}
     {@const readout = trainedReadout}
-    <div class="trained-readout-detail">
+    <div class="detail-box trained-readout-detail">
       <p>
         Weights optimized offline by the cross-entropy method (CEM) against
         the arena score — an engineering artifact, not biology, with
@@ -131,6 +205,51 @@
       <div><dt>License</dt><dd>{manifest.license}</dd></div>
       <div><dt>Neurons / edges (biological)</dt><dd>{manifest.neuronCount} / {manifest.edgeCount}</dd></div>
     </dl>
+  {/if}
+
+  {#if rewiringNull && rewiringNull.status !== 'absent'}
+    <!-- One block, not two separately-conditioned `{#if}`s (dual review,
+         Suggestion — the earlier version had to keep the heading's own
+         `{#if}` in sync with this body's by hand). This also lets
+         `rewiringNull.status` narrow inside the `{#if}/{:else if}` below
+         without `?.`, since the outer condition already excludes `undefined`
+         and `'absent'` (nothing was ever shipped, so there is nothing to say
+         here — `'unavailable'`/`'invalid'` are genuine attempts that failed
+         and still get a heading plus an honestly-worded message). -->
+    <h3>Topology null distribution</h3>
+    {#if rewiringNull.status === 'ok'}
+      <!-- `NullHistogram`'s own `<figcaption>` already links "Full
+           rewiring-null report" (the bean's non-negotiable) — this list adds
+           only the machine-readable JSON, matching the "JSON is linked too"
+           instruction without duplicating the same link text/target twice on
+           one page. -->
+      <NullHistogram data={rewiringNull.data} />
+      <ul class="links">
+        <li><a href={rewiringNullJsonUrl} target="_blank" rel="noreferrer">Rewiring-null result (JSON)</a></li>
+      </ul>
+
+      <!-- WP4 of `.agents/plans/null-explanation`: the finding note that
+           explains, under this model only, why biological scored where it
+           did above. Extracted into its own component
+           (`NullExplanationNote.svelte`, thermo-maintainability review I1) —
+           it owns its own `'missing'`/`'unavailable'`/`'invalid'` split
+           internally (`'missing'` hides the whole block; the other two show
+           their own honestly-worded message), mirroring
+           `rewiringNull.status`'s own three-way split just below. -->
+      <NullExplanationNote {nullExplanation} baselinePercentile={rewiringNull.data.bioPercentile} rewiringCount={rewiringNull.data.null.n} />
+    {:else if rewiringNull.status === 'unavailable'}
+      <!-- A fetch/network failure or an unexpected runtime error
+           (`controller.ts`'s leading `.catch`) — not a claim about the
+           artifact's integrity, so this must not say "failed verification"
+           (thermo review, Suggestion). -->
+      <p class="error-message">
+        Null-distribution result could not be loaded: {rewiringNull.reason}
+      </p>
+    {:else}
+      <p class="error-message">
+        Null-distribution result failed verification: {rewiringNull.reason}
+      </p>
+    {/if}
   {/if}
 
   <h3>Provenance and licensing</h3>
@@ -181,14 +300,11 @@
     color: #79d8d0;
   }
 
-  .trained-readout-detail {
-    margin: 0.9rem 0;
-    padding: 0.65rem 0.75rem;
-    border: 1px solid #304355;
-    border-radius: 0.4rem;
-    background: rgb(121 216 208 / 6%);
-  }
-
+  /* `.detail-box` (margin/padding/border/border-radius/background) is
+     shared with `NullExplanationNote.svelte`'s `.null-explanation-detail`
+     via `src/app.css` (thermo-maintainability review, carried-over
+     Suggestion) — this class keeps only the trained-readout block's own
+     content-specific rules. */
   .trained-readout-detail dl {
     margin: 0.5rem 0;
     display: grid;

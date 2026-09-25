@@ -10,6 +10,8 @@ import {
   type LoadedArenaArtifacts,
   type TrainedReadoutLoadResult
 } from './assets';
+import { loadRewiringNull, type RewiringNullLoadResult } from './rewiringNull';
+import { loadNullExplanation, type NullExplanationLoadResult } from './nullExplanation';
 import { buildGraphBufferForMode, createWorkerAgentBinding } from './bindings';
 import { ExperimentRunner, isNotInitializedRejection, type ExperimentTelemetry } from './runner';
 import { transition, type ExperimentStatus } from './state';
@@ -75,6 +77,29 @@ export interface ExperimentControllerCallbacks {
    */
   onTrainedReadoutStatus: (status: TrainedReadoutLoadResult) => void;
   /**
+   * Fired once `loadRewiringNull` resolves for this manifest — independent
+   * of, and never awaited before, Worker/binding construction (WP4's
+   * "loading must not block Start"). Started right after `onManifest` fires,
+   * in parallel with the trained-readout load and the Worker construction
+   * below it; like `onTrainedReadoutStatus`, this never blocks reaching
+   * `ready`. The host's hook for the ledger panel's "Topology null
+   * distribution" section (`LedgerPanel.svelte`/`NullHistogram.svelte`).
+   */
+  onRewiringNull: (result: RewiringNullLoadResult) => void;
+  /**
+   * Fired once `loadNullExplanation` resolves (WP4 of
+   * `.agents/plans/null-explanation`) — sequenced after the rewiring-null
+   * load settles (`initialize()`'s own `nullLoad` doc comment explains why:
+   * never races ahead of the histogram's own load, and this note's
+   * cross-check needs `manifest`, not the resolved rewiring-null data), but
+   * fired independently of `onRewiringNull` itself (a throwing
+   * `onRewiringNull` host callback must never also skip this one). Like
+   * `onRewiringNull`, this never blocks reaching `ready`. The host's hook
+   * for the ledger panel's finding note, rendered next to
+   * `NullHistogram.svelte` inside the "Topology null distribution" section.
+   */
+  onNullExplanation: (result: NullExplanationLoadResult) => void;
+  /**
    * Fired once per agent right after `setDecoder()` has successfully applied
    * a decoder switch to both arms' Workers and reset the run to tick 0 —
    * mirrors `onTopologyApplied`'s "never speculatively before a switch is
@@ -96,6 +121,18 @@ export interface ExperimentControllerOptions {
   loadArtifacts?: typeof loadArenaArtifacts;
   /** Injectable for tests; defaults to `./assets.ts#loadTrainedReadoutArtifact`. */
   loadTrainedReadout?: typeof loadTrainedReadoutArtifact;
+  /**
+   * Injectable for tests; defaults to `./rewiringNull.ts#loadRewiringNull`.
+   * Without this seam, a test could never observe the `destroyed` guard on
+   * this load's own `.then` (dual review, Important) — every other loader
+   * here is injectable for exactly the same reason.
+   */
+  loadRewiringNull?: typeof loadRewiringNull;
+  /**
+   * Injectable for tests; defaults to `./nullExplanation.ts#loadNullExplanation`.
+   * Same seam-for-testability reasoning as `loadRewiringNull` above.
+   */
+  loadNullExplanation?: typeof loadNullExplanation;
   /** Passed straight through to the constructed `ExperimentRunner` (see `ExperimentRunnerOptions.targetTickIntervalMs`); `0` disables real-time pacing entirely, which unit tests use to run a many-tick determinism check without waiting out real seconds. Omitted in production, matching the runner's own real-time default. */
   targetTickIntervalMs?: number;
 }
@@ -131,6 +168,49 @@ const graphBinarySha256ForMode = (manifest: ArenaManifest, mode: GraphMode): str
  * `topologySwitchChains`, unrelated to the decoder/topology invariant) —
  * only the read used to decide whether a decoder switch may start.
  */
+/**
+ * Shared "load a sidecar artifact, then dispatch it to a host callback"
+ * pipeline for `initialize()`'s `nullLoad`/explanation forks below
+ * (thermo-maintainability review I2). Both forks used to hand-roll the same
+ * four steps — wrap the injectable loader in `Promise.resolve().then(...)`
+ * so a synchronously-throwing test double is still caught, map any thrown
+ * error to a resolved `'unavailable'` result, dispatch to a host callback
+ * once `isDestroyed()` is re-checked, and route a throwing host callback to
+ * `onError` instead of an unhandled rejection — and had already drifted:
+ * the explanation fork alone grew an extra pre-guard skipping the fetch
+ * itself when already destroyed, which a prior review flagged as
+ * "goes beyond the round-1 ask" and untested. Using one helper for both
+ * forks makes that a single decision instead of two call sites that can
+ * silently disagree, in favor of the simpler, already-tested shape (never
+ * skip the fetch itself; only gate the dispatch/onError step).
+ *
+ * Returns the settled result promise (never rejects) so a caller can also
+ * use it as a sequencing gate for a second, dependent sidecar load, the way
+ * the explanation fork below needs to wait for `nullLoad` to settle without
+ * chaining directly onto its `onRewiringNull` dispatch (round-2 dual
+ * review, Important — see the call site's own comment for the isolation bug
+ * that chaining onto the dispatch step caused).
+ */
+function runSidecarLoad<T>(
+  load: () => Promise<T>,
+  onUnexpectedError: (reason: string) => T,
+  isDestroyed: () => boolean,
+  dispatch: (result: T) => void,
+  onError: (message: string) => void
+): Promise<T> {
+  const result = Promise.resolve()
+    .then(load)
+    .catch((error: unknown) => onUnexpectedError(error instanceof Error ? error.message : String(error)));
+  void result
+    .then((value) => {
+      if (!isDestroyed()) dispatch(value);
+    })
+    .catch((error: unknown) => {
+      if (!isDestroyed()) onError(error instanceof Error ? error.message : String(error));
+    });
+  return result;
+}
+
 class DecoderSwitch {
   private inFlight = false;
 
@@ -295,6 +375,8 @@ export class ExperimentController {
   async initialize(): Promise<void> {
     const load = this.options.loadArtifacts ?? loadArenaArtifacts;
     const loadReadout = this.options.loadTrainedReadout ?? loadTrainedReadoutArtifact;
+    const loadNull = this.options.loadRewiringNull ?? loadRewiringNull;
+    const loadExplanation = this.options.loadNullExplanation ?? loadNullExplanation;
     const dataBaseUrl = `${import.meta.env.BASE_URL}data`;
     let artifacts: LoadedArenaArtifacts;
     try {
@@ -311,6 +393,77 @@ export class ExperimentController {
     this.biologicalGraphBuffer = artifacts.biological;
     this.rewiredGraphBuffer = artifacts.rewired;
     this.options.callbacks.onManifest(artifacts.manifest, artifacts.parsedBiological);
+
+    // WP4: fire-and-forget, deliberately not awaited here (unlike the
+    // trained-readout load just below) — "loading must not block Start"
+    // means this must not sit in this method's own `await` chain ahead of
+    // Worker construction. `runSidecarLoad` (module-level helper above)
+    // owns the leading-`.catch`/trailing-`.catch` wrapping both forks need:
+    // the leading one enforces `loadRewiringNull`'s own "never throws"
+    // contract at this call site too (dual review, Important — mirrors
+    // `App.svelte`'s own `onManifest` handler, which added the equivalent
+    // `.catch` around `loadPositions` for the same reason), so an unexpected
+    // throw anywhere in the loader's chain can never leave
+    // `rewiringNullStatus` `undefined` forever (the ledger row stuck on
+    // "Loading…") or become an unhandled rejection; the trailing one guards
+    // the *callback* instead — `onRewiringNull` is host code (`App.svelte`),
+    // and a throw there is routed to `onError` rather than becoming an
+    // unhandled rejection.
+    //
+    // `runSidecarLoad` returns the settled result promise (never rejects —
+    // `loadNull` failures are converted to a resolved `'unavailable'` status
+    // right here) so the explanation fork below can fork off *this same
+    // settled promise* independently, rather than chaining onto this fork's
+    // own dispatch step. That independence matters (round-2 dual review,
+    // Important): an earlier version chained the null-explanation load
+    // directly after the `onRewiringNull(result)` callback call, so a
+    // throwing `onRewiringNull` host callback (host code, e.g. `App.svelte`)
+    // silently skipped the null-explanation load too, contradicting this
+    // method's own "attempted unconditionally" comment below. Forking both
+    // chains off the same settled `nullLoad` promise instead means the two
+    // host callbacks (`onRewiringNull`, `onNullExplanation`) can never take
+    // each other down.
+    const nullLoad = runSidecarLoad<RewiringNullLoadResult>(
+      () => loadNull(artifacts.manifest, dataBaseUrl),
+      // `'unavailable'`, not `'invalid'` (thermo review, Suggestion): this
+      // is a genuine runtime/JS error — a throw somewhere in the loader's
+      // chain, not a hash/shape/cross-check failure — so it must not be
+      // described to a visitor as "failed verification" (`LedgerPanel.svelte`).
+      (reason) => ({ status: 'unavailable', reason: `unexpected error while loading the rewiring null: ${reason}` }),
+      () => this.destroyed,
+      (result) => this.options.callbacks.onRewiringNull(result),
+      (message) => this.options.callbacks.onError(message)
+    );
+
+    // WP4 of `.agents/plans/null-explanation` (`04-ledger-note.md`): "Load
+    // after the null result" — sequenced after `nullLoad` *settles* (so it
+    // never races ahead of the null histogram's own load and never issues a
+    // duplicate fetch for the rewiring-null artifact), by making `nullLoad`
+    // itself part of this fork's own `load` thunk rather than chaining onto
+    // the `onRewiringNull` dispatch above (see `nullLoad`'s own comment for
+    // why). `loadExplanation` only needs `manifest`/`dataBaseUrl` (its own
+    // cross-check re-reads `manifest.rewiringNull.sha256` directly, not the
+    // resolved `RewiringNullLoadResult`), so it is attempted here
+    // unconditionally, independent of whichever status the null load itself
+    // resolved to — and independent of whether `onRewiringNull` throws.
+    // `runSidecarLoad` never pre-guards the fetch itself on `this.destroyed`
+    // (only the dispatch/onError step) — an earlier version of this fork
+    // alone added such a pre-guard, which a prior review flagged as
+    // untested and beyond what was asked; using the same shared helper as
+    // `nullLoad` above keeps both forks' `destroyed` handling identical by
+    // construction instead of two call sites that can silently disagree.
+    void runSidecarLoad<NullExplanationLoadResult>(
+      () => nullLoad.then(() => loadExplanation(artifacts.manifest, dataBaseUrl)),
+      // `'unavailable'`, not `'invalid'` (mirrors `nullLoad`'s own mapping
+      // above, and `NullExplanationLoadResult`'s doc comment): a genuine
+      // runtime/JS error is not a verification failure, and
+      // `LedgerPanel.svelte` renders `'invalid'` as "Explanation failed
+      // verification".
+      (reason) => ({ status: 'unavailable', reason: `unexpected error while loading the null explanation: ${reason}` }),
+      () => this.destroyed,
+      (result) => this.options.callbacks.onNullExplanation(result),
+      (message) => this.options.callbacks.onError(message)
+    );
 
     // Trained-readout artifact: optional relative to the required arena
     // graph artifacts above — `loadTrainedReadoutArtifact` never throws, and

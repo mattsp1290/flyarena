@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import ActivityPanel from '../../src/lib/ui/ActivityPanel.svelte';
 import type { PositionsArtifact, PositionsLoadResult } from '../../src/lib/experiment/assets';
 import type { ExperimentRunner } from '../../src/lib/experiment/runner';
+import { buildActivitySceneMockModule, type MockActivitySceneInstance } from '../helpers/mock-activity-scene';
 
 /**
  * A dedicated file (not folded into `activity-panel.test.ts`) because the
@@ -21,19 +22,6 @@ import type { ExperimentRunner } from '../../src/lib/experiment/runner';
  * file exists specifically to close that gap.
  */
 
-interface MockActivitySceneOptions {
-  onContextLost?: (info: { reason: string }) => void;
-}
-
-interface MockActivitySceneInstance {
-  options: MockActivitySceneOptions;
-  update: ReturnType<typeof vi.fn>;
-  clear: ReturnType<typeof vi.fn>;
-  dispose: ReturnType<typeof vi.fn>;
-  render: ReturnType<typeof vi.fn>;
-  setReducedMotion: ReturnType<typeof vi.fn>;
-}
-
 const instances: MockActivitySceneInstance[] = [];
 
 let importGateResolve: (() => void) | undefined;
@@ -41,26 +29,12 @@ const importGate = new Promise<void>((resolve) => {
   importGateResolve = resolve;
 });
 
-vi.mock('../../src/lib/render/ActivityScene', async () => {
-  // Held pending until the test calls `releaseImport()` below — this is
-  // what makes the "suspended at `await import(...)`" window in
-  // `ActivityPanel.svelte#expand()` actually reachable under test.
-  await importGate;
-  class ActivitySceneUnavailableError extends Error {}
-  class ActivityScene {
-    options: MockActivitySceneOptions;
-    update = vi.fn();
-    clear = vi.fn();
-    dispose = vi.fn();
-    render = vi.fn();
-    setReducedMotion = vi.fn();
-    constructor(options: MockActivitySceneOptions) {
-      this.options = options;
-      instances.push(this);
-    }
-  }
-  return { ActivityScene, ActivitySceneUnavailableError };
-});
+// Thermo-maintainability review S4: the mock `ActivityScene` class itself
+// now lives in one shared place (`tests/helpers/mock-activity-scene.ts`),
+// used here and by `activity-panel.test.ts` — previously hand-duplicated in
+// both files. `importGate` (this file's own reason for existing — see the
+// doc comment above) is passed through as the shared helper's `gate`.
+vi.mock('../../src/lib/render/ActivityScene', () => buildActivitySceneMockModule(instances, importGate));
 
 const releaseImport = (): void => importGateResolve?.();
 

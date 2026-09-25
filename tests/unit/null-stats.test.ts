@@ -5,7 +5,9 @@ import {
   buildHistogram,
   graphStats,
   nullSummary,
-  rankStatistics
+  percentileResolution,
+  rankStatistics,
+  trainerSeedSpread
 } from '../../scripts/null/null-stats';
 
 /**
@@ -169,5 +171,68 @@ describe('buildHistogram', () => {
 
   it('throws on a descending range', () => {
     expect(() => buildHistogram([1, 2], 5, [10, 0])).toThrow(/not a valid ascending range/);
+  });
+});
+
+/**
+ * `.agents/plans/rewiring-null/03-trained-sample.md`'s WP3 trained-section
+ * coverage: `rankStatistics` at the trained section's real n=20 (same tie
+ * rule as the authored null's n=500 -- no separate code path), plus the two
+ * WP3-only helpers this section adds (`percentileResolution`,
+ * `trainerSeedSpread`).
+ */
+describe('rankStatistics at n=20 (trained section)', () => {
+  it('computes the same tie rule at n=20 as at n=5', () => {
+    // 20 rewired trained scores, biological (trainer seed 101) tied with
+    // exactly one of them.
+    const nullValues = Array.from({ length: 20 }, (_, i) => i); // 0..19
+    const result = rankStatistics(nullValues, 7);
+    expect(result.kBelow).toBe(7); // 0..6
+    expect(result.kEqual).toBe(1); // 7
+    expect(result.bioPercentile).toBeCloseTo((7 + 0.5) / 20, 12);
+    expect(result.pLow).toBeCloseTo((7 + 1 + 1) / 21, 12);
+    expect(result.pHigh).toBeCloseTo((20 - 7 + 1) / 21, 12);
+  });
+
+  it('biological below every rewired trained score', () => {
+    const nullValues = Array.from({ length: 20 }, (_, i) => i + 100);
+    const result = rankStatistics(nullValues, 1);
+    expect(result.kBelow).toBe(0);
+    expect(result.kEqual).toBe(0);
+    expect(result.bioPercentile).toBe(0);
+  });
+});
+
+describe('percentileResolution', () => {
+  it('is 1/n -- 5% at the trained section\'s n=20', () => {
+    expect(percentileResolution(20)).toBeCloseTo(0.05, 12);
+  });
+
+  it('is 0.2% at the authored null\'s n=500', () => {
+    expect(percentileResolution(500)).toBeCloseTo(0.002, 12);
+  });
+
+  it('throws on a non-positive or non-integer n', () => {
+    expect(() => percentileResolution(0)).toThrow(/positive integer/);
+    expect(() => percentileResolution(-1)).toThrow(/positive integer/);
+    expect(() => percentileResolution(1.5)).toThrow(/positive integer/);
+  });
+});
+
+describe('trainerSeedSpread', () => {
+  it('computes min/max/range across the three biological trainer-seed scores', () => {
+    const spread = trainerSeedSpread([62.9627, 72.2304, 62.742]);
+    expect(spread.min).toBeCloseTo(62.742, 10);
+    expect(spread.max).toBeCloseTo(72.2304, 10);
+    expect(spread.range).toBeCloseTo(72.2304 - 62.742, 10);
+  });
+
+  it('a single value has zero range', () => {
+    const spread = trainerSeedSpread([42]);
+    expect(spread).toEqual({ min: 42, max: 42, range: 0 });
+  });
+
+  it('throws on an empty array', () => {
+    expect(() => trainerSeedSpread([])).toThrow(/at least one value/);
   });
 });

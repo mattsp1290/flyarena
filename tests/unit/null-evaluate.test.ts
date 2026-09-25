@@ -13,8 +13,14 @@ import { fileURLToPath } from 'node:url';
 import { encodeGraphBinary } from '../../src/lib/connectome/format';
 import { createTraceGraph } from '../fixtures/trace-graph';
 import { createFixtureRewiredTraceGraph } from '../fixtures/trace-graph-rewire';
-import { parseNullEvaluateArgs, readRewireIndex, runShardedEvaluation } from '../../scripts/null/null-evaluate';
-import type { NullWorkerTask } from '../../scripts/null/null-worker';
+import {
+  buildTasks,
+  parseNullEvaluateArgs,
+  readRewireIndex,
+  runNullEvaluate,
+  runShardedEvaluation
+} from '../../scripts/null/null-evaluate';
+import type { NullSeedResult, NullWorkerMessage, NullWorkerTask } from '../../scripts/null/null-worker';
 
 /**
  * Coverage for `scripts/null/null-evaluate.ts`. Two halves:
@@ -41,6 +47,50 @@ describe('parseNullEvaluateArgs', () => {
     expect(args.shards).toBe(18);
     expect(args.rewiredIndex).toBe(resolve(process.cwd(), 'i.json'));
     expect(args.graphsDir).toBe(resolve(process.cwd(), 'g'));
+    expect(args.decoder).toBe('authored');
+    expect(args.rewiredSeeds).toBeUndefined();
+  });
+
+  it('parses --decoder for each accepted variant', () => {
+    for (const decoder of ['authored', 'authored-flip-thrust', 'authored-flip-yaw', 'authored-flip-both'] as const) {
+      const args = parseNullEvaluateArgs(['--rewired-index', 'i.json', '--graphs-dir', 'g', '--decoder', decoder]);
+      expect(args.decoder).toBe(decoder);
+    }
+  });
+
+  it('rejects an unknown --decoder value', () => {
+    // 'trained'/'silenced'/'parked' are real EpisodeDecoderKind values --
+    // just never valid for null-evaluate.ts, which always drives the left
+    // agent through the authored family against a parked opponent.
+    for (const bogus of ['trained', 'silenced', 'parked', 'authored-flip-brake', '']) {
+      expect(() =>
+        parseNullEvaluateArgs(['--rewired-index', 'i.json', '--graphs-dir', 'g', '--decoder', bogus])
+      ).toThrow(/--decoder must be one of/);
+    }
+  });
+
+  it('parses --rewired-seeds START:END', () => {
+    const args = parseNullEvaluateArgs([
+      '--rewired-index',
+      'i.json',
+      '--graphs-dir',
+      'g',
+      '--rewired-seeds',
+      '0:5'
+    ]);
+    expect(args.rewiredSeeds).toEqual({ start: 0, end: 5 });
+  });
+
+  it('rejects a malformed --rewired-seeds value', () => {
+    expect(() =>
+      parseNullEvaluateArgs(['--rewired-index', 'i.json', '--graphs-dir', 'g', '--rewired-seeds', '5'])
+    ).toThrow(/--rewired-seeds must be START:END/);
+  });
+
+  it('rejects --rewired-seeds with end <= start', () => {
+    expect(() =>
+      parseNullEvaluateArgs(['--rewired-index', 'i.json', '--graphs-dir', 'g', '--rewired-seeds', '5:5'])
+    ).toThrow(/end must be greater than start/);
   });
 
   it('throws without --rewired-index', () => {
@@ -210,6 +260,49 @@ describe('null-evaluate CLI: shard determinism (trace-graph fixture)', () => {
     }
   });
 
+  it('--rewired-seeds 0:2 evaluates only those seeds end-to-end (buildTasks and assembleRaw agree)', () => {
+    // Regression test: an earlier version filtered buildTasks's task list by
+    // --rewired-seeds but assembleRaw still iterated the full, unfiltered
+    // index when reassembling output, throwing "missing results for
+    // rewired-2" (the first seed outside the requested range) instead of
+    // producing a 2-seed authored.json.
+    const out = join(root, 'authored-rewired-seeds-0-2.json');
+    const result = spawnSync(
+      process.execPath,
+      [
+        '--import',
+        'tsx',
+        'scripts/null/null-evaluate.ts',
+        '--biological',
+        '--graph',
+        bioGzipPath,
+        '--rewired-index',
+        indexPath,
+        '--graphs-dir',
+        graphsDir,
+        '--held-out-start',
+        String(HELD_OUT_START),
+        '--held-out-count',
+        String(HELD_OUT_COUNT),
+        '--ticks',
+        String(TICKS),
+        '--shards',
+        '2',
+        '--rewired-seeds',
+        '0:2',
+        '--decoder',
+        'authored',
+        '--out',
+        out
+      ],
+      { encoding: 'utf8', timeout: 60_000 }
+    );
+    expect(result.status, result.stderr).toBe(0);
+    const parsed = JSON.parse(readFileSync(out, 'utf8'));
+    expect(parsed.decoder).toBe('authored');
+    expect(parsed.rewired.map((r: { seed: number }) => r.seed)).toEqual([0, 1]);
+  });
+
   it('rejects a rewired file whose bytes do not match index.json', () => {
     const tamperedDir = join(root, 'graphs-tampered');
     mkdirSync(tamperedDir, { recursive: true });
@@ -335,6 +428,118 @@ describe('readRewireIndex: duplicate/malformed seed rejection', () => {
   });
 });
 
+describe('buildTasks: --decoder propagation and --rewired-seeds filtering', () => {
+  const indexFor = (seeds: readonly number[]) => ({
+    sourceArtifact: 'src.bin.gz',
+    sourceSha256: 'c'.repeat(64),
+    rewireSourceSha256: 'd'.repeat(64),
+    seeds: seeds.map((seed) => ({
+      seed,
+      artifact: `rewired-${seed}.bin.gz`,
+      binarySha256: `${seed}`.padStart(64, '0'),
+      binaryBytes: 1,
+      gzipSha256: `${seed}`.padStart(64, '0'),
+      gzipBytes: 1,
+      stats: { acceptedSwaps: 1, attempts: 1 }
+    }))
+  });
+
+  const baseArgs = () => ({
+    biological: true,
+    graph: undefined,
+    rewiredIndex: 'unused',
+    graphsDir: 'unused',
+    heldOutStart: 30001,
+    heldOutCount: 2,
+    ticks: 20,
+    shards: 1,
+    out: 'unused.json',
+    decoder: 'authored' as const,
+    rewiredSeeds: undefined as { start: number; end: number } | undefined
+  });
+
+  it('--rewired-seeds 0:2 evaluates only seeds 0 and 1', () => {
+    const index = indexFor([0, 1, 2, 3, 4]);
+    const args = { ...baseArgs(), rewiredSeeds: { start: 0, end: 2 } };
+    const tasks = buildTasks(index, args, 'bio.bin.gz');
+    const rewiredGraphIds = tasks.filter((t) => t.mode === 'rewired').map((t) => t.graphId);
+    expect(rewiredGraphIds).toEqual(['rewired-0', 'rewired-1']);
+  });
+
+  it('omitting --rewired-seeds evaluates every seed in the index', () => {
+    const index = indexFor([0, 1, 2]);
+    const tasks = buildTasks(index, baseArgs(), 'bio.bin.gz');
+    const rewiredGraphIds = tasks.filter((t) => t.mode === 'rewired').map((t) => t.graphId);
+    expect(rewiredGraphIds).toEqual(['rewired-0', 'rewired-1', 'rewired-2']);
+  });
+
+  it('every task (biological, disconnected, and each rewired seed) carries the requested decoder', () => {
+    const index = indexFor([0, 1]);
+    const args = { ...baseArgs(), decoder: 'authored-flip-both' as const };
+    const tasks = buildTasks(index, args, 'bio.bin.gz');
+    expect(tasks.length).toBeGreaterThan(0);
+    for (const task of tasks) expect(task.decoder).toBe('authored-flip-both');
+  });
+
+  it('throws when --rewired-seeds matches no seeds in the index (regression: used to silently produce an empty rewired list)', () => {
+    const index = indexFor([0, 1, 2]);
+    const args = { ...baseArgs(), rewiredSeeds: { start: 10, end: 12 } };
+    expect(() => buildTasks(index, args, 'bio.bin.gz')).toThrow(/missing 2: 10, 11/);
+  });
+
+  it('throws when --rewired-seeds only partially matches the index (regression: used to silently score fewer seeds than requested)', () => {
+    const index = indexFor([0, 1, 2]); // seed 3 is absent
+    const args = { ...baseArgs(), rewiredSeeds: { start: 1, end: 4 } };
+    expect(() => buildTasks(index, args, 'bio.bin.gz')).toThrow(/requested 3 seed\(s\).*missing 1: 3/s);
+  });
+});
+
+describe('runNullEvaluate: refuses to overwrite the canonical default --out with a non-canonical run', () => {
+  // Regression test for a dual-review finding: the plan's own reproduction-
+  // gate example command (`--rewired-seeds 0:5 --decoder authored`, no
+  // --out) would otherwise silently overwrite the canonical, hours-long
+  // full-index run at the default --out path. The guard must fire before
+  // any file is read (readRewireIndex would throw on the bogus paths below
+  // first if it ran), so a non-matching error message here would mean the
+  // guard isn't actually first.
+  const nonCanonicalArgsWithDefaultOut = (overrides: Partial<Parameters<typeof runNullEvaluate>[0]>) => ({
+    biological: true,
+    graph: undefined,
+    rewiredIndex: '/nonexistent/index.json',
+    graphsDir: '/nonexistent/graphs',
+    heldOutStart: 30001,
+    heldOutCount: 100,
+    ticks: 1800,
+    shards: 1,
+    out: resolve(process.cwd(), 'training/runs/null/authored.json'),
+    decoder: 'authored' as const,
+    rewiredSeeds: undefined as { start: number; end: number } | undefined,
+    ...overrides
+  });
+
+  it('throws for a non-authored decoder writing to the default --out', async () => {
+    await expect(
+      runNullEvaluate(nonCanonicalArgsWithDefaultOut({ decoder: 'authored-flip-both' }))
+    ).rejects.toThrow(/refusing to write a non-canonical run/);
+  });
+
+  it("throws for the reproduction gate's own --rewired-seeds-restricted authored run writing to the default --out", async () => {
+    await expect(
+      runNullEvaluate(nonCanonicalArgsWithDefaultOut({ rewiredSeeds: { start: 0, end: 5 } }))
+    ).rejects.toThrow(/refusing to write a non-canonical run/);
+  });
+
+  it('does not throw this guard for a canonical (authored, unfiltered) run at the default --out (fails later, on the nonexistent index instead)', async () => {
+    // Proves the guard is scoped correctly: a plain authored run targeting
+    // the default --out is legitimate and must not be blocked by this
+    // check. It still fails -- just for an unrelated, expected reason (the
+    // fixture's rewiredIndex path does not exist).
+    await expect(runNullEvaluate(nonCanonicalArgsWithDefaultOut({}))).rejects.not.toThrow(
+      /refusing to write a non-canonical run/
+    );
+  });
+});
+
 describe('runShardedEvaluation: failure/abort paths (stub worker)', () => {
   const stubWorkerPath = resolve(dirname(fileURLToPath(import.meta.url)), '../fixtures/null-stub-worker.mjs');
 
@@ -352,7 +557,11 @@ describe('runShardedEvaluation: failure/abort paths (stub worker)', () => {
   it('collects every result regardless of which shard finishes which task first', async () => {
     // Reverse-order completion: task 0 is slowest, task 4 is fastest.
     const tasks = [0, 1, 2, 3, 4].map((i) => task(`t${i}`, (5 - i) * 15));
-    const results = await runShardedEvaluation(tasks, 5, stubWorkerPath);
+    const results = await runShardedEvaluation<NullWorkerTask, NullSeedResult, NullWorkerMessage>(
+      tasks,
+      5,
+      stubWorkerPath
+    );
     expect([...results.keys()].sort()).toEqual(['t0', 't1', 't2', 't3', 't4']);
   });
 
@@ -377,13 +586,17 @@ describe('runShardedEvaluation: failure/abort paths (stub worker)', () => {
     const tasks = [task('err'), ...Array.from({ length: remainingTaskCount }, (_, i) => task(`t${i}`, delayMs))];
     const regressionFloorMs = (remainingTaskCount / 2) * delayMs; // 3600ms
     const started = Date.now();
-    await expect(runShardedEvaluation(tasks, 2, stubWorkerPath)).rejects.toThrow(/stub-induced failure/);
+    await expect(
+      runShardedEvaluation<NullWorkerTask, NullSeedResult, NullWorkerMessage>(tasks, 2, stubWorkerPath)
+    ).rejects.toThrow(/stub-induced failure/);
     const elapsedMs = Date.now() - started;
     expect(elapsedMs).toBeLessThan(regressionFloorMs / 2); // generous 1800ms bound, still well below the 3600ms floor
   });
 
   it('a worker killed by a signal is reported as a failure, not treated as a clean exit', async () => {
     const tasks = [task('kill'), task('t1', 50), task('t2', 50)];
-    await expect(runShardedEvaluation(tasks, 3, stubWorkerPath)).rejects.toThrow(/exited unexpectedly/);
+    await expect(
+      runShardedEvaluation<NullWorkerTask, NullSeedResult, NullWorkerMessage>(tasks, 3, stubWorkerPath)
+    ).rejects.toThrow(/exited unexpectedly/);
   });
 });

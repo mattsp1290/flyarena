@@ -171,6 +171,37 @@ export interface ArenaManifest {
   outputPopulationCount: number;
   /** WP1's soma-position sidecar entry; see `PositionsManifestEntry`. */
   positions?: PositionsManifestEntry;
+  /**
+   * The single-neuron lesion atlas's manifest entry
+   * (`.agents/plans/lesion-atlas/02-atlas-computation.md`,
+   * `public/data/lesion-atlas-v1.json`) — `experiment/lesionAtlas.ts#loadLesionAtlas`
+   * fetches and sha256-verifies this. Optional: a manifest produced before
+   * that WP (or a hand-built test fixture) simply has no lesion-effect color
+   * mode to offer — `loadLesionAtlas` reports that as `status: 'missing'`
+   * rather than throwing, and `ActivityPanel.svelte` disables the mode with
+   * an honest reason instead of pretending it exists.
+   */
+  lesionAtlas?: SidecarManifestEntry;
+  /**
+   * WP4's rewiring-null-distribution ledger entry: `null-report.ts`
+   * (`.agents/plans/rewiring-null/02-authored-null-evaluation.md`) writes
+   * this once `rewiring-null-v1.json` exists. Optional: a manifest produced
+   * before that WP (or a hand-built test fixture) simply has no null
+   * distribution to show — `loadRewiringNull` below reports that as
+   * `status: 'missing'` rather than throwing.
+   */
+  rewiringNull?: { artifact: string; sha256: string };
+  /**
+   * WP4 of `.agents/plans/null-explanation`: the ledger's null-result
+   * explanation note. `scripts/analysis/explain.py` writes this once
+   * `null-explanation-v1.json` exists — see `./nullExplanation.ts#loadNullExplanation`.
+   * Optional: a manifest produced before that WP (or a hand-built test
+   * fixture) simply has no explanation note to show — `loadNullExplanation`
+   * reports that as `status: 'missing'` rather than throwing, and
+   * `LedgerPanel.svelte` simply omits the paragraph rather than pretending
+   * it exists.
+   */
+  nullExplanation?: SidecarManifestEntry;
   sourceDataset: string;
   rewiredArms: Record<
     string,
@@ -216,6 +247,70 @@ export const fetchArrayBuffer = async (url: string): Promise<ArrayBuffer> => {
   const response = await fetch(url);
   if (!response.ok) throw new Error(`Failed to fetch ${url}: ${response.status} ${response.statusText}`);
   return response.arrayBuffer();
+};
+
+/** The shape every optional "sidecar" artifact's manifest entry shares (`PositionsManifestEntry`, `ArenaManifest.rewiringNull`): a filename plus the sha256 the fetched bytes must match. */
+export interface SidecarManifestEntry {
+  artifact: string;
+  sha256: string;
+}
+
+/**
+ * One step short of a caller-specific `status`: names exactly which step
+ * failed, so `loadPositions`, `loadRewiringNull` (`./rewiringNull.ts`), and
+ * `loadLesionAtlas` (`./lesionAtlas.ts`) can each map these onto their own
+ * vocabulary — e.g. `loadPositions` folds `'no-entry'`/`'fetch-error'` into
+ * `'missing'`, `loadRewiringNull` keeps them apart as `'absent'`/`'unavailable'`,
+ * and `loadLesionAtlas` maps `'no-entry'` to `'missing'` but `'fetch-error'`
+ * to its own `'unavailable'` (a fetch/network failure is not the same claim
+ * as "verification failed", and — unlike a `'missing'` manifest entry — is
+ * retryable).
+ */
+export type SidecarFetchResult =
+  | { status: 'ok'; parsed: unknown }
+  | { status: 'no-entry' }
+  | { status: 'fetch-error'; reason: string }
+  | { status: 'hash-mismatch'; reason: string }
+  | { status: 'parse-error'; reason: string };
+
+/**
+ * Fetch→sha256-verify→JSON.parse for an optional sidecar artifact named by
+ * `entry` (hash-verified before anything is parsed) — the skeleton
+ * `loadPositions`, `loadRewiringNull`, and `loadLesionAtlas` all need,
+ * extracted here so none hand-rolls its own copy (thermo-maintainability
+ * review, Important). `label` is folded into every failure reason (e.g.
+ * `"positions artifact"`) so callers' messages read the same as before.
+ */
+export const fetchAndVerifySidecarJson = async (
+  entry: Readonly<SidecarManifestEntry> | undefined,
+  dataBaseUrl: string,
+  label: string
+): Promise<SidecarFetchResult> => {
+  if (!entry) return { status: 'no-entry' };
+
+  let rawBytes: ArrayBuffer;
+  try {
+    rawBytes = await fetchArrayBuffer(`${dataBaseUrl}/${entry.artifact}`);
+  } catch (error) {
+    return { status: 'fetch-error', reason: error instanceof Error ? error.message : String(error) };
+  }
+
+  const rawHash = await sha256Hex(rawBytes);
+  if (rawHash !== entry.sha256) {
+    return {
+      status: 'hash-mismatch',
+      reason: `${label} sha256 ${rawHash} does not match the manifest (${entry.sha256})`
+    };
+  }
+
+  try {
+    return { status: 'ok', parsed: JSON.parse(new TextDecoder().decode(rawBytes)) };
+  } catch (error) {
+    return {
+      status: 'parse-error',
+      reason: `${label} is not valid JSON: ${error instanceof Error ? error.message : String(error)}`
+    };
+  }
 };
 
 export interface LoadedArenaArtifacts {
@@ -396,35 +491,21 @@ export const loadPositions = async (
   dataBaseUrl: string,
   biologicalGraph: ConnectomeGraph
 ): Promise<PositionsLoadResult> => {
-  const entry = manifest.positions;
-  if (!entry) {
+  // `fetchAndVerifySidecarJson` (above) owns the shared
+  // fetch→sha256-verify→JSON.parse skeleton this used to hand-roll; only the
+  // status mapping below is specific to positions (`loadRewiringNull` in
+  // `./rewiringNull.ts` maps the same four outcomes to its own vocabulary).
+  const fetched = await fetchAndVerifySidecarJson(manifest.positions, dataBaseUrl, 'positions artifact');
+  if (fetched.status === 'no-entry') {
     return { status: 'missing', reason: 'The manifest has no positions artifact entry.' };
   }
-
-  let rawBytes: ArrayBuffer;
-  try {
-    rawBytes = await fetchArrayBuffer(`${dataBaseUrl}/${entry.artifact}`);
-  } catch (error) {
-    return { status: 'missing', reason: error instanceof Error ? error.message : String(error) };
+  if (fetched.status === 'fetch-error') {
+    return { status: 'missing', reason: fetched.reason };
   }
-
-  const rawHash = await sha256Hex(rawBytes);
-  if (rawHash !== entry.sha256) {
-    return {
-      status: 'invalid',
-      reason: `positions artifact sha256 ${rawHash} does not match the manifest (${entry.sha256})`
-    };
+  if (fetched.status === 'hash-mismatch' || fetched.status === 'parse-error') {
+    return { status: 'invalid', reason: fetched.reason };
   }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(new TextDecoder().decode(rawBytes));
-  } catch (error) {
-    return {
-      status: 'invalid',
-      reason: `positions artifact is not valid JSON: ${error instanceof Error ? error.message : String(error)}`
-    };
-  }
+  const parsed: unknown = fetched.parsed;
   // A hash-matched file can still be valid JSON that isn't an object at all
   // (e.g. `null`, a bare number, or an array) — dereferencing `.bodyIds`
   // below on a non-object throws instead of returning a status, breaking
@@ -508,8 +589,11 @@ export const loadPositions = async (
   // The manifest carries its own copy of the same counts (WP1's ledger
   // output) — cross-check it too, so a generator bug that updates one copy
   // and not the other is caught here rather than only showing up as two
-  // disagreeing numbers somewhere in the product.
-  if (entry.coverage && !coverageMatches(entry.coverage)) {
+  // disagreeing numbers somewhere in the product. `manifest.positions` is
+  // guaranteed defined here: `fetchAndVerifySidecarJson` only reaches
+  // `status: 'ok'` (checked above) when its `entry` argument (this same
+  // `manifest.positions`) was defined.
+  if (manifest.positions?.coverage && !coverageMatches(manifest.positions.coverage)) {
     return {
       status: 'invalid',
       reason: `manifest positions.coverage does not match the actual positionSource counts (${JSON.stringify(countedCoverage)})`
@@ -701,3 +785,4 @@ export const loadTrainedReadoutArtifact = async (dataBaseUrl = '/data'): Promise
     return { status: 'unavailable', reason: error instanceof Error ? error.message : String(error) };
   }
 };
+

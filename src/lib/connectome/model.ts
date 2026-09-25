@@ -129,6 +129,29 @@ export const aggregateOutputs = (
 };
 
 /**
+ * Read-only per-substep observer for `runSubsteps`/`runLesionedSubsteps`:
+ * called after every `stepModel` call with that substep's resulting `rate`
+ * (the same live `NeuralModelState.rate` buffer the next `stepModel` call
+ * will mutate in place -- read it synchronously within the callback, since
+ * its contents are not stable across substeps) and the exact
+ * `channelValues` that substep's `stepModel` call was driven with (the same
+ * held-constant-per-tick array both functions already take, passed through
+ * unchanged -- not copied). Optional and additive: omitting it is
+ * numerically identical to before this parameter existed -- the only cost
+ * is one `undefined` check per substep (`onSubstep?.(...)`), not a branch
+ * that changes what gets computed -- so every existing caller and every
+ * parity/golden-trace test is numerically unaffected. Added for
+ * `scripts/null/regime-task.ts`'s `runTask` (`.agents/plans/null-explanation/
+ * 02-transfer-and-features.md`'s WP2 regime check), which needs both the
+ * per-substep rate (for the `±rateMax` clamp-fraction metric) and that
+ * tick's input (to compare against the graph's precomputed steady-state
+ * response) -- a rate-only callback cannot compute the latter, since the
+ * input a given substep was driven with is otherwise only visible to
+ * `stepModel`'s own caller.
+ */
+export type SubstepObserver = (rate: Float32Array, channelValues: ArrayLike<number>) => void;
+
+/**
  * Run `substeps` consecutive `stepModel` calls with the same held-constant
  * `channelValues`, then aggregate into `outputs`. This is the one call per
  * world tick the Worker runtime (and the in-thread oracle) actually makes;
@@ -140,10 +163,57 @@ export const runSubsteps = (
   scratch: StepScratch,
   channelValues: ArrayLike<number>,
   substeps: number,
-  outputs: Float32Array
+  outputs: Float32Array,
+  onSubstep?: SubstepObserver
 ): void => {
   for (let step = 0; step < substeps; step += 1) {
     stepModel(graph, state, scratch, channelValues);
+    onSubstep?.(state.rate, channelValues);
+  }
+  aggregateOutputs(graph, state, outputs);
+};
+
+/**
+ * Run `substeps` consecutive `stepModel` calls with the same held-constant
+ * `channelValues`, zeroing every neuron rate at the indices in `lesion`
+ * before the loop and again after every substep -- clearing whatever state a
+ * lesioned neuron carried over from the previous call, so a fresh `stepModel`
+ * scatter never propagates it -- then aggregate into `outputs`, exactly as
+ * `runSubsteps` does for the unlesioned case. Shared by the authoritative
+ * episode runner (`scripts/training/episode.ts`) and the counterfactual
+ * workbench (`stepBranch`, `src/lib/counterfactual/engine.ts`) so their
+ * lesion semantics can never drift apart, per this module's own "same
+ * functions back both" principle above. `lesion` may be empty
+ * (`ArrayLike<number>` of length 0), in which case the zeroing loops are
+ * no-ops and this function is numerically identical to `runSubsteps`. Like
+ * every other function in this module, this allocates nothing per call --
+ * `lesion`, `channelValues`, and `outputs` are all caller-owned and reused.
+ *
+ * Takes the same optional trailing `onSubstep` observer as `runSubsteps`
+ * (see `SubstepObserver`'s doc comment), called after each `stepModel` call
+ * *and* after that substep's post-`stepModel` lesion zeroing -- so, like
+ * `runSubsteps`, what the observer sees is exactly this function's own
+ * live `state.rate`, the same buffer `aggregateOutputs` will read from at
+ * the end of the loop. `episode.ts`'s authored decoder family always calls
+ * this function (never `runSubsteps` directly, even with an empty lesion;
+ * see `createNeuralRunner`), so a per-substep hook usable from the authored
+ * path has to live here too, not only on `runSubsteps`.
+ */
+export const runLesionedSubsteps = (
+  graph: Readonly<ConnectomeGraph>,
+  state: NeuralModelState,
+  scratch: StepScratch,
+  channelValues: ArrayLike<number>,
+  lesion: ArrayLike<number>,
+  substeps: number,
+  outputs: Float32Array,
+  onSubstep?: SubstepObserver
+): void => {
+  for (let i = 0; i < lesion.length; i += 1) state.rate[lesion[i]] = 0;
+  for (let step = 0; step < substeps; step += 1) {
+    stepModel(graph, state, scratch, channelValues);
+    for (let i = 0; i < lesion.length; i += 1) state.rate[lesion[i]] = 0;
+    onSubstep?.(state.rate, channelValues);
   }
   aggregateOutputs(graph, state, outputs);
 };

@@ -21,6 +21,11 @@
     "experiment:counterfactual": "tsx scripts/experiments/counterfactual.ts",
     "null:evaluate": "tsx scripts/null/null-evaluate.ts",
     "null:report": "tsx scripts/null/null-report.ts",
+    "null:lookup-rewired-artifact": "tsx scripts/null/lookup-rewired-artifact.ts",
+    "null:regime-check": "tsx scripts/null/regime-check.ts",
+    "analysis:fixture": "tsx scripts/analysis/export-trace-graph-fixture.ts",
+    "lesion:evaluate": "tsx scripts/lesion/atlas-evaluate.ts",
+    "lesion:report": "tsx scripts/lesion/atlas-report.ts",
     "test:subpath": "playwright test --config playwright.subpath.config.ts",
     "atlas:publish": "tsx scripts/atlas/cli.ts",
     "atlas:verify": "tsx scripts/atlas/cli.ts --verify public/data/behavior-atlas-v1.json"

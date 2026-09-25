@@ -5,6 +5,7 @@ import {
   createOutputBuffer,
   createStepScratch,
   resetModelState,
+  runLesionedSubsteps,
   runSubsteps,
   stepModel
 } from '../../src/lib/connectome/model';
@@ -149,5 +150,57 @@ describe('bounded leaky rate network', () => {
 
     expect(Array.from(combinedState.rate)).toEqual(Array.from(manualState.rate));
     expect(Array.from(combinedOutputs)).toEqual(Array.from(manualOutputs));
+  });
+
+  it('runLesionedSubsteps matches a manual zero/stepModel/zero loop and actually silences the lesioned neuron', () => {
+    const graph = createTinyGraph({ leakRate: 0.1 });
+    const lesion = Int32Array.from([0]);
+
+    const manualState = createModelState(graph);
+    const manualScratch = createStepScratch(graph);
+    const manualOutputs = createOutputBuffer(graph);
+    const zeroLesion = () => {
+      for (const index of lesion) manualState.rate[index] = 0;
+    };
+    zeroLesion();
+    for (let step = 0; step < 3; step += 1) {
+      stepModel(graph, manualState, manualScratch, [0.3, 0.2]);
+      zeroLesion();
+    }
+    aggregateOutputs(graph, manualState, manualOutputs);
+
+    const combinedState = createModelState(graph);
+    const combinedScratch = createStepScratch(graph);
+    const combinedOutputs = createOutputBuffer(graph);
+    runLesionedSubsteps(graph, combinedState, combinedScratch, [0.3, 0.2], lesion, 3, combinedOutputs);
+
+    expect(Array.from(combinedState.rate)).toEqual(Array.from(manualState.rate));
+    expect(Array.from(combinedOutputs)).toEqual(Array.from(manualOutputs));
+    expect(combinedState.rate[0]).toBe(0); // lesioned neuron never accumulates
+
+    // Nontriviality: neuron 2 only receives drive from neuron 0's recurrent
+    // scatter, so silencing neuron 0 every substep must starve neuron 2 of
+    // drive entirely, unlike the unlesioned run.
+    const unlesionedState = createModelState(graph);
+    runSubsteps(graph, unlesionedState, createStepScratch(graph), [0.3, 0.2], 3, createOutputBuffer(graph));
+    expect(combinedState.rate[2]).toBe(0);
+    expect(unlesionedState.rate[2]).not.toBe(0);
+  });
+
+  it('runLesionedSubsteps with an empty lesion is numerically identical to runSubsteps', () => {
+    const graph = createTinyGraph({ leakRate: 0.1 });
+
+    const lesionedState = createModelState(graph);
+    const lesionedScratch = createStepScratch(graph);
+    const lesionedOutputs = createOutputBuffer(graph);
+    runLesionedSubsteps(graph, lesionedState, lesionedScratch, [0.3, 0.2], new Int32Array(0), 3, lesionedOutputs);
+
+    const plainState = createModelState(graph);
+    const plainScratch = createStepScratch(graph);
+    const plainOutputs = createOutputBuffer(graph);
+    runSubsteps(graph, plainState, plainScratch, [0.3, 0.2], 3, plainOutputs);
+
+    expect(Array.from(lesionedState.rate)).toEqual(Array.from(plainState.rate));
+    expect(Array.from(lesionedOutputs)).toEqual(Array.from(plainOutputs));
   });
 });

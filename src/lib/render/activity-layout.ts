@@ -12,7 +12,7 @@
  * `xyz`/`positionSource`/`role` arrays (degree-preserving rewiring keeps the
  * node set; only connections differ), so one layout/partition serves both.
  */
-import { rateToLutIndex } from './colormap';
+import { DIVERGING_FADE_TARGET, effectToLutIndex, rateToLutIndex } from './colormap';
 import { POINT_SIZE } from './activity-constants';
 
 export type PositionSource = 'soma' | 'tosoma' | 'none';
@@ -212,4 +212,112 @@ export const writeColors = (
     out[outOffset + 1] = lut[lutIndex + 1];
     out[outOffset + 2] = lut[lutIndex + 2];
   }
+};
+
+/**
+ * Non-FDR-significant neurons are blended toward the LUT's own neutral
+ * (zero-effect) color at this weight, rather than shown at full saturation —
+ * the lesion-effect mode's honesty requirement that a merely larger point
+ * estimate must not read as more reliable than a smaller, FDR-surviving one
+ * (`docs/lesion-atlas-report.md`'s "Multiple comparisons" section). `60%`
+ * toward neutral is visually distinct from "significant, full color" without
+ * erasing the sign/magnitude entirely.
+ */
+const NON_SIGNIFICANT_BLEND = 0.6;
+
+/**
+ * Write RGB colors for `indices` from a static per-neuron `effect` array
+ * (the shipped lesion atlas's `effect`/`fdrSignificant` — see
+ * `experiment/lesionAtlas.ts#loadLesionAtlas`) into `out`, the lesion-effect
+ * color mode's counterpart to `writeColors` above. Same no-allocation,
+ * caller-owned-buffer contract; `lut` is expected to be a diverging table
+ * (`colormap.ts#DIVERGING_LUT`) but, like `writeColors`, is accepted as a
+ * parameter rather than hardcoded so this stays testable against a synthetic
+ * table.
+ *
+ * A neuron whose `emphasize[i]` is `false` (did not survive Benjamini-
+ * Hochberg FDR correction, per graph, at `q = 0.05` — see
+ * `docs/lesion-atlas-report.md`'s "Multiple comparisons" section) is blended
+ * toward `colormap.ts#DIVERGING_FADE_TARGET` — a dim, low-saturation neutral,
+ * not the LUT's own bright white zero-effect color — at `NON_SIGNIFICANT_BLEND`.
+ * Round-2 dual review (Important): blending toward the LUT's literal center
+ * (white) made a "not reliable" neuron the *highest*-contrast, most visually
+ * prominent point against the activity view's near-black canvas — exactly
+ * backwards from the intended de-emphasis, and especially severe for the
+ * biological graph (see `DIVERGING_FADE_TARGET`'s own doc comment for the
+ * concrete numbers). This blend is a real, distinct color change (not merely
+ * a labeling choice), so a larger raw effect never reads as visually
+ * "stronger" than a smaller, FDR-surviving one just because its point
+ * estimate happens to be bigger — and now also reads as genuinely
+ * de-emphasized, not merely differently-hued. This is one of two non-color-
+ * only-adjacent honesty signals for FDR significance the lesion-effect mode
+ * draws — `render/ActivityScene.ts`'s `setStaticColors` also draws a
+ * separate outline-ring marker (shape, not hue) at every non-significant
+ * neuron's position, so significance is never encoded by color/saturation
+ * alone.
+ */
+export const writeEffectColors = (
+  effect: ArrayLike<number>,
+  emphasize: ArrayLike<boolean>,
+  indices: Int32Array,
+  absMax: number,
+  lut: Float32Array,
+  out: Float32Array
+): void => {
+  const lutSteps = lut.length / 3;
+  for (let k = 0; k < indices.length; k += 1) {
+    const neuron = indices[k];
+    const lutIndex = effectToLutIndex(effect[neuron], absMax, lutSteps) * 3;
+    const outOffset = k * 3;
+    if (emphasize[neuron]) {
+      out[outOffset] = lut[lutIndex];
+      out[outOffset + 1] = lut[lutIndex + 1];
+      out[outOffset + 2] = lut[lutIndex + 2];
+    } else {
+      out[outOffset] = lut[lutIndex] * (1 - NON_SIGNIFICANT_BLEND) + DIVERGING_FADE_TARGET[0] * NON_SIGNIFICANT_BLEND;
+      out[outOffset + 1] = lut[lutIndex + 1] * (1 - NON_SIGNIFICANT_BLEND) + DIVERGING_FADE_TARGET[1] * NON_SIGNIFICANT_BLEND;
+      out[outOffset + 2] = lut[lutIndex + 2] * (1 - NON_SIGNIFICANT_BLEND) + DIVERGING_FADE_TARGET[2] * NON_SIGNIFICANT_BLEND;
+    }
+  }
+};
+
+/**
+ * Selects the positions (from `basePositions`, a shared/arm-agnostic
+ * centered/scaled `[x, y, z]` array, length `neuronCount * 3`) of every
+ * neuron whose `emphasize[i]` is `false` — the lesion-effect color mode's
+ * "not FDR-significant" outline-ring overlay (`ActivityScene.ts#paintOutline`)
+ * draws one ring at each of these positions, never at an FDR-significant
+ * one. Pure, allocation-free, and Three.js-independent — the position-
+ * selection half of what was previously inlined directly in `paintOutline`,
+ * pulled out so a reversed `emphasize` check (putting outlines on every
+ * *significant* neuron instead) is directly unit-testable without a real
+ * WebGL/jsdom canvas (thermo-maintainability review I2: `paintOutline` had
+ * zero test coverage, and every component-level test mocks `ActivityScene`
+ * wholesale, so a reversed check there would pass the entire suite).
+ *
+ * Writes into `out`, a caller-owned buffer that must be at least
+ * `neuronCount * 3` long (the worst case: every neuron is non-significant).
+ * `ActivityScene.ts` allocates that scratch buffer once per call — outside
+ * its "no allocation" per-frame hot path, since this only runs on lesion-mode
+ * entry or a topology switch while lesion mode is active — and slices it down
+ * to the returned count afterward. Positions are packed contiguously starting
+ * at offset 0, in ascending neuron-index order, matching the packing the
+ * original inline implementation produced.
+ *
+ * Returns the number of neurons written (`count`); the caller's own
+ * positions are `out.subarray(0, count * 3)`.
+ */
+export const writeOutlinePositions = (basePositions: Float32Array, emphasize: ArrayLike<boolean>, out: Float32Array): number => {
+  const neuronCount = basePositions.length / 3;
+  let writeIndex = 0;
+  for (let neuron = 0; neuron < neuronCount; neuron += 1) {
+    if (emphasize[neuron]) continue;
+    const source = neuron * 3;
+    const destination = writeIndex * 3;
+    out[destination] = basePositions[source];
+    out[destination + 1] = basePositions[source + 1];
+    out[destination + 2] = basePositions[source + 2];
+    writeIndex += 1;
+  }
+  return writeIndex;
 };

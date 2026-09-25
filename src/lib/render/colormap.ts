@@ -81,3 +81,99 @@ export const rateToLutIndex = (rate: number, min: number, max: number, lutSteps:
   const clamped = t < 0 ? 0 : t > 1 ? 1 : t;
   return Math.round(clamped * (lutSteps - 1));
 };
+
+/**
+ * Diverging colormap for the anatomical activity view's lesion-effect color
+ * mode (WP3, `.agents/plans/lesion-atlas/03-activity-lesion-mode.md`):
+ * colorblind-safe blue (negative effect) -> white (zero effect) -> vermillion
+ * (positive effect), the two endpoint hues taken from the Okabe-Ito
+ * colorblind-safe palette (`#0072B2`/`#D55E00`) rather than the red/green
+ * pair a diverging map would naively reach for. Built the same
+ * generate-once-at-module-load way as `VIRIDIS_LUT` above.
+ *
+ * This is a *sequential-looking* table read divergingly by `effectToLutIndex`
+ * below: index 0 is the most-negative effect, the entry nearest the middle is
+ * (almost exactly — see `DIVERGING_LUT_CENTER_INDEX`'s own doc comment on the
+ * one-index discretization gap an even `COLORMAP_SIZE` leaves) zero effect,
+ * and the last index is the most-positive effect — the same "caller-supplied
+ * LUT, shared clamp/index math" shape `VIRIDIS_LUT`/`rateToLutIndex` already
+ * establish for `writeColors`, so `writeEffectColors` (`activity-layout.ts`)
+ * can reuse that pattern rather than inventing a second one.
+ */
+const DIVERGING_LOW: readonly [number, number, number] = [0 / 255, 114 / 255, 178 / 255]; // Okabe-Ito blue, #0072B2
+const DIVERGING_MID: readonly [number, number, number] = [1, 1, 1]; // white: exactly zero effect
+const DIVERGING_HIGH: readonly [number, number, number] = [213 / 255, 94 / 255, 0 / 255]; // Okabe-Ito vermillion, #D55E00
+
+/**
+ * The neutral color non-FDR-significant neurons are blended toward
+ * (`activity-layout.ts#writeEffectColors`) — deliberately *not* `DIVERGING_MID`
+ * (pure white). Round-2 dual review (Important): the activity view's canvas
+ * background is near-black (`ActivityScene.ts`'s `#05070c`), so blending
+ * toward white makes an "unreliable, de-emphasized" neuron the *highest*-
+ * contrast, most visually prominent point on screen — the opposite of the
+ * intended effect. This value is itself considerably darker than
+ * `ActivityScene.ts#NO_DATA_COLOR` (a muted, not bright, grey for the same
+ * "de-emphasize, don't fabricate prominence" reason), and the two are kept
+ * distinct on purpose — "unreliable effect, still has atlas coverage" must
+ * never be visually confused with "no lesion data at all".
+ *
+ * Round-2, round-2 (a second dual review pass): because
+ * `NON_SIGNIFICANT_BLEND` is 60%, not 100% (`activity-layout.ts` keeps 40%
+ * of the neuron's own raw color on purpose — see that constant's doc
+ * comment — so a faded neuron's sign/magnitude tint is never fully erased),
+ * a neuron whose *raw* color was already near `DIVERGING_MID` (near-zero
+ * effect, common on the biological graph — see that module's own doc
+ * comment on the shared-`absMax` scale) still blends out closer to a
+ * middling grey (~0.4 + 0.6x this value, well above `NO_DATA_COLOR`) than
+ * to this constant's own dark value. That residual brightness is an honest
+ * consequence of keeping some raw-color information visible even while
+ * de-emphasized, not a bug — but it means this constant is a *ceiling* on
+ * how de-emphasized a faded point can look, not a guarantee that every
+ * faded point reads as dark.
+ */
+export const DIVERGING_FADE_TARGET: readonly [number, number, number] = [0.14, 0.15, 0.17];
+
+const buildDivergingLut = (): Float32Array => {
+  const lut = new Float32Array(COLORMAP_SIZE * 3);
+  for (let index = 0; index < COLORMAP_SIZE; index += 1) {
+    const t = index / (COLORMAP_SIZE - 1);
+    const [from, to, localT] =
+      t < 0.5 ? ([DIVERGING_LOW, DIVERGING_MID, t / 0.5] as const) : ([DIVERGING_MID, DIVERGING_HIGH, (t - 0.5) / 0.5] as const);
+    lut[index * 3] = from[0] + (to[0] - from[0]) * localT;
+    lut[index * 3 + 1] = from[1] + (to[1] - from[1]) * localT;
+    lut[index * 3 + 2] = from[2] + (to[2] - from[2]) * localT;
+  }
+  return lut;
+};
+
+/** `256 x 3` RGB lookup table, values in `[0, 1]`, centered at zero effect. Built once at module load; never mutated. */
+export const DIVERGING_LUT: Float32Array = buildDivergingLut();
+
+/**
+ * Map a signed `effect` (clamped to `[-absMax, absMax]`) to an index into a
+ * diverging LUT with `lutSteps` entries, centered at zero. Mirrors
+ * `rateToLutIndex`'s shape/degenerate-input handling exactly (a
+ * non-positive `absMax`, or a non-finite `effect`, both map to the LUT's
+ * own center — never NaN, never a division by zero) so a caller can reuse
+ * the same "shared clamp/round math, real color-write path" testing
+ * discipline this module already established for the sequential viridis
+ * path.
+ */
+export const effectToLutIndex = (effect: number, absMax: number, lutSteps: number): number => {
+  const t = absMax > 0 && Number.isFinite(effect) ? effect / absMax : 0;
+  const clamped = t < -1 ? -1 : t > 1 ? 1 : t;
+  return Math.round(((clamped + 1) / 2) * (lutSteps - 1));
+};
+
+/**
+ * The LUT index `effectToLutIndex` maps zero effect to, for `DIVERGING_LUT`'s
+ * own `COLORMAP_SIZE` step count. Reference/test constant only — no
+ * production caller reads this index at runtime (`writeEffectColors` blends
+ * non-FDR-significant neurons toward `DIVERGING_FADE_TARGET` above, not
+ * toward this index's own LUT color; see that constant's doc comment for
+ * why). `COLORMAP_SIZE` (256) is even, so there is no single index whose `t`
+ * is exactly `0.5`: `effectToLutIndex(0, ...)` rounds `127.5` up to `128`,
+ * which is why the exported value below (and the LUT's color at that index)
+ * is the entry *nearest* zero effect, not a mathematically exact center.
+ */
+export const DIVERGING_LUT_CENTER_INDEX = effectToLutIndex(0, 1, COLORMAP_SIZE);

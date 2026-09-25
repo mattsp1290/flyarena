@@ -5,7 +5,7 @@ import { decodeAction } from '../arena/actions';
 import { createWorld, createSnapshot, stepWorld } from '../arena/world';
 import type { AgentScore, WorldState, ReadonlyWorldState } from '../arena/types';
 import { NEURAL_SUBSTEPS_PER_TICK } from '../connectome/constants';
-import { aggregateOutputs, createModelState, createOutputBuffer, createStepScratch, stepModel } from '../connectome/model';
+import { createModelState, createOutputBuffer, createStepScratch, runLesionedSubsteps } from '../connectome/model';
 import type { ConnectomeGraph } from '../connectome/format';
 import type { PreparedGraph } from './targets';
 import {
@@ -23,13 +23,10 @@ export type SimulationBranch = ReturnType<typeof createBranch>;
 
 export function stepBranch(graph: ConnectomeGraph, branch: SimulationBranch, target: readonly number[] = []): void {
   const observation = observeAgent(branch.world, 'left');
-  // The first scatter must not propagate the targeted checkpoint activity.
-  for (const i of target) branch.state.rate[i] = 0;
-  for (let k = 0; k < NEURAL_SUBSTEPS_PER_TICK; k++) {
-    stepModel(graph, branch.state, branch.scratch, observation);
-    for (const i of target) branch.state.rate[i] = 0;
-  }
-  aggregateOutputs(graph, branch.state, branch.outputs);
+  // `target` must not propagate the checkpoint's own carried-over activity
+  // into the branch: `runLesionedSubsteps` zeros it before the first scatter
+  // as well as after every substep.
+  runLesionedSubsteps(graph, branch.state, branch.scratch, observation, target, NEURAL_SUBSTEPS_PER_TICK, branch.outputs);
   const action = decodeAction(branch.decode(branch.state.rate, branch.outputs));
   branch.world = stepWorld(branch.world, { left: [action.thrust, action.yaw, action.brake], right: [0, 0, 0] });
 }

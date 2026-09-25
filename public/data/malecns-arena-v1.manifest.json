@@ -8,8 +8,16 @@
   "gzipBytes": 107391,
   "gzipSha256": "ce247668a63df9a84d8e9969227de7b85d5eba679c45821644812ce0740dfb90",
   "inputChannelCount": 8,
+  "lesionAtlas": {
+    "artifact": "lesion-atlas-v1.json",
+    "sha256": "6e817e330cd45dfc615b4d03cf06f459b4a8e09c226c75c4ad13b57380267c94"
+  },
   "license": "CC-BY-4.0",
   "neuronCount": 1008,
+  "nullExplanation": {
+    "artifact": "null-explanation-v1.json",
+    "sha256": "e33e299148ca9975ead56cacc77844ae374ac4d98f62f0a59f2052e04b16ffd9"
+  },
   "outputPopulationCount": 3,
   "positions": {
     "artifact": "malecns-arena-v1.positions.json",
@@ -42,7 +50,7 @@
   },
   "rewiringNull": {
     "artifact": "rewiring-null-v1.json",
-    "sha256": "592446bb387acbc5354db807ae2f824547d168d9e338d3a55f94f525e39083d1"
+    "sha256": "06294ee5d631e26669ae52c999534b959a4156fa1a558f47c335033a58c4005f"
   },
   "sourceDataset": "male-cns:v1.0 (Janelia FlyEM Male CNS connectome)"
 }

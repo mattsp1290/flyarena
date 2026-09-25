@@ -110,6 +110,108 @@ opponent parked, 100 seeds, `T=1800`), agrees in direction — biological scores
 but the two studies differ in agent/opponent condition, tick count, and seed count (and seed set), so this
 is corroborating evidence under a related-but-distinct condition, not a replication of the same measurement.
 
+## Trained-readout sample
+
+Where the biological MaleCNS topology's *trained* score — a readout CEM-trained specifically for that
+topology, not the fixed hand-authored mapping the sections above use — falls among 20
+rewired topologies, each given its own readout trained with the identical production CEM configuration
+`flyarena-bigq` used for its own biological replicas.
+
+**Condition and config.** trained, opponent parked. `T = 1800`, `K = 4`,
+`D = 48`, held-out seeds `30001..30100`
+(n=100) — the same held-out seeds the authored null above and
+[the trained-readout report](trained-readout-report.md) both use. Every rewired readout is trained at the
+single trainer seed `replicaSeed = 101` (isolating topology from trainer-seed
+variance, per this study's key decisions), with the exact CEM config copied from the merged
+`flyarena-bigq` manifest (commit `69b610d4a9da11b12a7ac180997e702cf9fd2a4f`): population 128, elites 32, generations 150, alpha 0.7, stdFloor 0.02, initStd 0.5, E=16. Rescored by evaluator git rev
+`23c324da56dd7220972dc747447496b98de12e08` — the same TS `runEpisode` authoritative path the authored null
+above uses, so every number in this section shares one evaluator revision with every other number in this
+section, never a PyTorch-side validation fitness.
+
+### Rewired trained scores (n=20)
+
+| seed | trained score (95% CI) |
+| --- | --- |
+| 0 | 77.5669 (73.6120, 81.5604) |
+| 1 | 122.8570 (117.7549, 127.7131) |
+| 2 | 63.7140 (59.8406, 67.7208) |
+| 3 | 74.4400 (69.8391, 79.1383) |
+| 4 | 71.1723 (67.1730, 75.2335) |
+| 5 | 85.0891 (80.9429, 89.0783) |
+| 6 | 67.9147 (64.1074, 71.8472) |
+| 7 | 75.5309 (70.9921, 80.1535) |
+| 8 | 72.9251 (68.8233, 77.1131) |
+| 9 | 71.5533 (67.6914, 75.5193) |
+| 10 | 73.6187 (69.1414, 78.0363) |
+| 11 | 75.6174 (71.1762, 80.0592) |
+| 12 | 80.2122 (76.1720, 84.2526) |
+| 13 | 75.4194 (70.8880, 79.9064) |
+| 14 | 68.2911 (64.6110, 71.8715) |
+| 15 | 67.6136 (63.5480, 71.6205) |
+| 16 | 69.3956 (65.2115, 73.7358) |
+| 17 | 69.7696 (65.9172, 73.5896) |
+| 18 | 73.8657 (69.5527, 78.1792) |
+| 19 | 75.3015 (70.3144, 80.4141) |
+
+### Biological trained scores (per trainer seed)
+
+| trainer seed | trained score (95% CI) |
+| --- | --- |
+| 101 | 62.9627 (59.0038, 67.3063) |
+| 202 | 72.2304 (67.6313, 76.9528) |
+| 303 | 62.7420 (58.3866, 67.4470) |
+
+### Results
+
+| Quantity | Value |
+| --- | --- |
+| Null (rewired trained) mean | 75.5934 |
+| Null median | 73.7422 |
+| Null std | 11.8110 |
+| Null 2.5–97.5% | 63.7140 .. 122.8570 |
+| Null IQR | 5.7613 |
+| Biological (trainer seed 101) percentile among the 20 rewired trained scores | 0.0% |
+| Percentile resolution (1/n) | 5.0% |
+| Rank statistic p_low | 0.0476 |
+| Rank statistic p_high | 1.0000 |
+| Wall time | 124.5s |
+| Per-episode time | 54.2 ms |
+
+With only 20 rewired replicas, the percentile above has a resolution of only
+5.0%: one more or fewer rewired replica scoring below biological shifts it
+by a full 5.0% step. This is a much coarser distribution than the authored
+null's 500-replica, 0.2%-resolution percentile
+above, and percentile differences finer than 5.0% are not meaningfully
+distinguishable at this sample size.
+
+### Trainer-seed variance context
+
+Biological trained scores across the 3 `flyarena-bigq` replicas (trainer seeds
+101/202/303) span
+`62.7420` to `72.2304`
+(range `9.4884`). This is **trainer-noise variance at fixed (biological) topology -- NOT comparable to the null's topology variance at a fixed trainer seed (bioPercentile, above); no overlap-based conclusion may be drawn from comparing the two.**
+For context on how large this kind of noise alone can be: the merged
+[`trained-readout-v1.manifest.json`](../public/data/trained-readout-v1.manifest.json)'s recorded CUDA
+rerun of the shipped biological replica moved TS held-out `trained` fitness by
+`6.3540` (rerun minus original, that report's sign convention) —
+0.67x the trainer-seed spread recorded above (see that report's own Limitations for the CI comparison) — a magnitude comparison offered only as context for how large trainer-seed/run-to-run noise can be, not
+a claim that the two numbers should match. **This spread is not comparable to the 0.0%
+percentile above**: the spread measures trainer-seed/run-to-run noise at *fixed* topology; the percentile
+measures where one topology (biological, at trainer seed 101) falls among
+20 different topologies, each at the *same* one trainer seed. Neither whether these
+two numbers happen to overlap, nor either's size relative to the other, supports any conclusion about
+topology "mattering more or less" than trainer-seed noise.
+
+**Robustness of the headline percentile to which replica is used.** Ranking each of the
+3 biological replicas separately against the same
+20 rewired trained scores (same tie rule as above): trainer seed 101 (the headline above, and the seed the rewired runs were matched to) ranks at 0.0%, trainer seed 202 ranks at 40.0%, trainer seed 303 ranks at 0.0%. The headline 0.0% percentile above is therefore one sample from
+this trainer-seed-noise distribution, not a stable property of the biological topology: because
+trainer-seed variation at fixed topology (the `9.4884` spread above)
+is comparable in magnitude to the spread across the 20 rewirings (null IQR
+`5.7613`, std `11.8110`), this trained-readout comparison is **not
+robust to the choice of trainer-seed replica** and should not be read as biological reliably scoring lowest
+among the rewirings — no causal or superiority claim is made.
+
 ## Limitations
 
 - Scores come from a **single-agent condition with the opponent parked**, on the same held-out seeds and
@@ -123,3 +225,4 @@ is corroborating evidence under a related-but-distinct condition, not a replicat
 - **No causal or superiority claim is made.** The percentile and rank statistics above are descriptive: they
   say where the biological graph's score falls among this null model's rewirings under this exact evaluation
   setup, not that biological topology causes or predicts any particular score.
+- The trained section above (n=20 rewired replicas) reports the same kind of descriptive percentile/rank statistics as the authored null, at a much coarser 5.0% resolution, and makes no causal or superiority claim either. Its trainer-seed variance context (`bioTrainerSeedSpread`) is trainer-noise variance at fixed topology, explicitly not comparable to its own topology-variance percentile — see that section's own caveats.

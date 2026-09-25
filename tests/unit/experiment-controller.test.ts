@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { ExperimentController } from '../../src/lib/experiment/controller';
 import type { ConnectomeGraph, GraphMode } from '../../src/lib/connectome/format';
 import type { ArenaManifest } from '../../src/lib/experiment/assets';
+import type { RewiringNullLoadResult } from '../../src/lib/experiment/rewiringNull';
 import type { WorkerRequest, WorkerResponse } from '../../src/lib/worker/protocol';
 import { createPublicDataFetch, FakeNeuralWorker } from '../helpers/fake-worker';
 import { createCallbacks, createWorker, SEED, TOTAL_TICKS, useControllerTestLifecycle } from './experiment-controller-test-helpers';
@@ -112,6 +113,198 @@ describe('ExperimentController#initialize', () => {
     await initializing;
 
     expect(controller.getRunner()).toBeUndefined();
+  });
+});
+
+describe('ExperimentController rewiring-null loading (WP4)', () => {
+  /**
+   * `createPublicDataFetch` serves whichever committed `public/data/*` file
+   * matches the requested basename, and `rewiring-null-v1.json` plus its
+   * manifest entry are committed there (WP2) — so this runs against the
+   * real shipped artifact by default, matching how the trained-readout
+   * controller tests exercise the real WP5 artifact
+   * (`experiment-controller-decoder.test.ts`).
+   */
+  it('fires onRewiringNull with the real artifact as "ok", without blocking reaching "ready"', async () => {
+    const callbacks = createCallbacks();
+    const controller = new ExperimentController({
+      seed: SEED,
+      totalTicks: TOTAL_TICKS,
+      initialTopology: { left: 'biological', right: 'rewired' },
+      createWorker,
+      callbacks
+    });
+    trackController(controller);
+
+    await controller.initialize();
+
+    expect(controller.getRunner()).toBeDefined();
+    expect(callbacks.statuses).toContain('ready');
+    expect(callbacks.rewiringNullResults).toHaveLength(1);
+    const result = callbacks.rewiringNullResults[0];
+    expect(result.status).toBe('ok');
+    if (result.status === 'ok') {
+      expect(result.data.rewired.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('a tampered rewiring-null-v1.json reports "invalid" with an honest sha256 reason; the experiment still reaches "ready" (loading never blocks Start)', async () => {
+    vi.stubGlobal('fetch', createPublicDataFetch({ corrupt: 'rewiring-null-v1.json' }));
+    const callbacks = createCallbacks();
+    const controller = new ExperimentController({
+      seed: SEED,
+      totalTicks: TOTAL_TICKS,
+      initialTopology: { left: 'biological', right: 'rewired' },
+      createWorker,
+      callbacks
+    });
+    trackController(controller);
+
+    await controller.initialize();
+
+    expect(controller.getRunner()).toBeDefined();
+    expect(callbacks.statuses).toContain('ready');
+    expect(callbacks.errors).toHaveLength(0);
+    expect(callbacks.rewiringNullResults).toHaveLength(1);
+    const result = callbacks.rewiringNullResults[0];
+    expect(result.status).toBe('invalid');
+    if (result.status === 'invalid') expect(result.reason).toMatch(/sha256/i);
+  });
+
+  it('does not fire onRewiringNull once disposed before initialize() resolves at all', async () => {
+    const callbacks = createCallbacks();
+    const controller = new ExperimentController({
+      seed: SEED,
+      totalTicks: TOTAL_TICKS,
+      initialTopology: { left: 'biological', right: 'rewired' },
+      createWorker,
+      callbacks
+    });
+    trackController(controller);
+
+    const initializing = controller.initialize();
+    controller.dispose();
+    await initializing;
+
+    expect(callbacks.rewiringNullResults).toHaveLength(0);
+  });
+
+  /**
+   * The test above disposes before `initialize()`'s first `await` even
+   * resolves, so it never actually reaches the `if (this.destroyed) return;`
+   * guard on the null load's own `.then` (`controller.ts`'s
+   * `loadNull(...).catch(...).then(...)`) — a version of `controller.ts`
+   * with that guard deleted would still pass it (dual review, Important).
+   * This test uses the injectable `loadRewiringNull` option to hold the null
+   * load pending past `ready`, so `dispose()` races the load's own
+   * resolution and specifically exercises that guard.
+   */
+  it('drops a rewiring-null result that settles after dispose() — the actual post-ready race the destroyed guard exists for', async () => {
+    let resolveNull!: (result: RewiringNullLoadResult) => void;
+    const callbacks = createCallbacks();
+    const controller = new ExperimentController({
+      seed: SEED,
+      totalTicks: TOTAL_TICKS,
+      initialTopology: { left: 'biological', right: 'rewired' },
+      createWorker,
+      callbacks,
+      loadRewiringNull: () =>
+        new Promise((resolve) => {
+          resolveNull = resolve;
+        })
+    });
+    trackController(controller);
+
+    await controller.initialize();
+    expect(callbacks.statuses).toContain('ready');
+    // Reaching `ready` while the null load is still pending is itself proof
+    // that loading it never blocks Start (this stubbed loader never
+    // resolves at all until the assertion below does so explicitly).
+    expect(callbacks.rewiringNullResults).toHaveLength(0);
+
+    controller.dispose();
+    resolveNull({ status: 'absent', reason: 'settled after dispose' });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(callbacks.rewiringNullResults).toHaveLength(0);
+  });
+
+  it('with the injectable loader, reports a result that resolves before dispose() normally', async () => {
+    const callbacks = createCallbacks();
+    const controller = new ExperimentController({
+      seed: SEED,
+      totalTicks: TOTAL_TICKS,
+      initialTopology: { left: 'biological', right: 'rewired' },
+      createWorker,
+      callbacks,
+      loadRewiringNull: async () => ({ status: 'absent', reason: 'stubbed for this test' })
+    });
+    trackController(controller);
+
+    await controller.initialize();
+
+    expect(callbacks.rewiringNullResults).toHaveLength(1);
+    expect(callbacks.rewiringNullResults[0]).toEqual({ status: 'absent', reason: 'stubbed for this test' });
+  });
+
+  /**
+   * Round-2 dual review (cartographer S1): the leading `.catch` in
+   * `initialize()`'s `loadNull(...).catch(...).then(...)` chain had no
+   * regression coverage — every existing test's injected loader either
+   * resolves or never resolves, so a version of `controller.ts` with that
+   * `.catch` deleted would still pass them all.
+   */
+  it('maps a rejecting loadRewiringNull to an "unavailable" onRewiringNull result instead of an unhandled rejection', async () => {
+    const callbacks = createCallbacks();
+    const controller = new ExperimentController({
+      seed: SEED,
+      totalTicks: TOTAL_TICKS,
+      initialTopology: { left: 'biological', right: 'rewired' },
+      createWorker,
+      callbacks,
+      loadRewiringNull: async () => {
+        throw new Error('boom');
+      }
+    });
+    trackController(controller);
+
+    await controller.initialize();
+
+    expect(callbacks.rewiringNullResults).toHaveLength(1);
+    const result = callbacks.rewiringNullResults[0];
+    // 'unavailable', not 'invalid' (thermo review, Suggestion): this is a
+    // genuine runtime error, not a hash/shape verification failure, so it
+    // must not be described to a visitor as "failed verification".
+    expect(result.status).toBe('unavailable');
+    if (result.status === 'unavailable') expect(result.reason).toMatch(/unexpected error.*boom/);
+  });
+
+  /**
+   * The trailing `.catch` guards the opposite direction: `onRewiringNull`
+   * (host code, e.g. `App.svelte`) throwing instead of the loader.
+   */
+  it('routes a throwing onRewiringNull callback to onError instead of an unhandled rejection', async () => {
+    const callbacks = createCallbacks();
+    callbacks.onRewiringNull = () => {
+      throw new Error('host callback boom');
+    };
+    const controller = new ExperimentController({
+      seed: SEED,
+      totalTicks: TOTAL_TICKS,
+      initialTopology: { left: 'biological', right: 'rewired' },
+      createWorker,
+      callbacks,
+      loadRewiringNull: async () => ({ status: 'absent', reason: 'stubbed for this test' })
+    });
+    trackController(controller);
+
+    await controller.initialize();
+    // Let the rejected promise from the throwing callback settle.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(callbacks.errors.some((message) => message.includes('host callback boom'))).toBe(true);
   });
 });
 

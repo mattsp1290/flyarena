@@ -1,14 +1,17 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { NullEvaluationRaw, NullGraphRaw } from '../../scripts/null/null-evaluate';
+import type { NullTrainedEvaluationRaw } from '../../scripts/null/null-trained-evaluate';
+import type { NullDecoderKind } from '../../scripts/null/null-worker';
 import {
   DEFAULT_MANIFEST,
   DEFAULT_OUT,
   DEFAULT_REPORT_MD,
   buildArtifact,
+  guardShippedTimingProvenance,
   parseNullReportArgs,
   resolveRunMeta,
   runNullReport,
@@ -16,6 +19,7 @@ import {
   verifyManifestRoundTrips,
   type NullReportArgs
 } from '../../scripts/null/null-report';
+import { CONDITION_LABELS } from '../../scripts/null/null-report-variant';
 
 /**
  * Coverage for `scripts/null/null-report.ts` — a dual-review pass on the
@@ -45,6 +49,7 @@ const buildRaw = (overrides: Partial<NullEvaluationRaw> = {}): NullEvaluationRaw
     seeds: { start: 30001, count: 3 },
     ticks: 20,
     substeps: 4,
+    decoder: 'authored',
     biological: graph(1),
     disconnected: graph(-1),
     rewired: [0, 1, 2, 3, 4].map((seed) => ({
@@ -63,6 +68,37 @@ const buildRaw = (overrides: Partial<NullEvaluationRaw> = {}): NullEvaluationRaw
 const writeTestManifest = (path: string, binarySha256: string): void => {
   const manifest = { artifact: 'test.bin.gz', binarySha256, note: 'test fixture, not the real manifest' };
   writeFileSync(path, `${JSON.stringify(manifest, null, 2)}\n`);
+};
+
+/** A small, internally-consistent `NullTrainedEvaluationRaw` (WP3) — 4 rewired seeds (0..3) and the three biological trainer seeds, enough to exercise `buildTrainedSection`/the merge path without a real training run. */
+const buildTrainedRaw = (overrides: Partial<NullTrainedEvaluationRaw> = {}): NullTrainedEvaluationRaw => {
+  const heldOutSeeds = [30001, 30002, 30003];
+  const graph = (base: number) => ({
+    heldOutSeeds,
+    movementScore: [base, base + 1, base + 2],
+    foodPickups: [1, 2, 3],
+    hazardContacts: [0, 0, 1]
+  });
+  return {
+    version: 1,
+    seeds: { start: 30001, count: 3 },
+    ticks: 20,
+    substeps: 4,
+    replicaSeed: 101,
+    rewired: [0, 1, 2, 3].map((seed) => ({ seed, ...graph(seed) })),
+    biological: [101, 202, 303].map((trainerSeed) => ({ trainerSeed, ...graph(trainerSeed / 100) })),
+    host: { arch: 'arm64', node: 'v22.22.3' },
+    d: 48,
+    bigqMergeCommit: '69b610d4a9da11b12a7ac180997e702cf9fd2a4f',
+    evaluatorGitRev: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+    cemConfig: { population: 128, elites: 32, generations: 150, alpha: 0.7, stdFloor: 0.02, initStd: 0.5, trainingSeedsPerGeneration: 16 },
+    cemConfigWarnings: [],
+    ...overrides
+  };
+};
+
+const writeTrainedReadoutManifest = (path: string, gpuRerunFitnessDelta = 6.354025749714424): void => {
+  writeFileSync(path, JSON.stringify({ gpuRerunFitnessDelta }));
 };
 
 describe('parseNullReportArgs', () => {
@@ -100,6 +136,7 @@ describe('resolveRunMeta', () => {
   const baseArgs = (authored: string, shards?: number): NullReportArgs => ({
     authored,
     trained: join(root, 'trained.json'),
+    trainedReadoutManifest: join(root, 'trained-readout-manifest.json'),
     out: join(root, 'out.json'),
     reportMd: join(root, 'out.md'),
     manifest: join(root, 'manifest.json'),
@@ -132,10 +169,48 @@ describe('resolveRunMeta', () => {
   });
 });
 
+/**
+ * `.agents/plans/rewiring-null/00-overview.md`'s WP2 acceptance criterion
+ * ("running null:report again gives byte-identical output") was silently
+ * violated by a prior republish whose `training/runs/` tree had lost
+ * `authored.run.json` -- `resolveRunMeta` tolerated the missing sidecar
+ * (it's legitimately optional for a scratch/dev run) and the published
+ * artifact quietly lost its "Wall time"/"Per-episode time" rows (a
+ * thermo-methodology review finding, I1). `guardShippedTimingProvenance`
+ * closes that gap for the one path where it actually matters: publishing to
+ * the shipped default artifact.
+ */
+describe('guardShippedTimingProvenance', () => {
+  const DEFAULT = '/repo/public/data/rewiring-null-v1.json';
+
+  it('throws when publishing to the shipped default with no timing in runMeta', () => {
+    expect(() => guardShippedTimingProvenance(DEFAULT, DEFAULT, { shards: 18 })).toThrow(
+      /refusing to publish to the shipped artifact/
+    );
+  });
+
+  it('throws when only one of elapsedMs/perEpisodeMs is present (a malformed sidecar)', () => {
+    expect(() =>
+      guardShippedTimingProvenance(DEFAULT, DEFAULT, { shards: 18, elapsedMs: 1234 })
+    ).toThrow(/refusing to publish to the shipped artifact/);
+  });
+
+  it('does not throw when publishing to the shipped default WITH timing present', () => {
+    expect(() =>
+      guardShippedTimingProvenance(DEFAULT, DEFAULT, { shards: 18, elapsedMs: 1234, perEpisodeMs: 5.6 })
+    ).not.toThrow();
+  });
+
+  it('does not throw for a scratch (non-default) --out, even with no timing', () => {
+    expect(() => guardShippedTimingProvenance('/tmp/scratch-out.json', DEFAULT, { shards: 18 })).not.toThrow();
+  });
+});
+
 describe('buildArtifact', () => {
   const args: NullReportArgs = {
     authored: 'authored.json',
     trained: 'trained.json',
+    trainedReadoutManifest: 'trained-readout-manifest.json',
     out: 'out.json',
     reportMd: 'out.md',
     manifest: 'manifest.json',
@@ -204,6 +279,32 @@ describe('buildArtifact', () => {
     const withTiming = buildArtifact(buildRaw(), args, { shards: 1, elapsedMs: 100, perEpisodeMs: 2 });
     expect(withTiming.timing).toEqual({ elapsedMs: 100, perEpisodeMs: 2 });
   });
+
+  it('derives condition from raw.decoder, defaulting to the authored label when absent', () => {
+    const artifact = buildArtifact(buildRaw(), args, runMeta);
+    expect(artifact.condition).toBe('authored, opponent parked');
+  });
+
+  it('derives condition from raw.decoder for each decoder-variant label, not a caller-threaded parameter', () => {
+    for (const decoder of ['authored', 'authored-flip-thrust', 'authored-flip-yaw', 'authored-flip-both'] as const) {
+      const artifact = buildArtifact(buildRaw({ decoder }), args, runMeta);
+      expect(artifact.condition).toBe(CONDITION_LABELS[decoder]);
+    }
+  });
+
+  it('throws on an unrecognized raw.decoder rather than silently defaulting to the authored label', () => {
+    // Regression test for a thermo-maintainability finding: buildArtifact
+    // used to take `condition` as a separate parameter with a
+    // silently-wrong-if-forgotten default, so an unrecognized raw.decoder
+    // would never have been caught here at all (only by runNullReport's own,
+    // now-removed, duplicate validation). Deriving condition from raw.decoder
+    // internally means buildArtifact itself must reject this.
+    const raw: NullEvaluationRaw = {
+      ...buildRaw(),
+      decoder: 'authored-flip-brake' as unknown as NullDecoderKind
+    };
+    expect(() => buildArtifact(raw, args, runMeta)).toThrow(/unrecognized decoder/);
+  });
 });
 
 describe('runNullReport', () => {
@@ -228,6 +329,7 @@ describe('runNullReport', () => {
     args = {
       authored: authoredPath,
       trained: join(root, 'trained.json'), // does not exist -> --trained is a no-op
+      trainedReadoutManifest: join(root, 'trained-readout-manifest.json'), // only read when --trained's file exists
       out: outPath,
       reportMd: reportMdPath,
       manifest: manifestPath,
@@ -290,15 +392,326 @@ describe('runNullReport', () => {
     expect(() => readFileSync(outPath)).toThrow(); // nothing was written
   });
 
-  it('refuses to run when --trained points at a file that exists (WP3 not implemented yet)', () => {
-    const trainedPath = join(root, 'trained.json');
-    writeFileSync(trainedPath, '{}');
-    expect(() => runNullReport({ ...args, trained: trainedPath })).toThrow(/not implemented yet \(WP3\)/);
+  describe('with --trained (WP3 trained section)', () => {
+    let trainedArgs: NullReportArgs;
+
+    beforeEach(() => {
+      writeFileSync(args.trained, JSON.stringify(buildTrainedRaw()));
+      writeTrainedReadoutManifest(args.trainedReadoutManifest);
+      trainedArgs = args;
+    });
+
+    it('merges a trained section into the published artifact and report', () => {
+      const result = runNullReport(trainedArgs);
+      expect(result.artifact.trained).toBeDefined();
+      const trained = result.artifact.trained!;
+      expect(trained.rewired).toHaveLength(4);
+      expect(trained.biological).toHaveLength(3);
+      expect(trained.replicaSeed).toBe(101);
+      expect(trained.d).toBe(48);
+      expect(trained.bigqMergeCommit).toBe('69b610d4a9da11b12a7ac180997e702cf9fd2a4f');
+      expect(trained.percentileResolution).toBeCloseTo(0.25, 12); // 1/4 rewired replicas in this fixture
+      expect(trained.bigqGpuRerunFitnessDelta).toBeCloseTo(6.354025749714424, 10);
+      expect(trained.bioTrainerSeedSpread.label).toMatch(/trainer-noise variance/);
+
+      const reportMd = readFileSync(reportMdPath, 'utf8');
+      expect(reportMd).toContain('## Trained-readout sample');
+      expect(reportMd).toContain('69b610d4a9da11b12a7ac180997e702cf9fd2a4f');
+    });
+
+    it('computes a per-replica percentile for every biological trainer seed, not just the headline one (thermo-methodology C1)', () => {
+      const result = runNullReport(trainedArgs);
+      const trained = result.artifact.trained!;
+
+      // Fixture: nullValues (rewired means, seeds 0..3) = [1, 2, 3, 4];
+      // biological means are ~2.01 (101), ~3.02 (202), ~4.03 (303) ->
+      // percentiles 50%, 75%, 100% respectively (hand-computed, same tie
+      // rule rankStatistics uses elsewhere).
+      expect(trained.bioReplicaPercentiles).toHaveLength(3);
+      expect(trained.bioReplicaPercentiles.map((r) => r.trainerSeed)).toEqual([101, 202, 303]); // sorted, matches `biological`'s own order
+      expect(trained.bioReplicaPercentiles.find((r) => r.trainerSeed === 101)!.percentile).toBeCloseTo(0.5, 10);
+      expect(trained.bioReplicaPercentiles.find((r) => r.trainerSeed === 202)!.percentile).toBeCloseTo(0.75, 10);
+      expect(trained.bioReplicaPercentiles.find((r) => r.trainerSeed === 303)!.percentile).toBeCloseTo(1.0, 10);
+      // The headline `bioPercentile` (replicaSeed=101) must equal that
+      // same replica's own entry in bioReplicaPercentiles -- one shared
+      // computation, not two that could drift apart.
+      expect(trained.bioReplicaPercentiles.find((r) => r.trainerSeed === trained.replicaSeed)!.percentile).toBeCloseTo(
+        trained.bioPercentile,
+        12
+      );
+    });
+
+    it('states the per-replica robustness caveat in the report, naming the headline seed and every other replica\'s percentile', () => {
+      const result = runNullReport(trainedArgs);
+      const reportMd = readFileSync(reportMdPath, 'utf8');
+      expect(reportMd).toContain('Robustness of the headline percentile to which replica is used');
+      // The headline replica (101) is named as such; the other two replicas'
+      // own percentiles (75.0%, 100.0%) both appear in the prose.
+      expect(reportMd).toMatch(/trainer seed 101 \(the headline above/);
+      expect(reportMd).toContain('trainer seed 202 ranks at 75.0%');
+      expect(reportMd).toContain('trainer seed 303 ranks at 100.0%');
+      expect(reportMd).toMatch(/not\s+robust to the choice of trainer-seed replica/);
+      expect(reportMd).toMatch(/should not be read as biological reliably scoring lowest/);
+      expect(reportMd).toContain('no causal or superiority claim is made');
+    });
+
+    it('the trainer-seed-variance sentence is grammatically a negation (thermo-methodology I2): "Neither ... nor ... supports"', () => {
+      runNullReport(trainedArgs);
+      const reportMd = readFileSync(reportMdPath, 'utf8');
+      expect(reportMd).toMatch(/Neither whether these\s+two numbers happen to overlap, nor either's size relative to the other, supports/);
+      // The old, meaning-inverting phrasing must be gone.
+      expect(reportMd).not.toMatch(/Whether these two\s+numbers happen to overlap, and neither's size/);
+    });
+
+    it('bioTrainerSeedSpread.label renders as its own sentence, not a mid-sentence appositive with a dangling clause (thermo-methodology I3)', () => {
+      const result = runNullReport(trainedArgs);
+      const range = result.artifact.trained!.bioTrainerSeedSpread.range;
+      const reportMd = readFileSync(reportMdPath, 'utf8');
+      expect(reportMd).toContain(`(range \`${range.toFixed(4)}\`). This is **trainer-noise variance`);
+      // The old rendering wrapped the label in em dashes and appended a
+      // redundant "at the *same* biological topology" fragment right after
+      // it, immediately before "For context" -- that specific dangling
+      // fragment must be gone (not a blanket ban on the phrase, which
+      // legitimately appears elsewhere, e.g. "at the *same* one trainer
+      // seed" in the paired-comparison sentence).
+      expect(reportMd).not.toContain('*same* biological topology. For context');
+    });
+
+    it('running it twice with --trained present is still byte-identical', () => {
+      const first = runNullReport(trainedArgs);
+      const artifactAfterFirst = readFileSync(outPath);
+      const mdAfterFirst = readFileSync(reportMdPath);
+
+      const second = runNullReport(trainedArgs);
+      expect(readFileSync(outPath).equals(artifactAfterFirst)).toBe(true);
+      expect(readFileSync(reportMdPath).equals(mdAfterFirst)).toBe(true);
+      expect(second.artifactSha256).toBe(first.artifactSha256);
+    });
+
+    it('omits the trained section entirely when --trained does not exist (unchanged from before WP3)', () => {
+      const noTrained = { ...trainedArgs, trained: join(root, 'does-not-exist.json') };
+      const result = runNullReport(noTrained);
+      expect(result.artifact.trained).toBeUndefined();
+      expect(readFileSync(reportMdPath, 'utf8')).not.toContain('## Trained-readout sample');
+    });
+
+    it("throws when trained.json's held-out seeds do not match authored.json's", () => {
+      writeFileSync(args.trained, JSON.stringify(buildTrainedRaw({ seeds: { start: 30001, count: 5 } })));
+      expect(() => runNullReport(trainedArgs)).toThrow(/held-out seeds/);
+    });
+
+    it("throws when trained.json's ticks do not match authored.json's", () => {
+      writeFileSync(args.trained, JSON.stringify(buildTrainedRaw({ ticks: 999 })));
+      expect(() => runNullReport(trainedArgs)).toThrow(/ticks \(999\) do not match/);
+    });
+
+    it("throws when trained.json's substeps do not match authored.json's", () => {
+      writeFileSync(args.trained, JSON.stringify(buildTrainedRaw({ substeps: 999 })));
+      expect(() => runNullReport(trainedArgs)).toThrow(/substeps \(999\) do not match/);
+    });
+
+    it('falls back to the "no CEM config recorded" prose when cemConfig is null', () => {
+      writeFileSync(args.trained, JSON.stringify(buildTrainedRaw({ cemConfig: null })));
+      runNullReport(trainedArgs);
+      const reportMd = readFileSync(reportMdPath, 'utf8');
+      expect(reportMd).toContain('no CEM config was recorded on any scored run directory');
+    });
+
+    it('falls back to the "no CEM config recorded" prose when cemConfig is only partially populated', () => {
+      // `toCemConfigSummary` (null-report-trained.ts) is all-or-nothing: a
+      // real trained.json never has a partial cemConfig (reconcileCemConfig
+      // in null-trained-evaluate.ts throws instead of publishing one), but
+      // this pins the fallback behavior for a hand-edited/older fixture --
+      // the old code (reading fields straight off a Record<string, unknown>)
+      // would have silently interpolated "undefined" for the missing fields
+      // instead (a thermo-maintainability review finding).
+      writeFileSync(
+        args.trained,
+        JSON.stringify(buildTrainedRaw({ cemConfig: { population: 128, elites: 32 } }))
+      );
+      runNullReport(trainedArgs);
+      const reportMd = readFileSync(reportMdPath, 'utf8');
+      expect(reportMd).toContain('no CEM config was recorded on any scored run directory');
+      expect(reportMd).not.toContain('undefined');
+    });
+
+    it('throws when trained.json has no biological entry at raw.replicaSeed (the shipped replica)', () => {
+      writeFileSync(
+        args.trained,
+        JSON.stringify(
+          buildTrainedRaw({
+            replicaSeed: 555,
+            biological: [101, 202, 303].map((trainerSeed) => ({
+              trainerSeed,
+              heldOutSeeds: [30001, 30002, 30003],
+              movementScore: [1, 2, 3],
+              foodPickups: [1, 2, 3],
+              hazardContacts: [0, 0, 1]
+            }))
+          })
+        )
+      );
+      expect(() => runNullReport(trainedArgs)).toThrow(/no biological trainer-seed-555 entry/);
+    });
   });
 
   it('does not write authored.run.json as part of publishing (that sidecar is null-evaluate.ts\'s output)', () => {
     runNullReport(args);
     expect(() => readFileSync(join(root, 'authored.run.json'))).toThrow();
+  });
+
+  describe('variant mode (--variant-out, WP1 decoder-convention-check runs)', () => {
+    it('a non-authored decoder with no --variant-out throws before writing anything', () => {
+      writeFileSync(authoredPath, JSON.stringify(buildRaw({ decoder: 'authored-flip-both' })));
+      expect(() => runNullReport(args)).toThrow(/authored-flip-both.*--variant-out/s);
+      expect(() => readFileSync(outPath)).toThrow(); // nothing was written
+      expect(() => readFileSync(reportMdPath)).toThrow();
+      const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>;
+      expect(manifest.rewiringNull).toBeUndefined();
+    });
+
+    it('with --variant-out, writes only that file -- the shipped-path fixtures (out/report-md/manifest) keep their bytes', () => {
+      writeFileSync(authoredPath, JSON.stringify(buildRaw({ decoder: 'authored-flip-both' })));
+      const manifestBefore = readFileSync(manifestPath);
+      // out.json/out.md do not exist yet in this fixture -- assert they
+      // never get created, not merely that their bytes are unchanged.
+      expect(() => readFileSync(outPath)).toThrow();
+
+      const variantOut = join(root, 'variant-authored-flip-both-summary.json');
+      const result = runNullReport({ ...args, variantOut });
+
+      expect(result.out).toBe(variantOut);
+      expect(result.reportMdPath).toBeUndefined();
+      expect(() => readFileSync(outPath)).toThrow();
+      expect(() => readFileSync(reportMdPath)).toThrow();
+      expect(readFileSync(manifestPath).equals(manifestBefore)).toBe(true);
+
+      const variantArtifact = JSON.parse(readFileSync(variantOut, 'utf8')) as { condition: string };
+      expect(variantArtifact.condition).toBe(CONDITION_LABELS['authored-flip-both']);
+    });
+
+    it("the variant summary's condition names the variant for each decoder kind", () => {
+      for (const decoder of ['authored-flip-thrust', 'authored-flip-yaw', 'authored-flip-both'] as const) {
+        writeFileSync(authoredPath, JSON.stringify(buildRaw({ decoder })));
+        const variantOut = join(root, `variant-${decoder}-summary.json`);
+        const result = runNullReport({ ...args, variantOut });
+        expect(result.artifact.condition).toBe(CONDITION_LABELS[decoder]);
+      }
+    });
+
+    it('an authored decoder with --variant-out also writes only the variant file (variant mode is decoder-agnostic)', () => {
+      const variantOut = join(root, 'variant-authored-summary.json');
+      const result = runNullReport({ ...args, variantOut });
+      expect(result.artifact.condition).toBe('authored, opponent parked');
+      expect(() => readFileSync(outPath)).toThrow();
+    });
+
+    it('running variant mode twice on the same input is byte-identical', () => {
+      writeFileSync(authoredPath, JSON.stringify(buildRaw({ decoder: 'authored-flip-yaw' })));
+      const variantOut = join(root, 'variant-authored-flip-yaw-summary.json');
+      const first = runNullReport({ ...args, variantOut });
+      const bytesAfterFirst = readFileSync(variantOut);
+      const second = runNullReport({ ...args, variantOut });
+      expect(second.artifactSha256).toBe(first.artifactSha256);
+      expect(readFileSync(variantOut).equals(bytesAfterFirst)).toBe(true);
+    });
+
+    it('rejects --variant-out that resolves to any shipped default path -- and the real shipped files stay untouched', () => {
+      // Uses the REAL DEFAULT_OUT/DEFAULT_REPORT_MD/DEFAULT_MANIFEST paths
+      // (not scratch fixtures): guardVariantOutPath must throw before any
+      // write, so reading these committed files before/after and asserting
+      // byte-equality is a genuine end-to-end proof, not just "the scratch
+      // path was never created". DEFAULT_REPORT_MD is rejected by the
+      // ".json"-extension check first (it's a .md path) -- still a throw
+      // before any write, just a different message than the other two.
+      for (const shipped of [DEFAULT_OUT, DEFAULT_MANIFEST]) {
+        const before = readFileSync(shipped);
+        expect(() => runNullReport({ ...args, variantOut: shipped })).toThrow(/must not resolve to/);
+        expect(readFileSync(shipped).equals(before)).toBe(true);
+      }
+      const reportMdBefore = readFileSync(DEFAULT_REPORT_MD);
+      expect(() => runNullReport({ ...args, variantOut: DEFAULT_REPORT_MD })).toThrow(/must end with "\.json"/);
+      expect(readFileSync(DEFAULT_REPORT_MD).equals(reportMdBefore)).toBe(true);
+    });
+
+    it('rejects --variant-out that resolves to its own --authored input', () => {
+      expect(() => runNullReport({ ...args, variantOut: authoredPath })).toThrow(/its own --authored input/);
+    });
+
+    it('rejects a --variant-out anywhere under public/ or docs/, not just the three named shipped defaults', () => {
+      // Regression test for a reviewer finding: a named-file list would
+      // never keep up with other shipped tracked JSON (trained-readout-v1.json,
+      // the ledger, positions.json, lab-benchmark.json, ...) that a
+      // copy-pasted or typo'd --variant-out could still land on. Uses real
+      // shipped files (not fixtures) so an actual overwrite would be caught.
+      const publicJson = join(dirname(DEFAULT_OUT), 'trained-readout-v1.json');
+      const docsJson = join(dirname(DEFAULT_REPORT_MD), 'lab-benchmark.json');
+      for (const shipped of [publicJson, docsJson]) {
+        const before = readFileSync(shipped);
+        expect(() => runNullReport({ ...args, variantOut: shipped })).toThrow(/must not be under/);
+        expect(readFileSync(shipped).equals(before)).toBe(true);
+      }
+    });
+
+    it('rejects a --variant-out path without a .json extension', () => {
+      expect(() => runNullReport({ ...args, variantOut: join(root, 'variant-summary') })).toThrow(
+        /--variant-out must end with "\.json"/
+      );
+    });
+
+    it('never merges a --trained section into a variant summary, even when trained.json exists', () => {
+      // Regression test for a dual-review finding: the trained section
+      // describes the unrelated 'trained' decoder condition (WP3), not the
+      // authored-flip-* condition a variant summary is labelled with --
+      // merging it in would silently contaminate the variant JSON whenever
+      // a local trained.json happened to exist.
+      writeFileSync(authoredPath, JSON.stringify(buildRaw({ decoder: 'authored-flip-both' })));
+      writeFileSync(args.trained, JSON.stringify(buildTrainedRaw()));
+      writeTrainedReadoutManifest(args.trainedReadoutManifest);
+      const variantOut = join(root, 'variant-authored-flip-both-summary.json');
+      const result = runNullReport({ ...args, variantOut });
+      expect(result.artifact.trained).toBeUndefined();
+      const written = JSON.parse(readFileSync(variantOut, 'utf8')) as { trained?: unknown };
+      expect(written.trained).toBeUndefined();
+    });
+  });
+
+  describe('raw.decoder validation', () => {
+    it('treats a missing decoder field as authored (backward compatibility with pre-WP1 authored.json)', () => {
+      const { decoder: _decoder, ...raw } = buildRaw();
+      writeFileSync(authoredPath, JSON.stringify(raw));
+      const result = runNullReport(args);
+      expect(result.artifact.condition).toBe('authored, opponent parked');
+    });
+
+    it('treats an explicit null decoder as authored', () => {
+      const raw = { ...buildRaw(), decoder: null };
+      writeFileSync(authoredPath, JSON.stringify(raw));
+      const result = runNullReport(args);
+      expect(result.artifact.condition).toBe('authored, opponent parked');
+    });
+
+    it('throws on an unrecognized decoder value rather than producing a variant with no condition', () => {
+      const raw = { ...buildRaw(), decoder: 'authored-flip-brake' };
+      writeFileSync(authoredPath, JSON.stringify(raw));
+      const variantOut = join(root, 'variant-bogus-summary.json');
+      expect(() => runNullReport({ ...args, variantOut })).toThrow(/unrecognized decoder/);
+    });
+
+    it('throws on an inherited-property decoder value (constructor/toString/__proto__) instead of silently resolving a condition off Object.prototype', () => {
+      // Regression test for a reviewer finding: `decoder in CONDITION_LABELS`
+      // walks the prototype chain, so a hand-edited "constructor" would have
+      // passed and CONDITION_LABELS['constructor'] would have been the
+      // Object constructor function -- JSON.stringify then silently drops it,
+      // producing exactly the "variant with no condition" outcome this check
+      // exists to prevent. Object.hasOwn fixes this.
+      for (const bogus of ['constructor', 'toString', '__proto__', 'hasOwnProperty']) {
+        const raw = { ...buildRaw(), decoder: bogus };
+        writeFileSync(authoredPath, JSON.stringify(raw));
+        const variantOut = join(root, `variant-${bogus.replace(/[^a-z]/gi, '')}-summary.json`);
+        expect(() => runNullReport({ ...args, variantOut })).toThrow(/unrecognized decoder/);
+      }
+    });
   });
 });
 
