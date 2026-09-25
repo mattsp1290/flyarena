@@ -5,13 +5,12 @@ import { createWorkerClient, type WorkerClient } from '../worker/client';
 import type { DecoderKind } from '../worker/protocol';
 import {
   loadArenaArtifacts,
-  loadRewiringNull,
   loadTrainedReadoutArtifact,
   type ArenaManifest,
   type LoadedArenaArtifacts,
-  type RewiringNullLoadResult,
   type TrainedReadoutLoadResult
 } from './assets';
+import { loadRewiringNull, type RewiringNullLoadResult } from './rewiringNull';
 import { buildGraphBufferForMode, createWorkerAgentBinding } from './bindings';
 import { ExperimentRunner, isNotInitializedRejection, type ExperimentTelemetry } from './runner';
 import { transition, type ExperimentStatus } from './state';
@@ -109,7 +108,7 @@ export interface ExperimentControllerOptions {
   /** Injectable for tests; defaults to `./assets.ts#loadTrainedReadoutArtifact`. */
   loadTrainedReadout?: typeof loadTrainedReadoutArtifact;
   /**
-   * Injectable for tests; defaults to `./assets.ts#loadRewiringNull`.
+   * Injectable for tests; defaults to `./rewiringNull.ts#loadRewiringNull`.
    * Without this seam, a test could never observe the `destroyed` guard on
    * this load's own `.then` (dual review, Important) — every other loader
    * here is injectable for exactly the same reason.
@@ -358,8 +357,12 @@ export class ExperimentController {
     void Promise.resolve()
       .then(() => loadNull(artifacts.manifest, dataBaseUrl))
       .catch(
+        // `'unavailable'`, not `'invalid'` (thermo review, Suggestion): this
+        // is a genuine runtime/JS error — a throw somewhere in the loader's
+        // chain, not a hash/shape/cross-check failure — so it must not be
+        // described to a visitor as "failed verification" (`LedgerPanel.svelte`).
         (error: unknown): RewiringNullLoadResult => ({
-          status: 'invalid',
+          status: 'unavailable',
           reason: `unexpected error while loading the rewiring null: ${error instanceof Error ? error.message : String(error)}`
         })
       )

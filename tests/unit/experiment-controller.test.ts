@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { ExperimentController } from '../../src/lib/experiment/controller';
 import type { ConnectomeGraph, GraphMode } from '../../src/lib/connectome/format';
-import type { ArenaManifest, RewiringNullLoadResult } from '../../src/lib/experiment/assets';
+import type { ArenaManifest } from '../../src/lib/experiment/assets';
+import type { RewiringNullLoadResult } from '../../src/lib/experiment/rewiringNull';
 import type { WorkerRequest, WorkerResponse } from '../../src/lib/worker/protocol';
 import { createPublicDataFetch, FakeNeuralWorker } from '../helpers/fake-worker';
 import { createCallbacks, createWorker, SEED, TOTAL_TICKS, useControllerTestLifecycle } from './experiment-controller-test-helpers';
@@ -222,7 +223,7 @@ describe('ExperimentController rewiring-null loading (WP4)', () => {
     expect(callbacks.rewiringNullResults).toHaveLength(0);
 
     controller.dispose();
-    resolveNull({ status: 'missing', reason: 'settled after dispose' });
+    resolveNull({ status: 'absent', reason: 'settled after dispose' });
     await Promise.resolve();
     await Promise.resolve();
 
@@ -237,14 +238,14 @@ describe('ExperimentController rewiring-null loading (WP4)', () => {
       initialTopology: { left: 'biological', right: 'rewired' },
       createWorker,
       callbacks,
-      loadRewiringNull: async () => ({ status: 'missing', reason: 'stubbed for this test' })
+      loadRewiringNull: async () => ({ status: 'absent', reason: 'stubbed for this test' })
     });
     trackController(controller);
 
     await controller.initialize();
 
     expect(callbacks.rewiringNullResults).toHaveLength(1);
-    expect(callbacks.rewiringNullResults[0]).toEqual({ status: 'missing', reason: 'stubbed for this test' });
+    expect(callbacks.rewiringNullResults[0]).toEqual({ status: 'absent', reason: 'stubbed for this test' });
   });
 
   /**
@@ -254,7 +255,7 @@ describe('ExperimentController rewiring-null loading (WP4)', () => {
    * resolves or never resolves, so a version of `controller.ts` with that
    * `.catch` deleted would still pass them all.
    */
-  it('maps a rejecting loadRewiringNull to an "invalid" onRewiringNull result instead of an unhandled rejection', async () => {
+  it('maps a rejecting loadRewiringNull to an "unavailable" onRewiringNull result instead of an unhandled rejection', async () => {
     const callbacks = createCallbacks();
     const controller = new ExperimentController({
       seed: SEED,
@@ -272,8 +273,11 @@ describe('ExperimentController rewiring-null loading (WP4)', () => {
 
     expect(callbacks.rewiringNullResults).toHaveLength(1);
     const result = callbacks.rewiringNullResults[0];
-    expect(result.status).toBe('invalid');
-    if (result.status === 'invalid') expect(result.reason).toMatch(/unexpected error.*boom/);
+    // 'unavailable', not 'invalid' (thermo review, Suggestion): this is a
+    // genuine runtime error, not a hash/shape verification failure, so it
+    // must not be described to a visitor as "failed verification".
+    expect(result.status).toBe('unavailable');
+    if (result.status === 'unavailable') expect(result.reason).toMatch(/unexpected error.*boom/);
   });
 
   /**
@@ -291,7 +295,7 @@ describe('ExperimentController rewiring-null loading (WP4)', () => {
       initialTopology: { left: 'biological', right: 'rewired' },
       createWorker,
       callbacks,
-      loadRewiringNull: async () => ({ status: 'missing', reason: 'stubbed for this test' })
+      loadRewiringNull: async () => ({ status: 'absent', reason: 'stubbed for this test' })
     });
     trackController(controller);
 

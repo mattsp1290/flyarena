@@ -7,9 +7,9 @@
     loadPositions,
     type ArenaManifest,
     type PositionsLoadResult,
-    type RewiringNullLoadResult,
     type TrainedReadoutLoadResult
   } from './lib/experiment/assets';
+  import type { RewiringNullLoadResult } from './lib/experiment/rewiringNull';
   import { ExperimentController } from './lib/experiment/controller';
   import type { ExperimentRunner, ExperimentTelemetry } from './lib/experiment/runner';
   import type { ExperimentStatus } from './lib/experiment/state';

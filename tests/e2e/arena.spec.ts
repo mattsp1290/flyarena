@@ -295,10 +295,13 @@ test.describe('model ledger and provenance', () => {
     await expect(histogram).toBeVisible();
     // The sentence is built from the verified artifact's own `null.n`
     // (500)/`condition` ("authored, opponent parked")/`seeds.count` (100),
-    // not hardcoded (dual review, Important).
+    // not hardcoded (dual review, Important). Thermo review I1: the
+    // percentile direction is stated explicitly (`0% = lowest score, 100% =
+    // highest`) and the aria-label also carries the static "hand-written,
+    // not biology, not trained" disclaimer.
     await expect(histogram.locator('svg[role="img"]')).toHaveAttribute(
       'aria-label',
-      /Biological scored above \d+(\.\d+)?% of 500 degree-preserving rewirings \(authored, opponent parked, 100 held-out seeds\)\./
+      /Biological ranks at the \d+(\.\d+)?% percentile \(0% = lowest score, 100% = highest\) among 500 degree-preserving rewirings \(authored, opponent parked, 100 held-out seeds\)\. The "authored" decoder is a fixed, hand-written mapping — not biology and not trained\./
     );
     // The markers are labeled in a visible legend, never color alone —
     // scoped to the legend list specifically, since the same words also

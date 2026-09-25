@@ -3,15 +3,18 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { loadRewiringNull, type ArenaManifest } from '../../src/lib/experiment/assets';
+import type { ArenaManifest } from '../../src/lib/experiment/assets';
+import { loadRewiringNull } from '../../src/lib/experiment/rewiringNull';
 import { createPublicDataFetch } from '../helpers/fake-worker';
 
 /**
  * WP4 (`.agents/plans/rewiring-null/04-ledger-histogram.md`) unit coverage
- * for `assets.ts#loadRewiringNull`, split into its own file (rather than
- * folded into `tests/unit/experiment-assets.test.ts`) since this WP's plan
- * names it as its own file (`tests/unit/assets-null.test.ts`). Exercises the
- * real, committed `public/data/rewiring-null-v1.json` and manifest entry —
+ * for `rewiringNull.ts#loadRewiringNull` (extracted out of `assets.ts` by a
+ * later thermo-nuclear review pass — see that file's own doc comment),
+ * split into its own file (rather than folded into
+ * `tests/unit/experiment-assets.test.ts`) since this WP's plan names it as
+ * its own file (`tests/unit/assets-null.test.ts`). Exercises the real,
+ * committed `public/data/rewiring-null-v1.json` and manifest entry —
  * `loadTrainedReadoutArtifact`'s existing tests in `experiment-assets.test.ts`
  * are this function's closest precedent and this file mirrors their
  * structure/naming.
@@ -40,17 +43,20 @@ describe('loadRewiringNull (against the real committed WP2 artifact)', () => {
     expect(result.data.rewired.some((entry) => entry.seed === 0)).toBe(true);
   });
 
-  it('is "missing" with an honest reason when the manifest has no rewiringNull entry', async () => {
+  it('is "absent" with an honest reason when the manifest has no rewiringNull entry', async () => {
     vi.stubGlobal('fetch', createPublicDataFetch());
     const manifestWithoutEntry: ArenaManifest = { ...manifest, rewiringNull: undefined };
     const result = await loadRewiringNull(manifestWithoutEntry, '/data');
-    expect(result.status).toBe('missing');
+    expect(result.status).toBe('absent');
   });
 
-  it('is "missing" (never throws) when the artifact 404s', async () => {
+  // Thermo review, Suggestion: distinct from "absent" above — the manifest
+  // *does* pin an entry, but fetching it failed, which is not the same
+  // claim as "nothing was ever shipped".
+  it('is "unavailable" (never throws) when the artifact 404s', async () => {
     vi.stubGlobal('fetch', async () => new Response(null, { status: 404, statusText: 'Not Found' }));
     const result = await loadRewiringNull(manifest, '/data');
-    expect(result.status).toBe('missing');
+    expect(result.status).toBe('unavailable');
   });
 
   it('is "invalid" with a sha256 reason when rewiring-null-v1.json is tampered', async () => {
@@ -301,5 +307,41 @@ describe('loadRewiringNull (shape validation, with a synthetic manifest sha256 t
     const result = await loadRewiringNull(manifestForBody, '/data');
     expect(result.status).toBe('invalid');
     if (result.status === 'invalid') expect(result.reason).toMatch(/shipped rewired control arm/);
+  });
+
+  // Thermo review S3: the producer (`null-report.ts`) refuses to write a
+  // report at all without a seed-0 entry — an artifact that hash/shape-
+  // verifies but omits it must be rejected too, not silently rendered with
+  // one fewer marker.
+  it('is "invalid" when the rewired array has no seed-0 entry (the shipped control arm is missing entirely)', async () => {
+    const { manifest: manifestForBody } = manifestServing({
+      ...validArtifact,
+      rewired: [{ ...validArtifact.rewired[0], seed: 1 }]
+    });
+    const result = await loadRewiringNull(manifestForBody, '/data');
+    expect(result.status).toBe('invalid');
+    if (result.status === 'invalid') expect(result.reason).toMatch(/missing the shipped rewired-seed-0 control arm/);
+  });
+
+  // Thermo review S1: recomputes `(kBelow + 0.5*kEqual)/n` (and the paired
+  // pLow/pHigh) from the artifact's own `rewired[].score`/`biological.score`
+  // and rejects a hash/shape-valid artifact whose separately-authored
+  // bioPercentile/pLow/pHigh disagree with that recomputation — the same
+  // class of producer bug `null-report.ts`'s own comments document
+  // happening once before for the bin totals, but here in the headline
+  // percentile instead.
+  it('is "invalid" when bioPercentile/pLow/pHigh disagree with the rank statistics recomputed from the artifact\'s own scores', async () => {
+    const { manifest: manifestForBody } = manifestServing({
+      ...validArtifact,
+      // A second rewired graph scoring below biological (-0.22) shifts the
+      // true bioPercentile to 0.5 — `bioPercentile`/`pLow`/`pHigh` below are
+      // left at validArtifact's original (now-stale) values for n=1.
+      rewired: [validArtifact.rewired[0], { ...validArtifact.rewired[0], seed: 1, score: -1 }],
+      null: { ...validArtifact.null, n: 2 },
+      bins: { edges: [-2, 0, 2], counts: [1, 1] }
+    });
+    const result = await loadRewiringNull(manifestForBody, '/data');
+    expect(result.status).toBe('invalid');
+    if (result.status === 'invalid') expect(result.reason).toMatch(/rank statistics recomputed/);
   });
 });

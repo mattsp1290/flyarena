@@ -4,7 +4,8 @@ import ExperimentPanel from '../../src/lib/ui/ExperimentPanel.svelte';
 import TelemetryPanel from '../../src/lib/ui/TelemetryPanel.svelte';
 import LedgerPanel from '../../src/lib/ui/LedgerPanel.svelte';
 import type { ExperimentTelemetry } from '../../src/lib/experiment/runner';
-import type { ArenaManifest, RewiringNullLoadResult, TrainedReadoutLoadResult } from '../../src/lib/experiment/assets';
+import type { ArenaManifest, TrainedReadoutLoadResult } from '../../src/lib/experiment/assets';
+import type { RewiringNullLoadResult } from '../../src/lib/experiment/rewiringNull';
 
 afterEach(() => cleanup());
 
@@ -353,7 +354,10 @@ describe('LedgerPanel', () => {
     expect(ledgerRow(container, 'Biological annotations')).toHaveTextContent('Annotated');
     expect(ledgerRow(container, 'Network dynamics')).toHaveTextContent('Authored / literature-derived');
     expect(ledgerRow(container, 'Global parameters')).toHaveTextContent('Calibrated');
-    expect(ledgerRow(container, 'Sensory encoder and action decoder')).toHaveTextContent('Authored');
+    // Thermo review I1: "authored" carries a short "(hand-written)" gloss
+    // in-product, defining the word where a reader would otherwise take it
+    // as a neutral engineering label.
+    expect(ledgerRow(container, 'Sensory encoder and action decoder')).toHaveTextContent('Authored (hand-written)');
     expect(ledgerRow(container, '3D presentation')).toHaveTextContent('Synthetic');
     expect(ledgerRow(container, 'Neuron positions')).toHaveTextContent('Measured');
     expect(ledgerRow(container, 'Displayed neural activity')).toHaveTextContent('Computed');
@@ -466,8 +470,11 @@ describe('LedgerPanel', () => {
     // (2 and 100 here), not a hardcoded "500" — regression coverage for the
     // dual review finding that an earlier version hardcoded these numbers.
     const figcaption = container.querySelector('figcaption');
-    expect(figcaption).toHaveTextContent(/scored above 0\.0% of 2 degree-preserving rewirings/i);
+    expect(figcaption).toHaveTextContent(/ranks at the 0\.0% percentile.*among 2 degree-preserving rewirings/i);
     expect(figcaption).toHaveTextContent(/opponent parked/i);
+    // Thermo review I1: the static disclaimer is visible in-product, not
+    // only in the linked report.
+    expect(figcaption).toHaveTextContent(/fixed, hand-written mapping/i);
     expect(screen.getByRole('link', { name: /rewiring-null result \(json\)/i })).toHaveAttribute(
       'href',
       '/data/rewiring-null-v1.json'
@@ -475,19 +482,19 @@ describe('LedgerPanel', () => {
     expect(screen.getByRole('link', { name: /full rewiring-null report/i })).toBeInTheDocument();
   });
 
-  it('hides the "Topology null distribution" section entirely when the artifact is missing (the ledger row itself, like "Readout (trained mode)", still shows)', () => {
+  it('hides the "Topology null distribution" section entirely when the artifact is absent (the ledger row itself, like "Readout (trained mode)", still shows)', () => {
     const { container } = render(LedgerPanel, {
       manifest,
       decoder: 'authored',
       trainedReadout: undefined,
-      rewiringNull: { status: 'missing', reason: 'no entry' }
+      rewiringNull: { status: 'absent', reason: 'no entry' }
     });
     expect(ledgerRow(container, 'Topology null distribution')).toHaveTextContent('Computed (offline) — not shipped');
     expect(screen.queryByRole('heading', { name: /topology null distribution/i })).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: /rewiring-null result \(json\)/i })).not.toBeInTheDocument();
   });
 
-  it('shows the honest verification-failure message when the rewiring-null artifact is invalid, and labels the ledger row "unavailable"', () => {
+  it('shows the honest verification-failure message when the rewiring-null artifact is invalid, and labels the ledger row "failed verification"', () => {
     const { container } = render(LedgerPanel, {
       manifest,
       decoder: 'authored',
@@ -496,7 +503,23 @@ describe('LedgerPanel', () => {
     });
     const message = screen.getByText(/null-distribution result failed verification/i);
     expect(message).toHaveTextContent(/sha256 mismatch/i);
-    expect(ledgerRow(container, 'Topology null distribution')).toHaveTextContent('Computed (offline) — unavailable');
+    expect(ledgerRow(container, 'Topology null distribution')).toHaveTextContent('Computed (offline) — failed verification');
+    expect(screen.getByRole('heading', { name: /topology null distribution/i })).toBeInTheDocument();
+  });
+
+  // Thermo review, Suggestion: distinct wording from "invalid" above — a
+  // genuine fetch/network failure is not a claim that verification failed.
+  it('shows a "could not be loaded" message (not "failed verification") when the rewiring-null artifact is unavailable, and labels the ledger row accordingly', () => {
+    const { container } = render(LedgerPanel, {
+      manifest,
+      decoder: 'authored',
+      trainedReadout: undefined,
+      rewiringNull: { status: 'unavailable', reason: 'network error (test)' }
+    });
+    const message = screen.getByText(/null-distribution result could not be loaded/i);
+    expect(message).toHaveTextContent(/network error \(test\)/i);
+    expect(screen.queryByText(/failed verification/i)).not.toBeInTheDocument();
+    expect(ledgerRow(container, 'Topology null distribution')).toHaveTextContent('Computed (offline) — could not be loaded');
     expect(screen.getByRole('heading', { name: /topology null distribution/i })).toBeInTheDocument();
   });
 

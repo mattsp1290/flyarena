@@ -1,7 +1,7 @@
 import { cleanup, render, screen } from '@testing-library/svelte';
 import { afterEach, describe, expect, it } from 'vitest';
 import NullHistogram from '../../src/lib/ui/NullHistogram.svelte';
-import type { RewiringNullArtifact } from '../../src/lib/experiment/assets';
+import type { RewiringNullArtifact } from '../../src/lib/experiment/rewiringNull';
 
 /**
  * WP4 (`.agents/plans/rewiring-null/04-ledger-histogram.md`) component test
@@ -87,10 +87,18 @@ describe('NullHistogram', () => {
     // actual `null.n`/`seeds.count` (3 and 100 here) — this fixture
     // deliberately uses n=3, not 500, so a hardcoded "500" would fail this.
     expect(figcaption).toHaveTextContent(
-      'Biological scored above 0.0% of 3 degree-preserving rewirings (authored, opponent parked, 100 held-out seeds).'
+      'Biological ranks at the 0.0% percentile (0% = lowest score, 100% = highest) among 3 degree-preserving ' +
+        'rewirings (authored, opponent parked, 100 held-out seeds).'
     );
-    // Descriptive only — no causal/superiority language anywhere in the caption.
-    expect(figcaption?.textContent).not.toMatch(/causal|better|worse|superior/i);
+    // Thermo review I1: the static disclaimer must be visible in-product
+    // (not only in the linked report), and must name "hand-written"/"not
+    // biology"/"not trained" explicitly.
+    expect(figcaption).toHaveTextContent(
+      'The "authored" decoder is a fixed, hand-written mapping — not biology and not trained. This is a ' +
+        'descriptive comparison within this model, not a claim that any topology is better or worse.'
+    );
+    // Still descriptive only — no causal/superiority claim.
+    expect(figcaption?.textContent).not.toMatch(/\bcausal\b/i);
     const reportLink = screen.getByRole('link', { name: /full rewiring-null report/i });
     expect(reportLink).toHaveAttribute(
       'href',
@@ -112,16 +120,20 @@ describe('NullHistogram', () => {
   it('formats a nonzero percentile correctly', () => {
     const { container } = render(NullHistogram, { data: { ...fixture, bioPercentile: 0.337 } });
     const figcaption = container.querySelector('figcaption');
-    expect(figcaption).toHaveTextContent('Biological scored above 33.7% of 3 degree-preserving rewirings');
+    expect(figcaption).toHaveTextContent('Biological ranks at the 33.7% percentile');
+    expect(figcaption).toHaveTextContent('among 3 degree-preserving rewirings');
   });
 
-  it('gives the SVG role="img" with an aria-label repeating the figcaption sentence, and no redundant <desc>', () => {
+  it('gives the SVG role="img" with an aria-label repeating the figcaption sentence plus the disclaimer, and no redundant <desc>', () => {
     const { container } = render(NullHistogram, { data: fixture });
     const svg = container.querySelector('svg[role="img"]');
     expect(svg).toBeTruthy();
     expect(svg).toHaveAttribute(
       'aria-label',
-      'Biological scored above 0.0% of 3 degree-preserving rewirings (authored, opponent parked, 100 held-out seeds).'
+      'Biological ranks at the 0.0% percentile (0% = lowest score, 100% = highest) among 3 degree-preserving ' +
+        'rewirings (authored, opponent parked, 100 held-out seeds). The "authored" decoder is a fixed, ' +
+        'hand-written mapping — not biology and not trained. This is a descriptive comparison within this ' +
+        'model, not a claim that any topology is better or worse.'
     );
     // Dual review, Suggestion: `<desc>` duplicated the same sentence a third
     // time (after `aria-label` and the visible `<figcaption>`) with no extra
@@ -210,5 +222,26 @@ describe('NullHistogram', () => {
     const disconnectedLine = lines[lines.length - 1]; // disconnected last.
     expect(Number(biologicalLine.getAttribute('x1'))).toBe(PADDING_LEFT);
     expect(Number(disconnectedLine.getAttribute('x1'))).toBe(WIDTH - PADDING_RIGHT);
+  });
+
+  /**
+   * Thermo-maintainability review S1: the per-bar `<title>` tooltip needs a
+   * mouse hover and is invisible to a screen reader under `role="img"` —
+   * this asserts the visually-hidden table gives keyboard/screen-reader
+   * users the same per-bin data (bin range, count) without a mouse.
+   */
+  it('exposes a visually-hidden table of per-bin ranges and counts (keyboard/screen-reader path to the histogram data)', () => {
+    const { container } = render(NullHistogram, { data: fixture });
+    const table = container.querySelector('table.sr-only');
+    expect(table).toBeTruthy();
+    const rows = table?.querySelectorAll('tbody tr') ?? [];
+    expect(rows.length).toBe(fixture.bins.counts.length);
+    fixture.bins.counts.forEach((count, index) => {
+      const cells = rows[index].querySelectorAll('td');
+      expect(cells[0]).toHaveTextContent(
+        `${fixture.bins.edges[index].toFixed(2)} to ${fixture.bins.edges[index + 1].toFixed(2)}`
+      );
+      expect(cells[1]).toHaveTextContent(String(count));
+    });
   });
 });

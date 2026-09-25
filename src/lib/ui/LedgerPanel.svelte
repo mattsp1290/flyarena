@@ -1,7 +1,9 @@
 <script lang="ts">
-  import type { ArenaManifest, RewiringNullLoadResult, TrainedReadoutLoadResult } from '../experiment/assets';
+  import type { ArenaManifest, TrainedReadoutLoadResult } from '../experiment/assets';
+  import type { RewiringNullLoadResult } from '../experiment/rewiringNull';
   import type { DecoderKind } from '../worker/protocol';
   import NullHistogram from './NullHistogram.svelte';
+  import { githubDocUrl } from './links';
 
   /**
    * The model ledger vocabulary (`docs/model-ledger.md`) plus provenance
@@ -39,7 +41,15 @@
     // encoder and decodeAction stay Authored and identical either way.
     {
       term: 'Sensory encoder and action decoder',
-      label: decoder === 'trained' ? 'Authored (encoder) + Trained (readout, per-arm)' : 'Authored'
+      // "(hand-written)" gloss (thermo review I1): "Authored" alone reads as
+      // a neutral engineering label, but readers over-interpret bare
+      // "authored" numbers elsewhere in the product (see `NullHistogram.svelte`'s
+      // `CAPTION_DISCLAIMER`) — this row is the one place that word is
+      // *defined* in-product, without leaving the app.
+      label:
+        decoder === 'trained'
+          ? 'Authored (hand-written, encoder) + Trained (readout, per-arm)'
+          : 'Authored (hand-written)'
     },
     { term: '3D presentation', label: 'Synthetic' },
     // WP3 (anatomical activity view): neuron positions come from the MaleCNS
@@ -59,6 +69,12 @@
     // WP4 (`docs/model-ledger.md`'s new row): descriptive scores of
     // degree-preserving rewirings under the authored decoder, computed
     // offline — never a biological measurement.
+    //
+    // `'absent'`/`'unavailable'`/`'invalid'` are worded differently (thermo
+    // review, Suggestion): "not shipped" is only true when the manifest has
+    // no entry at all; a fetch/network failure ("could not load") is not a
+    // claim about the artifact's integrity the way "failed verification"
+    // is, so this row (and the section below) must not conflate them.
     {
       term: 'Topology null distribution',
       label:
@@ -66,9 +82,11 @@
           ? 'Loading…'
           : rewiringNull.status === 'ok'
             ? 'Computed (offline)'
-            : rewiringNull.status === 'missing'
+            : rewiringNull.status === 'absent'
               ? 'Computed (offline) — not shipped'
-              : 'Computed (offline) — unavailable'
+              : rewiringNull.status === 'unavailable'
+                ? 'Computed (offline) — could not be loaded'
+                : 'Computed (offline) — failed verification'
     }
   ]);
 
@@ -79,15 +97,17 @@
    * not part of the deployed static site (only `public/` is served) — a
    * relative `docs/trained-readout-report.md` link would 404 under any base
    * path. The JSON links above are the base-path-safe, always-resolvable
-   * links; this is offered alongside them for the prose version.
+   * links; this is offered alongside them for the prose version. Built via
+   * `./links.ts#githubDocUrl`, shared with `NullHistogram.svelte`'s own
+   * report link (thermo-maintainability review S3).
    */
-  const GITHUB_REPORT_URL = 'https://github.com/mattsp1290/flyarena/blob/main/docs/trained-readout-report.md';
+  const GITHUB_REPORT_URL = githubDocUrl('trained-readout-report.md');
 
   /**
    * WP4's counterpart to `reportUrl` above, for the rewiring-null artifact's
    * own JSON — `NullHistogram.svelte`'s figcaption links the human-readable
    * report. Built from `manifest.rewiringNull.artifact` (the same field
-   * `assets.ts#loadRewiringNull` itself fetches), not a hardcoded filename
+   * `rewiringNull.ts#loadRewiringNull` itself fetches), not a hardcoded filename
    * (dual review, Suggestion) — the manifest is the single source of truth
    * for this artifact's name, already available here as a prop. Falls back
    * to the conventional filename only for the (impossible in practice) case
@@ -165,13 +185,15 @@
     </dl>
   {/if}
 
-  {#if rewiringNull && rewiringNull.status !== 'missing'}
+  {#if rewiringNull && rewiringNull.status !== 'absent'}
     <!-- One block, not two separately-conditioned `{#if}`s (dual review,
          Suggestion — the earlier version had to keep the heading's own
          `{#if}` in sync with this body's by hand). This also lets
-         `rewiringNull.status` narrow inside the `{#if}/{:else}` below
+         `rewiringNull.status` narrow inside the `{#if}/{:else if}` below
          without `?.`, since the outer condition already excludes `undefined`
-         and `'missing'`. -->
+         and `'absent'` (nothing was ever shipped, so there is nothing to say
+         here — `'unavailable'`/`'invalid'` are genuine attempts that failed
+         and still get a heading plus an honestly-worded message). -->
     <h3>Topology null distribution</h3>
     {#if rewiringNull.status === 'ok'}
       <!-- `NullHistogram`'s own `<figcaption>` already links "Full
@@ -183,6 +205,14 @@
       <ul class="links">
         <li><a href={rewiringNullJsonUrl} target="_blank" rel="noreferrer">Rewiring-null result (JSON)</a></li>
       </ul>
+    {:else if rewiringNull.status === 'unavailable'}
+      <!-- A fetch/network failure or an unexpected runtime error
+           (`controller.ts`'s leading `.catch`) — not a claim about the
+           artifact's integrity, so this must not say "failed verification"
+           (thermo review, Suggestion). -->
+      <p class="error-message">
+        Null-distribution result could not be loaded: {rewiringNull.reason}
+      </p>
     {:else}
       <p class="error-message">
         Null-distribution result failed verification: {rewiringNull.reason}

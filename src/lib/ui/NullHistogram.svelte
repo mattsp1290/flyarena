@@ -1,12 +1,13 @@
 <script lang="ts">
-  import type { RewiringNullArtifact } from '../experiment/assets';
+  import type { RewiringNullArtifact } from '../experiment/rewiringNull';
+  import { githubDocUrl } from './links';
 
   /**
    * WP4: pure SVG histogram of the authored-decoder rewiring null
    * distribution (`.agents/plans/rewiring-null/04-ledger-histogram.md`).
    * `LedgerPanel.svelte` is the only caller, and only renders this once
    * `rewiringNull.status === 'ok'` — this component assumes `data` already
-   * passed `assets.ts#loadRewiringNull`'s sha256, shape, and (dual review)
+   * passed `rewiringNull.ts#loadRewiringNull`'s sha256, shape, and (dual review)
    * cross-consistency verification: `bioPercentile`/`pLow`/`pHigh` are in
    * `[0, 1]`, `sum(bins.counts) === rewired.length === null.n`, and every
    * marker score falls inside `[bins.edges[0], bins.edges[last]]`. `xForValue`
@@ -137,26 +138,39 @@
   const percentileLabel = $derived(`${(data.bioPercentile * 100).toFixed(1)}%`);
 
   /**
-   * The plan's literal sentence template (`04-ledger-histogram.md`),
-   * descriptive only — no causal or superiority claim — but every number
-   * and the condition text now come from the verified artifact itself
-   * (dual review, Important) rather than being hard-coded, so a future
-   * re-run with a different rewiring count or seed count can never leave
-   * this sentence silently describing the wrong run.
+   * Thermo-nuclear review (Important, "public honesty gap"): the earlier
+   * "scored above X% of N" phrasing reads as self-contradictory at the
+   * boundary value the real data ships with ("scored above 0.0%" means
+   * "at the very bottom", the opposite of what "above" normally signals),
+   * and named neither "authored" nor its own report's disclaiming language
+   * anywhere a visitor could see without leaving the app. This restates the
+   * percentile direction explicitly at every value (the `(0% = lowest
+   * score, 100% = highest)` parenthetical is itself data-independent, so it
+   * never needs a branch) — every other number and the condition text still
+   * come from the verified artifact itself (dual review, Important)
+   * rather than being hard-coded, so a future re-run with a different
+   * rewiring count or seed count can never leave this sentence silently
+   * describing the wrong run.
    */
   const captionSentence = $derived(
-    `Biological scored above ${percentileLabel} of ${data.null.n} degree-preserving rewirings ` +
-      `(${data.condition}, ${data.seeds.count} held-out seeds).`
+    `Biological ranks at the ${percentileLabel} percentile (0% = lowest score, 100% = highest) ` +
+      `among ${data.null.n} degree-preserving rewirings (${data.condition}, ${data.seeds.count} held-out seeds).`
   );
 
   /**
-   * A plain GitHub blob link, mirroring `LedgerPanel.svelte`'s own
-   * `GITHUB_REPORT_URL` for `docs/trained-readout-report.md`: `docs/` is not
-   * part of the deployed static site (only `public/` is served), so a
-   * relative `docs/rewiring-null-report.md` link would 404 under any base
-   * path.
+   * Static and condition-agnostic on purpose (thermo review I1): defines
+   * what "authored" means and forecloses the superiority reading a bare
+   * percentile invites, regardless of what `data.condition` says on a
+   * future run, so it never needs to parse or duplicate that field. Mirrors
+   * `docs/rewiring-null-report.md`'s own opening disclaimer, which — unlike
+   * this sentence — is not part of the deployed static site.
    */
-  const GITHUB_REPORT_URL = 'https://github.com/mattsp1290/flyarena/blob/main/docs/rewiring-null-report.md';
+  const CAPTION_DISCLAIMER =
+    'The "authored" decoder is a fixed, hand-written mapping — not biology and not trained. This is a ' +
+    'descriptive comparison within this model, not a claim that any topology is better or worse.';
+
+  /** `docs/` is not part of the deployed static site (only `public/` is served), so a relative `docs/rewiring-null-report.md` link would 404 under any base path — see `./links.ts`. */
+  const GITHUB_REPORT_URL = githubDocUrl('rewiring-null-report.md');
 
   // No local narrowing/rendering of WP3's `trained` section is done in this
   // WP (dual review, Suggestion — an earlier version hand-authored a guess
@@ -170,13 +184,21 @@
 </script>
 
 <figure class="null-histogram">
-  <svg viewBox={`0 0 ${WIDTH} ${HEIGHT}`} role="img" aria-label={captionSentence} focusable="false">
+  <svg
+    viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
+    role="img"
+    aria-label={`${captionSentence} ${CAPTION_DISCLAIMER}`}
+    focusable="false"
+  >
     <!-- No `<desc>` (dual review, Suggestion): `aria-label` already carries
-         the full result sentence as this image's accessible name, and the
-         same sentence is repeated a third time in the visible `<figcaption>`
-         below — a `<desc>` here would be a screen reader's fourth reading of
-         the same text. `<title>` stays as a short structural name for tools
-         that expose it independently of `aria-label` (e.g. a mouse tooltip). -->
+         the full result sentence (plus the disclaimer) as this image's
+         accessible name, and the same text is repeated again in the visible
+         `<figcaption>` below — a `<desc>` here would be a screen reader's
+         third reading of the same text. `<title>` stays as a short
+         structural name for tools that expose it independently of
+         `aria-label` (e.g. a mouse tooltip). Children of a `role="img"`
+         element are presentational to most screen readers, which is why the
+         per-bin data table below lives outside this `<svg>`, not inside it. -->
     <title>Topology null distribution</title>
     {#each bars as bar (bar.index)}
       <rect x={bar.x} y={bar.y} width={bar.width} height={bar.height} class="bar">
@@ -206,6 +228,30 @@
     {/each}
   </ul>
 
+  <!-- Thermo-maintainability review S1: the per-bar `<title>` tooltip above
+       needs a mouse hover and is invisible to a screen reader under
+       `role="img"` — this gives keyboard/screen-reader users the same
+       per-bin data (bin range, count) sighted-mouse users get, using data
+       the component already computes (`bars`). Visually hidden via `.sr-only`
+       (clipped, not `display:none`), never rendered on screen. -->
+  <table class="sr-only">
+    <caption>Per-bin counts of the {data.null.n} rewired graphs shown in the histogram above</caption>
+    <thead>
+      <tr>
+        <th scope="col">Bin range</th>
+        <th scope="col">Count</th>
+      </tr>
+    </thead>
+    <tbody>
+      {#each bars as bar (bar.index)}
+        <tr>
+          <td>{bar.rangeLabel}</td>
+          <td>{bar.count}</td>
+        </tr>
+      {/each}
+    </tbody>
+  </table>
+
   {#if data.null.degenerate}
     <!-- Placed before the figcaption, so "the percentile below" (not
          "above") is the accurate direction — round-2 dual review. Says "the
@@ -221,6 +267,7 @@
 
   <figcaption>
     {captionSentence}
+    {CAPTION_DISCLAIMER}
     <a href={GITHUB_REPORT_URL} target="_blank" rel="noreferrer">Full rewiring-null report</a>
   </figcaption>
 </figure>
@@ -238,6 +285,21 @@
     display: block;
     width: 100%;
     height: auto;
+  }
+
+  /* Visually hidden, never `display:none` — keeps the per-bin data table
+     reachable by keyboard/screen-reader navigation while invisible on
+     screen (standard "sr-only" clip pattern). */
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
   }
 
   .bar {
