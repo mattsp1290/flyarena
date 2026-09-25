@@ -191,6 +191,17 @@ export interface ArenaManifest {
    * `status: 'missing'` rather than throwing.
    */
   rewiringNull?: { artifact: string; sha256: string };
+  /**
+   * WP4 of `.agents/plans/null-explanation`: the ledger's null-result
+   * explanation note. `scripts/analysis/explain.py` writes this once
+   * `null-explanation-v1.json` exists — see `./nullExplanation.ts#loadNullExplanation`.
+   * Optional: a manifest produced before that WP (or a hand-built test
+   * fixture) simply has no explanation note to show — `loadNullExplanation`
+   * reports that as `status: 'missing'` rather than throwing, and
+   * `LedgerPanel.svelte` simply omits the paragraph rather than pretending
+   * it exists.
+   */
+  nullExplanation?: SidecarManifestEntry;
   sourceDataset: string;
   rewiredArms: Record<
     string,

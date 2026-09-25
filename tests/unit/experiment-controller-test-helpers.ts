@@ -4,6 +4,7 @@ import type { AgentId } from '../../src/lib/arena/types';
 import type { GraphMode } from '../../src/lib/connectome/format';
 import type { ArenaManifest, TrainedReadoutLoadResult } from '../../src/lib/experiment/assets';
 import type { RewiringNullLoadResult } from '../../src/lib/experiment/rewiringNull';
+import type { NullExplanationLoadResult } from '../../src/lib/experiment/nullExplanation';
 import type { ExperimentStatus } from '../../src/lib/experiment/state';
 import type { DecoderKind } from '../../src/lib/worker/protocol';
 import { createPublicDataFetch, FakeNeuralWorker } from '../helpers/fake-worker';
@@ -28,6 +29,7 @@ export type TestControllerCallbacks = ExperimentControllerCallbacks & {
   switchCounts: Array<Readonly<Record<AgentId, number>>>;
   trainedReadoutStatuses: TrainedReadoutLoadResult[];
   rewiringNullResults: RewiringNullLoadResult[];
+  nullExplanationResults: NullExplanationLoadResult[];
   decodersApplied: DecoderKind[];
 };
 
@@ -38,6 +40,7 @@ export const createCallbacks = (): TestControllerCallbacks => {
   const switchCounts: Array<Readonly<Record<AgentId, number>>> = [];
   const trainedReadoutStatuses: TrainedReadoutLoadResult[] = [];
   const rewiringNullResults: RewiringNullLoadResult[] = [];
+  const nullExplanationResults: NullExplanationLoadResult[] = [];
   const decodersApplied: DecoderKind[] = [];
   return {
     statuses,
@@ -46,6 +49,7 @@ export const createCallbacks = (): TestControllerCallbacks => {
     switchCounts,
     trainedReadoutStatuses,
     rewiringNullResults,
+    nullExplanationResults,
     decodersApplied,
     onStatusChange: (status) => statuses.push(status),
     onTelemetry: vi.fn(),
@@ -55,6 +59,7 @@ export const createCallbacks = (): TestControllerCallbacks => {
     onTopologySwitchCountChange: (counts) => switchCounts.push({ ...counts }),
     onTrainedReadoutStatus: (status) => trainedReadoutStatuses.push(status),
     onRewiringNull: (result) => rewiringNullResults.push(result),
+    onNullExplanation: (result) => nullExplanationResults.push(result),
     onDecoderApplied: (decoder) => decodersApplied.push(decoder)
   };
 };

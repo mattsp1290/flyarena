@@ -7,6 +7,14 @@ test('all views work beneath /fly/ with root asset routes deliberately unavailab
   await page.goto('/fly/');await expect(page.getByRole('status')).toHaveText('ready');
   const manifest=page.getByRole('link',{name:'Compiled artifact manifest (JSON)'});
   await expect(manifest).toHaveAttribute('href','/fly/data/malecns-arena-v1.manifest.json');
+  // WP4 of `.agents/plans/null-explanation`: `loadNullExplanation` (chained
+  // after `loadRewiringNull`, both fired from `initialize()` under this same
+  // /fly/-prefixed `dataBaseUrl`) must resolve to its real "ok" note here,
+  // not silently 404 against the deliberately-unavailable root /data/ path —
+  // a base-path bug here would either leave the note absent forever or show
+  // up in the `failed` 4xx/5xx log asserted at the end of this test.
+  await expect(page.getByRole('heading',{name:/why biological scores low/i})).toBeVisible({timeout:20000});
+  await expect(page.locator('.null-explanation-detail')).toContainText(/linear signal gain from right clearance input to thrust output/i);
   // WP3: `loadPositions` fetches the positions sidecar under this same
   // /fly/ base path — if it fell back to the (deliberately 404ing) root
   // /data/ path instead, the toggle would stay disabled forever and

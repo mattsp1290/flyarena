@@ -6,6 +6,7 @@ import LedgerPanel from '../../src/lib/ui/LedgerPanel.svelte';
 import type { ExperimentTelemetry } from '../../src/lib/experiment/runner';
 import type { ArenaManifest, TrainedReadoutLoadResult } from '../../src/lib/experiment/assets';
 import type { RewiringNullLoadResult } from '../../src/lib/experiment/rewiringNull';
+import type { NullExplanationLoadResult } from '../../src/lib/experiment/nullExplanation';
 
 afterEach(() => cleanup());
 
@@ -348,7 +349,7 @@ describe('LedgerPanel', () => {
   };
 
   it('renders the ledger vocabulary, never says brain emulation, and links to the manifest/ledger/license', () => {
-    const { container } = render(LedgerPanel, { manifest, decoder: 'authored', trainedReadout: undefined, rewiringNull: undefined });
+    const { container } = render(LedgerPanel, { manifest, decoder: 'authored', trainedReadout: undefined, rewiringNull: undefined, nullExplanation: undefined });
 
     expect(ledgerRow(container, 'Graph topology')).toHaveTextContent('Measured');
     expect(ledgerRow(container, 'Biological annotations')).toHaveTextContent('Annotated');
@@ -377,7 +378,7 @@ describe('LedgerPanel', () => {
   });
 
   it('renders the static ledger vocabulary even without a loaded manifest', () => {
-    const { container } = render(LedgerPanel, { manifest: undefined, decoder: 'authored', trainedReadout: undefined, rewiringNull: undefined });
+    const { container } = render(LedgerPanel, { manifest: undefined, decoder: 'authored', trainedReadout: undefined, rewiringNull: undefined, nullExplanation: undefined });
     expect(ledgerRow(container, 'Graph topology')).toHaveTextContent('Measured');
   });
 
@@ -391,7 +392,7 @@ describe('LedgerPanel', () => {
   } as unknown as TrainedReadoutLoadResult;
 
   it('shows the "Readout (trained mode)" row and provenance detail (hash prefix, param count, D -> H -> 3, report links) when the artifact is ok, visible even in Authored mode', () => {
-    const { container } = render(LedgerPanel, { manifest, decoder: 'authored', trainedReadout: trainedReadoutOk, rewiringNull: undefined });
+    const { container } = render(LedgerPanel, { manifest, decoder: 'authored', trainedReadout: trainedReadoutOk, rewiringNull: undefined, nullExplanation: undefined });
 
     expect(ledgerRow(container, 'Readout (trained mode)')).toHaveTextContent('Trained (offline)');
     expect(screen.getByText('835')).toBeInTheDocument();
@@ -409,7 +410,7 @@ describe('LedgerPanel', () => {
   });
 
   it('scopes the "Sensory encoder and action decoder" row label to Trained mode', () => {
-    const { container } = render(LedgerPanel, { manifest, decoder: 'trained', trainedReadout: trainedReadoutOk, rewiringNull: undefined });
+    const { container } = render(LedgerPanel, { manifest, decoder: 'trained', trainedReadout: trainedReadoutOk, rewiringNull: undefined, nullExplanation: undefined });
     const row = ledgerRow(container, 'Sensory encoder and action decoder');
     expect(row).toHaveTextContent(/authored/i);
     expect(row).toHaveTextContent(/trained/i);
@@ -420,7 +421,8 @@ describe('LedgerPanel', () => {
       manifest,
       decoder: 'authored',
       trainedReadout: { status: 'unavailable', reason: 'trained-readout-v1.json sha256 mismatch' },
-      rewiringNull: undefined
+      rewiringNull: undefined,
+      nullExplanation: undefined
     });
     const message = screen.getByText(/artifact failed verification/i);
     expect(message).toHaveTextContent(/sha256 mismatch/i);
@@ -451,12 +453,35 @@ describe('LedgerPanel', () => {
     }
   } as unknown as RewiringNullLoadResult;
 
+  const nullExplanationOk = {
+    status: 'ok',
+    data: {
+      version: 1,
+      sources: { rewiringNullSha256: 'a'.repeat(64) },
+      variants: { flipBoth: { bioPercentile: 0 } },
+      regime: { gatePassed: true },
+      finding: {
+        categories: ['linearPathway', 'structuralFeature'],
+        definitionSensitive: true,
+        qualifyingMetrics: [
+          { kind: 'transfer', name: 'T:rightClearance->thrust', spearman: 0.4669248436993748 },
+          { kind: 'feature', name: 'weightedInDegree:thrust', spearman: 0.3943192055100449 },
+          { kind: 'transfer', name: 'T:forwardClearance->thrust', spearman: 0.3534047736190945 }
+        ],
+        regimeInvalid: false,
+        summarySentence:
+          "Biological's low score is associated with: the linear transfer entry T:rightClearance->thrust sits outside the null's 2.5-97.5% range (rank correlation with score rho=0.467); the structural feature weightedInDegree:thrust sits outside the null's 2.5-97.5% range (rank correlation with score rho=0.394) -- a descriptive correlation, not a causal claim."
+      }
+    }
+  } as unknown as Extract<NullExplanationLoadResult, { status: 'ok' }>;
+
   it('shows the "Topology null distribution" section with the histogram and percentile sentence when the artifact is ok', () => {
     const { container } = render(LedgerPanel, {
       manifest,
       decoder: 'authored',
       trainedReadout: undefined,
-      rewiringNull: rewiringNullOk
+      rewiringNull: rewiringNullOk,
+      nullExplanation: undefined
     });
 
     expect(ledgerRow(container, 'Topology null distribution')).toHaveTextContent('Computed (offline)');
@@ -487,7 +512,8 @@ describe('LedgerPanel', () => {
       manifest,
       decoder: 'authored',
       trainedReadout: undefined,
-      rewiringNull: { status: 'absent', reason: 'no entry' }
+      rewiringNull: { status: 'absent', reason: 'no entry' },
+      nullExplanation: undefined
     });
     expect(ledgerRow(container, 'Topology null distribution')).toHaveTextContent('Computed (offline) — not shipped');
     expect(screen.queryByRole('heading', { name: /topology null distribution/i })).not.toBeInTheDocument();
@@ -499,7 +525,8 @@ describe('LedgerPanel', () => {
       manifest,
       decoder: 'authored',
       trainedReadout: undefined,
-      rewiringNull: { status: 'invalid', reason: 'rewiring-null artifact sha256 mismatch' }
+      rewiringNull: { status: 'invalid', reason: 'rewiring-null artifact sha256 mismatch' },
+      nullExplanation: undefined
     });
     const message = screen.getByText(/null-distribution result failed verification/i);
     expect(message).toHaveTextContent(/sha256 mismatch/i);
@@ -514,7 +541,8 @@ describe('LedgerPanel', () => {
       manifest,
       decoder: 'authored',
       trainedReadout: undefined,
-      rewiringNull: { status: 'unavailable', reason: 'network error (test)' }
+      rewiringNull: { status: 'unavailable', reason: 'network error (test)' },
+      nullExplanation: undefined
     });
     const message = screen.getByText(/null-distribution result could not be loaded/i);
     expect(message).toHaveTextContent(/network error \(test\)/i);
@@ -528,9 +556,122 @@ describe('LedgerPanel', () => {
       manifest,
       decoder: 'authored',
       trainedReadout: undefined,
-      rewiringNull: undefined
+      rewiringNull: undefined,
+      nullExplanation: undefined
     });
     expect(ledgerRow(container, 'Topology null distribution')).toHaveTextContent('Loading…');
     expect(screen.queryByRole('heading', { name: /topology null distribution/i })).not.toBeInTheDocument();
+  });
+
+  // WP4 of `.agents/plans/null-explanation`: the ledger's finding note,
+  // rendered next to the null histogram once both the histogram's own
+  // artifact and this note's artifact are `'ok'`.
+  it('always shows the static "Null-result explanation" ledger row, independent of nullExplanation status', () => {
+    const { container } = render(LedgerPanel, {
+      manifest,
+      decoder: 'authored',
+      trainedReadout: undefined,
+      rewiringNull: undefined,
+      nullExplanation: undefined
+    });
+    expect(ledgerRow(container, 'Null-result explanation')).toHaveTextContent('Computed (offline)');
+  });
+
+  it('renders the finding sentence, every qualifying metric in plain words with rho, the definition-sensitive flag/link, the mirrored-decoder clause, the regime clause, the non-causal disclaimer, and the report link', () => {
+    render(LedgerPanel, {
+      manifest,
+      decoder: 'authored',
+      trainedReadout: undefined,
+      rewiringNull: rewiringNullOk,
+      nullExplanation: nullExplanationOk
+    });
+
+    expect(screen.getByRole('heading', { name: /why biological scores low/i })).toBeInTheDocument();
+    expect(screen.getByText(nullExplanationOk.data.finding.summarySentence)).toBeInTheDocument();
+
+    // Every qualifying metric is listed in plain words with its own rho —
+    // never a hard-coded per-metric string table (the artifact drives every
+    // word here).
+    expect(
+      screen.getByText(/linear signal gain from right clearance input to thrust output \(ρ = 0\.467\)/i)
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/linear signal gain from forward clearance input to thrust output \(ρ = 0\.353\)/i)
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/weighted in-degree from input neurons to thrust output \(ρ = 0\.394\)/i)
+    ).toBeInTheDocument();
+
+    // Only the structural-feature (weightedInDegree) qualifying metric is
+    // flagged definition-sensitive, with a link into the report's
+    // disclosure — the two transfer-kind metrics above must not carry it.
+    const sensitiveLink = screen.getByRole('link', { name: /definition-sensitive/i });
+    expect(sensitiveLink).toHaveAttribute(
+      'href',
+      'https://github.com/mattsp1290/flyarena/blob/main/docs/null-explanation-report.md#structural-features'
+    );
+
+    // Mirrored decoder-convention check: still the bottom (0th percentile).
+    expect(screen.getByText(/mirroring the decoder's thrust and yaw signs still leaves biological at the bottom/i)).toBeInTheDocument();
+    // Regime check outcome.
+    expect(screen.getByText(/linear-regime check passed/i)).toBeInTheDocument();
+
+    // Always-carried framing.
+    expect(screen.getByText(/descriptive association within this model, not a cause/i)).toBeInTheDocument();
+    expect(screen.getByText(/fixed, hand-written decoder — not biology and not trained/i)).toBeInTheDocument();
+
+    const reportLink = screen.getByRole('link', { name: /full explanation report/i });
+    expect(reportLink).toHaveAttribute(
+      'href',
+      'https://github.com/mattsp1290/flyarena/blob/main/docs/null-explanation-report.md'
+    );
+  });
+
+  it('states a nonzero mirrored-decoder percentile and a failed regime gate in their own words', () => {
+    const movedUp = {
+      status: 'ok',
+      data: {
+        ...nullExplanationOk.data,
+        variants: { flipBoth: { bioPercentile: 0.337 } },
+        finding: { ...nullExplanationOk.data.finding, regimeInvalid: true }
+      }
+    } as unknown as NullExplanationLoadResult;
+    render(LedgerPanel, {
+      manifest,
+      decoder: 'authored',
+      trainedReadout: undefined,
+      rewiringNull: rewiringNullOk,
+      nullExplanation: movedUp
+    });
+    expect(screen.getByText(/moves biological to the 33\.7th percentile/i)).toBeInTheDocument();
+    expect(screen.getByText(/regime-invalid \(inconclusive\)/i)).toBeInTheDocument();
+  });
+
+  it('shows the honest "Explanation failed verification" message when the null-explanation artifact is invalid', () => {
+    render(LedgerPanel, {
+      manifest,
+      decoder: 'authored',
+      trainedReadout: undefined,
+      rewiringNull: rewiringNullOk,
+      nullExplanation: { status: 'invalid', reason: 'null-explanation artifact sha256 mismatch' }
+    });
+    const message = screen.getByText(/explanation failed verification/i);
+    expect(message).toHaveTextContent(/sha256 mismatch/i);
+    expect(screen.queryByRole('heading', { name: /why biological scores low/i })).not.toBeInTheDocument();
+  });
+
+  it('hides the explanation paragraph entirely when the null-explanation artifact is missing, while the histogram above it keeps rendering', () => {
+    const { container } = render(LedgerPanel, {
+      manifest,
+      decoder: 'authored',
+      trainedReadout: undefined,
+      rewiringNull: rewiringNullOk,
+      nullExplanation: { status: 'missing', reason: 'The manifest has no nullExplanation artifact entry.' }
+    });
+    expect(screen.queryByRole('heading', { name: /why biological scores low/i })).not.toBeInTheDocument();
+    expect(screen.queryByText(/explanation failed verification/i)).not.toBeInTheDocument();
+    // The histogram (a required, independent load) is unaffected.
+    expect(container.querySelector('.null-histogram')).not.toBeNull();
+    expect(screen.getByRole('heading', { name: /topology null distribution/i })).toBeInTheDocument();
   });
 });

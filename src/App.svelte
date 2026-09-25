@@ -10,6 +10,7 @@
     type TrainedReadoutLoadResult
   } from './lib/experiment/assets';
   import type { RewiringNullLoadResult } from './lib/experiment/rewiringNull';
+  import type { NullExplanationLoadResult } from './lib/experiment/nullExplanation';
   import { ExperimentController } from './lib/experiment/controller';
   import type { ExperimentRunner, ExperimentTelemetry } from './lib/experiment/runner';
   import type { ExperimentStatus } from './lib/experiment/state';
@@ -82,6 +83,8 @@
   let trainedReadoutStatus = $state<TrainedReadoutLoadResult | undefined>(undefined);
   /** `undefined` until `initialize()`'s rewiring-null load resolves (WP4); feeds the ledger's "Topology null distribution" section. Loading it never blocks Start — see `ExperimentController#initialize`'s doc comment. */
   let rewiringNullStatus = $state<RewiringNullLoadResult | undefined>(undefined);
+  /** `undefined` until `initialize()`'s null-explanation load resolves (WP4 of `.agents/plans/null-explanation`); feeds the ledger's finding note next to the "Topology null distribution" histogram. Loading it never blocks Start, and never blocks reaching a settled `rewiringNullStatus` either — see `ExperimentController#initialize`'s doc comment. */
+  let nullExplanationStatus = $state<NullExplanationLoadResult | undefined>(undefined);
   /** True for the duration of an in-flight `controller.setDecoder()` call — set/cleared locally around that call (there is only ever one decoder shared by both arms, unlike per-arm topology switches, so a single flag suffices). */
   let decoderSwitchPending = $state(false);
 
@@ -326,6 +329,9 @@
         onRewiringNull: (result) => {
           if (!destroyed) rewiringNullStatus = result;
         },
+        onNullExplanation: (result) => {
+          if (!destroyed) nullExplanationStatus = result;
+        },
         onDecoderApplied: (next) => {
           if (!destroyed) decoder = next;
         }
@@ -486,7 +492,13 @@
       <TelemetryPanel {telemetry} />
     {/if}
 
-    <LedgerPanel {manifest} {decoder} trainedReadout={trainedReadoutStatus} rewiringNull={rewiringNullStatus} />
+    <LedgerPanel
+      {manifest}
+      {decoder}
+      trainedReadout={trainedReadoutStatus}
+      rewiringNull={rewiringNullStatus}
+      nullExplanation={nullExplanationStatus}
+    />
   </aside>
 </main>
 

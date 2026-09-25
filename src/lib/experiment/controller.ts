@@ -11,6 +11,7 @@ import {
   type TrainedReadoutLoadResult
 } from './assets';
 import { loadRewiringNull, type RewiringNullLoadResult } from './rewiringNull';
+import { loadNullExplanation, type NullExplanationLoadResult } from './nullExplanation';
 import { buildGraphBufferForMode, createWorkerAgentBinding } from './bindings';
 import { ExperimentRunner, isNotInitializedRejection, type ExperimentTelemetry } from './runner';
 import { transition, type ExperimentStatus } from './state';
@@ -86,6 +87,17 @@ export interface ExperimentControllerCallbacks {
    */
   onRewiringNull: (result: RewiringNullLoadResult) => void;
   /**
+   * Fired once `loadNullExplanation` resolves (WP4 of
+   * `.agents/plans/null-explanation`) — chained after the rewiring-null load
+   * above (`initialize()`'s own doc comment explains why: same fetch, no
+   * duplicate request, and this note's cross-check needs `manifest`, not the
+   * resolved rewiring-null data). Like `onRewiringNull`, this never blocks
+   * reaching `ready`. The host's hook for the ledger panel's finding note,
+   * rendered next to `NullHistogram.svelte` inside the "Topology null
+   * distribution" section.
+   */
+  onNullExplanation: (result: NullExplanationLoadResult) => void;
+  /**
    * Fired once per agent right after `setDecoder()` has successfully applied
    * a decoder switch to both arms' Workers and reset the run to tick 0 —
    * mirrors `onTopologyApplied`'s "never speculatively before a switch is
@@ -114,6 +126,11 @@ export interface ExperimentControllerOptions {
    * here is injectable for exactly the same reason.
    */
   loadRewiringNull?: typeof loadRewiringNull;
+  /**
+   * Injectable for tests; defaults to `./nullExplanation.ts#loadNullExplanation`.
+   * Same seam-for-testability reasoning as `loadRewiringNull` above.
+   */
+  loadNullExplanation?: typeof loadNullExplanation;
   /** Passed straight through to the constructed `ExperimentRunner` (see `ExperimentRunnerOptions.targetTickIntervalMs`); `0` disables real-time pacing entirely, which unit tests use to run a many-tick determinism check without waiting out real seconds. Omitted in production, matching the runner's own real-time default. */
   targetTickIntervalMs?: number;
 }
@@ -314,6 +331,7 @@ export class ExperimentController {
     const load = this.options.loadArtifacts ?? loadArenaArtifacts;
     const loadReadout = this.options.loadTrainedReadout ?? loadTrainedReadoutArtifact;
     const loadNull = this.options.loadRewiringNull ?? loadRewiringNull;
+    const loadExplanation = this.options.loadNullExplanation ?? loadNullExplanation;
     const dataBaseUrl = `${import.meta.env.BASE_URL}data`;
     let artifacts: LoadedArenaArtifacts;
     try {
@@ -369,6 +387,31 @@ export class ExperimentController {
       .then((result) => {
         if (this.destroyed) return;
         this.options.callbacks.onRewiringNull(result);
+      })
+      .then(() =>
+        // WP4 of `.agents/plans/null-explanation` (`04-ledger-note.md`):
+        // "Load after the null result" — chained onto this same promise
+        // (after `onRewiringNull` has already fired above) so it never races
+        // ahead of the null histogram's own load and never issues a
+        // duplicate fetch for the rewiring-null artifact. `loadExplanation`
+        // only needs `manifest`/`dataBaseUrl` (its own cross-check re-reads
+        // `manifest.rewiringNull.sha256` directly, not the resolved
+        // `RewiringNullLoadResult` above), so it is attempted here
+        // unconditionally, independent of whichever status the null load
+        // itself resolved to. The leading `.catch` mirrors the null load's
+        // own (`loadPositions`'s exact "unexpected error -> 'invalid'"
+        // precedent, since `NullExplanationLoadResult` has no `'unavailable'`
+        // variant of its own).
+        loadExplanation(artifacts.manifest, dataBaseUrl).catch(
+          (error: unknown): NullExplanationLoadResult => ({
+            status: 'invalid',
+            reason: `unexpected error while loading the null explanation: ${error instanceof Error ? error.message : String(error)}`
+          })
+        )
+      )
+      .then((result) => {
+        if (this.destroyed) return;
+        this.options.callbacks.onNullExplanation(result);
       })
       .catch((error: unknown) => {
         if (this.destroyed) return;

@@ -322,6 +322,53 @@ test.describe('model ledger and provenance', () => {
       '/data/rewiring-null-v1.json'
     );
   });
+
+  test('shows the null-result explanation note next to the histogram, generated from the verified artifact (WP4 of .agents/plans/null-explanation)', async ({
+    page
+  }) => {
+    await page.goto('/');
+    await waitForReady(page);
+
+    const ledgerRow = (term: string) => page.locator('.ledger li', { hasText: term });
+    await expect(ledgerRow('Null-result explanation')).toContainText('Computed (offline)');
+
+    const detail = page.locator('.null-explanation-detail');
+    await expect(page.getByRole('heading', { name: /why biological scores low/i })).toBeVisible();
+
+    // The summary sentence is generated from the verified artifact's own
+    // `finding.summarySentence` — this asserts the real shipped content
+    // rather than a hardcoded placeholder.
+    await expect(detail).toContainText(/descriptive correlation, not a causal claim/i);
+
+    // Every qualifying metric is listed in plain words with its own rho, and
+    // the structural-feature (weighted in-degree) entry is flagged
+    // definition-sensitive with a link into the report's own disclosure.
+    await expect(detail).toContainText(/linear signal gain from right clearance input to thrust output \(ρ = 0\.467\)/i);
+    await expect(detail).toContainText(/linear signal gain from forward clearance input to thrust output \(ρ = 0\.353\)/i);
+    await expect(detail).toContainText(/weighted in-degree from input neurons to thrust output \(ρ = 0\.394\)/i);
+    const disclosureLink = detail.getByRole('link', { name: /definition-sensitive/i });
+    await expect(disclosureLink).toHaveAttribute(
+      'href',
+      'https://github.com/mattsp1290/flyarena/blob/main/docs/null-explanation-report.md#structural-features'
+    );
+
+    // Mirrored decoder-convention check and regime-check outcome, each in
+    // one clause.
+    await expect(detail).toContainText(/mirroring the decoder's thrust and yaw signs still leaves biological at the bottom/i);
+    await expect(detail).toContainText(/linear-regime check passed/i);
+
+    // Always-carried framing: descriptive association, not a cause; what
+    // "authored" means; never a claim that biology performed worse.
+    await expect(detail).toContainText(/descriptive association within this model, not a cause/i);
+    await expect(detail).toContainText(/fixed, hand-written decoder — not biology and not trained/i);
+    await expect(page.locator('body')).not.toContainText(/biology is worse/i);
+
+    const reportLink = detail.getByRole('link', { name: /full explanation report/i });
+    await expect(reportLink).toHaveAttribute(
+      'href',
+      'https://github.com/mattsp1290/flyarena/blob/main/docs/null-explanation-report.md'
+    );
+  });
 });
 
 test.describe('rewiring-null hash-mismatch integrity check', () => {
@@ -351,6 +398,64 @@ test.describe('rewiring-null hash-mismatch integrity check', () => {
     await startOrResumeButton(page).click();
     await waitForTick(page, 10);
     await expect(statusRegion(page)).toHaveText('running');
+  });
+});
+
+test.describe('null-explanation hash-mismatch integrity check', () => {
+  test('a tampered null-explanation-v1.json shows an honest verification-failure message in place of the note, while the histogram above it and the rest of the experiment (Start included) keep working', async ({
+    page
+  }) => {
+    const original = readFileSync(resolve(publicDataDir, 'null-explanation-v1.json'));
+    const tampered = Buffer.from(original);
+    tampered[10] ^= 0xff;
+
+    await page.route('**/data/null-explanation-v1.json', (route) =>
+      route.fulfill({ status: 200, contentType: 'application/json', body: tampered })
+    );
+
+    await page.goto('/');
+    await waitForReady(page);
+
+    await expect(page.locator('.ledger')).toContainText(/explanation failed verification/i);
+    await expect(page.locator('.ledger')).toContainText(/sha256/i);
+    // The note itself must never render over unverified bytes.
+    await expect(page.locator('.null-explanation-detail')).toHaveCount(0);
+    await expect(page.getByRole('heading', { name: /why biological scores low/i })).toHaveCount(0);
+
+    // The null histogram above it is an independent load and keeps working.
+    await expect(page.locator('.null-histogram')).toBeVisible();
+    await expect(page.getByRole('heading', { name: /topology null distribution/i })).toBeVisible();
+
+    // The required arena graph artifacts are untouched — the experiment
+    // keeps working exactly as if the null-explanation artifact were never
+    // routed.
+    await expect(startOrResumeButton(page)).toBeEnabled();
+    await startOrResumeButton(page).click();
+    await waitForTick(page, 10);
+    await expect(statusRegion(page)).toHaveText('running');
+  });
+
+  test('a missing null-explanation manifest entry hides the note entirely, with no failure message, while the histogram keeps working', async ({
+    page
+  }) => {
+    await page.route('**/data/malecns-arena-v1.manifest.json', async (route) => {
+      const response = await route.fetch();
+      const manifest = (await response.json()) as { nullExplanation?: unknown };
+      delete manifest.nullExplanation;
+      await route.fulfill({ response, json: manifest });
+    });
+
+    await page.goto('/');
+    await waitForReady(page);
+
+    await expect(page.locator('.ledger')).not.toContainText(/explanation failed verification/i);
+    await expect(page.getByRole('heading', { name: /why biological scores low/i })).toHaveCount(0);
+    await expect(page.locator('.null-explanation-detail')).toHaveCount(0);
+
+    // The histogram is unaffected: it has its own manifest entry.
+    await expect(page.locator('.null-histogram')).toBeVisible();
+    await expect(page.getByRole('heading', { name: /topology null distribution/i })).toBeVisible();
+    await expect(startOrResumeButton(page)).toBeEnabled();
   });
 });
 
