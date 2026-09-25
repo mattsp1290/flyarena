@@ -14,6 +14,7 @@ importers.
 from __future__ import annotations
 
 import argparse
+import ast
 import gzip
 import hashlib
 import json
@@ -45,29 +46,113 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def source_identity_sha256(source_dir: Path, filenames: "Sequence[str]") -> str:
-    """sha256 over a set of source files: sorted filenames, each contributing
-    the filename (UTF-8 bytes), then a single NUL byte, then the file's raw
-    bytes, into one hasher. This is the exact scheme `scripts/data/compile.py`'s
-    `compiler_source_sha256()` already uses for "does the committed artifact
-    reflect the code that produced it" (and its TypeScript mirror,
-    `tests/unit/malecns-artifact.test.ts`'s `computeCompilerSourceSha256`) --
-    reused here, unchanged, so `transfer.py`'s/`features.py`'s own
-    `producer.sourceSha256` (and `explain.py`'s recomputation of it, plus its
-    cross-language recomputation of `scripts/null/regime-check.ts`'s own
-    producer sha over its `.ts` source files -- reading raw bytes only, no
-    TypeScript execution required) are all computed the same, already-
-    reviewed way rather than a fourth reimplementation of the same idea.
-    Including the filename (not just concatenated bytes) means two files
-    swapping content is not an accidental hash collision; the NUL byte gives
-    an unambiguous filename/content boundary."""
+def source_identity_sha256(repo_root: Path, repo_relative_paths: "Sequence[str]") -> str:
+    """sha256 over a set of source files: sorted repo-relative paths, each
+    contributing the path (UTF-8 bytes, forward-slash separated), then a
+    single NUL byte, then the file's raw bytes, into one hasher. This is the
+    same scheme `scripts/data/compile.py`'s `compiler_source_sha256()`
+    already uses for "does the committed artifact reflect the code that
+    produced it" (and its TypeScript mirror, `tests/unit/
+    malecns-artifact.test.ts`'s `computeCompilerSourceSha256`) -- reused
+    here so `transfer.py`'s/`features.py`'s own `producer.sourceSha256`
+    (and `explain.py`'s recomputation of it, plus its cross-language
+    recomputation of `scripts/null/regime-check.ts`'s own producer sha over
+    its `.ts` source files -- reading raw bytes only, no TypeScript
+    execution required) are all computed the same, already-reviewed way
+    rather than a fourth reimplementation of the same idea.
+
+    Unlike the single-`source_dir`-plus-bare-filenames form this replaced,
+    `repo_relative_paths` are paths *relative to the repository root*
+    (e.g. `"src/lib/connectome/model.ts"`, not just `"model.ts"`), because
+    `python_dependency_closure`/`ts_import_graph.collect_repo_relative_
+    dependencies` below walk the real import graph across multiple
+    directories (`scripts/analysis/`, `scripts/data/`, `scripts/training/`,
+    `src/lib/...`) -- a bare-filename scheme could not tell apart two
+    same-named files in different directories, and a single `source_dir`
+    could not express files from more than one directory at all (the exact
+    mechanical gap a thermo-fix-verification review finding identified:
+    "`source_identity_sha256(source_dir, filenames)` only accepts one
+    directory"). Including the full repo-relative path (not just the
+    basename, and not just concatenated bytes) means two files swapping
+    content, or two identically-named files in different directories, are
+    never an accidental hash collision; the NUL byte gives an unambiguous
+    path/content boundary."""
     hasher = hashlib.sha256()
-    for name in sorted(filenames):
-        path = source_dir / name
-        hasher.update(path.name.encode("utf-8"))
+    for rel_path in sorted(repo_relative_paths):
+        path = repo_root / rel_path
+        hasher.update(rel_path.encode("utf-8"))
         hasher.update(b"\0")
         hasher.update(path.read_bytes())
     return hasher.hexdigest()
+
+
+def _resolve_python_module(module_name: str, from_file: Path, search_dirs: "Sequence[Path]") -> "Path | None":
+    """Resolve a bare top-level Python module name (`import graph_io`,
+    `from env_guard import ...` -- never a dotted or relative import in this
+    codebase's `scripts/analysis/`/`scripts/data/` modules, since every
+    producer script relies on `sys.path` containing its own directory plus
+    whatever directories it explicitly inserts, e.g. `graph_io.py`'s own
+    `sys.path.insert(0, ...)` of `scripts/data/`) against the same search
+    order Python's real import machinery would use at runtime: the
+    importing file's own directory first (matches `sys.path[0]` being the
+    running script's directory), then each of `search_dirs` in order.
+    Returns `None` (a stdlib/third-party import, e.g. `numpy`/`argparse`)
+    when no `<module_name>.py` is found in any of them -- these are
+    deliberately not pinned, the same "exclude node_modules/stdlib"
+    restriction the TypeScript-side walker applies via "only follow
+    specifiers starting with `.`"."""
+    candidate_dirs = [from_file.parent, *search_dirs]
+    seen: list[Path] = []
+    for directory in candidate_dirs:
+        if directory in seen:
+            continue
+        seen.append(directory)
+        candidate = directory / f"{module_name}.py"
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+def python_dependency_closure(entry_file: Path, repo_root: Path, search_dirs: "Sequence[Path]") -> list[str]:
+    """Walk the real, repo-relative Python import graph from `entry_file`
+    (AST-based, per this task's "walk the real import graph" structural
+    fix -- not a hand-maintained flat filename list, which is guaranteed to
+    drift as producer scripts grow their own dependencies, exactly the gap
+    a thermo-fix-verification review finding demonstrated: `scripts/data/
+    rewire.py`/`binfmt.py` were silently omitted from `transfer.py`'s/
+    `features.py`'s hashed set even though `graph_io.load_verified_graph`
+    calls `rewire.decode_graph_binary` on every graph load). Recurses into
+    every repo-local `import x` / `from x import y` (`ast.Import`/
+    `ast.ImportFrom`, `node.level == 0`, i.e. never a relative `from . import
+    y` -- none of this codebase's Python producers use those) that
+    `_resolve_python_module` can resolve against `search_dirs`; a module
+    that cannot be resolved there (numpy, argparse, the stdlib, ...) is
+    treated as external and not walked into, exactly mirroring the
+    TypeScript walker's "only follow `.`-prefixed specifiers" restriction.
+    Returns the sorted repo-relative path (forward-slash separated) of
+    every file in the closure, `entry_file` itself included (the existing
+    convention: the hand-maintained lists this replaces always listed the
+    producer script itself first)."""
+    visited: set[Path] = set()
+    stack = [entry_file.resolve()]
+    while stack:
+        current = stack.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        tree = ast.parse(current.read_text(encoding="utf-8"), filename=str(current))
+        for node in ast.walk(tree):
+            module_names: list[str] = []
+            if isinstance(node, ast.Import):
+                module_names = [alias.name.split(".")[0] for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                if node.level == 0 and node.module is not None:
+                    module_names = [node.module.split(".")[0]]
+            for module_name in module_names:
+                resolved = _resolve_python_module(module_name, current, search_dirs)
+                if resolved is not None and resolved not in visited:
+                    stack.append(resolved)
+    return sorted(str(path.relative_to(repo_root)).replace(os.sep, "/") for path in visited)
 
 
 def load_verified_graph(path: Path, expected_sha256: str) -> "binfmt.GraphArrays":

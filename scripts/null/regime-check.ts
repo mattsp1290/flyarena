@@ -1,8 +1,8 @@
-import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { collectRepoRelativeDependencies, computeSourceIdentitySha256 } from '../lib/import-graph';
 import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import { requireNonNegativeInt, requirePositiveInt, requireValue } from '../training/cli';
 import { atomicWriteFileSync } from '../training/fsio';
@@ -56,47 +56,56 @@ const repoRoot = resolve(here, '../..');
 const PUBLIC_DATA_DIR = resolve(repoRoot, 'public/data');
 
 /**
- * Files that determine `regime.json`'s own output bytes: this driver plus
- * the task/worker/shared modules it dispatches work through. Hashed into
- * `producer.sourceSha256` below via `computeSourceIdentitySha256`, the same
- * filename+NUL+bytes-per-file scheme Python's `scripts/data/compile.py`'s
- * `compiler_source_sha256()` and `scripts/analysis/graph_io.py`'s
- * `source_identity_sha256()` already use -- reused here (a third, TS-side
- * implementation of the identical scheme, not a new one) so
- * `scripts/analysis/explain.py`'s `verify_provenance` can recompute this
- * exact hash from raw file bytes, with no TypeScript execution required,
+ * `regime.json`'s producer sha is hashed over the *real, walked* import
+ * graph from this file (`collectRepoRelativeDependencies`, `scripts/lib/
+ * import-graph.ts`), not a hand-maintained flat filename list -- a
+ * thermo-fix-verification review finding's structural fix. The list this
+ * replaced (`['regime-check.ts', 'regime-task.ts', 'regime-worker.ts',
+ * 'null-worker-shared.ts']`) undercounted: `regime-task.ts` dispatches into
+ * `scripts/training/episode.ts`, which drives `src/lib/connectome/
+ * model.ts`'s `runSubsteps`/`runLesionedSubsteps` -- the substep execution
+ * this entire study is about -- plus `readout.ts`/`world.ts`/`sensors.ts`/
+ * `actions.ts`/`constants.ts`, none of which were hashed. Walking the real
+ * graph pins every one of those files mechanically, with no hand-curated
+ * exclusion list to keep in sync as `episode.ts`/`model.ts` grow their own
+ * dependencies over time (that drift risk is exactly what this fix
+ * removes). This intentionally also pulls in `null-evaluate.ts` (this
+ * driver's own `import ... from './null-evaluate'`) and whatever it
+ * imports in turn: `runShardedEvaluation` genuinely executes as part of
+ * producing `regime.json`'s bytes, so its source is genuinely part of what
+ * this hash should pin, even though it predates this bean and isn't this
+ * bean's own authored code -- "does this file's bytes affect the output"
+ * is the criterion the walk enforces, not "did this bean author it".
+ *
+ * `computeSourceIdentitySha256` (also in `scripts/lib/import-graph.ts`) is
+ * the same filename+NUL+bytes-per-file scheme Python's `scripts/data/
+ * compile.py`'s `compiler_source_sha256()` and `scripts/analysis/
+ * graph_io.py`'s `source_identity_sha256()` already use (generalized to
+ * repo-relative paths, so two identically-named files in different
+ * directories can't collide) -- reused here so `scripts/analysis/
+ * explain_provenance.py`'s `current_regime_source_sha256` can recompute
+ * this exact hash from raw file bytes via its own Python-side import-graph
+ * walker (`ts_import_graph.py`), with no TypeScript execution required,
  * and refuse a `regime.json` regenerated from a different version of this
- * code (a thermo-methodology review finding -- see `explain.py`'s
- * `verify_provenance` doc comment). `null-worker-shared.ts` is included
- * because both `regime-worker.ts` and (indirectly, via `null-evaluate.ts`'s
- * generic `runShardedEvaluation`) this driver's actual episode-stepping
- * logic depend on it; `null-evaluate.ts` itself is deliberately excluded --
- * it is shared, pre-existing infrastructure this bean did not author or
- * change, not part of "this study's own producer code" in the sense the
- * task's code-identity provenance requirement targets.
+ * code. `tests/unit/import-graph.test.ts`/`tests_python/
+ * test_ts_import_graph_cross_check.py` assert the two walkers agree on
+ * this exact file's dependency set.
  */
-const REGIME_SOURCE_FILENAMES = ['regime-check.ts', 'regime-task.ts', 'regime-worker.ts', 'null-worker-shared.ts'] as const;
-
-const computeSourceIdentitySha256 = (sourceDir: string, filenames: readonly string[]): string => {
-  const hash = createHash('sha256');
-  for (const name of [...filenames].sort()) {
-    hash.update(name, 'utf-8');
-    hash.update(Buffer.from([0]));
-    hash.update(readFileSync(resolve(sourceDir, name)));
-  }
-  return hash.digest('hex');
-};
-
 export interface RegimeProducer {
   readonly script: string;
   readonly sourceSha256: string;
+  readonly dependencies: readonly string[];
 }
 
-/** This run's code-identity block -- see `REGIME_SOURCE_FILENAMES`'s doc comment. */
-export const regimeProducer = (): RegimeProducer => ({
-  script: 'scripts/null/regime-check.ts',
-  sourceSha256: computeSourceIdentitySha256(here, REGIME_SOURCE_FILENAMES)
-});
+/** This run's code-identity block -- see the doc comment above. */
+export const regimeProducer = (): RegimeProducer => {
+  const dependencies = collectRepoRelativeDependencies(fileURLToPath(import.meta.url), repoRoot);
+  return {
+    script: 'scripts/null/regime-check.ts',
+    sourceSha256: computeSourceIdentitySha256(repoRoot, dependencies),
+    dependencies
+  };
+};
 
 const DEFAULT_HELD_OUT_START = 30001;
 const DEFAULT_HELD_OUT_COUNT = 10;

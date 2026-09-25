@@ -35,7 +35,12 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "analysis"))
 
 import explain  # noqa: E402
+import features  # noqa: E402
+import transfer  # noqa: E402
+import ts_import_graph  # noqa: E402
 from features import OBSERVATION_CHANNELS, OUTPUT_POPULATIONS  # noqa: E402
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 # ---------------------------------------------------------------------------
@@ -548,6 +553,7 @@ def synthetic_inputs(tmp_path, monkeypatch):
         "producer": {
             "script": "scripts/analysis/transfer.py",
             "sourceSha256": explain.current_transfer_source_sha256(),
+            "dependencies": transfer.transfer_producer()["dependencies"],
             "host": python_host,
         },
     }
@@ -558,6 +564,7 @@ def synthetic_inputs(tmp_path, monkeypatch):
         "producer": {
             "script": "scripts/analysis/features.py",
             "sourceSha256": explain.current_features_source_sha256(),
+            "dependencies": features.features_producer()["dependencies"],
             "host": python_host,
         },
     }
@@ -585,6 +592,9 @@ def synthetic_inputs(tmp_path, monkeypatch):
         "producer": {
             "script": "scripts/null/regime-check.ts",
             "sourceSha256": explain.current_regime_source_sha256(),
+            "dependencies": ts_import_graph.collect_repo_relative_dependencies(
+                REPO_ROOT / "scripts" / "null" / "regime-check.ts", REPO_ROOT
+            ),
         },
     }
 

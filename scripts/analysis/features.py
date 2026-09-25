@@ -122,27 +122,32 @@ OBSERVATION_CHANNELS: tuple[str, ...] = (
 #: `src/lib/arena/actions.ts`'s `OUTPUT_POPULATION`.
 OUTPUT_POPULATIONS: tuple[str, ...] = ("thrust", "yaw", "brake")
 
-#: Files that determine `features.json`'s own output bytes -- see
-#: `transfer.py`'s identically-shaped `TRANSFER_SOURCE_FILENAMES` doc
-#: comment for why (`graph_io.py`/`env_guard.py` as shared deps, hashed via
-#: `graph_io.source_identity_sha256` into `producer.sourceSha256`). The
-#: pre-adjudication `--features-exploratory-unrestricted` run is a
-#: deliberate exception: it is exempt from `explain.py`'s code-identity
-#: check by design (a pinned historical, stale-code snapshot -- see
-#: `explain.py`'s `verify_provenance` doc comment), so this producer block
-#: applies to it the same as any other `features.py` output; it is
-#: `explain.py`'s policy, not this module's, that decides which check to run
-#: on which input.
-FEATURES_SOURCE_FILENAMES: tuple[str, ...] = ("features.py", "graph_io.py", "env_guard.py")
-FEATURES_SOURCE_DIR = Path(__file__).resolve().parent
+#: `features.json`'s own producer sha is hashed over the *real, walked*
+#: Python import graph from this file -- see `transfer.py`'s identically-
+#: shaped `TRANSFER_SOURCE_DIR` doc comment for why (a thermo-fix-
+#: verification review finding's structural fix, replacing the old
+#: hand-maintained `FEATURES_SOURCE_FILENAMES` flat list, which silently
+#: omitted `scripts/data/rewire.py`/`binfmt.py`). The pre-adjudication
+#: `--features-exploratory-unrestricted` run is a deliberate exception: it
+#: is exempt from `explain.py`'s code-identity check by design (a pinned
+#: historical, stale-code snapshot -- see `explain.py`'s `verify_
+#: provenance` doc comment), so this producer block applies to it the same
+#: as any other `features.py` output; it is `explain.py`'s policy, not this
+#: module's, that decides which check to run on which input.
+FEATURES_ENTRY = Path(__file__).resolve()
+FEATURES_SOURCE_DIR = FEATURES_ENTRY.parent
+FEATURES_SEARCH_DIRS: tuple[Path, ...] = (FEATURES_SOURCE_DIR, FEATURES_SOURCE_DIR.parent / "data")
+REPO_ROOT = FEATURES_SOURCE_DIR.parents[1]
 
 
 def features_producer() -> dict:
     """See `transfer.py`'s `transfer_producer()` doc comment -- identical
-    shape and rationale, `features.py`'s own source files."""
+    shape and rationale, `features.py`'s own real import-graph closure."""
+    dependencies = graph_io.python_dependency_closure(FEATURES_ENTRY, REPO_ROOT, FEATURES_SEARCH_DIRS)
     return {
         "script": "scripts/analysis/features.py",
-        "sourceSha256": graph_io.source_identity_sha256(FEATURES_SOURCE_DIR, FEATURES_SOURCE_FILENAMES),
+        "sourceSha256": graph_io.source_identity_sha256(REPO_ROOT, dependencies),
+        "dependencies": dependencies,
         "host": {"arch": platform.machine(), "python": platform.python_version()},
     }
 

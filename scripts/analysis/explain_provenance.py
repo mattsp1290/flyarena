@@ -17,35 +17,60 @@ build_family_rank_matrix` already uses.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Mapping, Sequence
 
 import graph_io
+import ts_import_graph
 
-#: The producer scripts (plus shared helpers) this study's code-identity
-#: check pins -- hashed via `graph_io.source_identity_sha256` (the same
-#: scheme as `scripts/data/compile.py`'s `compiler_source_sha256()`).
-#: `graph_io.py`/`env_guard.py` are listed for both Python producers since
-#: both import them; a change to either shared file correctly changes both
-#: producer shas.
-TRANSFER_SOURCE_FILENAMES: tuple[str, ...] = ("transfer.py", "graph_io.py", "env_guard.py")
-FEATURES_SOURCE_FILENAMES: tuple[str, ...] = ("features.py", "graph_io.py", "env_guard.py")
-#: `scripts/null/regime-check.ts`'s own producer files, kept in lockstep with
-#: that file's `REGIME_SOURCE_FILENAMES` constant. Hashed from raw file bytes
-#: only (no TypeScript execution needed), the same cross-language
-#: recomputation `tests/unit/malecns-artifact.test.ts` does for `compile.py`.
-REGIME_SOURCE_FILENAMES: tuple[str, ...] = ("regime-check.ts", "regime-task.ts", "regime-worker.ts", "null-worker-shared.ts")
+#: Each producer's entry file plus the search directories its own Python
+#: imports actually resolve against at runtime -- see `transfer.py`'s
+#: `TRANSFER_SEARCH_DIRS`/`FEATURES_SEARCH_DIRS` doc comments. Recomputing
+#: `graph_io.python_dependency_closure` from these exact entry files (the
+#: same call `transfer_producer()`/`features_producer()` themselves make)
+#: is what makes this verification structurally unable to drift from what
+#: was stamped: both sides call the identical closure-walking function
+#: against the identical entry file, rather than maintaining two separate
+#: filename lists in lockstep (the exact gap a thermo-fix-verification
+#: review finding identified in the flat-list predecessor of this module).
 
 
-def current_transfer_source_sha256(analysis_source_dir) -> str:
-    return graph_io.source_identity_sha256(analysis_source_dir, TRANSFER_SOURCE_FILENAMES)
+def _analysis_dir(repo_root) -> "Path":
+    return Path(repo_root) / "scripts" / "analysis"
 
 
-def current_features_source_sha256(analysis_source_dir) -> str:
-    return graph_io.source_identity_sha256(analysis_source_dir, FEATURES_SOURCE_FILENAMES)
+def _data_dir(repo_root) -> "Path":
+    return Path(repo_root) / "scripts" / "data"
 
 
-def current_regime_source_sha256(null_source_dir) -> str:
-    return graph_io.source_identity_sha256(null_source_dir, REGIME_SOURCE_FILENAMES)
+def current_transfer_source_sha256(repo_root) -> str:
+    entry = _analysis_dir(repo_root) / "transfer.py"
+    search_dirs = (_analysis_dir(repo_root), _data_dir(repo_root))
+    dependencies = graph_io.python_dependency_closure(entry, Path(repo_root), search_dirs)
+    return graph_io.source_identity_sha256(Path(repo_root), dependencies)
+
+
+def current_features_source_sha256(repo_root) -> str:
+    entry = _analysis_dir(repo_root) / "features.py"
+    search_dirs = (_analysis_dir(repo_root), _data_dir(repo_root))
+    dependencies = graph_io.python_dependency_closure(entry, Path(repo_root), search_dirs)
+    return graph_io.source_identity_sha256(Path(repo_root), dependencies)
+
+
+def current_regime_source_sha256(repo_root) -> str:
+    """Recomputes `scripts/null/regime-check.ts`'s `regimeProducer()` sha
+    from raw `.ts` file bytes only (no TypeScript execution needed) via
+    `ts_import_graph.collect_repo_relative_dependencies` -- a Python-side
+    regex scanner over import specifiers that mirrors `scripts/lib/
+    import-graph.ts`'s `collectRepoRelativeDependencies` exactly (see that
+    module's doc comment; `tests_python/
+    test_ts_import_graph_cross_check.py` runs the real TS implementation
+    via `npx tsx` and asserts the two agree, the same cross-language
+    cross-check pattern `tests_python/test_null_stats_cross_check.py`
+    already established for `explain_stats.py`/`null-stats.ts`)."""
+    entry = Path(repo_root) / "scripts" / "null" / "regime-check.ts"
+    dependencies = ts_import_graph.collect_repo_relative_dependencies(entry, Path(repo_root))
+    return graph_io.source_identity_sha256(Path(repo_root), dependencies)
 
 
 def _require_matching_source(label: str, value: str, expected: str) -> None:
@@ -76,9 +101,9 @@ def _require_matching_producer(label: str, payload: Mapping[str, object], expect
     if producer.get("sourceSha256") != current_sha:
         raise ValueError(
             f"explain: {label} was produced by {expected_script} with producer.sourceSha256="
-            f"{producer.get('sourceSha256')!r}, but the current {expected_script} (plus its shared helpers) hashes "
-            f"to {current_sha!r} -- regenerate {label} from the current code before combining (code-identity "
-            "provenance mismatch)"
+            f"{producer.get('sourceSha256')!r}, but the current {expected_script}'s real import-graph closure "
+            f"hashes to {current_sha!r} -- regenerate {label} from the current code before combining "
+            "(code-identity provenance mismatch)"
         )
 
 
@@ -104,8 +129,7 @@ def verify_provenance(
     features_json: dict,
     features_exploratory_json: dict,
     regime_json: dict,
-    analysis_source_dir,
-    null_source_dir,
+    repo_root,
 ) -> None:
     """`variants` is every loaded decoder-variant payload (flip-both, plus
     any provided single-axis ones), checked in one loop (an edge-case-review
@@ -116,11 +140,20 @@ def verify_provenance(
     (`sourceGraphSha256`/`rewireSourceSha256`, every input below) and, for
     `transfer.json`/`features.json`/`regime.json` only, producer *code*
     identity (`_require_matching_producer`, recomputed from the current
-    working tree). `features_exploratory_json` is deliberately exempt from
+    working tree by walking each producer's real import graph from its
+    entry file -- `current_transfer_source_sha256`/`current_features_
+    source_sha256`/`current_regime_source_sha256` above -- rather than a
+    hand-maintained flat filename list, per a thermo-fix-verification
+    review finding). `features_exploratory_json` is deliberately exempt from
     the code-identity check: it is a pinned, stale-code exploratory input by
     design (feature 6's pre-adjudication run -- rerunning it against current
     code would defeat its purpose as a historical snapshot), so only its
-    graph identity and content sha (set in `explain.main()`) are pinned."""
+    graph identity and content sha (set in `explain.main()`) are pinned.
+    `repo_root` is the single directory every producer's entry file and
+    search-directory set is derived from (see `_analysis_dir`/`_data_dir`
+    above) -- replacing the old `analysis_source_dir`/`null_source_dir`
+    pair, which could not express a dependency closure spanning more than
+    one directory (`scripts/training/`, `src/lib/...`, `scripts/data/`)."""
     expected_source = rewiring_null["sourceGraphSha256"]
     expected_rewire = rewiring_null["rewireSourceSha256"]
     payloads: list[tuple[str, dict]] = [(f"variant-{key}", payload) for key, payload in variants.items()]
@@ -136,11 +169,11 @@ def verify_provenance(
     _require_matching_source("regime.json.rewireSourceSha256", regime_json["rewireSourceSha256"], expected_rewire)
 
     _require_matching_producer(
-        "transfer.json", transfer_json, "scripts/analysis/transfer.py", current_transfer_source_sha256(analysis_source_dir)
+        "transfer.json", transfer_json, "scripts/analysis/transfer.py", current_transfer_source_sha256(repo_root)
     )
     _require_matching_producer(
-        "features.json", features_json, "scripts/analysis/features.py", current_features_source_sha256(analysis_source_dir)
+        "features.json", features_json, "scripts/analysis/features.py", current_features_source_sha256(repo_root)
     )
     _require_matching_producer(
-        "regime.json", regime_json, "scripts/null/regime-check.ts", current_regime_source_sha256(null_source_dir)
+        "regime.json", regime_json, "scripts/null/regime-check.ts", current_regime_source_sha256(repo_root)
     )

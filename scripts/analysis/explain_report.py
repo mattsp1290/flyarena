@@ -481,7 +481,17 @@ def render_limitations_section(explanation: dict) -> list[str]:
     # record a `producer.sourceSha256` this module's `verify_provenance`
     # recomputes and refuses to combine on mismatch; recorded here (`sources.
     # producers`) so a reader can see exactly what was pinned without
-    # re-deriving it.
+    # re-deriving it. A second thermo-fix-verification review finding
+    # showed the *first* version of this code-identity check itself
+    # undercounted: a hand-maintained flat filename list omitted files a
+    # producer genuinely depends on (`scripts/training/episode.ts`,
+    # `src/lib/connectome/model.ts`, `scripts/data/rewire.py`, ...) --
+    # replaced below by walking each producer's real import graph from its
+    # entry file, so the sentence here describes what that walk actually
+    # covers (and, just as importantly, what it deliberately does not).
+    transfer_dep_count = len(producers["transfer"]["dependencies"])
+    features_dep_count = len(producers["features"]["dependencies"])
+    regime_dep_count = len(producers["regime"]["dependencies"])
     lines.append(
         "- **Provenance pins two independent things.** Every input's `sourceGraphSha256`/`rewireSourceSha256` "
         "pins *graph identity* (all five inputs were computed against the same 502 graphs -- biological, "
@@ -489,14 +499,24 @@ def render_limitations_section(explanation: dict) -> list[str]:
         "code identity*: each records a `producer.sourceSha256` "
         f"(`transfer.py` {producers['transfer']['sourceSha256'][:12]}..., "
         f"`features.py` {producers['features']['sourceSha256'][:12]}..., "
-        f"`regime-check.ts` {producers['regime']['sourceSha256'][:12]}...) -- a sha256 over that script's own "
-        "source plus its shared helpers, the same `filename+NUL+bytes` scheme `scripts/data/compile.py`'s "
-        "`compiler_source_sha256()` already uses -- and `verify_provenance` recomputes that hash from the current "
-        "working tree and refuses to combine a stale input. The one deliberate exception is "
-        "`features-exploratory-unrestricted.json`: a pinned, stale-code exploratory input (feature 6's "
-        "pre-adjudication run, disclosed above) -- its *content* sha256 is still pinned and verified, but it is "
-        "explicitly exempt from the code-identity check, since re-running it against current code would defeat its "
-        "purpose as a historical snapshot of what the unrestricted reading looked like at adjudication time."
+        f"`regime-check.ts` {producers['regime']['sourceSha256'][:12]}...) -- a sha256 over the *real import-graph "
+        "closure* walked from that script's own entry file (repo-relative source files only; third-party "
+        f"packages and the standard library are never walked into): {transfer_dep_count} files for `transfer.py` "
+        f"(including `scripts/analysis/graph_io.py` and, transitively, `scripts/data/rewire.py`/`binfmt.py`, "
+        f"the code that decodes every graph's own bytes), {features_dep_count} for `features.py`, and "
+        f"{regime_dep_count} for `regime-check.ts` (including the episode driver, `src/lib/connectome/model.ts`'s "
+        "substep execution, and the rest of the simulation code this study characterizes -- every file listed in "
+        "`producer.dependencies`) -- the same `filename+NUL+bytes` scheme `scripts/data/compile.py`'s "
+        "`compiler_source_sha256()` already uses, generalized to repo-relative paths. `verify_provenance` "
+        "recomputes that hash from the current working tree (by re-walking the same import graph, not by "
+        "re-reading a stored file list) and refuses to combine a stale input. **What this does not pin:** the "
+        "Node/Python runtime version each producer ran under (recorded separately, per input, as `producer.host`) "
+        "and every third-party package (numpy, etc.) -- those are pinned by this repo's lockfiles "
+        "(`package-lock.json`/`uv.lock`), not hashed into `producer.sourceSha256`. The one deliberate source-file "
+        "exception is `features-exploratory-unrestricted.json`: a pinned, stale-code exploratory input (feature "
+        "6's pre-adjudication run, disclosed above) -- its *content* sha256 is still pinned and verified, but it "
+        "is explicitly exempt from the code-identity check, since re-running it against current code would defeat "
+        "its purpose as a historical snapshot of what the unrestricted reading looked like at adjudication time."
     )
     lines.append("- **No biological claim.** See \"This model only\" above.")
     lines.append("")

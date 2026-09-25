@@ -112,35 +112,44 @@ OUTPUT_POPULATION_INDEX: Mapping[str, int] = {"thrust": 0, "yaw": 1, "brake": 2}
 #: `illConditioned` (the plan's predeclared threshold).
 ILL_CONDITIONED_THRESHOLD = 1e8
 
-#: Files that determine `transfer.json`'s own output bytes: this module
-#: itself, plus the two shared helpers it depends on for graph loading/
-#: dense-matrix construction (`graph_io.py`) and the single-threaded-BLAS
-#: guard (`env_guard.py`). Hashed into `producer.sourceSha256` below (via
-#: `graph_io.source_identity_sha256`, the same filename+NUL+bytes-per-file
-#: scheme `scripts/data/compile.py`'s `compiler_source_sha256()` already
-#: uses) so `explain.py`'s `verify_provenance` can mechanically refuse a
-#: `transfer.json` regenerated from a different version of this code -- a
-#: thermo-methodology review finding: this pipeline previously pinned only
-#: *graph* identity (`sourceGraphSha256`/`rewireSourceSha256`), never *code*
-#: identity, so a `transfer.json` regenerated from stale code against the
-#: same 502 graphs would have passed every existing check silently.
-TRANSFER_SOURCE_FILENAMES: tuple[str, ...] = ("transfer.py", "graph_io.py", "env_guard.py")
-TRANSFER_SOURCE_DIR = Path(__file__).resolve().parent
+#: `transfer.json`'s own producer sha is hashed over the *real, walked*
+#: Python import graph from this file (`graph_io.python_dependency_closure`,
+#: a thermo-fix-verification review finding's structural fix), not a
+#: hand-maintained flat filename list -- the old `TRANSFER_SOURCE_FILENAMES
+#: = ("transfer.py", "graph_io.py", "env_guard.py")` silently omitted
+#: `scripts/data/rewire.py`/`binfmt.py` even though `graph_io.
+#: load_verified_graph` calls `rewire.decode_graph_binary` on every graph
+#: this module loads -- the actual bytes-to-arrays decode feeding every
+#: number in `transfer.json`. `TRANSFER_SEARCH_DIRS` mirrors the two
+#: directories this file's own imports actually resolve against at
+#: runtime: its own directory (`scripts/analysis/`, for `graph_io`/
+#: `env_guard`) and `scripts/data/` (for `graph_io.py`'s own `sys.path.
+#: insert` of that directory, which is how `binfmt`/`fsutil`/`rewire`
+#: resolve).
+TRANSFER_ENTRY = Path(__file__).resolve()
+TRANSFER_SOURCE_DIR = TRANSFER_ENTRY.parent
+TRANSFER_SEARCH_DIRS: tuple[Path, ...] = (TRANSFER_SOURCE_DIR, TRANSFER_SOURCE_DIR.parent / "data")
+REPO_ROOT = TRANSFER_SOURCE_DIR.parents[1]
 
 
 def transfer_producer() -> dict:
     """This run's code-identity block: which script produced this output,
-    the sha256 of its own source (`TRANSFER_SOURCE_FILENAMES`), and the host
-    it ran on. `host` uses `platform.machine()`/`platform.python_version()`
-    (not `scripts/null/regime-check.ts`'s `process.arch`/`process.version`
-    convention) because this is a Python producer -- `platform.machine()`
-    and Node's `process.arch` report the *same* physical ARM64 host
-    differently (`"aarch64"` vs `"arm64"`), so `explain.py` cross-checks this
-    block's `arch` only against `features.py`'s own (another Python
-    producer), never against a TypeScript producer's `host.arch` string."""
+    the sha256 of its own real import-graph closure (`TRANSFER_ENTRY`'s
+    dependency set, see `TRANSFER_SOURCE_DIR`'s doc comment), that
+    dependency set itself (so a reader can see exactly what was pinned
+    without re-deriving it), and the host it ran on. `host` uses
+    `platform.machine()`/`platform.python_version()` (not `scripts/null/
+    regime-check.ts`'s `process.arch`/`process.version` convention)
+    because this is a Python producer -- `platform.machine()` and Node's
+    `process.arch` report the *same* physical ARM64 host differently
+    (`"aarch64"` vs `"arm64"`), so `explain.py` cross-checks this block's
+    `arch` only against `features.py`'s own (another Python producer),
+    never against a TypeScript producer's `host.arch` string."""
+    dependencies = graph_io.python_dependency_closure(TRANSFER_ENTRY, REPO_ROOT, TRANSFER_SEARCH_DIRS)
     return {
         "script": "scripts/analysis/transfer.py",
-        "sourceSha256": graph_io.source_identity_sha256(TRANSFER_SOURCE_DIR, TRANSFER_SOURCE_FILENAMES),
+        "sourceSha256": graph_io.source_identity_sha256(REPO_ROOT, dependencies),
+        "dependencies": dependencies,
         "host": {"arch": platform.machine(), "python": platform.python_version()},
     }
 

@@ -92,8 +92,6 @@ import explain_provenance  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PUBLIC_DATA_DIR = REPO_ROOT / "public" / "data"
 DOCS_DIR = REPO_ROOT / "docs"
-NULL_SOURCE_DIR = REPO_ROOT / "scripts" / "null"
-ANALYSIS_SOURCE_DIR = Path(__file__).resolve().parent
 
 VERSION = 1
 REWIRED_COUNT = 500
@@ -597,23 +595,26 @@ def build_qualifying_metrics_note(qualifying_metrics: Sequence[Mapping[str, obje
 # `explain_provenance.verify_provenance` (extracted to its own module for
 # the same "keep each file under this repo's 1000-line rule" reason as
 # `explain_stats.py`/`explain_report.py`; see that module's doc comment).
-# The two thin wrappers below bind `REWIRED_COUNT`/`ANALYSIS_SOURCE_DIR`/
-# `NULL_SOURCE_DIR` (this module's own globals) into `explain_provenance`'s
-# otherwise-parameterized functions, so callers below read like the
-# single-module version did.
+# The two thin wrappers below bind `REWIRED_COUNT`/`REPO_ROOT` (this
+# module's own globals) into `explain_provenance`'s otherwise-parameterized
+# functions, so callers below read like the single-module version did.
+# `REPO_ROOT` (not the narrower `ANALYSIS_SOURCE_DIR`/`NULL_SOURCE_DIR` this
+# replaced) is what each producer's real import-graph closure is walked
+# and hashed relative to, since that closure now spans `scripts/analysis/`,
+# `scripts/data/`, `scripts/training/`, and `src/lib/...`.
 # ---------------------------------------------------------------------------
 
 
 def current_transfer_source_sha256() -> str:
-    return explain_provenance.current_transfer_source_sha256(ANALYSIS_SOURCE_DIR)
+    return explain_provenance.current_transfer_source_sha256(REPO_ROOT)
 
 
 def current_features_source_sha256() -> str:
-    return explain_provenance.current_features_source_sha256(ANALYSIS_SOURCE_DIR)
+    return explain_provenance.current_features_source_sha256(REPO_ROOT)
 
 
 def current_regime_source_sha256() -> str:
-    return explain_provenance.current_regime_source_sha256(NULL_SOURCE_DIR)
+    return explain_provenance.current_regime_source_sha256(REPO_ROOT)
 
 
 def _require_complete_seed_coverage(label: str, seeds: Sequence[int]) -> None:
@@ -635,8 +636,7 @@ def verify_provenance(
         features_json,
         features_exploratory_json,
         regime_json,
-        ANALYSIS_SOURCE_DIR,
-        NULL_SOURCE_DIR,
+        REPO_ROOT,
     )
 
 
