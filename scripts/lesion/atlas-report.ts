@@ -633,7 +633,20 @@ ${renderGraphSection('Rewired seed 0', artifact.graphs.rewiredSeed0, artifact.bo
 - **The opponent is parked** for every episode, matching the null studies' single-agent condition, not a
   competitive one.
 - **No biological claim.** This describes how this specific hand-authored decoder and rate-model dynamics
-  interact with the measured topology, not a measurement of the real fly's neural function.
+  interact with the measured topology, not a measurement of the real fly's neural function.${
+    artifact.timing
+      ? `
+- **Timing correction.** \`.agents/plans/lesion-atlas/02-atlas-computation.md\` projected "about 6 min at 18
+  shards" for this run. The actual measured wall time was ${(artifact.timing.elapsedMs / 60000).toFixed(1)} minutes
+  (${(artifact.timing.elapsedMs / 1000).toFixed(1)}s, see Parameters above) -- roughly 20x longer. The plan's
+  estimate treated the rewiring-null study's published "32.1 ms/episode" figure as a serial per-episode cost;
+  that figure is itself a wall-clock-per-episode average over an already-18-way-parallel run, not a serial cost,
+  so the estimate understated the real wall time by roughly the shard count. A pre-run calibration on the real
+  Spark (10 lesions x 2 graphs x 100 seeds, single-process) measured the true serial cost at
+  approximately 421-424 ms/episode, correctly projecting the multi-hour range this run's actual wall time falls
+  within.`
+      : ''
+  }
 `;
 
   return `${markdown.trimEnd()}\n`;
