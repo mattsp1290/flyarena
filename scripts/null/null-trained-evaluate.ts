@@ -5,8 +5,9 @@ import { fileURLToPath } from 'node:url';
 
 import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import { requireNonNegativeInt, requirePositiveInt, requireValue } from '../training/cli';
-import { atomicWriteFileSync } from '../training/fsio';
+import { atomicWriteFileSync, sha256Hex } from '../training/fsio';
 import { CEM_CONFIG_FIELDS, isEmptyCemConfig, readRunDir } from '../training/run-dir';
+import { readInterventionIndex, resolveVerifiedInterventionGraphPath } from './lookup-intervention-graph';
 import { runCliMain, runMetaPathFor, runShardedEvaluation, toGraphRaw, type NullGraphRaw } from './null-evaluate';
 import type { NullSeedResult, NullWorkerMessage } from './null-worker';
 import type { NullTrainedWorkerTask } from './null-trained-worker';
@@ -543,4 +544,334 @@ export const runNullTrainedEvaluate = async (
 
 const main = runCliMain('null-trained-evaluate', 'runs', parseNullTrainedEvaluateArgs, runNullTrainedEvaluate);
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) void main();
+// ---------------------------------------------------------------------------
+// --graph-list / --trained-dir (pathway-interventions WP3)
+// ---------------------------------------------------------------------------
+
+/**
+ * `.agents/plans/pathway-interventions/03-evaluation.md`'s WP3:
+ * `--graph-list`/`--trained-dir` mode. Rescores `scripts/null/train-sample.sh`'s
+ * `--graph-list`/`--ids` run directories (`<trained-dir>/<id>-seed<trainerSeed>/`,
+ * one per `(intervention-or-control id, trainer seed)` pair — P at trainer
+ * seeds 101/202/303, C000..C004 and M1000..M1004 at trainer seed 101, this
+ * study's predeclared 13 runs) — decoder `trained`, opponent parked, same
+ * held-out seeds (30001..30100 by default) the rewired-seed mode above and
+ * the authored null both use.
+ *
+ * A wholly separate CLI mode/output shape from the rewired-seed mode above
+ * (`NullTrainedEvaluationRaw`'s numeric `rewired`/`biological` seed lists
+ * don't fit "arbitrary string ids, 1-3 trainer seeds each"), but it reuses
+ * every reusable piece of that pipeline unchanged: `null-trained-worker.ts`
+ * (the SAME worker script — `NullTrainedWorkerTask`'s shape already covers
+ * "a run directory + arm bundle path scored with `--arm rewired`", which
+ * this mode's tasks are, exactly), `runShardedEvaluation`, `findSingleSubdirectory`,
+ * `readBundleD`/`assertMatchingD`, `reconcileCemConfig`, `gitRev`, and
+ * `BIGQ_MERGE_COMMIT`.
+ */
+
+interface InterventionRunSpec {
+  readonly id: string;
+  readonly trainerSeed: number;
+}
+
+/** `--runs id:trainerSeed[,id:trainerSeed...]` — mirrors `parseTrainerSeeds`'s validation style above, generalized to an `id:seed` pair per entry (an intervention/control id has no fixed numeric range the way a rewiring seed does). */
+const parseRunSpecs = (flag: string, value: string): readonly InterventionRunSpec[] => {
+  const specs = value.split(',').map((raw) => {
+    const trimmed = raw.trim();
+    const match = /^([^:,\s]+):(\d+)$/.exec(trimmed);
+    if (!match) {
+      throw new Error(`${flag} must be a comma-separated list of id:trainerSeed pairs (got "${value}")`);
+    }
+    const trainerSeed = Number(match[2]);
+    if (!Number.isInteger(trainerSeed) || trainerSeed <= 0) {
+      throw new Error(`${flag}: trainer seed for id "${match[1]}" must be a positive integer (got "${match[2]}")`);
+    }
+    return { id: match[1], trainerSeed };
+  });
+  if (specs.length === 0) throw new Error(`${flag} must list at least one id:trainerSeed pair`);
+  const seen = new Set<string>();
+  for (const spec of specs) {
+    const key = `${spec.id}:${spec.trainerSeed}`;
+    // A duplicate (id, trainerSeed) pair would create two tasks with the
+    // same graphId (see `buildInterventionTasks`'s own `graphId`), which
+    // result "wins" then depends on completion order -- exactly what the
+    // shard byte-identity guarantee promises can never happen.
+    if (seen.has(key)) throw new Error(`${flag} lists "${key}" more than once`);
+    seen.add(key);
+  }
+  return specs;
+};
+
+export interface NullTrainedInterventionEvaluateArgs {
+  readonly graphList: string;
+  readonly runs: readonly InterventionRunSpec[];
+  readonly trainedDir: string;
+  readonly armsDir: string;
+  readonly heldOutStart: number;
+  readonly heldOutCount: number;
+  readonly ticks: number;
+  readonly hiddenSize: number;
+  readonly shards: number;
+  readonly out: string;
+}
+
+const DEFAULT_INTERVENTION_TRAINED_DIR = resolve(repoRoot, 'training/runs/interventions/trained');
+const DEFAULT_INTERVENTION_ARMS_DIR = resolve(repoRoot, 'training/runs/interventions/arms');
+const DEFAULT_INTERVENTION_OUT = resolve(repoRoot, 'training/runs/interventions/trained.json');
+
+export const parseNullTrainedInterventionEvaluateArgs = (argv: readonly string[]): NullTrainedInterventionEvaluateArgs => {
+  let graphList: string | undefined;
+  let runs: readonly InterventionRunSpec[] | undefined;
+  let trainedDir = DEFAULT_INTERVENTION_TRAINED_DIR;
+  let armsDir = DEFAULT_INTERVENTION_ARMS_DIR;
+  let heldOutStart = DEFAULT_HELD_OUT_START;
+  let heldOutCount = DEFAULT_HELD_OUT_COUNT;
+  let ticks = DEFAULT_TICKS;
+  let hiddenSize = DEFAULT_HIDDEN_SIZE;
+  let shards = DEFAULT_SHARDS;
+  let out = DEFAULT_INTERVENTION_OUT;
+
+  let index = 0;
+  while (index < argv.length) {
+    const flag = argv[index];
+    if (flag === '--graph-list') {
+      graphList = resolve(process.cwd(), requireValue(flag, argv[index + 1]));
+      index += 2;
+    } else if (flag === '--runs') {
+      runs = parseRunSpecs(flag, requireValue(flag, argv[index + 1]));
+      index += 2;
+    } else if (flag === '--trained-dir') {
+      trainedDir = resolve(process.cwd(), requireValue(flag, argv[index + 1]));
+      index += 2;
+    } else if (flag === '--arms-dir') {
+      armsDir = resolve(process.cwd(), requireValue(flag, argv[index + 1]));
+      index += 2;
+    } else if (flag === '--held-out-start') {
+      heldOutStart = requireNonNegativeInt(flag, argv[index + 1]);
+      index += 2;
+    } else if (flag === '--held-out-count') {
+      heldOutCount = requirePositiveInt(flag, argv[index + 1]);
+      index += 2;
+    } else if (flag === '--ticks') {
+      ticks = requirePositiveInt(flag, argv[index + 1]);
+      index += 2;
+    } else if (flag === '--hidden-size') {
+      hiddenSize = requirePositiveInt(flag, argv[index + 1]);
+      index += 2;
+    } else if (flag === '--shards') {
+      shards = requirePositiveInt(flag, argv[index + 1]);
+      index += 2;
+    } else if (flag === '--out') {
+      out = resolve(process.cwd(), requireValue(flag, argv[index + 1]));
+      index += 2;
+    } else {
+      throw new Error(`Unknown argument: ${flag}`);
+    }
+  }
+
+  if (!graphList) throw new Error('--graph-list is required');
+  if (!runs) throw new Error('--runs is required');
+  if (!out.endsWith('.json')) throw new Error(`--out must end with ".json" (got "${out}")`);
+
+  return { graphList, runs, trainedDir, armsDir, heldOutStart, heldOutCount, ticks, hiddenSize, shards, out };
+};
+
+/**
+ * `id`'s graph-list entry, re-verified against its actual on-disk bytes
+ * (`resolveVerifiedInterventionGraphPath` throws on any sha256 mismatch) --
+ * so a WP1 `training/runs/interventions/` tree that changed or was
+ * re-copied between `train-sample.sh`'s training run and this rescoring
+ * run is caught here, not silently scored against whatever graph happens
+ * to be on disk now.
+ */
+const verifiedInterventionEntry = (
+  index: ReturnType<typeof readInterventionIndex>,
+  graphListPath: string,
+  id: string
+): { readonly gzipSha256: string } => {
+  const entry = index.entries.find((candidate) => candidate.id === id);
+  if (!entry) throw new Error(`null-trained-evaluate: id "${id}" not found in --graph-list ${graphListPath}`);
+  resolveVerifiedInterventionGraphPath(graphListPath, id);
+  return entry;
+};
+
+/**
+ * Every requested `(id, trainerSeed)` pair's arm bundle is also checked
+ * against the graph-list's own recorded `gzipSha256` for that id
+ * (`provenance.kind === 'rewired-artifact'` and `artifactSha256` equal) --
+ * proof that this run directory was actually trained against WP1's `id`
+ * graph, not merely a directory that happens to be named `<id>-seed<seed>`
+ * (a stale/mismatched rename, or an operator error). `assertMatchingD`
+ * (below, reused from the rewired-seed mode) separately checks every
+ * bundle in this run shares one output-neuron count.
+ */
+const assertBundleMatchesInterventionGraph = (
+  armBundlePath: string,
+  graphListPath: string,
+  id: string,
+  entry: { readonly gzipSha256: string }
+): void => {
+  const bundle = JSON.parse(readFileSync(armBundlePath, 'utf8')) as {
+    readonly provenance?: { readonly kind?: string; readonly artifactSha256?: string };
+  };
+  if (bundle.provenance?.kind !== 'rewired-artifact' || bundle.provenance.artifactSha256 !== entry.gzipSha256) {
+    throw new Error(
+      `null-trained-evaluate: arm bundle for id "${id}" (${armBundlePath}) does not match --graph-list ` +
+        `${graphListPath}'s "${id}" entry (provenance ${JSON.stringify(bundle.provenance)} vs expected ` +
+        `rewired-artifact with artifactSha256 ${entry.gzipSha256})`
+    );
+  }
+};
+
+export const buildInterventionTasks = (
+  args: Readonly<NullTrainedInterventionEvaluateArgs>
+): NullTrainedWorkerTask[] => {
+  const index = readInterventionIndex(args.graphList);
+  const heldOutSeeds = Array.from({ length: args.heldOutCount }, (_, i) => args.heldOutStart + i);
+  const bundlePathsByGraphId = new Map<string, string>();
+
+  const tasks = args.runs.map((run) => {
+    const entry = verifiedInterventionEntry(index, args.graphList, run.id);
+    const graphId = `${run.id}-seed${run.trainerSeed}`;
+    const runDir = resolve(args.trainedDir, graphId);
+    requireFile(resolve(runDir, 'config.json'), `intervention "${run.id}" trainer seed ${run.trainerSeed} config.json`);
+    requireFile(
+      resolve(runDir, 'theta_final.npy'),
+      `intervention "${run.id}" trainer seed ${run.trainerSeed} theta_final.npy`
+    );
+    const bundleDir = findSingleSubdirectory(resolve(args.armsDir, run.id), `intervention "${run.id}" arms`);
+    const armBundlePath = resolve(bundleDir, 'rewired.json');
+    requireFile(armBundlePath, `intervention "${run.id}" arm bundle`);
+    assertBundleMatchesInterventionGraph(armBundlePath, args.graphList, run.id, entry);
+    bundlePathsByGraphId.set(graphId, armBundlePath);
+    const task: NullTrainedWorkerTask = {
+      graphId,
+      runDir,
+      armBundlePath,
+      heldOutSeeds,
+      ticks: args.ticks,
+      expectedArm: 'rewired',
+      expectedTrainerSeed: run.trainerSeed,
+      expectedSubsteps: NEURAL_SUBSTEPS_PER_TICK,
+      expectedHiddenSize: args.hiddenSize
+    };
+    return task;
+  });
+
+  assertMatchingD(bundlePathsByGraphId);
+  return tasks;
+};
+
+export interface NullTrainedInterventionGraphRaw extends NullTrainedGraphRaw {
+  readonly id: string;
+  readonly trainerSeed: number;
+}
+
+/**
+ * `runs`, sorted by `id` ascending then `trainerSeed` ascending -- never
+ * `args.runs`' own (caller-supplied, and possibly shard-timing-adjacent)
+ * order, so this output is independent of `--runs`' argument order and of
+ * `--shards`/completion timing, matching `null-evaluate.ts`'s/this file's
+ * own "canonical task order" convention above.
+ */
+export interface NullTrainedInterventionEvaluationRaw {
+  readonly version: 1;
+  readonly seeds: { readonly start: number; readonly count: number };
+  readonly ticks: number;
+  readonly substeps: number;
+  readonly graphListSha256: string;
+  readonly runs: readonly NullTrainedInterventionGraphRaw[];
+  readonly host: { readonly arch: string; readonly node: string };
+  readonly d: number;
+  readonly evaluatorGitRev: string | null;
+  /** See `reconcileCemConfig`'s doc comment above -- reused verbatim for this mode's own tasks. */
+  readonly cemConfig: Record<string, unknown> | null;
+  readonly cemConfigWarnings: readonly string[];
+}
+
+export const assembleInterventionRaw = (
+  args: Readonly<NullTrainedInterventionEvaluateArgs>,
+  tasks: readonly NullTrainedWorkerTask[],
+  results: ReadonlyMap<string, readonly NullSeedResult[]>
+): NullTrainedInterventionEvaluationRaw => {
+  const require = (graphId: string): readonly NullSeedResult[] => {
+    const found = results.get(graphId);
+    if (!found) throw new Error(`null-trained-evaluate: missing results for "${graphId}"`);
+    return found;
+  };
+
+  const runs: NullTrainedInterventionGraphRaw[] = [...args.runs]
+    .sort((a, b) => (a.id === b.id ? a.trainerSeed - b.trainerSeed : a.id < b.id ? -1 : 1))
+    .map((run) => ({
+      id: run.id,
+      trainerSeed: run.trainerSeed,
+      ...toGraphRaw(require(`${run.id}-seed${run.trainerSeed}`))
+    }));
+
+  if (tasks.length === 0) throw new Error('null-trained-evaluate: assembleInterventionRaw requires at least one task');
+  const { cemConfig, warnings: cemConfigWarnings } = reconcileCemConfig(tasks);
+
+  return {
+    version: 1,
+    seeds: { start: args.heldOutStart, count: args.heldOutCount },
+    ticks: args.ticks,
+    substeps: NEURAL_SUBSTEPS_PER_TICK,
+    graphListSha256: sha256Hex(readFileSync(args.graphList)),
+    runs,
+    host: { arch: process.arch, node: process.version },
+    d: readBundleD(tasks[0].armBundlePath),
+    evaluatorGitRev: gitRev(),
+    cemConfig,
+    cemConfigWarnings
+  };
+};
+
+export const runNullTrainedInterventionEvaluate = async (
+  args: Readonly<NullTrainedInterventionEvaluateArgs>
+): Promise<{ out: string; runMetaOut: string; taskCount: number; elapsedMs: number }> => {
+  const tasks = buildInterventionTasks(args);
+  const workerPath = fileURLToPath(new URL('./null-trained-worker.ts', import.meta.url));
+
+  const started = performance.now();
+  const results = await runShardedEvaluation<NullTrainedWorkerTask, NullSeedResult, NullWorkerMessage>(
+    tasks,
+    args.shards,
+    workerPath
+  );
+  const elapsedMs = performance.now() - started;
+  const perEpisodeMs = elapsedMs / (tasks.length * args.heldOutCount);
+
+  const raw = assembleInterventionRaw(args, tasks, results);
+  mkdirSync(dirname(args.out), { recursive: true });
+  atomicWriteFileSync(args.out, JSON.stringify(raw));
+
+  const runMetaOut = runMetaPathFor('null-trained-evaluate', args.out);
+  atomicWriteFileSync(runMetaOut, `${JSON.stringify({ shards: args.shards, elapsedMs, perEpisodeMs }, null, 2)}\n`);
+
+  return { out: args.out, runMetaOut, taskCount: tasks.length, elapsedMs };
+};
+
+const interventionMain = runCliMain(
+  'null-trained-evaluate',
+  'runs',
+  parseNullTrainedInterventionEvaluateArgs,
+  runNullTrainedInterventionEvaluate
+);
+
+/**
+ * `--graph-list` selects this file's WP3 intervention mode instead of the
+ * default rewired-seed mode above -- the two modes' argument sets are
+ * otherwise disjoint enough (`--rewired-trained-dir` vs `--trained-dir`,
+ * etc.) that dispatching on one flag's presence, rather than requiring a
+ * separate `--mode` flag, is unambiguous and matches `null-evaluate.ts`'s
+ * own `--graph-list`-selects-a-mode convention (WP2).
+ */
+const dispatchMain = async (): Promise<void> => {
+  if (process.argv.slice(2).includes('--graph-list')) {
+    await interventionMain();
+  } else {
+    await main();
+  }
+};
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) void dispatchMain();

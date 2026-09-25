@@ -115,6 +115,26 @@ graph_path="public/data/malecns-arena-v1.bin.gz"
 graphs_dir="training/runs/null/graphs"
 arms_out="training/runs/null/arms"
 trained_out="training/runs/null/trained"
+arms_out_explicit=0
+trained_out_explicit=0
+# --graph-list/--ids (`.agents/plans/pathway-interventions/03-evaluation.md`'s
+# WP3): trains one readout per id in a `scripts/analysis/interventions.py`
+# `index.json` (P/Q/C000.../M1000...) instead of a `rewire_batch.py`
+# seed-keyed `--graphs-dir`. `graph_list_mode` (set at the flags themselves,
+# below) is what actually switches the seed loop over to id-keyed behavior.
+graph_list=""
+ids=""
+graph_list_mode=0
+# training/runs/interventions/{arms,trained} -- WP1's own gitignored output
+# root, kept separate from train-sample.sh's existing training/runs/null/*
+# defaults so a --graph-list run can never collide with (or be mistaken
+# for) the rewired-seed study's own arms/trained trees. Only applied when
+# --graph-list/--ids is used AND the operator did not pass an explicit
+# --arms-out/--trained-out of their own (see right after CLI parsing) --
+# an explicit flag always wins, exactly like --dry-run-fixture's own
+# directory suffixing.
+DEFAULT_GRAPH_LIST_ARMS_OUT="training/runs/interventions/arms"
+DEFAULT_GRAPH_LIST_TRAINED_OUT="training/runs/interventions/trained"
 
 # A RELATIVE --graph/--graphs-dir/--arms-out/--trained-out resolves against
 # repo_root (this script `cd`s there below), NOT against the directory this
@@ -137,6 +157,7 @@ usage() {
   echo "          [--population N] [--elites N] [--generations N] [--train-seeds-per-generation N]" >&2
   echo "          [--alpha F] [--std-floor F] [--init-std F] [--hidden-size N] [--ticks N]" >&2
   echo "          [--graph PATH] [--graphs-dir DIR] [--arms-out DIR] [--trained-out DIR]" >&2
+  echo "          [--graph-list index.json --ids id1,id2,...]" >&2
   exit 1
 }
 
@@ -157,12 +178,50 @@ while [[ $# -gt 0 ]]; do
     --ticks) ticks="${2:?}"; shift 2 ;;
     --graph) graph_path="${2:?}"; shift 2 ;;
     --graphs-dir) graphs_dir="${2:?}"; shift 2 ;;
-    --arms-out) arms_out="${2:?}"; shift 2 ;;
-    --trained-out) trained_out="${2:?}"; shift 2 ;;
+    --arms-out) arms_out="${2:?}"; arms_out_explicit=1; shift 2 ;;
+    --trained-out) trained_out="${2:?}"; trained_out_explicit=1; shift 2 ;;
+    --graph-list) graph_list="${2:?}"; graph_list_mode=1; shift 2 ;;
+    --ids) ids="${2:?}"; graph_list_mode=1; shift 2 ;;
     -h|--help) usage ;;
     *) echo "train-sample.sh: unknown argument: $1" >&2; usage ;;
   esac
 done
+
+# --graph-list/--ids form one mode together: an id list with no index.json
+# to resolve it against (or vice versa) cannot proceed -- EXCEPT under
+# --dry-run-fixture, which (like the existing seed-based dry run) never
+# reads a real index.json at all; there, --ids alone selects id-keyed
+# fixture-rewire exports (one per id, in --ids order) instead of the
+# existing numeric --seed-start/--seed-count range. --graph-list itself is
+# refused under --dry-run-fixture (mirroring export-arms.ts's own
+# "--fixture-rewire cannot be combined with --graph" rule): a fixture run
+# must never be able to point at, verify against, or be mistaken for a real
+# WP1 index.json.
+if [[ "$graph_list_mode" -eq 1 && "$dry_run_fixture" -eq 0 ]]; then
+  if [[ -z "$graph_list" || -z "$ids" ]]; then
+    echo "train-sample.sh: --graph-list and --ids must be given together" >&2
+    usage
+  fi
+fi
+if [[ "$dry_run_fixture" -eq 1 && -n "$graph_list" ]]; then
+  echo "train-sample.sh: --graph-list cannot be combined with --dry-run-fixture (pass --ids alone for an id-keyed fixture dry run)" >&2
+  usage
+fi
+if [[ "$dry_run_fixture" -eq 1 && "$graph_list_mode" -eq 1 && -z "$ids" ]]; then
+  echo "train-sample.sh: --dry-run-fixture's id-keyed mode requires --ids" >&2
+  usage
+fi
+
+if [[ "$graph_list_mode" -eq 1 ]]; then
+  # See DEFAULT_GRAPH_LIST_ARMS_OUT/DEFAULT_GRAPH_LIST_TRAINED_OUT's own doc
+  # comment above: an explicit --arms-out/--trained-out always wins.
+  if [[ "$arms_out_explicit" -eq 0 ]]; then
+    arms_out="$DEFAULT_GRAPH_LIST_ARMS_OUT"
+  fi
+  if [[ "$trained_out_explicit" -eq 0 ]]; then
+    trained_out="$DEFAULT_GRAPH_LIST_TRAINED_OUT"
+  fi
+fi
 
 # --seed-start/--seed-count feed the `(( seed = seed_start; ...))` C-style
 # `for` loop below -- a non-integer value there fails with bash's own
@@ -331,7 +390,110 @@ rewired_artifact_for_seed() {
   node --import tsx scripts/null/lookup-rewired-artifact.ts "$index_path" "$seed"
 }
 
+# `--graph-list`/`--ids`'s own lookup, mirroring `rewired_artifact_for_seed`
+# above but for `scripts/analysis/interventions.py`'s id-keyed index.json --
+# see `scripts/null/lookup-intervention-graph.ts`'s doc comment for why this
+# is a separate script/module rather than an addition to
+# `lookup-rewired-artifact.ts`/`null-evaluate.ts`. Verifies the resolved
+# graph's gzip sha256 against the index BEFORE printing its path (so a
+# corrupted/stale/mismatched graph fails here, before any GPU time is
+# spent), unlike `rewired_artifact_for_seed`, which only ever returns a
+# filename for its caller to separately check `-f` on.
+verified_intervention_graph_for_id() {
+  local index_path="$1" id="$2"
+  node --import tsx scripts/null/lookup-intervention-graph.ts "$index_path" "$id"
+}
+
 mkdir -p "$trained_out"
+
+if [[ "$graph_list_mode" -eq 1 ]]; then
+  if [[ "$dry_run_fixture" -eq 0 && ! -f "$graph_list" ]]; then
+    echo "train-sample.sh: --graph-list ${graph_list} not found" >&2
+    exit 1
+  fi
+
+  # Split --ids on commas into an array, preserving the caller's own order
+  # (never re-sorted): this script's own stdout/log order should match what
+  # the operator asked for, and downstream rescoring
+  # (null-trained-evaluate.ts's --graph-list mode) establishes its own
+  # canonical output order independently -- this loop's order is a
+  # scheduling convenience only, not a correctness requirement.
+  IFS=',' read -r -a id_list <<< "$ids"
+  if [[ "${#id_list[@]}" -eq 0 ]]; then
+    echo "train-sample.sh: --ids must list at least one id" >&2
+    exit 1
+  fi
+
+  id_index=0
+  for id in "${id_list[@]}"; do
+    if [[ -z "$id" ]]; then
+      echo "train-sample.sh: --ids has an empty entry (check for a stray comma)" >&2
+      exit 1
+    fi
+
+    # id-and-trainer-seed-keyed, NOT id-only: this study trains "P" at three
+    # different --replica-seed values (101/202/303) across three separate
+    # invocations of this script, and each one is its own run directory --
+    # keying on id alone would make the second/third invocation's
+    # resumability check find the FIRST invocation's (different-trainer-seed)
+    # config.json and wrongly skip training entirely.
+    id_out="${trained_out}/${id}-seed${replica_seed}"
+    config_path="${id_out}/config.json"
+
+    if [[ -f "$config_path" ]]; then
+      echo "train-sample.sh: id ${id} (seed ${replica_seed}): ${config_path} already exists -- skipping (resumable)"
+      id_index=$((id_index + 1))
+      continue
+    fi
+
+    # Exported once per id (not once per id+trainer-seed): the rewired arm
+    # bundle itself doesn't depend on the trainer seed, only training does --
+    # matches this script's existing seed-based mode, which likewise exports
+    # arms once per rewiring seed regardless of --replica-seed.
+    arms_id_out="${arms_out}/${id}"
+
+    if [[ "$dry_run_fixture" -eq 1 ]]; then
+      echo "train-sample.sh: id ${id}: exporting fixture-rewired arms (fixture-rewire-seed=${id_index})"
+      npm run training:export-arms -- --fixture-rewire --fixture-rewire-seed "$id_index" --out "$arms_id_out"
+      bundle_dir="$(find "$arms_id_out" -mindepth 1 -maxdepth 1 -type d)"
+    else
+      rewired_path="$(verified_intervention_graph_for_id "$graph_list" "$id")"
+      echo "train-sample.sh: id ${id}: exporting arms from ${rewired_path}"
+      npm run training:export-arms -- --graph "$graph_path" --rewired "$rewired_path" --out "$arms_id_out"
+      graph_sha256="$(sha256sum "$graph_path" | cut -d' ' -f1)"
+      bundle_dir="${arms_id_out}/${graph_sha256}"
+    fi
+
+    bundle_path="${bundle_dir}/rewired.json"
+    if [[ ! -f "$bundle_path" ]]; then
+      echo "train-sample.sh: id ${id}: expected export-arms bundle not found at ${bundle_path}" >&2
+      exit 1
+    fi
+
+    echo "train-sample.sh: id ${id}: training (replica-seed=${replica_seed} population=${population} elites=${elites} generations=${generations})"
+    "${repo_root}/training/scripts/run.sh" flyarena-train \
+      --arm rewired \
+      --graph "$(to_abs_path "$bundle_path")" \
+      --replica-seed "$replica_seed" \
+      --substeps "$substeps" \
+      --hidden-size "$hidden_size" \
+      --ticks "$ticks" \
+      --population "$population" \
+      --elites "$elites" \
+      --generations "$generations" \
+      --train-seeds-per-generation "$train_seeds_per_generation" \
+      --alpha "$alpha" \
+      --std-floor "$std_floor" \
+      --init-std "$init_std" \
+      --out "$(to_abs_path "$id_out")"
+
+    echo "train-sample.sh: id ${id}: done"
+    id_index=$((id_index + 1))
+  done
+
+  echo "train-sample.sh: complete (ids ${ids}, replica-seed ${replica_seed})"
+  exit 0
+fi
 
 if [[ "$dry_run_fixture" -eq 0 && ! -f "${graphs_dir}/index.json" ]]; then
   echo "train-sample.sh: ${graphs_dir}/index.json not found (pass --dry-run-fixture for a fixture smoke test, or --graphs-dir)" >&2
