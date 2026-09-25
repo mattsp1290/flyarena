@@ -16,7 +16,7 @@
   "neuronCount": 1008,
   "nullExplanation": {
     "artifact": "null-explanation-v1.json",
-    "sha256": "474f9368cb53fce94d735eb2a3cef26933428834768df75843584f2f4dfabc0a"
+    "sha256": "baabe4a149bfd7b5f48759ec2aa45098071ddf42c4bc2c38beabe6b95981834b"
   },
   "outputPopulationCount": 3,
   "positions": {
