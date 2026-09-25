@@ -153,11 +153,13 @@ def _regime_entry(seed_or_label, clamp_fraction, steady_state_distance):
     }
 
 
-def _transfer_entry(*, singular=False, ill_conditioned=False, condition_number=4.0):
+def _transfer_entry(*, singular=False, ill_conditioned=False, condition_number=4.0, stable=True, discretized_stable=True):
     return {
         "singular": singular,
         "illConditioned": ill_conditioned,
         "conditionNumber": condition_number,
+        "stable": stable,
+        "discretizedStable": discretized_stable,
         "T": None if singular else [[0.1] * 8, [0.1] * 8, [0.1] * 8],
         "turnGain": None if singular else 0.05,
         "approachGain": None if singular else 0.02,
@@ -216,6 +218,53 @@ def test_biological_own_regime_failure_fails_the_aggregate_gate():
     transfer_json = {"graphs": {"biological": _transfer_entry(), **{f"rewired-{i}": _transfer_entry() for i in range(5)}}}
     regime = explain.compute_regime(regime_json, transfer_json)
     assert regime["gatePassed"] is False
+
+
+def test_null_median_clamp_fraction_above_threshold_fails_the_gate():
+    # Every rewiring individually over the clamp threshold -- the module's
+    # own doc comment says the null-median clamp fraction is gated
+    # alongside the null-median distance; this pins that it actually is.
+    regime_json = {
+        "biological": _regime_entry("biological", 0.01, 0.1),
+        "rewired": [_regime_entry(i, 0.9, 0.1) for i in range(5)],
+    }
+    transfer_json = {"graphs": {"biological": _transfer_entry(), **{f"rewired-{i}": _transfer_entry() for i in range(5)}}}
+    regime = explain.compute_regime(regime_json, transfer_json)
+    assert regime["gatePassed"] is False
+    # Every rewiring is also individually excluded (its own clamp fraction
+    # exceeds threshold too), so no transfer/derived metric could ever pick
+    # up a spurious candidate from an all-excluded null set.
+    assert regime["excludedCount"] == 5
+
+
+def test_unstable_biological_transfer_fails_the_gate():
+    regime_json = {
+        "biological": _regime_entry("biological", 0.01, 0.1),
+        "rewired": [_regime_entry(i, 0.01, 0.1) for i in range(3)],
+    }
+    transfer_json = {
+        "graphs": {
+            "biological": _transfer_entry(stable=False),
+            **{f"rewired-{i}": _transfer_entry() for i in range(3)},
+        }
+    }
+    regime = explain.compute_regime(regime_json, transfer_json)
+    assert regime["gatePassed"] is False
+
+
+def test_discretized_unstable_rewiring_is_excluded():
+    regime_json = {
+        "biological": _regime_entry("biological", 0.01, 0.1),
+        "rewired": [_regime_entry(i, 0.01, 0.1) for i in range(3)],
+    }
+    transfer_graphs = {"biological": _transfer_entry(), **{f"rewired-{i}": _transfer_entry() for i in range(3)}}
+    transfer_graphs["rewired-1"] = _transfer_entry(discretized_stable=False)
+    transfer_json = {"graphs": transfer_graphs}
+    regime = explain.compute_regime(regime_json, transfer_json)
+    assert regime["excludedGraphIds"] == ["rewired-1"]
+    # Biological's own transfer entry is still stable, so the aggregate gate
+    # (which only looks at biological's conditioning) still passes.
+    assert regime["gatePassed"] is True
 
 
 def test_build_metric_drops_excluded_graphs_from_the_null_set(monkeypatch):
@@ -319,11 +368,15 @@ def test_regime_gate_failure_yields_regime_invalid_and_never_linear_pathway():
 
 def test_regime_gate_failure_does_not_suppress_structural_feature():
     # Structural features never depend on the linear regime -- a failed
-    # regime gate must not block a qualifying structural-feature finding.
+    # regime gate must not block a qualifying structural-feature finding,
+    # even though `regimeInvalid` (which describes the *transfer* analysis
+    # only) is still correctly `True` whenever the gate itself failed,
+    # independent of whether any transfer/derived candidate existed.
     qualifying_structural = _metric("weightedInDegree:thrust", "feature", 0.0, 90.0, 160.0, 0.4)
     finding = explain.evaluate_categories(0.0, [], [qualifying_structural], FAILING_REGIME)
     assert finding["categories"] == ["structuralFeature"]
-    assert finding["regimeInvalid"] is False  # no linear candidate existed to be invalidated
+    assert "linearPathway" not in finding["categories"]
+    assert finding["regimeInvalid"] is True
 
 
 def test_near_threshold_spearman_boundary_does_not_qualify():
@@ -338,6 +391,119 @@ def test_inside_range_does_not_qualify_even_with_high_rho():
     assert finding["categories"] == []
 
 
+def test_direction_consistent_low_bio_positive_rho():
+    # bio below the range, positive rho (the metric rises with score) --
+    # consistent with explaining a *low* score.
+    metric = _metric("T:a->b", "transfer", 0.0, 1.0, 2.0, 0.5)
+    assert explain._direction_consistent(metric) is True
+
+
+def test_direction_consistent_high_bio_negative_rho():
+    metric = _metric("T:a->b", "transfer", 3.0, 1.0, 2.0, -0.5)
+    assert explain._direction_consistent(metric) is True
+
+
+def test_direction_inconsistent_low_bio_negative_rho():
+    # bio below the range but rho is negative (the metric *falls* with
+    # score) -- this metric's sign predicts a HIGHER score for biological,
+    # not the observed low one.
+    metric = _metric("T:a->b", "transfer", 0.0, 1.0, 2.0, -0.5)
+    assert explain._direction_consistent(metric) is False
+
+
+def test_linear_pathway_detail_flags_direction_inconsistency_in_summary():
+    inconsistent = _metric("T:a->b", "transfer", 0.0, 1.0, 2.0, -0.5)
+    finding = explain.evaluate_categories(0.0, [inconsistent], [], PASSING_REGIME)
+    assert finding["categories"] == ["linearPathway"]
+    assert finding["linearDetail"]["directionConsistent"] is False
+    sentence = explain.build_summary_sentence(finding)
+    assert "direction-inconsistent" in sentence
+
+
+# ---------------------------------------------------------------------------
+# Permutation calibration: missing values fail loud, joint rate is a real union
+# ---------------------------------------------------------------------------
+
+
+def test_build_family_rank_matrix_raises_on_missing_value(monkeypatch):
+    monkeypatch.setattr(explain, "REWIRED_COUNT", 3)
+    graphs = {f"rewired-{i}": {"weightBalance": {"thrust": None if i == 1 else float(i)}} for i in range(3)}
+    metrics = [{"name": "weightBalance:thrust"}]
+    with pytest.raises(ValueError, match="missing value"):
+        explain.build_family_rank_matrix(metrics, explain.extract_feature_value, graphs, frozenset())
+
+
+def test_joint_permutation_chance_rate_is_deterministic_and_at_least_max_of_families():
+    rng = np.random.default_rng(0)
+    n = 100
+    scores = rng.standard_normal(n)
+    # Family A: one metric strongly correlated with score.
+    metric_a = scores + rng.standard_normal(n) * 0.01
+    rank_a = explain._rank(metric_a).reshape(-1, 1)
+    # Family B: pure noise.
+    metric_b = rng.standard_normal(n)
+    rank_b = explain._rank(metric_b).reshape(-1, 1)
+    seed_indices = np.arange(n)
+
+    joint_rate_a = explain.joint_permutation_chance_rate(
+        [(rank_a, seed_indices)], scores, 0.3, 300, np.random.default_rng(99)
+    )
+    joint_rate_both = explain.joint_permutation_chance_rate(
+        [(rank_a, seed_indices), (rank_b, seed_indices)], scores, 0.3, 300, np.random.default_rng(99)
+    )
+    # Adding a second family (evaluated under the *same* permutation draws)
+    # can only add hits, never remove them -- the union rate must be at
+    # least as large as any single family's rate.
+    assert joint_rate_both >= joint_rate_a
+
+    rate_repeat = explain.joint_permutation_chance_rate(
+        [(rank_a, seed_indices), (rank_b, seed_indices)], scores, 0.3, 300, np.random.default_rng(99)
+    )
+    assert joint_rate_both == rate_repeat
+
+
+def test_joint_permutation_chance_rate_empty_families_returns_zero():
+    assert explain.joint_permutation_chance_rate([], np.array([1.0, 2.0, 3.0]), 0.3, 10, np.random.default_rng(0)) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Seed coverage and report-rendering defensiveness
+# ---------------------------------------------------------------------------
+
+
+def test_require_complete_seed_coverage_accepts_full_range(monkeypatch):
+    monkeypatch.setattr(explain, "REWIRED_COUNT", 5)
+    explain._require_complete_seed_coverage("test", [0, 1, 2, 3, 4])  # no raise
+
+
+def test_require_complete_seed_coverage_rejects_missing_seed(monkeypatch):
+    monkeypatch.setattr(explain, "REWIRED_COUNT", 5)
+    with pytest.raises(ValueError, match="does not cover"):
+        explain._require_complete_seed_coverage("test", [0, 1, 2, 3])
+
+
+def test_require_complete_seed_coverage_rejects_duplicate_seed(monkeypatch):
+    monkeypatch.setattr(explain, "REWIRED_COUNT", 5)
+    with pytest.raises(ValueError, match="does not cover"):
+        explain._require_complete_seed_coverage("test", [0, 1, 2, 3, 3])
+
+
+def test_render_transfer_matrix_handles_missing_metric_without_crashing():
+    # Simulates biological's transfer solve being singular: every `T:*`
+    # metric is dropped, so `metrics_by_name` has none of them.
+    rendered = explain.render_transfer_matrix({}, "bio")
+    assert "n/a" in rendered
+    assert "foodBearing" in rendered
+
+
+def test_render_metric_stats_table_shows_null_constant_as_na():
+    constant_metric = _metric("pathLength:a->b", "feature", 2.0, 1.0, 1.0, 0.0)
+    constant_metric["nullConstant"] = True
+    rendered = explain.render_metric_stats_table([constant_metric])
+    assert "n/a (constant in null)" in rendered
+    assert "0.000" not in rendered
+
+
 # ---------------------------------------------------------------------------
 # End-to-end determinism (byte-identical rerun on a small synthetic input)
 # ---------------------------------------------------------------------------
@@ -349,6 +515,8 @@ def _synthetic_transfer_graph(rng: np.random.Generator) -> dict:
         "singular": False,
         "illConditioned": False,
         "conditionNumber": 5.0,
+        "stable": True,
+        "discretizedStable": True,
         "turnGain": float(rng.standard_normal()),
         "approachGain": float(rng.standard_normal()),
     }
@@ -389,12 +557,14 @@ def synthetic_inputs(tmp_path, monkeypatch):
     rewired = []
     transfer_graphs = {"biological": _synthetic_transfer_graph(rng)}
     features_graphs = {"biological": _synthetic_features_graph(rng)}
+    features_exploratory_graphs = {"biological": _synthetic_features_graph(rng)}
     regime_rewired = []
     for seed in range(20):
         score = float(rng.standard_normal())
         rewired.append({"seed": seed, "score": score})
         transfer_graphs[f"rewired-{seed}"] = _synthetic_transfer_graph(rng)
         features_graphs[f"rewired-{seed}"] = _synthetic_features_graph(rng)
+        features_exploratory_graphs[f"rewired-{seed}"] = _synthetic_features_graph(rng)
         regime_rewired.append(
             {
                 "seed": seed,
@@ -434,6 +604,11 @@ def synthetic_inputs(tmp_path, monkeypatch):
         "rewireSourceSha256": rewire_sha,
         "graphs": features_graphs,
     }
+    features_exploratory_json = {
+        "sourceGraphSha256": source_sha,
+        "rewireSourceSha256": rewire_sha,
+        "graphs": features_exploratory_graphs,
+    }
     regime_json = {
         "sourceGraphSha256": source_sha,
         "rewireSourceSha256": rewire_sha,
@@ -452,6 +627,7 @@ def synthetic_inputs(tmp_path, monkeypatch):
         ("variant-flip-both.json", variant_flip_both),
         ("transfer.json", transfer_json),
         ("features.json", features_json),
+        ("features-exploratory-unrestricted.json", features_exploratory_json),
         ("regime.json", regime_json),
     ):
         path = tmp_path / name
@@ -474,6 +650,8 @@ def test_main_produces_deterministic_output(tmp_path, synthetic_inputs):
                 str(synthetic_inputs["transfer.json"]),
                 "--features",
                 str(synthetic_inputs["features.json"]),
+                "--features-exploratory-unrestricted",
+                str(synthetic_inputs["features-exploratory-unrestricted.json"]),
                 "--regime",
                 str(synthetic_inputs["regime.json"]),
                 "--out",
@@ -497,3 +675,100 @@ def test_main_produces_deterministic_output(tmp_path, synthetic_inputs):
     assert payload["host"] == {"arch": "arm64", "node": "v22.22.3"}
     assert "finding" in payload
     assert "summarySentence" in payload["finding"]
+    assert "definitionSensitive" in payload["finding"]
+    assert payload["calibration"]["metricsTested"] == len(payload["metrics"])
+    assert payload["calibration"]["chanceHits"] == round(payload["calibration"]["chanceRate"] * payload["calibration"]["permutations"])
+    assert "exploratory" in payload
+    assert len(payload["exploratory"]["featureSixUnrestricted"]["metrics"]) == 3
+
+
+# ---------------------------------------------------------------------------
+# Single-axis variant validation (I7: both-or-neither, trigger-consistent)
+# ---------------------------------------------------------------------------
+
+
+def _run_main(tmp_path, synthetic_inputs, extra_args: list[str]) -> None:
+    explain.main(
+        [
+            "--rewiring-null",
+            str(synthetic_inputs["rewiring-null.json"]),
+            "--variant-flip-both",
+            str(synthetic_inputs["variant-flip-both.json"]),
+            "--transfer",
+            str(synthetic_inputs["transfer.json"]),
+            "--features",
+            str(synthetic_inputs["features.json"]),
+            "--features-exploratory-unrestricted",
+            str(synthetic_inputs["features-exploratory-unrestricted.json"]),
+            "--regime",
+            str(synthetic_inputs["regime.json"]),
+            "--out",
+            str(tmp_path / "out.json"),
+            "--report-out",
+            str(tmp_path / "report.md"),
+            "--skip-manifest-update",
+            *extra_args,
+        ]
+    )
+
+
+def test_single_axis_supplied_when_not_triggered_raises(tmp_path, synthetic_inputs):
+    # The synthetic fixture's mirrored variant has bioPercentile 0.0, well
+    # under the predeclared 25% trigger -- supplying single-axis files here
+    # is exactly the "ran variants the predeclared rule didn't call for"
+    # case that must be rejected, not silently accepted.
+    single_axis = json.loads(synthetic_inputs["variant-flip-both.json"].read_text())
+    single_axis_path = tmp_path / "flip-thrust.json"
+    single_axis_path.write_text(json.dumps(single_axis))
+    with pytest.raises(ValueError, match="predeclared rule did not call"):
+        _run_main(tmp_path, synthetic_inputs, ["--variant-flip-thrust", str(single_axis_path)])
+
+
+def test_single_axis_partial_pair_when_triggered_raises(tmp_path, synthetic_inputs, monkeypatch):
+    # Rewrite the mirrored variant to trigger the single-axis condition
+    # (bioPercentile >= 0.25), then supply only one of the two required
+    # single-axis files.
+    flip_both = json.loads(synthetic_inputs["variant-flip-both.json"].read_text())
+    flip_both["bioPercentile"] = 0.5
+    synthetic_inputs["variant-flip-both.json"].write_text(json.dumps(flip_both))
+    single_axis_path = tmp_path / "flip-thrust.json"
+    single_axis_path.write_text(json.dumps(flip_both))
+    with pytest.raises(ValueError, match="both --variant-flip-thrust and --variant-flip-yaw are required"):
+        _run_main(tmp_path, synthetic_inputs, ["--variant-flip-thrust", str(single_axis_path)])
+
+
+def test_single_axis_both_supplied_when_triggered_succeeds(tmp_path, synthetic_inputs):
+    flip_both = json.loads(synthetic_inputs["variant-flip-both.json"].read_text())
+    flip_both["bioPercentile"] = 0.5
+    synthetic_inputs["variant-flip-both.json"].write_text(json.dumps(flip_both))
+    thrust_path = tmp_path / "flip-thrust.json"
+    yaw_path = tmp_path / "flip-yaw.json"
+    thrust_path.write_text(json.dumps(flip_both))
+    yaw_path.write_text(json.dumps(flip_both))
+    _run_main(tmp_path, synthetic_inputs, ["--variant-flip-thrust", str(thrust_path), "--variant-flip-yaw", str(yaw_path)])
+    payload = json.loads((tmp_path / "out.json").read_bytes())
+    assert "flipThrust" in payload["variants"]
+    assert "flipYaw" in payload["variants"]
+    assert "singleAxisSkipped" not in payload["variants"]
+
+
+def test_single_axis_wrong_provenance_is_rejected(tmp_path, synthetic_inputs):
+    flip_both = json.loads(synthetic_inputs["variant-flip-both.json"].read_text())
+    flip_both["bioPercentile"] = 0.5
+    synthetic_inputs["variant-flip-both.json"].write_text(json.dumps(flip_both))
+    bad = dict(flip_both)
+    bad["sourceGraphSha256"] = "c" * 64  # does not match rewiring-null-v1.json's source
+    thrust_path = tmp_path / "flip-thrust.json"
+    yaw_path = tmp_path / "flip-yaw.json"
+    thrust_path.write_text(json.dumps(bad))
+    yaw_path.write_text(json.dumps(flip_both))
+    with pytest.raises(ValueError, match="does not match"):
+        _run_main(tmp_path, synthetic_inputs, ["--variant-flip-thrust", str(thrust_path), "--variant-flip-yaw", str(yaw_path)])
+
+
+def test_regime_seed_gap_is_rejected(tmp_path, synthetic_inputs):
+    regime = json.loads(synthetic_inputs["regime.json"].read_text())
+    regime["rewired"].pop()  # drop one seed -- coverage is now incomplete
+    synthetic_inputs["regime.json"].write_text(json.dumps(regime))
+    with pytest.raises(ValueError, match="does not cover rewired seeds"):
+        _run_main(tmp_path, synthetic_inputs, [])

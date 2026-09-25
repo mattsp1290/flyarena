@@ -16,7 +16,11 @@ Inputs (all already computed by WP1/WP2, none re-simulated here):
 - `scripts/analysis/transfer.py`'s `transfer.json` (T, spectral abscissa,
   condition number, `turnGain`/`approachGain` per graph);
 - `scripts/analysis/features.py`'s `features.json` (40 predeclared
-  structural features per graph);
+  structural features per graph), plus a pre-adjudication
+  `features-exploratory-unrestricted.json` run with feature 6
+  (`weightedInDegree`) unrestricted -- disclosed in the report as
+  exploratory/non-predeclared, never used in the outcome-category
+  evaluation (see `render_feature6_disclosure`'s doc comment);
 - `scripts/null/regime-check.ts`'s `regime.json` (per-graph clamp-fraction
   and steady-state-distance samples on 10 held-out seeds).
 
@@ -265,6 +269,91 @@ def permutation_chance_rate(
     return hits / permutations
 
 
+def joint_permutation_chance_rate(
+    families: Sequence[tuple[np.ndarray, np.ndarray]],
+    full_scores: np.ndarray,
+    threshold: float,
+    permutations: int,
+    rng: np.random.Generator,
+) -> float:
+    """The real multiple-comparisons calibration across *every* metric
+    family at once: `families` is `[(rank_matrix, seed_indices), ...]`, one
+    pair per metric family (transfer/derived, structural-feature), where
+    `rank_matrix` is that family's `(n_family, n_metrics)` array of metric
+    ranks (fixed, computed once from the real, unpermuted scores via
+    `_family_rank_matrix`) and `seed_indices` are the 0-based seeds each row
+    corresponds to, indexing into `full_scores` (length `REWIRED_COUNT`).
+    One shared permutation of the *full* score vector is drawn per
+    iteration, then subset (and re-ranked, since a subset's own average-tie
+    ranks differ from the full array's) per family -- both families see the
+    same underlying seed-to-score re-pairing, not two independently permuted
+    draws -- and a permutation counts as a hit if *any* family reaches the
+    threshold, which is the actual "at least one of the ~66 metrics" union
+    probability `00-overview.md` describes.
+
+    Replaces an earlier version that ran two independent single-family
+    permutation loops (`permutation_chance_rate`, above) and reported their
+    `max`, mislabeled "the more conservative (larger) chance rate" -- for a
+    union of two families, P(A or B) >= max(P(A), P(B)), so `max`
+    *understates* the true union rate (a dual-review finding, both
+    reviewers independently)."""
+    prepared: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    for rank_matrix, seed_indices in families:
+        if rank_matrix.shape[1] == 0:
+            continue
+        metric_c = rank_matrix - rank_matrix.mean(axis=0, keepdims=True)
+        metric_denom = np.sqrt(np.sum(metric_c * metric_c, axis=0))
+        prepared.append((metric_c, metric_denom, seed_indices))
+    if not prepared:
+        return 0.0
+    n_full = full_scores.shape[0]
+    hits = 0
+    for _ in range(permutations):
+        permuted_full = full_scores[rng.permutation(n_full)]
+        hit = False
+        for metric_c, metric_denom, seed_indices in prepared:
+            ry = _rank(permuted_full[seed_indices])
+            y_c = ry - ry.mean()
+            y_denom = float(np.sqrt(np.sum(y_c * y_c)))
+            num = metric_c.T @ y_c
+            denom = metric_denom * y_denom
+            with np.errstate(invalid="ignore", divide="ignore"):
+                rhos = np.where(denom > 0, num / denom, 0.0)
+            if np.max(np.abs(rhos)) >= threshold:
+                hit = True
+                break
+        hits += int(hit)
+    return hits / permutations
+
+
+def build_family_rank_matrix(
+    metrics: Sequence[dict], extractor, graphs: Mapping[str, dict], excluded_ids: frozenset[str]
+) -> tuple[np.ndarray, np.ndarray]:
+    """`(rank_matrix, seed_indices)` for `joint_permutation_chance_rate`:
+    `rank_matrix[i, j]` is metric `j`'s average rank at seed `seed_indices[i]`
+    (restricted to non-excluded seeds), for every metric in `metrics`.
+    Raises rather than silently letting a `None` extracted value become
+    `NaN` through `numpy`/`pandas` -- an all-`NaN`-propagated column would
+    otherwise make that column's rho `NaN` in every permutation, and because
+    `NaN >= threshold` is `False`, would silently make that column *never*
+    register a hit, understating the chance rate without raising anywhere
+    (an edge-case-review finding). This study's real `features.json` has no
+    `None`s among non-excluded rewired graphs, so this path was previously
+    unexercised, not previously safe."""
+    seed_indices = np.array([s for s in range(REWIRED_COUNT) if f"rewired-{s}" not in excluded_ids], dtype=np.int64)
+    columns = []
+    for metric in metrics:
+        raw = [extractor(graphs[f"rewired-{s}"], metric["name"]) for s in seed_indices]
+        if any(v is None for v in raw):
+            raise ValueError(
+                f"explain: {metric['name']} has a missing value on a non-excluded rewiring -- the permutation "
+                "calibration requires a complete column"
+            )
+        columns.append(_rank(np.asarray(raw, dtype=np.float64)))
+    rank_matrix = np.stack(columns, axis=1) if columns else np.zeros((seed_indices.shape[0], 0))
+    return rank_matrix, seed_indices
+
+
 # ---------------------------------------------------------------------------
 # Metric name tables (single source of truth: the exact order + names every
 # metric is reported under, in both the JSON and the report). Reuses
@@ -349,6 +438,27 @@ def per_graph_regime_summary(regime_entry: dict) -> dict:
     }
 
 
+def _transfer_entry_invalid(entry: Mapping[str, object]) -> bool:
+    """A transfer entry is untrustworthy as a steady-state gain if the solve
+    was singular, ill-conditioned, or the continuous-time system is not
+    stable (`spectralAbscissa >= leakRate`) or the discretized per-substep
+    Euler update is not stable (`discretizedSpectralRadius >= 1`) --
+    `transfer.py`'s own module docstring hands this off explicitly: "when
+    WP3 writes the report's stability prose, it must present both numbers
+    side by side ... not report `stable` alone". `T` can be algebraically
+    well-defined and well-conditioned for an unstable graph while being
+    meaningless as a steady-state gain, so this is checked independently of
+    `illConditioned`/`singular` (a rigor-review finding: unchecked before,
+    though every graph in this study's actual data is both stable and
+    discretized-stable, so this made no numeric difference here)."""
+    return bool(
+        entry.get("singular")
+        or entry.get("illConditioned")
+        or not entry.get("stable", False)
+        or not entry.get("discretizedStable", False)
+    )
+
+
 def compute_regime(regime_json: dict, transfer_json: dict) -> dict:
     bio_regime = per_graph_regime_summary(regime_json["biological"])
     rewired_regime = {
@@ -358,12 +468,21 @@ def compute_regime(regime_json: dict, transfer_json: dict) -> dict:
     null_median_clamp = float(np.median([v["clampFraction"] for v in rewired_regime.values()]))
 
     bio_transfer = transfer_json["graphs"]["biological"]
-    bio_transfer_ok = not bio_transfer.get("singular") and not bio_transfer.get("illConditioned")
+    bio_transfer_ok = not _transfer_entry_invalid(bio_transfer)
 
+    # The plan's regime-gate sentence ("the median steady-state distance ...
+    # is <= 0.5 for biological and for the null median ... also requires the
+    # rate-clamp fraction to be <= 20%") reads "for biological and for the
+    # null median" as applying to both the distance and the clamp fraction,
+    # not to distance alone -- gate on both null-median statistics, not only
+    # the distance one (an edge-case-review finding: this module's own doc
+    # comment above already claimed the null-median clamp was gated; it
+    # previously was not).
     gate_passed = (
         bio_regime["steadyStateDistance"] <= STEADY_STATE_DISTANCE_THRESHOLD
         and null_median_distance <= STEADY_STATE_DISTANCE_THRESHOLD
         and bio_regime["clampFraction"] <= CLAMP_FRACTION_THRESHOLD
+        and null_median_clamp <= CLAMP_FRACTION_THRESHOLD
         and bio_transfer_ok
     )
 
@@ -373,8 +492,7 @@ def compute_regime(regime_json: dict, transfer_json: dict) -> dict:
         fails = (
             summary["clampFraction"] > CLAMP_FRACTION_THRESHOLD
             or summary["steadyStateDistance"] > STEADY_STATE_DISTANCE_THRESHOLD
-            or transfer_entry.get("illConditioned")
-            or transfer_entry.get("singular")
+            or _transfer_entry_invalid(transfer_entry)
         )
         if fails:
             excluded_graph_ids.append(graph_id)
@@ -424,6 +542,15 @@ def build_metric(
     range_summary = null_range_summary(null_values)
     rank_stats = rank_statistics(null_values, bio_value)
 
+    # A metric constant across the (non-excluded) null set has an undefined
+    # Spearman rho, not a zero one -- `_pearson` returns `0.0` as a safe
+    # internal sentinel (it can never spuriously clear `SPEARMAN_RHO_
+    # THRESHOLD`), but reporting "0.000 [0.000, 0.000]" to a reader would
+    # read as a precisely measured null correlation rather than "not
+    # computable" (a rigor-review finding). `nullConstant` lets
+    # `render_metric_stats_table` show "n/a" instead.
+    null_constant = bool(np.ptp(metric_values) == 0.0)
+
     rx = _rank(metric_values)
     ry = _rank(scores)
     rho = _pearson(rx, ry)
@@ -440,6 +567,7 @@ def build_metric(
         "bioPercentile": rank_stats["bioPercentile"],
         "spearman": rho,
         "spearmanCi": [ci_lo, ci_hi],
+        "nullConstant": null_constant,
     }
 
 
@@ -478,6 +606,23 @@ def build_all_metrics(
 # ---------------------------------------------------------------------------
 
 
+def _direction_consistent(metric: Mapping[str, object]) -> bool:
+    """Whether a qualifying metric's sign is consistent with explaining
+    biological's *low* score: a positive rho with biological in the null's
+    low tail (a metric that rises with score, and biological sits below the
+    range), or a negative rho with biological in the high tail (a metric
+    that falls with score, and biological sits above the range). `qualifies`
+    only checks that biological is outside the range and `|rho| >=`
+    threshold -- it does not check this, so a metric could in principle
+    qualify while actually predicting a *higher* score for biological (a
+    rigor-review finding). Neither of this study's two published triggers is
+    affected (both are direction-consistent), but the check and its
+    disclosure are added so `build_summary_sentence` never asserts a
+    direction the data does not support."""
+    bio_low = metric["bio"] < metric["p2_5"]
+    return (metric["spearman"] > 0) == bio_low
+
+
 def evaluate_categories(
     decoder_bio_percentile: float,
     transfer_and_derived_metrics: Sequence[dict],
@@ -502,10 +647,22 @@ def evaluate_categories(
     linear_candidates = [m for m in transfer_and_derived_metrics if qualifies(m)]
     regime_gate_passed = bool(regime["gatePassed"])
     linear_triggered = bool(linear_candidates) and regime_gate_passed
-    regime_invalid = bool(linear_candidates) and not regime_gate_passed
+    # The plan's rule is unconditional: "Otherwise [if the regime gate
+    # fails] the transfer analysis is reported as regime-invalid
+    # (inconclusive)" -- whenever the gate fails, the whole transfer
+    # analysis is inconclusive, independent of whether any individual
+    # metric happens to qualify. Gating this on `bool(linear_candidates)`
+    # (as an earlier version did) meant a gate failure with zero qualifying
+    # candidates -- including the degenerate case where biological's own
+    # transfer solve is singular, so every transfer/derived metric is
+    # dropped entirely -- was silently reported as a clean "no linear
+    # finding" rather than "could not be evaluated" (an edge-case-review
+    # finding).
+    regime_invalid = not regime_gate_passed
     linear_detail: dict | None = None
     if linear_triggered:
         linear_detail = max(linear_candidates, key=lambda m: abs(m["spearman"]))
+        linear_detail = {**linear_detail, "directionConsistent": _direction_consistent(linear_detail)}
         categories.append("linearPathway")
         triggers.append(("linearPathway", abs(linear_detail["spearman"]), linear_detail))
 
@@ -513,6 +670,7 @@ def evaluate_categories(
     structural_detail: dict | None = None
     if structural_candidates:
         structural_detail = max(structural_candidates, key=lambda m: abs(m["spearman"]))
+        structural_detail = {**structural_detail, "directionConsistent": _direction_consistent(structural_detail)}
         categories.append("structuralFeature")
         triggers.append(("structuralFeature", abs(structural_detail["spearman"]), structural_detail))
 
@@ -548,6 +706,18 @@ def build_summary_sentence(finding: Mapping[str, object]) -> str:
             )
         return "No single predeclared factor explains it under this model."
 
+    def describe(kind_label: str, detail: Mapping[str, object]) -> str:
+        base = (
+            f"the {kind_label} {detail['name']} sits outside the null's 2.5-97.5% range "
+            f"(rank correlation with score rho={detail['spearman']:.3f})"
+        )
+        if not detail.get("directionConsistent", True):
+            base += (
+                " -- but its sign predicts a HIGHER score for biological, not the observed low one "
+                "(direction-inconsistent; reported for completeness, not as an explanation of the low score)"
+            )
+        return base
+
     parts: list[str] = []
     if "decoderConvention" in categories:
         parts.append(
@@ -555,17 +725,9 @@ def build_summary_sentence(finding: Mapping[str, object]) -> str:
             f"{format_pct(finding['decoderBioPercentile'])}"
         )
     if "linearPathway" in categories:
-        detail = finding["linearDetail"]
-        parts.append(
-            f"the linear transfer entry {detail['name']} sits outside the null's 2.5-97.5% range "
-            f"(rank correlation with score rho={detail['spearman']:.3f})"
-        )
+        parts.append(describe("linear transfer entry", finding["linearDetail"]))
     if "structuralFeature" in categories:
-        detail = finding["structuralDetail"]
-        parts.append(
-            f"the structural feature {detail['name']} sits outside the null's 2.5-97.5% range "
-            f"(rank correlation with score rho={detail['spearman']:.3f})"
-        )
+        parts.append(describe("structural feature", finding["structuralDetail"]))
     return "Biological's low score is associated with: " + "; ".join(parts) + " -- a descriptive correlation, not a causal claim."
 
 
@@ -579,14 +741,43 @@ def _require_matching_source(label: str, value: str, expected: str) -> None:
         raise ValueError(f"explain: {label} sourceGraphSha256/rewireSourceSha256 does not match rewiring-null-v1.json")
 
 
-def verify_provenance(rewiring_null: dict, variant_flip_both: dict, transfer_json: dict, features_json: dict, regime_json: dict) -> None:
+def _require_complete_seed_coverage(label: str, seeds: Sequence[int]) -> None:
+    """A rewired-graph seed missing from `regime.json` or
+    `rewiring-null-v1.json` would otherwise be silently dropped: a seed
+    absent from `regime.json["rewired"]` is never checked against the
+    per-graph regime thresholds (so it can never be excluded, correctly or
+    not), and a seed absent from `rewiring-null-v1.json["rewired"]` is
+    simply missing from `score_by_seed`, which raises a `KeyError` deep in
+    `build_metric` with no context about which input was short. A duplicate
+    seed would silently overwrite a dict entry the same way. Checked once,
+    loudly, at load time (an edge-case-review finding: previously
+    unchecked)."""
+    if sorted(seeds) != list(range(REWIRED_COUNT)):
+        raise ValueError(f"explain: {label} does not cover rewired seeds 0..{REWIRED_COUNT - 1} exactly once")
+
+
+def verify_provenance(
+    rewiring_null: dict,
+    variants: Mapping[str, dict],
+    transfer_json: dict,
+    features_json: dict,
+    features_exploratory_json: dict,
+    regime_json: dict,
+) -> None:
+    """`variants` is every loaded decoder-variant payload (flip-both, plus
+    any provided single-axis ones) -- checked in one loop rather than a
+    fixed `variant_flip_both` parameter, so the (previously unchecked)
+    single-axis path gets the same provenance guarantee (an edge-case-review
+    finding)."""
     expected_source = rewiring_null["sourceGraphSha256"]
     expected_rewire = rewiring_null["rewireSourceSha256"]
-    for label, payload in (
-        ("variant-flip-both", variant_flip_both),
+    payloads: list[tuple[str, dict]] = [(f"variant-{key}", payload) for key, payload in variants.items()]
+    payloads += [
         ("transfer.json", transfer_json),
         ("features.json", features_json),
-    ):
+        ("features-exploratory-unrestricted.json", features_exploratory_json),
+    ]
+    for label, payload in payloads:
         _require_matching_source(f"{label}.sourceGraphSha256", payload["sourceGraphSha256"], expected_source)
         _require_matching_source(f"{label}.rewireSourceSha256", payload["rewireSourceSha256"], expected_rewire)
     _require_matching_source("regime.json.sourceGraphSha256", regime_json["sourceGraphSha256"], expected_source)
@@ -605,11 +796,20 @@ def _fmt(value: float | None, digits: int = 4) -> str:
 
 
 def render_transfer_matrix(metrics_by_name: Mapping[str, dict], field: str) -> str:
+    """`metrics_by_name.get(...)` (not direct indexing): if biological's own
+    transfer solve is singular, `build_all_metrics` drops every `T:*` metric
+    entirely (`build_metric` returns `None` when `bio_value is None`), so a
+    direct `metrics_by_name[name]` would raise `KeyError` here -- reported
+    as "n/a" instead (an edge-case-review finding: this study's actual data
+    never singular, so this path was previously unexercised and untested)."""
     header = "| channel \\ population | " + " | ".join(OUTPUT_POPULATIONS) + " |"
     sep = "| --- | " + " | ".join("---" for _ in OUTPUT_POPULATIONS) + " |"
     rows = [header, sep]
     for channel in OBSERVATION_CHANNELS:
-        cells = [_fmt(metrics_by_name[f"T:{channel}->{population}"][field], 6) for population in OUTPUT_POPULATIONS]
+        cells = [
+            _fmt(metrics_by_name.get(f"T:{channel}->{population}", {}).get(field), 6)
+            for population in OUTPUT_POPULATIONS
+        ]
         rows.append(f"| {channel} | " + " | ".join(cells) + " |")
     return "\n".join(rows)
 
@@ -619,12 +819,88 @@ def render_metric_stats_table(metrics: Sequence[dict]) -> str:
     sep = "| --- | --- | --- | --- | --- | --- | --- | --- |"
     rows = [header, sep]
     for metric in sorted(metrics, key=lambda m: abs(m["spearman"]), reverse=True):
+        # A metric constant across the null has an undefined (not zero)
+        # Spearman rho -- shown as "n/a" rather than the internal `0.0`
+        # sentinel `build_metric` stores (a rigor-review finding).
+        if metric.get("nullConstant"):
+            rho_cell, ci_cell = "n/a (constant in null)", "n/a"
+        else:
+            rho_cell = f"{metric['spearman']:.3f}"
+            ci_cell = f"[{metric['spearmanCi'][0]:.3f}, {metric['spearmanCi'][1]:.3f}]"
         rows.append(
             f"| {metric['name']} | {_fmt(metric['bio'])} | {_fmt(metric['nullMedian'])} | {_fmt(metric['p2_5'])} | "
-            f"{_fmt(metric['p97_5'])} | {metric['bioPercentile'] * 100:.1f}% | {metric['spearman']:.3f} | "
-            f"[{metric['spearmanCi'][0]:.3f}, {metric['spearmanCi'][1]:.3f}] |"
+            f"{_fmt(metric['p97_5'])} | {metric['bioPercentile'] * 100:.1f}% | {rho_cell} | {ci_cell} |"
         )
     return "\n".join(rows)
+
+
+def render_feature6_disclosure(explanation: dict) -> list[str]:
+    """The feature-6 (`weightedInDegree`) adjudication disclosure, built
+    entirely from computed values in `explanation["exploratory"]` (never
+    hardcoded prose numbers) -- a dual-review finding: an earlier version
+    hardcoded the exploratory statistics as prose and asserted the restricted
+    reading was "decided before any result was seen", which the repository's
+    own timestamps and the adjudication debate's write-ups (both computed
+    and compared each reading's outcome, including its Spearman rho against
+    score, before the restricted reading was adopted) contradict. This
+    version states what actually happened and computes every number from a
+    sha-pinned input (`--features-exploratory-unrestricted`) instead of an
+    unpinned, session-local `/tmp` citation."""
+    exploratory = explanation["exploratory"]["featureSixUnrestricted"]
+    restricted_by_name = {
+        m["name"]: m
+        for m in explanation["metrics"]
+        if m["kind"] == "feature" and m["name"].startswith("weightedInDegree:")
+    }
+    exploratory_by_name = {m["name"]: m for m in exploratory["metrics"]}
+    thresholds = explanation["thresholds"]
+
+    lines = [
+        "**Feature 6 adjudication.** `weightedInDegree` (mean weighted in-degree per output population) was "
+        "first implemented and run **unrestricted** (counting edges from any presynaptic neuron), matching one "
+        "reading of the plan's ambiguous \"input->output weighted in-degree\" wording. A review flagged that "
+        "wording as ambiguous against features 1/2's own restrictive use of \"input\" (channel-mapped neurons "
+        "only); the resulting adjudication computed **both** readings' full statistics -- including each reading's "
+        "rank correlation with score across all 500 rewirings -- before the input-restricted reading was adopted "
+        "on plan-text grounds (bean `flyarena-r37r`'s log). Because both readings' outcomes were visible before "
+        "the decision, this was not a fully outcome-blind pre-registration, and the `structuralFeature` finding "
+        "below should be read with that limitation in mind, not as a clean, one-shot predeclared test."
+    ]
+    lines.append("")
+    lines.append(
+        "The unrestricted reading is disclosed here as **exploratory, non-predeclared**: it is not part of the "
+        "frozen 40-feature list and plays no role in the outcome-category evaluation. Both readings, computed by "
+        "this same pipeline (`exploratory.featureSixUnrestricted.sourceSha256` = "
+        f"`{exploratory['sourceSha256'][:12]}...`):"
+    )
+    lines.append("")
+    lines.append(
+        "| population | restricted (predeclared) bio | restricted rho | unrestricted (exploratory) bio | "
+        "unrestricted rho |"
+    )
+    lines.append("| --- | --- | --- | --- | --- |")
+    for population in OUTPUT_POPULATIONS:
+        restricted = restricted_by_name[f"weightedInDegree:{population}"]
+        unrestricted = exploratory_by_name[f"weightedInDegree:{population}"]
+        lines.append(
+            f"| {population} | {_fmt(restricted['bio'])} | {restricted['spearman']:.3f} | "
+            f"{_fmt(unrestricted['bio'])} | {unrestricted['spearman']:.3f} |"
+        )
+    lines.append("")
+    max_unrestricted_rho = max(abs(m["spearman"]) for m in exploratory["metrics"])
+    lines.append(
+        f"The unrestricted reading's strongest population correlation is \\|rho\\| = {max_unrestricted_rho:.3f}, "
+        f"below the predeclared {thresholds['spearmanRho']} threshold on every population -- under the "
+        "unrestricted reading, feature 6 would not itself qualify for the structural-feature-associated category "
+        "on any population."
+    )
+    if explanation["finding"].get("definitionSensitive"):
+        lines.append("")
+        lines.append(
+            "**This report's `structuralFeature` finding is definition-sensitive**: it is triggered by a "
+            "`weightedInDegree` entry, and the finding would not hold under the unrestricted reading above."
+        )
+    return lines
 
 
 def render_report_markdown(explanation: dict, rewiring_null: dict) -> str:
@@ -665,7 +941,8 @@ def render_report_markdown(explanation: dict, rewiring_null: dict) -> str:
     lines.append("")
     lines.append(
         "Three predeclared analyses (`.agents/plans/null-explanation/00-overview.md`), evaluated only after all "
-        "three finished, with a fixed feature list not edited after the first run:"
+        "three finished (see the feature-6 disclosure under \"Structural features\" below for one qualification "
+        "to the feature list's predeclaration):"
     )
     lines.append("")
     lines.append(
@@ -695,12 +972,14 @@ def render_report_markdown(explanation: dict, rewiring_null: dict) -> str:
     lines.append("")
     lines.append(
         f"**Multiple comparisons.** {calibration['metricsTested']} metrics are tested (24 transfer entries, 2 "
-        "derived predictors, 40 structural features). Correlations are reported descriptively, without per-metric "
-        "significance testing; a permutation calibration "
-        f"({calibration['permutations']} seeded permutations of the score against the fixed metric set) found that "
-        f"at least one of the {calibration['metricsTested']} metrics reaches \\|rho\\| >= "
-        f"{thresholds['spearmanRho']} by chance alone in {calibration['chanceRate'] * 100:.1f}% of permutations -- "
-        "this chance rate applies to any triggered linear-pathway or structural-feature finding below."
+        f"derived predictors, 40 structural features; {calibration['constantMetricCount']} of these are constant "
+        "across the null and so can never reach the |rho| threshold). Correlations are reported descriptively, "
+        "without per-metric significance testing; a permutation calibration "
+        f"({calibration['permutations']} seeded permutations of the score, applied jointly to every metric family "
+        "at once) found that at least one of the tested metrics reaches "
+        f"\\|rho\\| >= {thresholds['spearmanRho']} by chance alone in {calibration['chanceHits']} of "
+        f"{calibration['permutations']} permutations ({calibration['chanceRate'] * 100:.1f}%) -- this chance rate "
+        "applies to any triggered linear-pathway or structural-feature finding below."
     )
     lines.append("")
 
@@ -718,6 +997,17 @@ def render_report_markdown(explanation: dict, rewiring_null: dict) -> str:
         f"{flip_both['nullMean']:.4f} | {flip_both['bioPercentile'] * 100:.1f}% | {flip_both['pLow']:.4f} | "
         f"{flip_both['pHigh']:.4f} |"
     )
+    single_axis_labels = {
+        "flipThrust": "authored (thrust flipped), opponent parked",
+        "flipYaw": "authored (yaw flipped), opponent parked",
+    }
+    for key, label in single_axis_labels.items():
+        if key in variants:
+            entry = variants[key]
+            lines.append(
+                f"| {label} | {entry['bioScore']:.4f} | {entry['nullMean']:.4f} | "
+                f"{entry['bioPercentile'] * 100:.1f}% | {entry['pLow']:.4f} | {entry['pHigh']:.4f} |"
+            )
     lines.append("")
     if variants.get("singleAxisSkipped"):
         lines.append(
@@ -769,41 +1059,44 @@ def render_report_markdown(explanation: dict, rewiring_null: dict) -> str:
         f"{regime['nullSampleMedian']['steadyStateDistance']:.4f} |"
     )
     lines.append("")
-    gate_word = "passed" if regime["gatePassed"] else "failed"
     lines.append(
-        f"The aggregate regime gate **{gate_word}** (biological and the null median both within threshold, "
-        "biological's transfer solve not ill-conditioned or singular). "
         f"{regime['excludedCount']} of 500 rewirings were individually excluded from the transfer-kind "
         "correlations above for failing their own per-graph regime threshold "
         f"({', '.join(regime['excludedGraphIds']) if regime['excludedGraphIds'] else 'none'})."
     )
     lines.append("")
-    lines.append(
-        "This licenses treating the linear analysis as applicable to both biological and the null sample under "
-        "this model (steady-state distances and clamp fractions are all well inside threshold); it does not by "
-        "itself certify that any single transfer entry explains the score -- that still requires the "
-        "outside-range-and-\\|rho\\|-threshold test above."
-    )
+    if regime["gatePassed"]:
+        lines.append(
+            "The aggregate regime gate **passed**: biological's steady-state distance "
+            f"({regime['bio']['steadyStateDistance']:.4f}) and the null median's "
+            f"({regime['nullSampleMedian']['steadyStateDistance']:.4f}) are both at or below the "
+            f"{thresholds['steadyStateDistance']} threshold; biological's rate-clamp fraction "
+            f"({regime['bio']['clampFraction'] * 100:.2f}%) and the null median's "
+            f"({regime['nullSampleMedian']['clampFraction'] * 100:.2f}%) are both at or below "
+            f"{thresholds['clampFraction'] * 100:.0f}%; and biological's transfer solve is not singular, "
+            "ill-conditioned, or unstable. This licenses treating the linear analysis as applicable to both "
+            "biological and the null sample under this model; it does not by itself certify that any single "
+            "transfer entry explains the score -- that still requires the outside-range-and-\\|rho\\|-threshold "
+            "test above."
+        )
+    else:
+        lines.append(
+            "The aggregate regime gate **failed**: biological's or the null median's steady-state distance or "
+            "rate-clamp fraction exceeded threshold, or biological's own transfer solve was singular, "
+            "ill-conditioned, or unstable. Per the predeclared rule, the linear transfer analysis is therefore "
+            "reported as **regime-invalid (inconclusive)** and is never reported as a positive `linearPathway` "
+            "finding, regardless of any individual transfer entry's statistics above."
+        )
     lines.append("")
 
     lines.append("## Structural features")
     lines.append("")
     lines.append(
-        "40 predeclared graph features (fixed before any analysis ran; not edited after the first run). Feature 6 "
-        "(`weightedInDegree`, mean input-restricted weighted in-degree per output population) was adjudicated "
-        "during WP2: the plan's \"input->output weighted in-degree\" wording was read as restricted to edges whose "
-        "*presynaptic* neuron is input-labeled (channel-mapped), on plan-text grounds (features 1/2's own "
-        "\"input\"/\"from any input neuron\" usage, and the parallel with feature 4's unqualified \"edges into "
-        "output neurons\" phrasing) decided **before any result was seen**, not selected because of its outcome "
-        "(bean `flyarena-r37r`'s log; advocate write-ups under `/tmp/claude-1000/feature6-debate/`). An "
-        "**unrestricted** variant (counting edges from *any* presynaptic neuron, not only input-labeled ones) was "
-        "also computed during that adjudication for comparison and is disclosed here as **exploratory, "
-        "non-predeclared** -- it is not part of the frozen feature list and is not used in the outcome-category "
-        "evaluation below: biological's unrestricted thrust in-degree is 1476.5 (null mean 1126.4, sd 72.4, ~100th "
-        "percentile), with rank correlation to score rho <= 0.072 on every output population -- weaker on every "
-        "population than the predeclared, input-restricted reading, and it would not itself qualify for the "
-        "structural-feature-associated category (\\|rho\\| < 0.3)."
+        "40 predeclared graph features (fixed before any analysis ran; the frozen list is not edited after the "
+        "first *production* run against it -- see the feature-6 disclosure below for what happened before that)."
     )
+    lines.append("")
+    lines.extend(render_feature6_disclosure(explanation))
     lines.append("")
     lines.append(render_metric_stats_table(feature_metrics))
     lines.append("")
@@ -848,6 +1141,17 @@ def render_report_markdown(explanation: dict, rewiring_null: dict) -> str:
         "across the 500 rewirings describes an association within this null model's sample, not a causal "
         "mechanism."
     )
+    lines.append(
+        "- **Bootstrap CIs are approximate.** Each metric's 95% Spearman CI resamples the already rank-transformed "
+        "pairs and does not re-rank within each resample -- a bootstrap of the rank-transformed sample's Pearson "
+        "correlation, not a fully faithful re-ranking bootstrap. The CIs are descriptive only and play no role in "
+        "any outcome-category decision (only the point estimate and the predeclared |rho| threshold do)."
+    )
+    lines.append(
+        "- **A metric constant across the null (`n/a (constant in null)` in the tables above) has an undefined, "
+        "not zero, Spearman correlation** and can never trigger the |rho| threshold; it is still counted toward "
+        "the metrics-tested total above."
+    )
     lines.append("- **No biological claim.** See \"This model only\" above.")
     lines.append("")
     return "\n".join(lines)
@@ -866,6 +1170,17 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--variant-flip-yaw", type=Path, default=None)
     parser.add_argument("--transfer", type=Path, required=True)
     parser.add_argument("--features", type=Path, required=True)
+    parser.add_argument(
+        "--features-exploratory-unrestricted",
+        type=Path,
+        required=True,
+        help=(
+            "pre-adjudication features.json computed with feature 6 (weightedInDegree) unrestricted "
+            "(any presynaptic neuron, not only input-labeled ones) -- disclosed in the report as "
+            "exploratory/non-predeclared, never used in the outcome-category evaluation "
+            "(.agents/plans/null-explanation/02-transfer-and-features.md's feature-6 adjudication note)"
+        ),
+    )
     parser.add_argument("--regime", type=Path, required=True)
     parser.add_argument("--out", type=Path, default=PUBLIC_DATA_DIR / "null-explanation-v1.json")
     parser.add_argument("--report-out", type=Path, default=DOCS_DIR / "null-explanation-report.md")
@@ -891,14 +1206,15 @@ def _sort_keys_deep(value: object) -> object:
     return value
 
 
-def update_manifest(manifest_path: Path, entry: dict) -> None:
-    """Add/overwrite `nullExplanation` in place, matching
-    `scripts/null/null-report.ts`'s `updateManifestWithRewiringNull`
-    convention exactly (sorted keys, 2-space indent, trailing newline) --
-    verified round-trip-safe first, since the manifest is otherwise
-    Python-written (`scripts/data/compile.py`) and this file is also
-    Python, the round trip holds unconditionally here (no JS float/
-    non-ASCII formatting mismatch to guard against)."""
+def check_manifest_round_trips(manifest_path: Path) -> dict:
+    """Verify `manifest_path` re-serializes byte-identically before anything
+    is written -- the manifest is otherwise Python-written
+    (`scripts/data/compile.py`) and this file is also Python, so the round
+    trip holds unconditionally here (no JS float/non-ASCII formatting
+    mismatch to guard against, unlike `scripts/null/null-report.ts`'s
+    equivalent check). Returns the parsed manifest so `update_manifest`
+    (or a caller running this as a preflight before any file is touched,
+    per `main`'s write ordering) does not have to re-read and re-parse it."""
     original_text = manifest_path.read_text()
     manifest = json.loads(original_text)
     round_tripped = json.dumps(_sort_keys_deep(manifest), indent=2, sort_keys=True) + "\n"
@@ -907,6 +1223,21 @@ def update_manifest(manifest_path: Path, entry: dict) -> None:
             f"explain: re-serializing {manifest_path} without any change produced different bytes -- refusing to "
             "write, to avoid silently rewriting unrelated manifest bytes"
         )
+    return manifest
+
+
+def update_manifest(manifest_path: Path, entry: dict, manifest: dict | None = None) -> None:
+    """Add/overwrite `nullExplanation` in place, matching
+    `scripts/null/null-report.ts`'s `updateManifestWithRewiringNull`
+    convention exactly (sorted keys, 2-space indent, trailing newline).
+    `manifest`, if given, is the already-round-trip-checked dict from
+    `check_manifest_round_trips` (`main` runs that check as a preflight,
+    before any file is written); if omitted, this re-reads and re-checks
+    `manifest_path` itself, for any other caller (e.g. a test) that wants
+    the guard and the write in one call."""
+    if manifest is None:
+        manifest = check_manifest_round_trips(manifest_path)
+    manifest = dict(manifest)
     manifest["nullExplanation"] = entry
     write_canonical_json(manifest_path, manifest)
 
@@ -918,11 +1249,40 @@ def main(argv: list[str] | None = None) -> None:
     variant_flip_both = _load(args.variant_flip_both)
     transfer_json = _load(args.transfer)
     features_json = _load(args.features)
+    features_exploratory_json = _load(args.features_exploratory_unrestricted)
     regime_json = _load(args.regime)
 
-    verify_provenance(rewiring_null, variant_flip_both, transfer_json, features_json, regime_json)
-
     decoder_bio_percentile = variant_flip_both["bioPercentile"]
+    single_axis_paths = {"flipThrust": args.variant_flip_thrust, "flipYaw": args.variant_flip_yaw}
+    provided_single_axis_paths = {k: v for k, v in single_axis_paths.items() if v is not None}
+    triggered = decoder_bio_percentile >= DECODER_PERCENTILE_THRESHOLD
+    # Both-or-neither, and only on the branch the predeclared rule actually
+    # calls for: a partial pair would publish an incomplete axis-attribution
+    # story, and single-axis files supplied when the mirrored run did *not*
+    # trigger them would silently look like they were part of the
+    # predeclared procedure when they were not (a dual-review finding).
+    if triggered and set(provided_single_axis_paths) != {"flipThrust", "flipYaw"}:
+        raise ValueError(
+            "explain: the mirrored variant's biological percentile "
+            f"({decoder_bio_percentile * 100:.1f}%) meets the predeclared >= "
+            f"{DECODER_PERCENTILE_THRESHOLD * 100:.0f}% threshold that triggers the single-axis runs "
+            "(.agents/plans/null-explanation/00-overview.md) -- both --variant-flip-thrust and "
+            "--variant-flip-yaw are required, not just one"
+        )
+    if not triggered and provided_single_axis_paths:
+        raise ValueError(
+            "explain: --variant-flip-thrust/--variant-flip-yaw were supplied, but the mirrored variant's "
+            f"biological percentile ({decoder_bio_percentile * 100:.1f}%) did not meet the predeclared >= "
+            f"{DECODER_PERCENTILE_THRESHOLD * 100:.0f}% threshold that triggers them -- omit these flags "
+            "when the predeclared rule did not call for them"
+        )
+    provided_single_axis = {key: _load(path) for key, path in provided_single_axis_paths.items()}
+
+    variants_loaded: dict[str, dict] = {"flipBoth": variant_flip_both, **provided_single_axis}
+    verify_provenance(rewiring_null, variants_loaded, transfer_json, features_json, features_exploratory_json, regime_json)
+    _require_complete_seed_coverage("regime.json rewired", [entry["seed"] for entry in regime_json["rewired"]])
+    _require_complete_seed_coverage("rewiring-null-v1.json rewired", [entry["seed"] for entry in rewiring_null["rewired"]])
+
     variant_shas = {"flipBoth": sha256_hex(args.variant_flip_both.read_bytes())}
     variants: dict = {
         "flipBoth": {
@@ -933,19 +1293,8 @@ def main(argv: list[str] | None = None) -> None:
             "bioScore": variant_flip_both["biological"]["score"],
         }
     }
-    single_axis_paths = {"flipThrust": args.variant_flip_thrust, "flipYaw": args.variant_flip_yaw}
-    provided_single_axis = {k: v for k, v in single_axis_paths.items() if v is not None}
-    if decoder_bio_percentile >= DECODER_PERCENTILE_THRESHOLD and not provided_single_axis:
-        raise ValueError(
-            "explain: the mirrored variant's biological percentile "
-            f"({decoder_bio_percentile * 100:.1f}%) meets the predeclared >= "
-            f"{DECODER_PERCENTILE_THRESHOLD * 100:.0f}% threshold that triggers the single-axis runs "
-            "(.agents/plans/null-explanation/00-overview.md), but --variant-flip-thrust/--variant-flip-yaw were "
-            "not supplied -- rerun WP1's single-axis procedure before running explain.py"
-        )
-    for key, path in provided_single_axis.items():
-        payload = _load(path)
-        variant_shas[key] = sha256_hex(path.read_bytes())
+    for key, payload in provided_single_axis.items():
+        variant_shas[key] = sha256_hex(provided_single_axis_paths[key].read_bytes())
         variants[key] = {
             "bioPercentile": payload["bioPercentile"],
             "pLow": payload["pLow"],
@@ -962,9 +1311,25 @@ def main(argv: list[str] | None = None) -> None:
     score_by_seed = {entry["seed"]: entry["score"] for entry in rewiring_null["rewired"]}
     metrics = build_all_metrics(transfer_json["graphs"], features_json["graphs"], score_by_seed, excluded)
 
-    metrics_by_kind = {"transfer": [], "derived": [], "feature": []}
+    metrics_by_kind: dict[str, list[dict]] = {"transfer": [], "derived": [], "feature": []}
     for metric in metrics:
         metrics_by_kind[metric["kind"]].append(metric)
+
+    # Feature 6's exploratory, non-predeclared unrestricted reading: the
+    # same `weightedInDegree:*` metrics, computed by the same `build_metric`
+    # pipeline, from `--features-exploratory-unrestricted` instead of the
+    # frozen `--features`. No per-graph regime exclusion (features never
+    # depend on the linear regime, same as the predeclared feature metrics).
+    exploratory_metrics = [
+        metric
+        for name in (f"weightedInDegree:{population}" for population in OUTPUT_POPULATIONS)
+        if (
+            metric := build_metric(
+                name, "feature", extract_feature_value, features_exploratory_json["graphs"], score_by_seed, frozenset(), BOOTSTRAP_BASE_SEED
+            )
+        )
+        is not None
+    ]
 
     finding_internal = evaluate_categories(
         decoder_bio_percentile,
@@ -972,68 +1337,58 @@ def main(argv: list[str] | None = None) -> None:
         metrics_by_kind["feature"],
         regime,
     )
+    structural_detail = finding_internal["structuralDetail"]
+    definition_sensitive = bool(
+        structural_detail is not None
+        and structural_detail["name"].startswith("weightedInDegree:")
+        and not any(
+            outside_range(m["bio"], m["p2_5"], m["p97_5"]) and abs(m["spearman"]) >= SPEARMAN_RHO_THRESHOLD
+            for m in exploratory_metrics
+        )
+    )
     finding = {
         "categories": finding_internal["categories"],
         "ranked": finding_internal["ranked"],
         "regimeInvalid": finding_internal["regimeInvalid"],
+        "definitionSensitive": definition_sensitive,
         "summarySentence": build_summary_sentence(finding_internal),
     }
 
     ordered_names = TRANSFER_METRIC_NAMES + DERIVED_METRIC_NAMES + FEATURE_METRIC_NAMES
     metrics_by_name = {m["name"]: m for m in metrics}
     ordered_metrics = [metrics_by_name[name] for name in ordered_names if name in metrics_by_name]
+    constant_metric_count = sum(1 for m in ordered_metrics if m["nullConstant"])
 
-    # Permutation calibration needs each metric's rank vector over the same
-    # (non-excluded) null set it was scored on. Transfer/derived metrics
-    # share one exclusion set (possibly non-empty, from the regime gate);
-    # structural features always use the full 500 (they never depend on the
-    # linear regime -- see `compute_regime`'s doc comment). The two
-    # exclusion sets can therefore differ in size, so this calibrates each
-    # metric family separately against its own null sample and reports the
-    # more conservative (larger) chance rate, rather than concatenating
-    # possibly-mismatched-length columns into one matrix.
-    def _metric_ranks_and_scores(
-        kind_metrics: Sequence[dict], extractor, graphs: Mapping[str, dict], excluded_ids: frozenset[str]
-    ) -> tuple[np.ndarray, np.ndarray]:
-        seeds = [s for s in range(REWIRED_COUNT) if f"rewired-{s}" not in excluded_ids]
-        scores = np.array([score_by_seed[s] for s in seeds], dtype=np.float64)
-        columns = [
-            _rank(np.array([extractor(graphs[f"rewired-{s}"], metric["name"]) for s in seeds], dtype=np.float64))
-            for metric in kind_metrics
-        ]
-        rank_matrix = np.stack(columns, axis=1) if columns else np.zeros((len(seeds), 0))
-        return rank_matrix, _rank(scores)
-
-    transfer_rank_matrix, transfer_rank_scores = _metric_ranks_and_scores(
+    transfer_family = build_family_rank_matrix(
         metrics_by_kind["transfer"] + metrics_by_kind["derived"],
         lambda g, n: extract_transfer_value(g, n) if n.startswith("T:") else extract_derived_value(g, n),
         transfer_json["graphs"],
         excluded,
     )
-    feature_rank_matrix, feature_rank_scores = _metric_ranks_and_scores(
+    feature_family = build_family_rank_matrix(
         metrics_by_kind["feature"], extract_feature_value, features_json["graphs"], frozenset()
     )
-    permutation_rng = np.random.default_rng(PERMUTATION_BASE_SEED)
-    chance_rate_transfer = (
-        permutation_chance_rate(
-            transfer_rank_matrix, transfer_rank_scores, SPEARMAN_RHO_THRESHOLD, PERMUTATION_COUNT, permutation_rng
-        )
-        if transfer_rank_matrix.shape[1] > 0
-        else 0.0
+    full_scores = np.array([score_by_seed[s] for s in range(REWIRED_COUNT)], dtype=np.float64)
+    chance_rate = joint_permutation_chance_rate(
+        [transfer_family, feature_family],
+        full_scores,
+        SPEARMAN_RHO_THRESHOLD,
+        PERMUTATION_COUNT,
+        np.random.default_rng(PERMUTATION_BASE_SEED),
     )
-    chance_rate_feature = permutation_chance_rate(
-        feature_rank_matrix, feature_rank_scores, SPEARMAN_RHO_THRESHOLD, PERMUTATION_COUNT, permutation_rng
-    )
-    chance_rate = max(chance_rate_transfer, chance_rate_feature)
 
     calibration = {
-        "metricsTested": TOTAL_METRIC_COUNT,
+        "metricsTested": len(ordered_metrics),
+        "constantMetricCount": constant_metric_count,
         "permutations": PERMUTATION_COUNT,
+        "chanceHits": round(chance_rate * PERMUTATION_COUNT),
         "chanceRate": chance_rate,
     }
 
     host = {"arch": regime_json["host"]["arch"], "node": regime_json["host"]["node"]}
-    for label, payload in (("variant-flip-both", variant_flip_both), ("regime.json", regime_json)):
+    for label, payload in (("variant-flip-both", variant_flip_both), ("regime.json", regime_json), *(
+        (f"variant-{key}", payload) for key, payload in provided_single_axis.items()
+    )):
         if payload["host"] != host:
             raise ValueError(f"explain: {label}'s host {payload['host']} does not match {host}")
 
@@ -1056,20 +1411,36 @@ def main(argv: list[str] | None = None) -> None:
         "variants": variants,
         "regime": regime,
         "metrics": ordered_metrics,
+        "exploratory": {
+            "featureSixUnrestricted": {
+                "sourceSha256": sha256_hex(args.features_exploratory_unrestricted.read_bytes()),
+                "metrics": exploratory_metrics,
+            }
+        },
         "calibration": calibration,
         "finding": finding,
         "host": host,
     }
 
-    write_canonical_json(args.out, explanation)
-    artifact_sha256 = sha256_hex(args.out.read_bytes())
-
-    if not args.skip_manifest_update:
-        update_manifest(args.manifest, {"artifact": args.out.name, "sha256": artifact_sha256})
-
+    # Build everything that can still raise (the report render, and the
+    # manifest's round-trip guard) *before* writing any file, so a failure
+    # here never leaves a new artifact on disk next to a stale manifest sha
+    # or a missing report -- the exact partial-publish state the "manifest
+    # sha256 equals the artifact bytes" acceptance criterion exists to rule
+    # out (a dual-review finding: an earlier version wrote the artifact
+    # first, then ran the manifest guard, then rendered the report, any of
+    # which could raise after the artifact was already on disk).
+    artifact_text = canonical_json_text(explanation)
+    artifact_sha256 = sha256_hex(artifact_text.encode("utf-8"))
     report_markdown = render_report_markdown(explanation, rewiring_null)
+    manifest_dict = None if args.skip_manifest_update else check_manifest_round_trips(args.manifest)
+
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    graph_io.fsutil.atomic_write_text(args.out, artifact_text)
     args.report_out.parent.mkdir(parents=True, exist_ok=True)
-    args.report_out.write_text(report_markdown)
+    graph_io.fsutil.atomic_write_text(args.report_out, report_markdown)
+    if not args.skip_manifest_update:
+        update_manifest(args.manifest, {"artifact": args.out.name, "sha256": artifact_sha256}, manifest_dict)
 
     print(
         f"explain: wrote {args.out} ({len(ordered_metrics)} metrics, sha256 {artifact_sha256[:12]}...) and "
