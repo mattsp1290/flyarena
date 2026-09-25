@@ -424,17 +424,30 @@ export class ExperimentController {
       .then(() =>
         this.destroyed
           ? undefined
-          : loadExplanation(artifacts.manifest, dataBaseUrl).catch(
-              // `'unavailable'`, not `'invalid'` (mirrors `nullLoad`'s own
-              // catch just above, and `NullExplanationLoadResult`'s doc
-              // comment): a genuine runtime/JS error is not a verification
-              // failure, and `LedgerPanel.svelte` renders `'invalid'` as
-              // "Explanation failed verification".
-              (error: unknown): NullExplanationLoadResult => ({
-                status: 'unavailable',
-                reason: `unexpected error while loading the null explanation: ${error instanceof Error ? error.message : String(error)}`
-              })
-            )
+          : // `Promise.resolve().then(...)` rather than calling `loadExplanation`
+            // directly — the same seam `nullLoad` above needs `loadNull` for
+            // (round-2 dual review, Suggestion): the production
+            // `loadNullExplanation` is `async` and can never throw
+            // synchronously, but `loadExplanation` here can also be a
+            // test-injected `ExperimentControllerOptions.loadNullExplanation`
+            // double, which is only typed as returning a `Promise` — nothing
+            // stops a non-async double from throwing before it ever produces
+            // one. Without this wrapper, that throw would reject this
+            // `.then()` callback itself, skipping the `.catch` below entirely
+            // and routing to `onError` instead of `onNullExplanation`.
+            Promise.resolve()
+              .then(() => loadExplanation(artifacts.manifest, dataBaseUrl))
+              .catch(
+                // `'unavailable'`, not `'invalid'` (mirrors `nullLoad`'s own
+                // catch just above, and `NullExplanationLoadResult`'s doc
+                // comment): a genuine runtime/JS error is not a verification
+                // failure, and `LedgerPanel.svelte` renders `'invalid'` as
+                // "Explanation failed verification".
+                (error: unknown): NullExplanationLoadResult => ({
+                  status: 'unavailable',
+                  reason: `unexpected error while loading the null explanation: ${error instanceof Error ? error.message : String(error)}`
+                })
+              )
       )
       .then((result) => {
         if (this.destroyed || result === undefined) return;

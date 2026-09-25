@@ -485,9 +485,14 @@
     text-align: right;
   }
 
-  /* Mirrors `.trained-readout-detail`'s own box; a distinct class only
-     because the two blocks are never both shown at once, so sharing one
-     name would be misleading about which content it wraps. */
+  /* Mirrors `.trained-readout-detail`'s own box. A distinct class, not a
+     shared one — round-2 dual review corrected an earlier version of this
+     comment, which wrongly claimed the two blocks are never both shown at
+     once: `trainedReadout?.status === 'ok'` and `nullExplanation?.status
+     === 'ok'` are independent conditions and commonly both hold in
+     production, so the two boxes do render together. The distinct class
+     name is still the right call regardless — sharing one would be
+     misleading about which content it wraps when they *are* both visible. */
   .null-explanation-detail {
     margin: 0.9rem 0;
     padding: 0.65rem 0.75rem;
