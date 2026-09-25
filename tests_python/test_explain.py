@@ -159,7 +159,10 @@ def _transfer_entry(*, singular=False, ill_conditioned=False, condition_number=4
         "illConditioned": ill_conditioned,
         "conditionNumber": condition_number,
         "stable": stable,
+        "spectralAbscissa": 0.1,
+        "leakRate": 0.35,
         "discretizedStable": discretized_stable,
+        "discretizedSpectralRadius": 0.99,
         "T": None if singular else [[0.1] * 8, [0.1] * 8, [0.1] * 8],
         "turnGain": None if singular else 0.05,
         "approachGain": None if singular else 0.02,
@@ -176,6 +179,13 @@ def test_regime_gate_passes_and_no_exclusions_when_everything_is_within_threshol
     assert regime["gatePassed"] is True
     assert regime["excludedGraphIds"] == []
     assert regime["excludedCount"] == 0
+    # `T`'s own stability numbers are published, not only the derived
+    # pass/fail gate (a round-2 rigor-review finding: WP2's `transfer.py`
+    # hands off "report both `stable` and `discretizedStable` side by
+    # side" -- the gate alone does not satisfy that).
+    assert regime["stability"]["bio"]["spectralAbscissa"] == pytest.approx(0.1)
+    assert regime["stability"]["bio"]["discretizedSpectralRadius"] == pytest.approx(0.99)
+    assert regime["stability"]["unstableNullCount"] == 0
 
 
 def test_ill_conditioned_rewiring_is_excluded_from_transfer_correlations():
@@ -516,7 +526,10 @@ def _synthetic_transfer_graph(rng: np.random.Generator) -> dict:
         "illConditioned": False,
         "conditionNumber": 5.0,
         "stable": True,
+        "spectralAbscissa": 0.1449,
+        "leakRate": 0.35,
         "discretizedStable": True,
+        "discretizedSpectralRadius": 0.9932,
         "turnGain": float(rng.standard_normal()),
         "approachGain": float(rng.standard_normal()),
     }

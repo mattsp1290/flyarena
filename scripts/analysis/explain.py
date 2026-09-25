@@ -498,12 +498,42 @@ def compute_regime(regime_json: dict, transfer_json: dict) -> dict:
             excluded_graph_ids.append(graph_id)
     excluded_graph_ids.sort(key=lambda gid: int(gid.split("-")[1]))
 
+    # Publish the stability numbers themselves, not only the pass/fail gate
+    # derived from them -- `transfer.py`'s module docstring hands this off
+    # explicitly ("when WP3 writes the report's stability prose, it must
+    # present both numbers side by side ... not report `stable` alone under
+    # a bare 'stable' label"), and a round-2 rigor review found the gate fix
+    # alone left this unmet: biological's `discretizedSpectralRadius` is
+    # 0.9932, close to the 1.0 instability boundary despite being on the
+    # stable side, which a reader weighing the linear-pathway finding should
+    # be able to see rather than only "not unstable".
+    rewired_transfer_entries = [transfer_json["graphs"][gid] for gid in rewired_regime]
+    stability = {
+        "bio": {
+            "stable": bool(bio_transfer["stable"]),
+            "spectralAbscissa": bio_transfer["spectralAbscissa"],
+            "leakRate": bio_transfer["leakRate"],
+            "discretizedStable": bool(bio_transfer["discretizedStable"]),
+            "discretizedSpectralRadius": bio_transfer["discretizedSpectralRadius"],
+        },
+        "nullMedian": {
+            "spectralAbscissa": float(np.median([e["spectralAbscissa"] for e in rewired_transfer_entries])),
+            "discretizedSpectralRadius": float(
+                np.median([e["discretizedSpectralRadius"] for e in rewired_transfer_entries])
+            ),
+        },
+        "unstableNullCount": sum(
+            1 for e in rewired_transfer_entries if not e["stable"] or not e["discretizedStable"]
+        ),
+    }
+
     return {
         "bio": bio_regime,
         "nullSampleMedian": {"clampFraction": null_median_clamp, "steadyStateDistance": null_median_distance},
         "gatePassed": bool(gate_passed),
         "excludedGraphIds": excluded_graph_ids,
         "excludedCount": len(excluded_graph_ids),
+        "stability": stability,
     }
 
 
@@ -971,8 +1001,10 @@ def render_report_markdown(explanation: dict, rewiring_null: dict) -> str:
     lines.append(f"| Regime gate: condition number | <= {thresholds['conditionNumber']:.0e} |")
     lines.append("")
     lines.append(
-        f"**Multiple comparisons.** {calibration['metricsTested']} metrics are tested (24 transfer entries, 2 "
-        f"derived predictors, 40 structural features; {calibration['constantMetricCount']} of these are constant "
+        f"**Multiple comparisons.** {calibration['metricsTested']} metrics are tested ({len(transfer_metrics)} "
+        f"transfer entries, {len(derived_metrics)} derived predictors, {len(feature_metrics)} structural features"
+        f"{' (predeclared count: 24/2/40; fewer here because some were not computable -- see the finding above)' if calibration['metricsTested'] != 66 else ''}"
+        f"; {calibration['constantMetricCount']} of these are constant "
         "across the null and so can never reach the |rho| threshold). Correlations are reported descriptively, "
         "without per-metric significance testing; a permutation calibration "
         f"({calibration['permutations']} seeded permutations of the score, applied jointly to every metric family "
@@ -1088,12 +1120,26 @@ def render_report_markdown(explanation: dict, rewiring_null: dict) -> str:
             "finding, regardless of any individual transfer entry's statistics above."
         )
     lines.append("")
+    stability = regime["stability"]
+    lines.append(
+        "**Stability** (`T`'s own docstring: both numbers reported side by side, never `stable` alone). "
+        f"Biological's continuous-time spectral abscissa is {stability['bio']['spectralAbscissa']:.4f} against a "
+        f"leak rate of {stability['bio']['leakRate']:.4f} ({'stable' if stability['bio']['stable'] else 'UNSTABLE'}); "
+        f"its per-substep discretized spectral radius is {stability['bio']['discretizedSpectralRadius']:.4f} "
+        f"({'stable' if stability['bio']['discretizedStable'] else 'UNSTABLE'} -- must be < 1). Null medians: "
+        f"spectral abscissa {stability['nullMedian']['spectralAbscissa']:.4f}, discretized spectral radius "
+        f"{stability['nullMedian']['discretizedSpectralRadius']:.4f}. "
+        f"{stability['unstableNullCount']} of 500 rewirings are unstable (continuous-time or discretized)."
+    )
+    lines.append("")
 
     lines.append("## Structural features")
     lines.append("")
     lines.append(
-        "40 predeclared graph features (fixed before any analysis ran; the frozen list is not edited after the "
-        "first *production* run against it -- see the feature-6 disclosure below for what happened before that)."
+        "40 predeclared graph features. The plan's stop/go gate 3 (`00-overview.md`: \"The feature list is not "
+        "edited after the first run\") was **not met for feature 6**: its definition changed after a full "
+        "production run against the original (unrestricted) reading, as disclosed below. The other 39 features "
+        "were never edited."
     )
     lines.append("")
     lines.extend(render_feature6_disclosure(explanation))
