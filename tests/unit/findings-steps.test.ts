@@ -11,6 +11,7 @@ import {
   type PathwayInterventionsArtifact,
   type PathwayInterventionsLoadResult
 } from '../../src/lib/experiment/pathwayInterventions';
+import { loadRepertoireNull, type RepertoireNullArtifact, type RepertoireNullLoadResult } from '../../src/lib/atlas/repertoire';
 import { createPublicDataFetch } from '../helpers/fake-worker';
 
 /**
@@ -39,20 +40,24 @@ const manifest = JSON.parse(readFileSync(resolve(publicDataDir, 'malecns-arena-v
 let realRewiringNull: RewiringNullArtifact;
 let realNullExplanation: NullExplanationArtifact;
 let realPathwayInterventions: PathwayInterventionsArtifact;
+let realRepertoireNull: RepertoireNullArtifact;
 
 beforeAll(async () => {
   vi.stubGlobal('fetch', createPublicDataFetch());
   const rewiringNullResult = await loadRewiringNull(manifest, '/data');
   const nullExplanationResult = await loadNullExplanation(manifest, '/data');
   const pathwayInterventionsResult = await loadPathwayInterventions(manifest, '/data');
+  const repertoireNullResult = await loadRepertoireNull(manifest, '/data');
   if (rewiringNullResult.status !== 'ok') throw new Error(`Fixture setup: rewiringNull is "${rewiringNullResult.status}"`);
   if (nullExplanationResult.status !== 'ok') throw new Error(`Fixture setup: nullExplanation is "${nullExplanationResult.status}"`);
   if (pathwayInterventionsResult.status !== 'ok') {
     throw new Error(`Fixture setup: pathwayInterventions is "${pathwayInterventionsResult.status}"`);
   }
+  if (repertoireNullResult.status !== 'ok') throw new Error(`Fixture setup: repertoireNull is "${repertoireNullResult.status}"`);
   realRewiringNull = rewiringNullResult.data;
   realNullExplanation = nullExplanationResult.data;
   realPathwayInterventions = pathwayInterventionsResult.data;
+  realRepertoireNull = repertoireNullResult.data;
   vi.unstubAllGlobals();
 });
 
@@ -67,13 +72,18 @@ const pathwayInterventionsOk = (data: PathwayInterventionsArtifact = realPathway
   status: 'ok',
   data
 });
+const repertoireNullOk = (data: RepertoireNullArtifact = realRepertoireNull): RepertoireNullLoadResult => ({
+  status: 'ok',
+  data
+});
 
 const baseInputs = (): BuildFindingStepsInputs => ({
   manifest,
   dataBaseUrl: '/data',
   rewiringNull: rewiringNullOk(),
   nullExplanation: nullExplanationOk(),
-  pathwayInterventions: pathwayInterventionsOk()
+  pathwayInterventions: pathwayInterventionsOk(),
+  repertoireNull: repertoireNullOk()
 });
 
 const findStep = (steps: readonly FindingStep[], id: string): FindingStep => {
@@ -311,12 +321,46 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     expect(step.sentence).not.toContain('reporting convention');
   });
 
-  it('step 7 (behavior repertoire) is always "missing" with "Not yet published" in this WP (repertoire-null has not landed)', () => {
+  it('step 7 (behavior repertoire) states the real primary category, occupied count, rewired median, and search-seed robustness', () => {
     const steps = buildFindingSteps(baseInputs());
+    const step = findStep(steps, 'behavior-repertoire');
+    expect(step.status).toBe('ok');
+    expect(step.condition).toBe('both');
+    expect(step.sentence).toContain(`biological occupies ${realRepertoireNull.primary.bio.occupied} of 36`);
+    expect(step.sentence).toContain(`rewired median of ${realRepertoireNull.primary.rewiredDistribution.occupied.p50}`);
+    expect(step.sentence).toContain(realRepertoireNull.primary.category);
+    expect(step.sentence).toContain(`search seed ${realRepertoireNull.search.primarySearchSeed}`);
+    // Real shipped data (`00-overview.md`'s worked example): the category is
+    // not robust across the 5 biological search seeds.
+    expect(realRepertoireNull.robustness.robust).toBe(false);
+    expect(step.sentence).toContain('not robust across search seeds');
+    expect(step.sentence).toMatch(/under this model\.$/);
+    expect(step.provenance).toHaveLength(1);
+    expect(step.provenance[0].sha256Prefix).toBe(manifest.behaviorRepertoireNull?.sha256.slice(0, 12));
+  });
+
+  it('step 7 states "robust across all 5 search seeds" when every seed agrees', () => {
+    const robust: RepertoireNullArtifact = {
+      ...realRepertoireNull,
+      robustness: {
+        ...realRepertoireNull.robustness,
+        robust: true,
+        perSeed: Object.fromEntries(Object.keys(realRepertoireNull.robustness.perSeed).map((seed) => [seed, 'typical']))
+      }
+    };
+    const step = findStep(buildFindingSteps({ ...baseInputs(), repertoireNull: repertoireNullOk(robust) }), 'behavior-repertoire');
+    expect(step.sentence).toContain('robust across all 5 search seeds');
+    expect(step.sentence).not.toContain('not robust');
+  });
+
+  it('step 7 is "missing" with no sentence when the repertoire-null artifact has not been published', () => {
+    const steps = buildFindingSteps({
+      ...baseInputs(),
+      repertoireNull: { status: 'missing', reason: 'The manifest has no behaviorRepertoireNull artifact entry.' }
+    });
     const step = findStep(steps, 'behavior-repertoire');
     expect(step.status).toBe('missing');
     expect(step.sentence).toBeUndefined();
-    expect(step.provenance).toHaveLength(0);
   });
 
   it('every step is "loading" when its inputs are undefined (the controller has not resolved yet)', () => {
@@ -325,7 +369,8 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
       dataBaseUrl: '/data',
       rewiringNull: undefined,
       nullExplanation: undefined,
-      pathwayInterventions: undefined
+      pathwayInterventions: undefined,
+      repertoireNull: undefined
     });
     expect(findStep(steps, 'rewiring-null').status).toBe('loading');
     expect(findStep(steps, 'mirrored-decoder').status).toBe('loading');
@@ -333,8 +378,7 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     expect(findStep(steps, 'intervention').status).toBe('loading');
     expect(findStep(steps, 'trained-null').status).toBe('loading');
     expect(findStep(steps, 'trained-interventions').status).toBe('loading');
-    // Step 7 is always "missing" regardless of loading state -- there is no loader for it in this WP.
-    expect(findStep(steps, 'behavior-repertoire').status).toBe('missing');
+    expect(findStep(steps, 'behavior-repertoire').status).toBe('loading');
   });
 
   it('maps rewiringNull "absent" onto the step vocabulary\'s "missing", with no sentence', () => {

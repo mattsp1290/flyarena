@@ -1,10 +1,14 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { loadAtlas } from './assets';
+  import { loadRepertoireNull, type RepertoireNullLoadResult } from './repertoire';
+  import type { ArenaManifest } from '../experiment/assets';
+  import { githubDocUrl } from '../ui/links';
   import { COVERAGE_EDGES, TURN_EDGES, HELDOUT_SEEDS, CONTROL_NAMES, average, type Control, type LoadedAtlas } from './types';
   import BehaviorReplay from './BehaviorReplay.svelte';
   import Workbench from '../counterfactual/Workbench.svelte';
   let loaded = $state<LoadedAtlas | null>(null), error = $state(''), selectedId = $state<number | null>(null);
+  let repertoireNull = $state<RepertoireNullLoadResult | undefined>(undefined);
   let disposed = false;
   const selected = $derived(loaded?.atlas.cells.find(c => c.id === selectedId));
   const qualityScale = $derived(loaded ? Math.max(1, ...loaded.atlas.cells.map(c => Math.abs(c.quality))) : 1);
@@ -15,10 +19,61 @@
       loaded = next; selectedId = next.atlas.cells.reduce((best, cell) => cell.quality > best.quality ? cell : best).id;
     } catch (e) { if (!disposed) error = e instanceof Error ? e.message : 'Unable to load behavior atlas'; }
   }
-  onMount(() => { void load(); return () => { disposed = true; }; });
+  /**
+   * `03-artifact-and-atlas-strip.md`: "fetch the central manifest
+   * independently of `loadAtlas()`, then call `loadRepertoireNull`" — the
+   * repertoire strip's own fetch chain, wholly independent of `load()`
+   * above (which fetches the *atlas-specific* manifest,
+   * `behavior-atlas-v1.manifest.json`, a different file). Its state never
+   * delays or fails the atlas load: any failure here only ever sets
+   * `repertoireNull` to an honest `unavailable`/`invalid` status, never
+   * touches `loaded`/`error` above.
+   */
+  async function loadRepertoireStrip() {
+    const base = `${import.meta.env.BASE_URL}data`;
+    try {
+      const response = await fetch(`${base}/malecns-arena-v1.manifest.json`);
+      if (!response.ok) throw new Error(`Failed to fetch manifest: ${response.status} ${response.statusText}`);
+      const manifest = (await response.json()) as ArenaManifest;
+      if (disposed) return;
+      const result = await loadRepertoireNull(manifest, base);
+      if (!disposed) repertoireNull = result;
+    } catch (e) {
+      if (!disposed) {
+        repertoireNull = { status: 'unavailable', reason: e instanceof Error ? e.message : 'Unable to load the manifest' };
+      }
+    }
+  }
+  onMount(() => { void load(); void loadRepertoireStrip(); return () => { disposed = true; }; });
   const pct = (n: number) => `${(n * 100).toFixed(0)}%`;
   const controlLabels: Record<Control, string> = { biological: 'Intact circuit', disconnected: 'No recurrent edges', silenced: 'Zero readout inputs' };
   const mean = (name: Control) => selected ? average(selected.heldout[name].map(m => m.movementScore)) : 0;
+  /**
+   * `03-artifact-and-atlas-strip.md`'s one-line strip, templated only from
+   * `repertoireNull.data`'s own verified fields — never a hard-coded number.
+   * `null` when there is nothing to show (still loading, or `missing`,
+   * which hides the line entirely per spec).
+   */
+  const repertoireStripText = $derived.by(() => {
+    const result = repertoireNull;
+    if (result?.status !== 'ok') return null;
+    const { primary, search, robustness } = result.data;
+    const dist = primary.rewiredDistribution.occupied;
+    const range = `${dist.values[0]}–${dist.values.at(-1)}`;
+    const seeds = [search.primarySearchSeed, ...search.extraSearchSeeds];
+    const seedCount = seeds.length;
+    const robustClause = robustness.robust
+      ? `robust across all ${seedCount} search seeds`
+      : `not robust: seeds give ${seeds.map((seed) => `${seed}: ${robustness.perSeed[seed]}`).join(', ')}`;
+    const extraSeedRange =
+      search.extraSearchSeeds.length > 0 ? `${search.extraSearchSeeds[0]}–${search.extraSearchSeeds.at(-1)}` : '';
+    return (
+      `Repertoire vs ${search.rewiredCount} rewirings: biological occupies ${primary.bio.occupied} of 36 cells ` +
+      `(rewired median ${dist.p50}, range ${range}) — ${primary.category} at search seed ${search.primarySearchSeed}; ` +
+      `${robustClause}. Seeds ${extraSeedRange} compare against only ${search.rewiredSeedMatchedCount} seed-matched rewirings.`
+    );
+  });
+  const REPERTOIRE_REPORT_URL = githubDocUrl('behavior-repertoire-null-report.md');
 </script>
 <div class="atlas">
   <header><p class="eyebrow">DGX discovery / interactive circuit experiments</p><h1>Find a behavior.<br /><em>Ask what drives it.</em></h1>
@@ -49,6 +104,24 @@
         </div>
         <div class="axis">{#each COVERAGE_EDGES.slice(0, -1) as edge}<span>{pct(edge)}+</span>{/each}</div>
         <p class="axis-caption">Area visited →</p>
+        <!-- No `role="status"`: the DGX sandbox's own run-status region and
+             `App.svelte`'s experiment-status span already own that role
+             (`LedgerPanel.svelte`'s identical precedent/doc comment) — a
+             second `role="status"` element anywhere on the page breaks
+             every unscoped `getByRole('status')` locator across the e2e
+             suite (confirmed directly: `tests/e2e/subpath.spec.ts`'s own
+             `getByRole('status')` started resolving to two elements once
+             this strip gained the role). -->
+        {#if repertoireStripText}
+          <p class="repertoire-strip">
+            {repertoireStripText}
+            <a href={REPERTOIRE_REPORT_URL} target="_blank" rel="noreferrer">Full report</a>
+          </p>
+        {:else if repertoireNull?.status === 'unavailable'}
+          <p class="repertoire-strip error-message">Repertoire comparison could not be loaded</p>
+        {:else if repertoireNull?.status === 'invalid'}
+          <p class="repertoire-strip error-message">Repertoire comparison failed verification</p>
+        {/if}
         <details><summary>How this repertoire was discovered</summary>
           <p>MAP-Elites retained the highest movement score within each of 36 behavior cells. {loaded.atlas.source.options.population} candidates × {loaded.atlas.source.options.generations} generations × 8 discovery seeds. The graph and world equations stayed fixed.</p>
           <p>Device: {loaded.atlas.source.runtime.deviceName}. {loaded.atlas.source.runtime.seconds.toFixed(1)} seconds; peak tensor allocation {(loaded.atlas.source.runtime.peakTensorBytes / 1024 ** 2).toFixed(1)} MiB. Canonical TypeScript evaluation determines the displayed cells and scores.</p>
@@ -89,6 +162,9 @@
   .grid button { cursor:pointer; } .grid button span { font-size:.65rem; opacity:.8; } .grid button strong { font-size:.95rem; } .grid button[aria-pressed=true] { outline:3px solid #f1c870; outline-offset:1px; } .empty { color:#516778; border-style:dashed; }
   .axis { display:grid; grid-template-columns:repeat(6,1fr); text-align:center; margin-top:.7rem; font-size:.7rem; color:#a6bacb; } .axis-caption { text-align:center; font-size:.75rem; }
   details { margin-top:1rem; } summary { cursor:pointer; color:#b9d7cc; } .hash { overflow-wrap:anywhere; font-family:monospace; font-size:.7rem; }
+  .repertoire-strip { margin-top:.9rem; padding:.6rem .75rem; border:1px solid #365d52; border-radius:.4rem; font-size:.78rem; color:#cbd8e7; }
+  .repertoire-strip a { color:#79d8d0; margin-left:.3rem; }
+  .repertoire-strip.error-message { border-color:#ef476f; color:#ffd7de; background:rgb(239 71 111 / 12%); }
   table { width:100%; border-collapse:collapse; font-size:.8rem; } caption { text-align:left; padding:.8rem 0; color:#a6bacb; } th,td { text-align:left; padding:.55rem .3rem; border-bottom:1px solid #2a3d4d; } td { font-variant-numeric:tabular-nums; }
   a { color:#a0e9cd; } button:focus-visible,a:focus-visible,summary:focus-visible { outline:2px solid #f1c870; outline-offset:3px; } .probe-intro { margin-top:3rem; }
   @media(max-width:800px) { .discovery { grid-template-columns:1fr; } .panel { padding:1rem; } .grid button,.empty { height:52px; } }

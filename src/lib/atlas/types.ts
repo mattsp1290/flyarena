@@ -8,6 +8,10 @@ export const DISCOVERY_SEEDS = Array.from({ length: 8 }, (_, i) => 61001 + i);
 export const HELDOUT_SEEDS = Array.from({ length: 12 }, (_, i) => 62001 + i);
 export const COVERAGE_EDGES = [0, 0.05, 0.1, 0.2, 0.35, 0.6, 1];
 export const TURN_EDGES = [-1, -2 / 3, -1 / 3, 0, 1 / 3, 2 / 3, 1];
+/** The 6x6 coverage x turning cell grid's own dimensions, derived from the edges above rather than hand-typed -- shared by every consumer that would otherwise hard-code `6`/`36` (`.agents/plans/repertoire-null`'s WP3 producer and its browser-side strip/Findings step; a dual-review finding that these values had drifted into bare numeric literals in more than one place). */
+export const COVERAGE_BIN_COUNT = COVERAGE_EDGES.length - 1;
+export const TURN_BIN_COUNT = TURN_EDGES.length - 1;
+export const CELL_COUNT = COVERAGE_BIN_COUNT * TURN_BIN_COUNT;
 export const CONTROL_NAMES = ['biological', 'disconnected', 'silenced'] as const;
 export type Control = (typeof CONTROL_NAMES)[number];
 export interface Metrics extends AgentScore {

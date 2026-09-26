@@ -6,6 +6,7 @@ import type { ArenaManifest, TrainedReadoutLoadResult } from '../../src/lib/expe
 import type { RewiringNullLoadResult } from '../../src/lib/experiment/rewiringNull';
 import type { NullExplanationLoadResult } from '../../src/lib/experiment/nullExplanation';
 import type { PathwayInterventionsLoadResult } from '../../src/lib/experiment/pathwayInterventions';
+import type { RepertoireNullLoadResult } from '../../src/lib/atlas/repertoire';
 import type { ExperimentStatus } from '../../src/lib/experiment/state';
 import type { DecoderKind } from '../../src/lib/worker/protocol';
 import { createPublicDataFetch, FakeNeuralWorker } from '../helpers/fake-worker';
@@ -32,6 +33,7 @@ export type TestControllerCallbacks = ExperimentControllerCallbacks & {
   rewiringNullResults: RewiringNullLoadResult[];
   nullExplanationResults: NullExplanationLoadResult[];
   pathwayInterventionsResults: PathwayInterventionsLoadResult[];
+  repertoireNullResults: RepertoireNullLoadResult[];
   decodersApplied: DecoderKind[];
 };
 
@@ -44,6 +46,7 @@ export const createCallbacks = (): TestControllerCallbacks => {
   const rewiringNullResults: RewiringNullLoadResult[] = [];
   const nullExplanationResults: NullExplanationLoadResult[] = [];
   const pathwayInterventionsResults: PathwayInterventionsLoadResult[] = [];
+  const repertoireNullResults: RepertoireNullLoadResult[] = [];
   const decodersApplied: DecoderKind[] = [];
   return {
     statuses,
@@ -54,6 +57,7 @@ export const createCallbacks = (): TestControllerCallbacks => {
     rewiringNullResults,
     nullExplanationResults,
     pathwayInterventionsResults,
+    repertoireNullResults,
     decodersApplied,
     onStatusChange: (status) => statuses.push(status),
     onTelemetry: vi.fn(),
@@ -65,6 +69,7 @@ export const createCallbacks = (): TestControllerCallbacks => {
     onRewiringNull: (result) => rewiringNullResults.push(result),
     onNullExplanation: (result) => nullExplanationResults.push(result),
     onPathwayInterventions: (result) => pathwayInterventionsResults.push(result),
+    onRepertoireNull: (result) => repertoireNullResults.push(result),
     onDecoderApplied: (decoder) => decodersApplied.push(decoder)
   };
 };

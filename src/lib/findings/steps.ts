@@ -36,7 +36,12 @@ import {
   type PathwayInterventionsLoadResult,
   type PathwayInterventionsTrainedCategory
 } from '../experiment/pathwayInterventions';
+import type { RepertoireNullLoadResult } from '../atlas/repertoire';
+import { COVERAGE_EDGES, TURN_EDGES } from '../atlas/types';
 import { githubDocUrl } from '../ui/links';
+
+/** The atlas's fixed coverage x turning grid size — never a bare numeric literal in a step sentence (see `buildBehaviorRepertoireStep`). */
+const TOTAL_CELLS = (COVERAGE_EDGES.length - 1) * (TURN_EDGES.length - 1);
 import { describeTrainedCategory, formatPercentile, formatRho } from './format';
 
 /**
@@ -78,6 +83,8 @@ export interface BuildFindingStepsInputs {
   readonly rewiringNull: RewiringNullLoadResult | undefined;
   readonly nullExplanation: NullExplanationLoadResult | undefined;
   readonly pathwayInterventions: PathwayInterventionsLoadResult | undefined;
+  /** WP3 of `.agents/plans/repertoire-null`, following `findings-tour`'s own `01-findings-panel.md` ("optional `repertoireNull`" input). `undefined` while the repertoire-null load has not yet resolved -- `buildBehaviorRepertoireStep` below reports that as `'loading'`, the same convention every other step's `undefined` input already uses. */
+  readonly repertoireNull: RepertoireNullLoadResult | undefined;
 }
 
 const STATUS_LABEL: Record<Exclude<FindingStepStatus, 'ok'>, string> = {
@@ -118,7 +125,7 @@ const rewiringNullStepStatus = (result: RewiringNullLoadResult | undefined): Exc
 };
 
 const sidecarStepStatus = (
-  result: NullExplanationLoadResult | PathwayInterventionsLoadResult | undefined
+  result: NullExplanationLoadResult | PathwayInterventionsLoadResult | RepertoireNullLoadResult | undefined
 ): Exclude<FindingStepStatus, 'ok'> | 'ok' => {
   if (result === undefined) return 'loading';
   return result.status;
@@ -468,21 +475,51 @@ const buildTrainedInterventionsStep = (inputs: BuildFindingStepsInputs): Finding
 // ---------------------------------------------------------------------------
 
 /**
- * Always `'missing'` in this WP: `.agents/plans/repertoire-null` has not
- * landed (no `manifest.behaviorRepertoireNull` field exists on
- * `ArenaManifest` yet — see `00-overview.md`'s "Repository findings" and
- * this bean's own follow-up note), so there is no loader to call and no
- * artifact to cite. `FindingsPanel.svelte` links out to `#atlas` next to
- * this step regardless of status (the atlas is a separate hash route, not
- * an artifact this step loads — see `00-overview.md`).
+ * WP3 of `.agents/plans/repertoire-null` (wired per `findings-tour`'s own
+ * `01-findings-panel.md`): the behavior-repertoire comparison between the
+ * biological topology and its degree-preserving rewirings, under the
+ * shipped MAP-Elites search. `FindingsPanel.svelte` links out to `#atlas`
+ * next to this step regardless of status (the atlas is a separate hash
+ * route, not an artifact this step loads — see `00-overview.md`'s "the
+ * repertoire step links to #atlas rather than loading the atlas").
+ *
+ * Not decoder-specific (`condition: 'both'`, unchanged from before this WP):
+ * the search itself always uses the authored readout family, but the
+ * finding is about topology, not about which decoder is currently selected.
  */
-const buildBehaviorRepertoireStep = (): FindingStep => ({
-  id: 'behavior-repertoire',
-  title: 'Behavior repertoire',
-  status: 'missing',
-  condition: 'both',
-  provenance: []
-});
+const buildBehaviorRepertoireStep = (inputs: BuildFindingStepsInputs): FindingStep => {
+  const provenance = provenanceFor(
+    inputs.manifest,
+    inputs.manifest?.behaviorRepertoireNull,
+    'Behavior-repertoire result (behavior-repertoire-null-v1.json)',
+    'behavior-repertoire-null-report.md',
+    inputs.dataBaseUrl
+  );
+  const status = sidecarStepStatus(inputs.repertoireNull);
+  const base = {
+    id: 'behavior-repertoire',
+    title: 'Behavior repertoire',
+    condition: 'both' as const,
+    provenance: provenance ? [provenance] : []
+  };
+  if (status !== 'ok' || inputs.repertoireNull?.status !== 'ok') {
+    return { ...base, status, reason: reasonFor(status, inputs.repertoireNull) };
+  }
+  const { primary, search, robustness: repertoireRobustness } = inputs.repertoireNull.data;
+  const seeds = [search.primarySearchSeed, ...search.extraSearchSeeds];
+  const robustnessClause = repertoireRobustness.robust
+    ? `robust across all ${seeds.length} search seeds`
+    : `not robust across search seeds (${seeds.map((seed) => `seed ${seed}: ${repertoireRobustness.perSeed[seed]}`).join(', ')})`;
+  // `TOTAL_CELLS` (never a bare `36` literal — the template-lint test below
+  // forbids a hard-coded numeric literal in this file's own source): the
+  // atlas's fixed 6x6 coverage x turning grid (`COVERAGE_EDGES`/`TURN_EDGES`,
+  // `src/lib/atlas/types.ts`), not a field this artifact itself carries.
+  const sentence =
+    `Under this model's shipped MAP-Elites search, biological occupies ${primary.bio.occupied} of ${TOTAL_CELLS} ` +
+    `behavior cells against a rewired median of ${primary.rewiredDistribution.occupied.p50} (n=${search.rewiredCount}) — ` +
+    `${primary.category} at search seed ${search.primarySearchSeed}, ${robustnessClause}, under this model.`;
+  return { ...base, status: 'ok', sentence };
+};
 
 /**
  * Builds all seven Findings-panel steps, in evidence-chain order
@@ -497,5 +534,5 @@ export const buildFindingSteps = (inputs: BuildFindingStepsInputs): readonly Fin
   buildInterventionStep(inputs),
   buildTrainedNullStep(inputs),
   buildTrainedInterventionsStep(inputs),
-  buildBehaviorRepertoireStep()
+  buildBehaviorRepertoireStep(inputs)
 ];

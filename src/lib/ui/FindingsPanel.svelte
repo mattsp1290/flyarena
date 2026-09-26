@@ -4,6 +4,7 @@
   import type { RewiringNullLoadResult } from '../experiment/rewiringNull';
   import type { NullExplanationLoadResult } from '../experiment/nullExplanation';
   import type { PathwayInterventionsLoadResult } from '../experiment/pathwayInterventions';
+  import type { RepertoireNullLoadResult } from '../atlas/repertoire';
   import { buildFindingSteps, findingStepStatusLabel, type FindingStep } from '../findings/steps';
 
   /**
@@ -44,9 +45,11 @@
     rewiringNull: RewiringNullLoadResult | undefined;
     nullExplanation: NullExplanationLoadResult | undefined;
     pathwayInterventions: PathwayInterventionsLoadResult | undefined;
+    /** WP3 of `.agents/plans/repertoire-null`, wired per `findings-tour`'s own `01-findings-panel.md` ("optional `repertoireNull`" input). `undefined` while `App.svelte`'s repertoire-null load has not yet resolved. */
+    repertoireNull: RepertoireNullLoadResult | undefined;
   }
 
-  let { manifest, rewiringNull, nullExplanation, pathwayInterventions }: Props = $props();
+  let { manifest, rewiringNull, nullExplanation, pathwayInterventions, repertoireNull }: Props = $props();
 
   let expanded = $state(false);
   let currentIndex = $state(0);
@@ -60,7 +63,7 @@
   const dataBaseUrl = `${import.meta.env.BASE_URL}data`;
 
   const steps = $derived<readonly FindingStep[]>(
-    buildFindingSteps({ manifest, dataBaseUrl, rewiringNull, nullExplanation, pathwayInterventions })
+    buildFindingSteps({ manifest, dataBaseUrl, rewiringNull, nullExplanation, pathwayInterventions, repertoireNull })
   );
 
   const toggle = (): void => {
@@ -136,8 +139,13 @@
 
           {#if step.id === 'behavior-repertoire'}
             <p class="see-also">
-              Once published, this step will compare the measured topology's behavior repertoire against the
-              rewired null. See the <a href="#atlas">behavior atlas</a> in the meantime.
+              {#if step.status === 'ok'}
+                See the full comparison, including the occupancy map and audit table, in the
+                <a href="#atlas">behavior atlas</a>.
+              {:else}
+                Once published, this step will compare the measured topology's behavior repertoire against the
+                rewired null. See the <a href="#atlas">behavior atlas</a> in the meantime.
+              {/if}
             </p>
           {/if}
 

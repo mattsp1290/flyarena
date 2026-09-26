@@ -214,6 +214,19 @@ export interface ArenaManifest {
    * rather than pretending it exists.
    */
   pathwayInterventions?: SidecarManifestEntry;
+  /**
+   * WP3 of `.agents/plans/repertoire-null`: the behavior-repertoire
+   * comparison between the biological topology and its degree-preserving
+   * rewirings, under the shipped behavior-atlas MAP-Elites search.
+   * `scripts/atlas/repertoire-report.ts` writes this once
+   * `behavior-repertoire-null-v1.json` exists — see
+   * `../atlas/repertoire.ts#loadRepertoireNull`. Optional: a manifest
+   * produced before that WP (or a hand-built test fixture) simply has no
+   * repertoire comparison to show — `loadRepertoireNull` reports that as
+   * `status: 'missing'` rather than throwing, and `Atlas.svelte` simply
+   * omits its one-line strip rather than pretending it exists.
+   */
+  behaviorRepertoireNull?: SidecarManifestEntry;
   sourceDataset: string;
   rewiredArms: Record<
     string,

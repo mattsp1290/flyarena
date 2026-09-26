@@ -65,6 +65,12 @@ test('all views work beneath /fly/ with root asset routes deliberately unavailab
   await expect(page.getByRole('status')).toHaveText('completed');
   await page.getByRole('link',{name:'03 Behavior atlas',exact:true}).click();
   await expect(page.getByRole('group',{name:'Select a discovered behavior'})).toBeVisible();
+  // WP3 of `.agents/plans/repertoire-null`: `Atlas.svelte` fetches the
+  // central manifest and `loadRepertoireNull` independently, under this same
+  // /fly/-prefixed base URL — a base-path bug here would either leave the
+  // strip absent forever or point its report link at the wrong host path.
+  await expect(page.locator('.repertoire-strip')).toContainText(/Repertoire vs 20 rewirings: biological occupies 28 of 36 cells/i,{timeout:20000});
+  await expect(page.locator('.repertoire-strip').getByRole('link',{name:/full report/i})).toHaveAttribute('href','https://github.com/mattsp1290/flyarena/blob/main/docs/behavior-repertoire-null-report.md');
   await page.getByRole('button',{name:'Use quick probe settings'}).click();
   await page.getByRole('button',{name:'Fork & compare →'}).click();
   await expect(page.getByRole('status')).toHaveText('completed');
@@ -109,4 +115,16 @@ test('a tampered pathway-interventions-v1.json under /fly/ shows an honest verif
   await expect(page.locator('.ledger')).toContainText(/intervention test failed verification/i);
   await expect(page.locator('body')).not.toContainText(/tested under this model/i);
   await expect(page.getByRole('heading',{name:/what biological's low score is associated with/i})).toBeVisible();
+});
+
+test('a tampered behavior-repertoire-null-v1.json under /fly/ shows an honest verification-failure line, while the atlas view keeps working', async ({page}) => {
+  await page.route('**/data/behavior-repertoire-null-v1.json', async route => {
+    const bytes = await readFile('public/data/behavior-repertoire-null-v1.json');
+    bytes[10] ^= 0xff;
+    await route.fulfill({status:200, contentType:'application/json', body:bytes});
+  });
+  await page.goto('/fly/#atlas');
+  await expect(page.getByRole('group',{name:'Select a discovered behavior'})).toBeVisible();
+  await expect(page.locator('.repertoire-strip.error-message')).toHaveText('Repertoire comparison failed verification',{timeout:20000});
+  await expect(page.locator('body')).not.toContainText(/Repertoire vs \d+ rewirings/i);
 });

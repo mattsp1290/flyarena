@@ -13,6 +13,7 @@ import {
 import { loadRewiringNull, type RewiringNullLoadResult } from './rewiringNull';
 import { loadNullExplanation, type NullExplanationLoadResult } from './nullExplanation';
 import { loadPathwayInterventions, type PathwayInterventionsLoadResult } from './pathwayInterventions';
+import { loadRepertoireNull, type RepertoireNullLoadResult } from '../atlas/repertoire';
 import { buildGraphBufferForMode, createWorkerAgentBinding } from './bindings';
 import { ExperimentRunner, isNotInitializedRejection, type ExperimentTelemetry } from './runner';
 import { transition, type ExperimentStatus } from './state';
@@ -114,6 +115,20 @@ export interface ExperimentControllerCallbacks {
    */
   onPathwayInterventions: (result: PathwayInterventionsLoadResult) => void;
   /**
+   * Fired once `loadRepertoireNull` resolves (WP3 of
+   * `.agents/plans/repertoire-null`, following `findings-tour`'s
+   * `01-findings-panel.md`: "Add a repertoire load behind the `destroyed`
+   * guard, with an injectable seam, following `loadPathwayInterventions`")
+   * — sequenced after the pathway-interventions load settles, for the same
+   * reason every fork above is sequenced after the one before it (never
+   * races ahead of `initialize()`'s own load order; this artifact's own
+   * cross-check needs `manifest`, not any other resolved load result), but
+   * fired independently of `onPathwayInterventions` itself. Never blocks
+   * reaching `ready`. The host's hook for the Findings panel's step 7
+   * ("Behavior repertoire") sentence.
+   */
+  onRepertoireNull: (result: RepertoireNullLoadResult) => void;
+  /**
    * Fired once per agent right after `setDecoder()` has successfully applied
    * a decoder switch to both arms' Workers and reset the run to tick 0 —
    * mirrors `onTopologyApplied`'s "never speculatively before a switch is
@@ -153,6 +168,11 @@ export interface ExperimentControllerOptions {
    * seam-for-testability reasoning as `loadNullExplanation` above.
    */
   loadPathwayInterventions?: typeof loadPathwayInterventions;
+  /**
+   * Injectable for tests; defaults to `../atlas/repertoire.ts#loadRepertoireNull`.
+   * Same seam-for-testability reasoning as `loadPathwayInterventions` above.
+   */
+  loadRepertoireNull?: typeof loadRepertoireNull;
   /** Passed straight through to the constructed `ExperimentRunner` (see `ExperimentRunnerOptions.targetTickIntervalMs`); `0` disables real-time pacing entirely, which unit tests use to run a many-tick determinism check without waiting out real seconds. Omitted in production, matching the runner's own real-time default. */
   targetTickIntervalMs?: number;
 }
@@ -398,6 +418,7 @@ export class ExperimentController {
     const loadNull = this.options.loadRewiringNull ?? loadRewiringNull;
     const loadExplanation = this.options.loadNullExplanation ?? loadNullExplanation;
     const loadInterventions = this.options.loadPathwayInterventions ?? loadPathwayInterventions;
+    const loadRepertoire = this.options.loadRepertoireNull ?? loadRepertoireNull;
     const dataBaseUrl = `${import.meta.env.BASE_URL}data`;
     let artifacts: LoadedArenaArtifacts;
     try {
@@ -497,11 +518,30 @@ export class ExperimentController {
     // `manifest.rewiringNull.sha256`/`manifest.nullExplanation.sha256`
     // directly), so it is attempted unconditionally, independent of
     // whichever status the explanation load itself resolved to.
-    void runSidecarLoad<PathwayInterventionsLoadResult>(
+    const interventionsLoad = runSidecarLoad<PathwayInterventionsLoadResult>(
       () => explanationLoad.then(() => loadInterventions(artifacts.manifest, dataBaseUrl)),
       (reason) => ({ status: 'unavailable', reason: `unexpected error while loading the pathway-interventions study: ${reason}` }),
       () => this.destroyed,
       (result) => this.options.callbacks.onPathwayInterventions(result),
+      (message) => this.options.callbacks.onError(message)
+    );
+
+    // WP3 of `.agents/plans/repertoire-null`, wired per `findings-tour`'s
+    // `01-findings-panel.md` ("Add a repertoire load behind the `destroyed`
+    // guard, with an injectable seam, following `loadPathwayInterventions`.
+    // Otherwise pass `missing`") -- sequenced after `interventionsLoad`
+    // *settles*, mirroring every earlier fork's "never races ahead of the
+    // load before it" reasoning. `loadRepertoire` only needs
+    // `manifest`/`dataBaseUrl` (its own cross-check re-reads
+    // `manifest.binarySha256`/`manifest.rewiringNull.sha256` directly), so
+    // it is attempted unconditionally, independent of whichever status the
+    // interventions load itself resolved to, and independent of whether
+    // `onPathwayInterventions` throws.
+    void runSidecarLoad<RepertoireNullLoadResult>(
+      () => interventionsLoad.then(() => loadRepertoire(artifacts.manifest, dataBaseUrl)),
+      (reason) => ({ status: 'unavailable', reason: `unexpected error while loading the repertoire-null comparison: ${reason}` }),
+      () => this.destroyed,
+      (result) => this.options.callbacks.onRepertoireNull(result),
       (message) => this.options.callbacks.onError(message)
     );
 

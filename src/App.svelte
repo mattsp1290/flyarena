@@ -12,6 +12,7 @@
   import type { RewiringNullLoadResult } from './lib/experiment/rewiringNull';
   import type { NullExplanationLoadResult } from './lib/experiment/nullExplanation';
   import type { PathwayInterventionsLoadResult } from './lib/experiment/pathwayInterventions';
+  import type { RepertoireNullLoadResult } from './lib/atlas/repertoire';
   import { ExperimentController } from './lib/experiment/controller';
   import type { ExperimentRunner, ExperimentTelemetry } from './lib/experiment/runner';
   import type { ExperimentStatus } from './lib/experiment/state';
@@ -89,6 +90,8 @@
   let nullExplanationStatus = $state<NullExplanationLoadResult | undefined>(undefined);
   /** `undefined` until `initialize()`'s pathway-interventions load resolves (WP4 of `.agents/plans/pathway-interventions`); feeds the ledger's tested-outcome sentence under the null-explanation note. Loading it never blocks Start, and never blocks reaching a settled `nullExplanationStatus` either — see `ExperimentController#initialize`'s doc comment. */
   let pathwayInterventionsStatus = $state<PathwayInterventionsLoadResult | undefined>(undefined);
+  /** `undefined` until `initialize()`'s repertoire-null load resolves (WP3 of `.agents/plans/repertoire-null`); feeds the Findings panel's step 7 ("Behavior repertoire") sentence. Loading it never blocks Start, and never blocks reaching a settled `pathwayInterventionsStatus` either — see `ExperimentController#initialize`'s doc comment. */
+  let repertoireNullStatus = $state<RepertoireNullLoadResult | undefined>(undefined);
   /** True for the duration of an in-flight `controller.setDecoder()` call — set/cleared locally around that call (there is only ever one decoder shared by both arms, unlike per-arm topology switches, so a single flag suffices). */
   let decoderSwitchPending = $state(false);
 
@@ -339,6 +342,9 @@
         onPathwayInterventions: (result) => {
           if (!destroyed) pathwayInterventionsStatus = result;
         },
+        onRepertoireNull: (result) => {
+          if (!destroyed) repertoireNullStatus = result;
+        },
         onDecoderApplied: (next) => {
           if (!destroyed) decoder = next;
         }
@@ -504,6 +510,7 @@
       rewiringNull={rewiringNullStatus}
       nullExplanation={nullExplanationStatus}
       pathwayInterventions={pathwayInterventionsStatus}
+      repertoireNull={repertoireNullStatus}
     />
 
     <LedgerPanel

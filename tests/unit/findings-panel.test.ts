@@ -12,6 +12,7 @@ import {
   type PathwayInterventionsArtifact,
   type PathwayInterventionsLoadResult
 } from '../../src/lib/experiment/pathwayInterventions';
+import { loadRepertoireNull, type RepertoireNullArtifact, type RepertoireNullLoadResult } from '../../src/lib/atlas/repertoire';
 import { createPublicDataFetch } from '../helpers/fake-worker';
 
 /**
@@ -39,20 +40,24 @@ const manifest = JSON.parse(readFileSync(resolve(publicDataDir, 'malecns-arena-v
 let realRewiringNull: RewiringNullArtifact;
 let realNullExplanation: NullExplanationArtifact;
 let realPathwayInterventions: PathwayInterventionsArtifact;
+let realRepertoireNull: RepertoireNullArtifact;
 
 beforeAll(async () => {
   vi.stubGlobal('fetch', createPublicDataFetch());
   const rewiringNullResult = await loadRewiringNull(manifest, '/data');
   const nullExplanationResult = await loadNullExplanation(manifest, '/data');
   const pathwayInterventionsResult = await loadPathwayInterventions(manifest, '/data');
+  const repertoireNullResult = await loadRepertoireNull(manifest, '/data');
   if (rewiringNullResult.status !== 'ok') throw new Error(`Fixture setup: rewiringNull is "${rewiringNullResult.status}"`);
   if (nullExplanationResult.status !== 'ok') throw new Error(`Fixture setup: nullExplanation is "${nullExplanationResult.status}"`);
   if (pathwayInterventionsResult.status !== 'ok') {
     throw new Error(`Fixture setup: pathwayInterventions is "${pathwayInterventionsResult.status}"`);
   }
+  if (repertoireNullResult.status !== 'ok') throw new Error(`Fixture setup: repertoireNull is "${repertoireNullResult.status}"`);
   realRewiringNull = rewiringNullResult.data;
   realNullExplanation = nullExplanationResult.data;
   realPathwayInterventions = pathwayInterventionsResult.data;
+  realRepertoireNull = repertoireNullResult.data;
   vi.unstubAllGlobals();
 });
 
@@ -60,7 +65,8 @@ const okProps = () => ({
   manifest,
   rewiringNull: { status: 'ok', data: realRewiringNull } as RewiringNullLoadResult,
   nullExplanation: { status: 'ok', data: realNullExplanation } as NullExplanationLoadResult,
-  pathwayInterventions: { status: 'ok', data: realPathwayInterventions } as PathwayInterventionsLoadResult
+  pathwayInterventions: { status: 'ok', data: realPathwayInterventions } as PathwayInterventionsLoadResult,
+  repertoireNull: { status: 'ok', data: realRepertoireNull } as RepertoireNullLoadResult
 });
 
 describe('FindingsPanel', () => {
@@ -131,10 +137,24 @@ describe('FindingsPanel', () => {
     expect(screen.getByText('Step 1 of 7')).toBeInTheDocument();
   });
 
-  it('step 7 (behavior repertoire) always shows "Not yet published" in this WP, with a link to the atlas', async () => {
+  it('step 7 (behavior repertoire) states the real category and links to the atlas', async () => {
     render(FindingsPanel, okProps());
     await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    expect(screen.getByText(new RegExp(`biological occupies ${realRepertoireNull.primary.bio.occupied} of 36`))).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /behavior atlas/i })).toHaveAttribute('href', '#atlas');
+  });
+
+  it('step 7 shows "Not yet published" when the repertoire-null artifact is missing', async () => {
+    render(FindingsPanel, {
+      ...okProps(),
+      repertoireNull: {
+        status: 'missing',
+        reason: 'The manifest has no behaviorRepertoireNull artifact entry.'
+      } as RepertoireNullLoadResult
+    });
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
     expect(screen.getByText('Not yet published')).toBeInTheDocument();
+    expect(screen.getByText(/Once published, this step will compare/i)).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /behavior atlas/i })).toHaveAttribute('href', '#atlas');
   });
 
