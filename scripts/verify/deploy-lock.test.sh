@@ -387,12 +387,18 @@ fi
 # parser ship undetected: every prior marker test above only ever used a
 # synthetic, single-marker fixture, never the actual production input.
 # ---------------------------------------------------------------------------
+#
+# The expected id is the doc's last real release entry, found here with awk
+# rather than a hard-coded id, so appending a deployment record doesn't break
+# this check. It must also be well formed, so an awk match on a placeholder
+# can't make this pass vacuously.
+expected_real_marker=$(awk '$1 == "Release:" && $2 ~ /^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$/ && NF == 2 { last = $2 } END { print last }' .agents/deployment.md)
 run_child "$root" 'result=$(deploy_last_release_marker); printf "REAL_MARKER:%s\n" "$result"' \
   "$(child_prelude)"
-if [[ $child_status -eq 0 && "$child_out" == *'REAL_MARKER:20260924T141451Z-e994aaab005c'* ]]; then
+if [[ $child_status -eq 0 && -n "$expected_real_marker" && "$child_out" == *"REAL_MARKER:$expected_real_marker"* ]]; then
   pass 'the parser run against the real, checked-in .agents/deployment.md returns the real anchor release id'
 else
-  fail 'the parser run against the real, checked-in .agents/deployment.md returns the real anchor release id' "status=$child_status out=$child_out"
+  fail 'the parser run against the real, checked-in .agents/deployment.md returns the real anchor release id' "status=$child_status expected=$expected_real_marker out=$child_out"
 fi
 
 # 5c. A decoy example line shaped like a real marker (mimicking the exact
