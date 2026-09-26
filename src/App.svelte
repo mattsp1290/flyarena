@@ -20,6 +20,7 @@
   import ExperimentPanel from './lib/ui/ExperimentPanel.svelte';
   import TelemetryPanel from './lib/ui/TelemetryPanel.svelte';
   import LedgerPanel from './lib/ui/LedgerPanel.svelte';
+  import FindingsPanel from './lib/ui/FindingsPanel.svelte';
   import ActivityPanel from './lib/ui/ActivityPanel.svelte';
   // Type-only: `three`/OrbitControls are large enough to warrant their own
   // chunk (see docs/architecture.md's load-budget note), so the actual
@@ -497,6 +498,13 @@
     {#if telemetry}
       <TelemetryPanel {telemetry} />
     {/if}
+
+    <FindingsPanel
+      {manifest}
+      rewiringNull={rewiringNullStatus}
+      nullExplanation={nullExplanationStatus}
+      pathwayInterventions={pathwayInterventionsStatus}
+    />
 
     <LedgerPanel
       {manifest}

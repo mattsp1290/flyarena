@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // `vi.mock` calls are hoisted above imports by Vitest's transform, so this
 // static import below receives the mocked module even though it is
@@ -132,7 +132,13 @@ describe('App activity view asset loading (thermo-architecture I1 fix: no duplic
     // own expand/collapse state) has to resolve `status: 'ok'` before the
     // "Expand" toggle becomes enabled — waiting for that is what proves the
     // cross-check against the graph completed without a second fetch.
-    const toggle = await screen.findByRole('button', { name: 'Expand' });
+    // Scoped to `section.activity` specifically: WP1 of
+    // `.agents/plans/findings-tour` added `FindingsPanel.svelte`'s own
+    // "Expand" toggle to the sidebar, so an unscoped `findByRole` now
+    // matches two buttons with the same accessible name.
+    const activitySection = document.querySelector('section.activity');
+    if (!activitySection) throw new Error('section.activity not found');
+    const toggle = await within(activitySection as HTMLElement).findByRole('button', { name: 'Expand' });
     await waitFor(() => expect(toggle).toBeEnabled(), { timeout: 5000 });
 
     // Opening the panel itself renders from data already loaded (no fetch
