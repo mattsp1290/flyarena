@@ -2,6 +2,7 @@ import { describe, it, expect, afterAll, beforeAll } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { gunzipSync } from 'node:zlib';
 import { loadLocalAssets } from '../../scripts/experiments/local-assets';
 import { loadLocalAtlas } from '../../scripts/atlas/files';
 import { publishAtlas, evaluateSearchOnGraph } from '../../scripts/atlas/publish';
@@ -32,6 +33,7 @@ import { readoutFromFlat } from '../../src/lib/connectome/readout-serialization'
 import { readoutParameterCount } from '../../src/lib/connectome/readout';
 import { encodeGraphBinary } from '../../src/lib/connectome/format';
 import {
+  computeArmBundleSha256,
   deserializeArmBundle,
   runExportArms,
   type SerializedArmBundle
@@ -310,7 +312,15 @@ describe('evaluateSearchOnGraph / evaluateSearchForGraph (generalized to any ver
     // mislabeled as arm "disconnected" -- the tamper scenario this check
     // exists for, not a bundle whose metadata disagrees with its own arrays
     // (which `deserializeArmBundle`'s `validateGraph` would already reject).
-    const mislabeled: SerializedArmBundle = { ...biological, arm: 'disconnected' };
+    // Its own sha256 is recomputed for the new `arm` value so this genuinely
+    // tests "a self-consistent bundle that lies about its arm", not "an
+    // internally-inconsistent bundle" (which the self-consistency check
+    // above would reject first, with a less specific error).
+    const mislabeledWithoutHash: SerializedArmBundle = { ...biological, arm: 'disconnected' };
+    const mislabeled: SerializedArmBundle = {
+      ...mislabeledWithoutHash,
+      sha256: computeArmBundleSha256(mislabeledWithoutHash)
+    };
     const searchPath = join(root, 'disconnected-search-nonzero-edges.json');
     writeFileSync(searchPath, JSON.stringify(buildSearchArtifact(mislabeled)));
     await expect(
@@ -331,6 +341,51 @@ describe('evaluateSearchOnGraph / evaluateSearchForGraph (generalized to any ver
     expect(result.cells.length).toBe(1);
   });
 
+  it('verifies a disconnected bundle\'s binarySha256 when one is supplied, rather than ignoring it', async () => {
+    const searchPath = join(root, 'disconnected-search-with-binary-sha.json');
+    writeFileSync(searchPath, JSON.stringify(buildSearchArtifact(disconnected)));
+    const binarySha256 = sha256Hex(new Uint8Array(encodeGraphBinary(deserializeArmBundle(disconnected))));
+    const result = await evaluateSearchForGraph(searchPath, {
+      arm: 'disconnected',
+      binarySha256,
+      parentGzipSha256: disconnected.graphArtifactSha256
+    });
+    expect(result.cells.length).toBe(1);
+
+    const searchPathWrong = join(root, 'disconnected-search-wrong-binary-sha.json');
+    writeFileSync(searchPathWrong, JSON.stringify(buildSearchArtifact(disconnected)));
+    await expect(
+      evaluateSearchForGraph(searchPathWrong, {
+        arm: 'disconnected',
+        binarySha256: 'f'.repeat(64),
+        parentGzipSha256: disconnected.graphArtifactSha256
+      })
+    ).rejects.toThrow('binary identity mismatch');
+  });
+
+  it('accepts a biological bundle the same way as a rewired one', async () => {
+    const searchPath = join(root, 'biological-search.json');
+    writeFileSync(searchPath, JSON.stringify(buildSearchArtifact(biological)));
+    const binarySha256 = sha256Hex(new Uint8Array(encodeGraphBinary(deserializeArmBundle(biological))));
+    const result = await evaluateSearchForGraph(searchPath, {
+      arm: 'biological',
+      binarySha256,
+      parentGzipSha256: biological.graphArtifactSha256
+    });
+    expect(result.cells.length).toBe(1);
+  });
+
+  it('requires binarySha256 for a rewired arm (never silently skipped)', async () => {
+    const searchPath = join(root, 'rewired-search-missing-binary-sha.json');
+    writeFileSync(searchPath, JSON.stringify(buildSearchArtifact(rewired)));
+    await expect(
+      evaluateSearchForGraph(searchPath, {
+        arm: 'rewired',
+        parentGzipSha256: rewired.graphArtifactSha256
+      })
+    ).rejects.toThrow('requires binarySha256');
+  });
+
   it('rejects an arm mismatch between the bundle and what was expected', async () => {
     const searchPath = join(root, 'arm-mismatch-search.json');
     writeFileSync(searchPath, JSON.stringify(buildSearchArtifact(rewired)));
@@ -341,5 +396,87 @@ describe('evaluateSearchOnGraph / evaluateSearchForGraph (generalized to any ver
         parentGzipSha256: rewired.graphArtifactSha256
       })
     ).rejects.toThrow('arm mismatch');
+  });
+
+  it('rejects a search artifact whose top-level identity disagrees with its own bundle', async () => {
+    const corrupted = { ...buildSearchArtifact(rewired), bundleSha256: 'a'.repeat(64) };
+    const searchPath = join(root, 'self-inconsistent-search.json');
+    writeFileSync(searchPath, JSON.stringify(corrupted));
+    const binarySha256 = sha256Hex(new Uint8Array(encodeGraphBinary(deserializeArmBundle(rewired))));
+    await expect(
+      evaluateSearchForGraph(searchPath, {
+        arm: 'rewired',
+        binarySha256,
+        parentGzipSha256: rewired.graphArtifactSha256
+      })
+    ).rejects.toThrow('not self-consistent');
+  });
+
+  it('rejects a search artifact whose top-level arm disagrees with its own bundle', async () => {
+    const corrupted = { ...buildSearchArtifact(rewired), arm: 'biological' };
+    const searchPath = join(root, 'arm-field-mismatch-search.json');
+    writeFileSync(searchPath, JSON.stringify(corrupted));
+    const binarySha256 = sha256Hex(new Uint8Array(encodeGraphBinary(deserializeArmBundle(rewired))));
+    await expect(
+      evaluateSearchForGraph(searchPath, {
+        arm: 'rewired',
+        binarySha256,
+        parentGzipSha256: rewired.graphArtifactSha256
+      })
+    ).rejects.toThrow('disagrees with its bundle arm');
+  });
+
+  it('counts collisions and keeps the earlier candidate on a quality tie', async () => {
+    const base = buildSearchArtifact(biological);
+    const [c0] = base.candidates;
+    // Identical theta => identical discovery metrics => the same TS cell,
+    // equal quality -- every candidate after the first collides.
+    const source: SearchArtifact = {
+      ...base,
+      candidates: [c0, { ...c0, id: 1 }, { ...c0, id: 2 }]
+    };
+    const graph = deserializeArmBundle(biological);
+    const result = await evaluateSearchOnGraph(source, graph, {
+      requireDiversity: false,
+      heldout: 'own'
+    });
+    expect(result.gpuArchiveSize).toBe(3);
+    expect(result.evaluations.map((e) => e.id)).toEqual([0, 1, 2]);
+    expect(result.cells).toHaveLength(1);
+    expect(result.collisions).toBe(2);
+    expect(result.cells[0].id).toBe(0); // strict '>' means a tie keeps the earlier id
+  });
+
+  it('throws the canonical diversity gate before any held-out episode', async () => {
+    const source = buildSearchArtifact(biological);
+    const graph = deserializeArmBundle(biological);
+    await expect(
+      evaluateSearchOnGraph(source, graph, { requireDiversity: true, heldout: 'all' })
+    ).rejects.toThrow('Canonical diversity gate failed');
+  });
+
+  it('re-encodes a real rewired artifact to the same sha rewire_batch.py would call binarySha256', async () => {
+    // Unlike the synthetic-fixture tests above (which compute their own
+    // expected sha with the same TS expression the implementation uses,
+    // and so cannot catch TS re-encoding drifting away from Python), this
+    // uses the two real artifacts already committed to public/data and an
+    // independently-computed expected value: the decompressed sha of the
+    // real seed-0 rewired .bin.gz, which is exactly what rewire_batch.py's
+    // index.json calls binarySha256 for that seed.
+    const exportResult = runExportArms({
+      graphPath: 'public/data/malecns-arena-v1.bin.gz',
+      rewiredPath: 'public/data/malecns-arena-v1-rewired-seed0.bin.gz',
+      fixtureRewire: false,
+      fixtureRewireSeed: 0,
+      outDir: join(root, 'real-artifact-export')
+    });
+    const realRewired = JSON.parse(
+      readFileSync(join(exportResult.outDir, 'rewired.json'), 'utf8')
+    ) as SerializedArmBundle;
+    const expectedBinarySha256 = sha256Hex(
+      gunzipSync(readFileSync('public/data/malecns-arena-v1-rewired-seed0.bin.gz'))
+    );
+    const actual = sha256Hex(new Uint8Array(encodeGraphBinary(deserializeArmBundle(realRewired))));
+    expect(actual).toBe(expectedBinarySha256);
   });
 });
