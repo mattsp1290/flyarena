@@ -161,6 +161,12 @@ describe('parseNullEvaluateArgs', () => {
     expect(() => parseNullEvaluateArgs([])).toThrow(/--rewired-index is required/);
   });
 
+  it('rejects --graph-list combined with --rewired-seeds (a silent no-op otherwise: --graph-list ignores it)', () => {
+    expect(() =>
+      parseNullEvaluateArgs(['--graph-list', 'list.json', '--rewired-seeds', '0:5'])
+    ).toThrow(/--rewired-seeds only applies to --rewired-index mode/);
+  });
+
   it('rejects --out without a .json extension', () => {
     // Regression test for a dual-review finding: runNullEvaluate derives its
     // <out>.run.json sidecar path by stripping a trailing ".json" off --out;
@@ -538,6 +544,47 @@ describe('null-evaluate CLI: --graph-list mode (trace-graph fixture)', () => {
     rmSync(tamperedRoot, { recursive: true, force: true });
   });
 
+  it('rejects a graph-list entry whose binarySha256 does not match the decompressed bytes (worker-side check, correct gzipSha256)', () => {
+    // Regression test for the worker-side (decompressed) sha layer actually
+    // being enforced, not merely declared: a regression that accidentally
+    // wired `expectedSha256: entry.gzipSha256` (instead of `binarySha256`)
+    // into the task would pass every other test in this suite, since the
+    // gzip bytes themselves are untouched here -- only the index's recorded
+    // binarySha256 is corrupted, so verifyGraphListFiles's gzip-level check
+    // (parent, pre-fork) still passes, and only null-worker.ts's
+    // loadVerifiedGraphBinary (decompressed, in-worker) can catch this.
+    const tamperedRoot = mkdtempSync(join(tmpdir(), 'null-evaluate-graph-list-binary-sha-'));
+    cpSync(root, tamperedRoot, { recursive: true });
+    const indexPath = join(tamperedRoot, 'index.json');
+    const index = JSON.parse(readFileSync(indexPath, 'utf8'));
+    index.entries[0].binarySha256 = '0'.repeat(64);
+    writeFileSync(indexPath, JSON.stringify(index));
+
+    const out = join(tamperedRoot, 'authored-binary-sha-tampered.json');
+    const result = spawnSync(
+      process.execPath,
+      [
+        '--import',
+        'tsx',
+        'scripts/null/null-evaluate.ts',
+        '--graph-list',
+        indexPath,
+        '--held-out-count',
+        '1',
+        '--ticks',
+        String(TICKS),
+        '--shards',
+        '1',
+        '--out',
+        out
+      ],
+      { encoding: 'utf8', timeout: 60_000 }
+    );
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/decompressed sha256/);
+    rmSync(tamperedRoot, { recursive: true, force: true });
+  });
+
   it('--graph-list combined with --rewired-index fails at the CLI', () => {
     const out = join(root, 'authored-mutex.json');
     const result = spawnSync(
@@ -591,6 +638,51 @@ describe('readGraphListIndex: duplicate/malformed entry rejection', () => {
       })
     );
     expect(() => readGraphListIndex(indexPath)).toThrow(/malformed graph-list entry/);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it.each(['biological', 'disconnected'])('rejects an entry using the reserved id "%s"', (reservedId) => {
+    const root = mkdtempSync(join(tmpdir(), 'null-evaluate-graph-list-reserved-id-'));
+    const indexPath = join(root, 'index.json');
+    writeFileSync(
+      indexPath,
+      JSON.stringify({
+        sourceArtifact: 'src.bin.gz',
+        sourceSha256: 'c'.repeat(64),
+        entries: [{ id: reservedId, path: 'x.bin.gz', gzipSha256: 'a'.repeat(64), binarySha256: 'b'.repeat(64) }]
+      })
+    );
+    expect(() => readGraphListIndex(indexPath)).toThrow(/reserved graph id/);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('rejects an entry path that escapes index.json\'s own directory (absolute path)', () => {
+    const root = mkdtempSync(join(tmpdir(), 'null-evaluate-graph-list-abs-path-'));
+    const indexPath = join(root, 'index.json');
+    writeFileSync(
+      indexPath,
+      JSON.stringify({
+        sourceArtifact: 'src.bin.gz',
+        sourceSha256: 'c'.repeat(64),
+        entries: [{ id: 'P', path: '/etc/passwd', gzipSha256: 'a'.repeat(64), binarySha256: 'b'.repeat(64) }]
+      })
+    );
+    expect(() => readGraphListIndex(indexPath)).toThrow(/path outside index\.json's own directory/);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('rejects an entry path that traverses above index.json\'s own directory ("..")', () => {
+    const root = mkdtempSync(join(tmpdir(), 'null-evaluate-graph-list-traversal-'));
+    const indexPath = join(root, 'index.json');
+    writeFileSync(
+      indexPath,
+      JSON.stringify({
+        sourceArtifact: 'src.bin.gz',
+        sourceSha256: 'c'.repeat(64),
+        entries: [{ id: 'P', path: '../outside.bin.gz', gzipSha256: 'a'.repeat(64), binarySha256: 'b'.repeat(64) }]
+      })
+    );
+    expect(() => readGraphListIndex(indexPath)).toThrow(/path outside index\.json's own directory/);
     rmSync(root, { recursive: true, force: true });
   });
 });
@@ -826,6 +918,25 @@ describe('runNullEvaluate: --graph-list mutual exclusion (direct call, bypassing
         rewiredSeeds: undefined
       })
     ).rejects.toThrow(/--graph-list is mutually exclusive with --rewired-index\/--graphs-dir/);
+  });
+
+  it('rejects --graph-list combined with --rewired-seeds', async () => {
+    await expect(
+      runNullEvaluate({
+        biological: false,
+        graph: undefined,
+        rewiredIndex: undefined,
+        graphsDir: undefined,
+        graphList: '/nonexistent/graph-list.json',
+        heldOutStart: 30001,
+        heldOutCount: 1,
+        ticks: 20,
+        shards: 1,
+        out: resolve(process.cwd(), 'training/runs/interventions/scratch.json'),
+        decoder: 'authored' as const,
+        rewiredSeeds: { start: 0, end: 5 }
+      })
+    ).rejects.toThrow(/--rewired-seeds only applies to --rewired-index mode/);
   });
 });
 

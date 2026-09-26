@@ -53,7 +53,16 @@ export interface NullSummary {
  * mean, median, std, 2.5/97.5 percentiles" (the plan's own wording) are
  * empirical statistics of the null set, not a bootstrap of it.
  */
-const quantileIndex = (n: number, p: number): number =>
+/**
+ * Exported (a dual-review finding on `scripts/null/intervention-report.ts`,
+ * WP2 of the pathway-interventions study): that module needs the exact same
+ * low-tail-floor / high-tail-ceil-minus-one quantile convention for its own
+ * `armDistribution`/null-floor computations, and previously carried a
+ * hand-duplicated copy whose correctness depended on a doc comment claiming
+ * "the same convention" rather than the type system/a shared import
+ * guaranteeing it.
+ */
+export const quantileIndex = (n: number, p: number): number =>
   p <= 0.5 ? Math.floor(p * n) : Math.min(n - 1, Math.ceil(p * n) - 1);
 
 /**

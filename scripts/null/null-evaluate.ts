@@ -229,6 +229,19 @@ export interface GraphListIndex {
 }
 
 /**
+ * `buildGraphListTasks` synthesizes tasks with `graphId: 'biological'`/
+ * `'disconnected'` when `--biological` is set (see `biologicalAndDisconnectedTasks`).
+ * A graph-list entry using either id would collide with those tasks:
+ * `runShardedEvaluation` keeps whichever result arrives first for a given
+ * `graphId` and silently discards the other, so which graph's scores end up
+ * in the output (and in the reproduction check `intervention-report.ts`
+ * depends on) would depend on shard completion timing — the exact
+ * determinism failure `readGraphListIndex`'s duplicate-id check exists to
+ * prevent, just via a different id source (a dual-review finding).
+ */
+const RESERVED_GRAPH_IDS: ReadonlySet<string> = new Set(['biological', 'disconnected']);
+
+/**
  * Parse and lightly validate `scripts/analysis/interventions.py`'s
  * `index.json`. Deliberately tolerant of extra fields beyond the ones this
  * script reads (`kind`, `swaps`, `targetReached`, `transfer`, `producer`,
@@ -254,6 +267,24 @@ export const readGraphListIndex = (path: string): GraphListIndex => {
       typeof entry.binarySha256 !== 'string'
     ) {
       throw new Error(`null-evaluate: ${path} has a malformed graph-list entry: ${JSON.stringify(entry)}`);
+    }
+    if (RESERVED_GRAPH_IDS.has(entry.id)) {
+      throw new Error(
+        `null-evaluate: ${path} uses reserved graph id "${entry.id}" (reserved for --biological's own tasks)`
+      );
+    }
+    // A path escaping index.json's own directory (an absolute path, or a
+    // "../" traversal) would break this mode's documented contract ("every
+    // entry's path is relative to the graph-list index.json's own
+    // directory" — see `GraphListEntry.path`'s doc comment) and let a
+    // mis-generated index silently read a file outside the run's own graph
+    // set. Content integrity is still independently enforced by both sha
+    // layers either way, so this is a fail-fast/contract check, not the
+    // primary integrity guard.
+    if (entry.path.startsWith('/') || entry.path.split('/').includes('..')) {
+      throw new Error(
+        `null-evaluate: ${path} entry "${entry.id}" has a path outside index.json's own directory: "${entry.path}"`
+      );
     }
     // Two tasks sharing the same graphId would let whichever result arrives
     // last silently win (the same reasoning as readRewireIndex's duplicate-
@@ -426,6 +457,15 @@ export const parseNullEvaluateArgs = (argv: readonly string[]): NullEvaluateArgs
   if (graphList === undefined) {
     if (!rewiredIndex) throw new Error('--rewired-index is required (or use --graph-list)');
     if (!graphsDir) throw new Error('--graphs-dir is required (or use --graph-list)');
+  } else if (rewiredSeeds !== undefined) {
+    // `--rewired-seeds` only means something against a `rewire_batch.py`
+    // seed-indexed index (it narrows `index.seeds` to a numeric range) --
+    // `--graph-list`'s entries have no numeric seed to narrow by, and
+    // `buildGraphListTasks` never reads it, so every entry would silently
+    // be scored anyway. This file already rejects the same class of silent
+    // no-op for `--graph` without `--biological` just above (a dual-review
+    // finding).
+    throw new Error('--rewired-seeds only applies to --rewired-index mode (not --graph-list)');
   }
   // `graph` is only ever read when `biological` is set (see `runNullEvaluate`)
   // — silently accepting it otherwise would let an operator believe an
@@ -1033,10 +1073,11 @@ const writeEvaluationOutput = (
  * keyed by `id`).
  */
 const runNullEvaluateGraphList = async (
-  args: Readonly<NullEvaluateArgs> & { readonly graphList: string }
+  args: Readonly<NullEvaluateArgs>,
+  graphList: string
 ): Promise<{ out: string; runMetaOut: string; taskCount: number; elapsedMs: number }> => {
-  const index = readGraphListIndex(args.graphList);
-  const indexDir = dirname(args.graphList);
+  const index = readGraphListIndex(graphList);
+  const indexDir = dirname(graphList);
   verifyGraphListFiles(index, indexDir);
 
   const biologicalPath = args.biological ? args.graph ?? resolve(PUBLIC_DATA_DIR, index.sourceArtifact) : '';
@@ -1070,11 +1111,15 @@ export const runNullEvaluate = async (
   // existing test builds its own `NullEvaluateArgs` object literal, bypassing
   // the CLI parser), so this function re-checks rather than trusting that
   // callers always route through `parseNullEvaluateArgs` first.
-  if (args.graphList !== undefined) {
+  const graphList = args.graphList;
+  if (graphList !== undefined) {
     if (args.rewiredIndex !== undefined || args.graphsDir !== undefined) {
       throw new Error('null-evaluate: --graph-list is mutually exclusive with --rewired-index/--graphs-dir');
     }
-    return runNullEvaluateGraphList(args as Readonly<NullEvaluateArgs> & { readonly graphList: string });
+    if (args.rewiredSeeds !== undefined) {
+      throw new Error('null-evaluate: --rewired-seeds only applies to --rewired-index mode (not --graph-list)');
+    }
+    return runNullEvaluateGraphList(args, graphList);
   }
   if (args.rewiredIndex === undefined || args.graphsDir === undefined) {
     throw new Error('null-evaluate: --rewired-index and --graphs-dir are required (or use --graph-list)');

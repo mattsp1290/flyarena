@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
@@ -10,9 +10,14 @@ import {
   checkBiologicalReproduction,
   evaluateCategory,
   evaluateChannelSpecific,
-  readGraphKinds,
+  parseInterventionReportArgs,
+  publishedNullFloorValue,
+  readGraphListIndexInfo,
   readPublishedNull,
+  runInterventionReport,
   type GraphKind,
+  type GraphListIndexEntryInfo,
+  type InterventionReportArgs,
   type PublishedNull
 } from '../../scripts/null/intervention-report';
 import type { NullGraphListEvaluationRaw } from '../../scripts/null/null-evaluate';
@@ -25,6 +30,53 @@ import type { NullGraphListEvaluationRaw } from '../../scripts/null/null-evaluat
  * (`tests/unit/null-evaluate.test.ts` covers that); this module is pure
  * statistics over already-computed scores.
  */
+
+const SCRATCH_INPUTS = {
+  authoredSha256: 'a'.repeat(64),
+  indexSha256: 'b'.repeat(64),
+  publishedNullSha256: 'c'.repeat(64)
+};
+
+describe('parseInterventionReportArgs', () => {
+  it('applies defaults, including allowReproductionMismatch: false', () => {
+    const args = parseInterventionReportArgs([]);
+    expect(args.allowReproductionMismatch).toBe(false);
+    expect(args.bootstrapResamples).toBe(10000);
+  });
+
+  it('parses --allow-reproduction-mismatch as a boolean flag (no value consumed)', () => {
+    const args = parseInterventionReportArgs(['--allow-reproduction-mismatch', '--authored', 'a.json']);
+    expect(args.allowReproductionMismatch).toBe(true);
+    expect(args.authored).toContain('a.json');
+  });
+
+  it('parses --authored/--index/--null/--out/--bootstrap-seed/--bootstrap-resamples', () => {
+    const args = parseInterventionReportArgs([
+      '--authored',
+      'a.json',
+      '--index',
+      'i.json',
+      '--null',
+      'n.json',
+      '--out',
+      'o.json',
+      '--bootstrap-seed',
+      '7',
+      '--bootstrap-resamples',
+      '500'
+    ]);
+    expect(args.authored).toContain('a.json');
+    expect(args.index).toContain('i.json');
+    expect(args.publishedNull).toContain('n.json');
+    expect(args.out).toContain('o.json');
+    expect(args.bootstrapSeed).toBe(7);
+    expect(args.bootstrapResamples).toBe(500);
+  });
+
+  it('rejects an unknown flag', () => {
+    expect(() => parseInterventionReportArgs(['--bogus'])).toThrow(/Unknown argument/);
+  });
+});
 
 describe('armDistribution', () => {
   it('computes n/p5/p50/p95 over a sorted 100-length arm', () => {
@@ -43,178 +95,240 @@ describe('armDistribution', () => {
   });
 });
 
+describe('publishedNullFloorValue', () => {
+  it('computes sorted(scores)[quantileIndex(n, 0.25)], matching interventions.py\'s own definition', () => {
+    // n = 8: quantileIndex(8, 0.25) = floor(0.25 * 8) = 2 -> sorted[2].
+    const scores = [7, 3, 1, 8, 2, 6, 5, 4]; // sorted: 1,2,3,4,5,6,7,8
+    const publishedNull: PublishedNull = {
+      biologicalScore: 0,
+      scores,
+      sourceGraphSha256: 'x'.repeat(64),
+      seeds: { start: 30001, count: 100 },
+      ticks: 1800
+    };
+    expect(publishedNullFloorValue(publishedNull)).toBe(3);
+  });
+});
+
 describe('evaluateCategory', () => {
   const cArm = armDistribution(Array.from({ length: 100 }, () => 1));
   const mArm = armDistribution(Array.from({ length: 100 }, () => 2));
+  const nullFloorScore = 0;
 
-  it('not-supported: P below the null floor percentile', () => {
-    expect(evaluateCategory(10, 0.1, cArm, mArm)).toBe('not-supported');
+  it('not-supported: P below the null floor value', () => {
+    expect(evaluateCategory(-0.001, nullFloorScore, cArm, mArm)).toBe('not-supported');
+  });
+
+  it('at-or-above the floor: exactly at the floor value counts as reached ("at or above")', () => {
+    // P (5, == floor) is <= C's p95 (1)? No: 5 > 1, so it clears C. Use a
+    // floor equal to a low P score to isolate the floor boundary itself.
+    expect(evaluateCategory(0.5, 0.5, cArm, mArm)).toBe('generic-rewiring-effect');
   });
 
   it('generic-rewiring-effect: P at/above the floor but at/below C p95', () => {
-    expect(evaluateCategory(1, 0.25, cArm, mArm)).toBe('generic-rewiring-effect');
-    expect(evaluateCategory(0.5, 0.9, cArm, mArm)).toBe('generic-rewiring-effect');
+    expect(evaluateCategory(1, nullFloorScore, cArm, mArm)).toBe('generic-rewiring-effect');
+    expect(evaluateCategory(0.5, 0.5, cArm, mArm)).toBe('generic-rewiring-effect');
   });
 
   it('edge-class-effect: P above C p95 but at/below M p95', () => {
-    expect(evaluateCategory(1.5, 0.9, cArm, mArm)).toBe('edge-class-effect');
+    expect(evaluateCategory(1.5, nullFloorScore, cArm, mArm)).toBe('edge-class-effect');
   });
 
   it('pathway-supported: P above both C p95 and M p95', () => {
-    expect(evaluateCategory(3, 0.99, cArm, mArm)).toBe('pathway-supported');
-  });
-
-  it('boundary: exactly at the null floor percentile counts as reached', () => {
-    // 0.25 is not < 0.25, so the floor check passes; P (0.5) is <= C's p95 (1), so generic.
-    expect(evaluateCategory(0.5, 0.25, cArm, mArm)).toBe('generic-rewiring-effect');
+    expect(evaluateCategory(3, nullFloorScore, cArm, mArm)).toBe('pathway-supported');
   });
 });
 
 describe('evaluateChannelSpecific', () => {
   const mqArm = armDistribution(Array.from({ length: 100 }, () => 1));
 
-  it('true when Q clears both the null floor and MQ p95', () => {
+  it('true when Q clears both the null floor and MQ p95 (both strict >)', () => {
     expect(evaluateChannelSpecific(2, 0.5, mqArm)).toBe(true);
   });
 
-  it('false when Q is below the null floor percentile', () => {
-    expect(evaluateChannelSpecific(2, 0.1, mqArm)).toBe(false);
+  it('false when Q is below the null floor value', () => {
+    expect(evaluateChannelSpecific(2, 3, mqArm)).toBe(false);
+  });
+
+  it('false when Q is exactly at the null floor value (plan says "above", strict)', () => {
+    expect(evaluateChannelSpecific(2, 2, mqArm)).toBe(false);
   });
 
   it('false when Q does not clear MQ p95', () => {
-    expect(evaluateChannelSpecific(1, 0.9, mqArm)).toBe(false);
+    expect(evaluateChannelSpecific(1, 0.5, mqArm)).toBe(false);
   });
 });
 
 describe('checkBiologicalReproduction', () => {
+  const publishedNull = (biologicalScore: number): PublishedNull => ({
+    biologicalScore,
+    scores: [0, 1, 2, 3],
+    sourceGraphSha256: 'x'.repeat(64),
+    seeds: { start: 30001, count: 100 },
+    ticks: 1800
+  });
+
   it('matches when the computed mean equals the published score exactly', () => {
-    const publishedNull: PublishedNull = { biologicalScore: 2, scores: [0, 1, 2, 3] };
-    const check = checkBiologicalReproduction([1, 2, 3], publishedNull);
+    const check = checkBiologicalReproduction([1, 2, 3], publishedNull(2));
     expect(check.computedScore).toBe(2);
     expect(check.matches).toBe(true);
   });
 
   it('does not match on any deviation', () => {
-    const publishedNull: PublishedNull = { biologicalScore: 2, scores: [0, 1, 2, 3] };
-    const check = checkBiologicalReproduction([1, 2, 3.0001], publishedNull);
+    const check = checkBiologicalReproduction([1, 2, 3.0001], publishedNull(2));
     expect(check.matches).toBe(false);
   });
 });
 
-describe('readGraphKinds', () => {
+describe('readGraphListIndexInfo', () => {
   let root: string;
   beforeEach(() => {
-    root = mkdtempSync(join(tmpdir(), 'intervention-report-kinds-'));
+    root = mkdtempSync(join(tmpdir(), 'intervention-report-info-'));
   });
 
-  it('parses id -> kind from index.json entries', () => {
+  it('parses id -> {kind, gzipSha256} from index.json entries', () => {
     const path = join(root, 'index.json');
     writeFileSync(
       path,
       JSON.stringify({
         entries: [
-          { id: 'P', kind: 'P' },
-          { id: 'C000', kind: 'C' },
-          { id: 'MQ2000', kind: 'MQ' }
+          { id: 'P', kind: 'P', gzipSha256: 'a'.repeat(64) },
+          { id: 'C000', kind: 'C', gzipSha256: 'b'.repeat(64) },
+          { id: 'MQ2000', kind: 'MQ', gzipSha256: 'c'.repeat(64) }
         ]
       })
     );
-    const kinds = readGraphKinds(path);
-    expect(kinds.get('P')).toBe('P');
-    expect(kinds.get('C000')).toBe('C');
-    expect(kinds.get('MQ2000')).toBe('MQ');
-    rmSync(root, { recursive: true, force: true });
+    const info = readGraphListIndexInfo(path);
+    expect(info.get('P')).toEqual({ kind: 'P', gzipSha256: 'a'.repeat(64) });
+    expect(info.get('C000')).toEqual({ kind: 'C', gzipSha256: 'b'.repeat(64) });
+    expect(info.get('MQ2000')).toEqual({ kind: 'MQ', gzipSha256: 'c'.repeat(64) });
   });
 
   it('rejects an entry with an unrecognized kind', () => {
     const path = join(root, 'index.json');
-    writeFileSync(path, JSON.stringify({ entries: [{ id: 'X', kind: 'bogus' }] }));
-    expect(() => readGraphKinds(path)).toThrow(/malformed entry/);
-    rmSync(root, { recursive: true, force: true });
+    writeFileSync(path, JSON.stringify({ entries: [{ id: 'X', kind: 'bogus', gzipSha256: 'a'.repeat(64) }] }));
+    expect(() => readGraphListIndexInfo(path)).toThrow(/malformed entry/);
   });
 
-  it('rejects the same id listed with two different kinds', () => {
+  it('rejects an entry missing gzipSha256', () => {
     const path = join(root, 'index.json');
-    writeFileSync(
-      path,
-      JSON.stringify({
-        entries: [
-          { id: 'X', kind: 'C' },
-          { id: 'X', kind: 'M' }
-        ]
-      })
-    );
-    expect(() => readGraphKinds(path)).toThrow(/two different kinds/);
-    rmSync(root, { recursive: true, force: true });
+    writeFileSync(path, JSON.stringify({ entries: [{ id: 'X', kind: 'C' }] }));
+    expect(() => readGraphListIndexInfo(path)).toThrow(/malformed entry/);
   });
 
-  it('tolerates the same id/kind repeated', () => {
+  it('rejects a duplicate id (even with the same kind/sha)', () => {
     const path = join(root, 'index.json');
-    writeFileSync(
-      path,
-      JSON.stringify({
-        entries: [
-          { id: 'X', kind: 'C' },
-          { id: 'X', kind: 'C' }
-        ]
-      })
-    );
-    expect(() => readGraphKinds(path)).not.toThrow();
-    rmSync(root, { recursive: true, force: true });
+    const entry = { id: 'X', kind: 'C', gzipSha256: 'a'.repeat(64) };
+    writeFileSync(path, JSON.stringify({ entries: [entry, { ...entry }] }));
+    expect(() => readGraphListIndexInfo(path)).toThrow(/more than once/);
+  });
+
+  it('rejects an empty entries array', () => {
+    const path = join(root, 'index.json');
+    writeFileSync(path, JSON.stringify({ entries: [] }));
+    expect(() => readGraphListIndexInfo(path)).toThrow(/has no entries/);
   });
 });
 
 describe('readPublishedNull', () => {
-  it('parses biological.score and rewired[].score', () => {
-    const root = mkdtempSync(join(tmpdir(), 'intervention-report-null-'));
+  const validBody = {
+    biological: { score: 1.5 },
+    rewired: [{ score: 1 }, { score: 2 }, { score: 3 }],
+    sourceGraphSha256: 'x'.repeat(64),
+    seeds: { start: 30001, count: 100 },
+    ticks: 1800
+  };
+
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'intervention-report-null-'));
+  });
+
+  it('parses biological.score, rewired[].score, sourceGraphSha256, seeds, ticks', () => {
     const path = join(root, 'null.json');
-    writeFileSync(
-      path,
-      JSON.stringify({ biological: { score: 1.5 }, rewired: [{ score: 1 }, { score: 2 }, { score: 3 }] })
-    );
+    writeFileSync(path, JSON.stringify(validBody));
     const parsed = readPublishedNull(path);
     expect(parsed.biologicalScore).toBe(1.5);
     expect(parsed.scores).toEqual([1, 2, 3]);
-    rmSync(root, { recursive: true, force: true });
+    expect(parsed.sourceGraphSha256).toBe('x'.repeat(64));
+    expect(parsed.seeds).toEqual({ start: 30001, count: 100 });
+    expect(parsed.ticks).toBe(1800);
   });
 
   it('throws when biological.score is missing', () => {
-    const root = mkdtempSync(join(tmpdir(), 'intervention-report-null-bad-'));
     const path = join(root, 'null.json');
-    writeFileSync(path, JSON.stringify({ rewired: [{ score: 1 }] }));
-    expect(() => readPublishedNull(path)).toThrow(/missing biological\.score/);
-    rmSync(root, { recursive: true, force: true });
+    const { biological: _b, ...rest } = validBody;
+    writeFileSync(path, JSON.stringify(rest));
+    expect(() => readPublishedNull(path)).toThrow(/missing a finite biological\.score/);
+  });
+
+  it('throws when biological.score is non-finite (NaN cannot appear in real JSON, but a hand-edited file could smuggle Infinity via a string)', () => {
+    const path = join(root, 'null.json');
+    writeFileSync(path, JSON.stringify({ ...validBody, biological: { score: 'Infinity' } }));
+    expect(() => readPublishedNull(path)).toThrow(/missing a finite biological\.score/);
   });
 
   it('throws when rewired is empty', () => {
-    const root = mkdtempSync(join(tmpdir(), 'intervention-report-null-empty-'));
     const path = join(root, 'null.json');
-    writeFileSync(path, JSON.stringify({ biological: { score: 1 }, rewired: [] }));
+    writeFileSync(path, JSON.stringify({ ...validBody, rewired: [] }));
     expect(() => readPublishedNull(path)).toThrow(/no rewired entries/);
-    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('throws when a rewired score is not a finite number', () => {
+    const path = join(root, 'null.json');
+    writeFileSync(path, JSON.stringify({ ...validBody, rewired: [{ score: 'nope' }] }));
+    expect(() => readPublishedNull(path)).toThrow(/not a finite number/);
+  });
+
+  it('throws when sourceGraphSha256 is missing', () => {
+    const path = join(root, 'null.json');
+    const { sourceGraphSha256: _s, ...rest } = validBody;
+    writeFileSync(path, JSON.stringify(rest));
+    expect(() => readPublishedNull(path)).toThrow(/missing sourceGraphSha256/);
+  });
+
+  it('throws when seeds is missing', () => {
+    const path = join(root, 'null.json');
+    const { seeds: _s, ...rest } = validBody;
+    writeFileSync(path, JSON.stringify(rest));
+    expect(() => readPublishedNull(path)).toThrow(/missing seeds\.start\/seeds\.count/);
+  });
+
+  it('throws when ticks is missing', () => {
+    const path = join(root, 'null.json');
+    const { ticks: _t, ...rest } = validBody;
+    writeFileSync(path, JSON.stringify(rest));
+    expect(() => readPublishedNull(path)).toThrow(/missing ticks/);
   });
 });
 
 describe('buildInterventionStatistics: end-to-end on synthetic data', () => {
-  // A deliberately tiny graph list: P, Q, 4 C, 4 M, 4 MQ graphs. Scores are
-  // hand-picked so P clearly beats C and M (pathway-supported) and Q clearly
-  // beats MQ (channel-specific), against a published null whose scores put
-  // P/Q comfortably above the 25th percentile.
   const seeds = [30001, 30002, 30003];
   const constantMovementScore = (value: number): readonly number[] => seeds.map(() => value);
+  const SOURCE_SHA = 'x'.repeat(64);
 
   const graphList = (idsAndScores: readonly (readonly [string, number])[]): NullGraphListEvaluationRaw => ({
     version: 1,
-    sourceGraphSha256: 'x'.repeat(64),
+    sourceGraphSha256: SOURCE_SHA,
     seeds: { start: 30001, count: seeds.length },
     ticks: 20,
     substeps: 4,
     decoder: 'authored',
-    biological: { heldOutSeeds: seeds, movementScore: constantMovementScore(0), foodPickups: [0, 0, 0], hazardContacts: [0, 0, 0] },
-    disconnected: { heldOutSeeds: seeds, movementScore: constantMovementScore(-1), foodPickups: [0, 0, 0], hazardContacts: [0, 0, 0] },
+    biological: {
+      heldOutSeeds: seeds,
+      movementScore: constantMovementScore(0),
+      foodPickups: [0, 0, 0],
+      hazardContacts: [0, 0, 0]
+    },
+    disconnected: {
+      heldOutSeeds: seeds,
+      movementScore: constantMovementScore(-1),
+      foodPickups: [0, 0, 0],
+      hazardContacts: [0, 0, 0]
+    },
     graphs: idsAndScores.map(([id, score]) => ({
       id,
-      gzipSha256: 'y'.repeat(64),
+      gzipSha256: `gz-${id}`.padEnd(64, '0'),
       binarySha256: 'z'.repeat(64),
       heldOutSeeds: seeds,
       movementScore: constantMovementScore(score),
@@ -224,8 +338,16 @@ describe('buildInterventionStatistics: end-to-end on synthetic data', () => {
     host: { arch: 'arm64', node: 'v22.0.0' }
   });
 
-  const kindsFor = (idsAndKinds: readonly (readonly [string, GraphKind])[]): ReadonlyMap<string, GraphKind> =>
-    new Map(idsAndKinds);
+  const infoFor = (idsAndKinds: readonly (readonly [string, GraphKind])[]): ReadonlyMap<string, GraphListIndexEntryInfo> =>
+    new Map(idsAndKinds.map(([id, kind]) => [id, { kind, gzipSha256: `gz-${id}`.padEnd(64, '0') }]));
+
+  const nullFor = (scores: readonly number[]): PublishedNull => ({
+    biologicalScore: 0,
+    scores,
+    sourceGraphSha256: SOURCE_SHA,
+    seeds: { start: 30001, count: seeds.length },
+    ticks: 20
+  });
 
   const buildFixture = () => {
     const cIds = ['C000', 'C001', 'C002', 'C003'];
@@ -239,7 +361,7 @@ describe('buildInterventionStatistics: end-to-end on synthetic data', () => {
       ...mqIds.map((id) => [id, 1] as const)
     ];
     const raw = graphList(idsAndScores);
-    const kinds = kindsFor([
+    const info = infoFor([
       ['P', 'P'],
       ['Q', 'Q'],
       ...cIds.map((id) => [id, 'C'] as const),
@@ -247,21 +369,18 @@ describe('buildInterventionStatistics: end-to-end on synthetic data', () => {
       ...mqIds.map((id) => [id, 'MQ'] as const)
     ]);
     // A published null of 20 values, all well below P/Q's scores, so both
-    // land at the 100th percentile (comfortably above the 25% floor).
-    const publishedNull: PublishedNull = {
-      biologicalScore: 0,
-      scores: Array.from({ length: 20 }, (_, i) => -5 + i * 0.1)
-    };
-    return { raw, kinds, publishedNull };
+    // land above the 25th-percentile floor value comfortably.
+    const publishedNull = nullFor(Array.from({ length: 20 }, (_, i) => -5 + i * 0.1));
+    return { raw, info, publishedNull };
   };
 
   it('P is pathway-supported and Q is channel-specific under these scores', () => {
-    const { raw, kinds, publishedNull } = buildFixture();
-    const stats = buildInterventionStatistics(raw, kinds, publishedNull, 42, 200);
+    const { raw, info, publishedNull } = buildFixture();
+    const stats = buildInterventionStatistics(raw, info, publishedNull, 42, 200, SCRATCH_INPUTS);
 
     expect(stats.biologicalReproduction.matches).toBe(true);
+    expect(stats.inputs).toEqual(SCRATCH_INPUTS);
     expect(stats.graphs).toHaveLength(14); // P, Q, 4 C, 4 M, 4 MQ
-    // Sorted by id ascending.
     expect(stats.graphs.map((g) => g.id)).toEqual([...stats.graphs.map((g) => g.id)].sort());
 
     expect(stats.controls.C.n).toBe(4);
@@ -271,20 +390,21 @@ describe('buildInterventionStatistics: end-to-end on synthetic data', () => {
     expect(stats.controls.MQ.n).toBe(4);
     expect(stats.controls.MQ.p95).toBe(1);
 
+    expect(stats.publishedNullFloor).toBeLessThan(10);
     expect(stats.p.score).toBe(10);
-    expect(stats.p.percentileInPublishedNull).toBe(1); // above every published-null value
     expect(stats.p.category).toBe('pathway-supported');
-    expect(stats.p.pRankAmongC).toBeGreaterThan(0);
-    expect(stats.p.pRankAmongC).toBeLessThanOrEqual(1);
+    // n=4 controls, P above all of them: pHigh = (4 - 4 + 1)/(4+1) = 1/5.
+    expect(stats.p.pRankAmongC).toBe(1 / 5);
+    expect(stats.p.pRankAmongM).toBe(1 / 5);
 
     expect(stats.q.score).toBe(8);
     expect(stats.q.channelSpecific).toBe(true);
-    expect(stats.q.qRankAmongMQ).toBeGreaterThan(0);
+    expect(stats.q.qRankAmongMQ).toBe(1 / 5);
   });
 
   it('every non-biological graph carries a pairedVsBiological difference', () => {
-    const { raw, kinds, publishedNull } = buildFixture();
-    const stats = buildInterventionStatistics(raw, kinds, publishedNull, 42, 200);
+    const { raw, info, publishedNull } = buildFixture();
+    const stats = buildInterventionStatistics(raw, info, publishedNull, 42, 200, SCRATCH_INPUTS);
     for (const graph of stats.graphs) {
       expect(graph.pairedVsBiological).toBeDefined();
       expect(graph.pairedVsBiological?.n).toBe(seeds.length);
@@ -292,9 +412,9 @@ describe('buildInterventionStatistics: end-to-end on synthetic data', () => {
   });
 
   it('running the statistics twice on the same input is byte-identical (JSON.stringify)', () => {
-    const { raw, kinds, publishedNull } = buildFixture();
-    const first = buildInterventionStatistics(raw, kinds, publishedNull, 42, 200);
-    const second = buildInterventionStatistics(raw, kinds, publishedNull, 42, 200);
+    const { raw, info, publishedNull } = buildFixture();
+    const first = buildInterventionStatistics(raw, info, publishedNull, 42, 200, SCRATCH_INPUTS);
+    const second = buildInterventionStatistics(raw, info, publishedNull, 42, 200, SCRATCH_INPUTS);
     expect(JSON.stringify(second)).toBe(JSON.stringify(first));
   });
 
@@ -310,15 +430,15 @@ describe('buildInterventionStatistics: end-to-end on synthetic data', () => {
       ...mqIds.map((id) => [id, 5] as const)
     ];
     const raw = graphList(idsAndScores);
-    const kinds = kindsFor([
+    const info = infoFor([
       ['P', 'P'],
       ['Q', 'Q'],
       ...cIds.map((id) => [id, 'C'] as const),
       ...mIds.map((id) => [id, 'M'] as const),
       ...mqIds.map((id) => [id, 'MQ'] as const)
     ]);
-    const publishedNull: PublishedNull = { biologicalScore: 0, scores: Array.from({ length: 20 }, (_, i) => -5 + i * 0.1) };
-    const stats = buildInterventionStatistics(raw, kinds, publishedNull, 42, 200);
+    const publishedNull = nullFor(Array.from({ length: 20 }, (_, i) => -5 + i * 0.1));
+    const stats = buildInterventionStatistics(raw, info, publishedNull, 42, 200, SCRATCH_INPUTS);
     expect(stats.p.category).toBe('generic-rewiring-effect');
   });
 
@@ -334,30 +454,250 @@ describe('buildInterventionStatistics: end-to-end on synthetic data', () => {
       ...mqIds.map((id) => [id, 1] as const)
     ];
     const raw = graphList(idsAndScores);
-    const kinds = kindsFor([
+    const info = infoFor([
       ['P', 'P'],
       ['Q', 'Q'],
       ...cIds.map((id) => [id, 'C'] as const),
       ...mIds.map((id) => [id, 'M'] as const),
       ...mqIds.map((id) => [id, 'MQ'] as const)
     ]);
-    const publishedNull: PublishedNull = { biologicalScore: 0, scores: Array.from({ length: 20 }, (_, i) => -5 + i * 0.1) };
-    const stats = buildInterventionStatistics(raw, kinds, publishedNull, 42, 200);
+    const publishedNull = nullFor(Array.from({ length: 20 }, (_, i) => -5 + i * 0.1));
+    const stats = buildInterventionStatistics(raw, info, publishedNull, 42, 200, SCRATCH_INPUTS);
     expect(stats.p.category).toBe('not-supported');
     expect(stats.q.channelSpecific).toBe(false);
   });
 
   it('throws when the raw evaluation has no biological section', () => {
-    const { raw, kinds, publishedNull } = buildFixture();
+    const { raw, info, publishedNull } = buildFixture();
     const { biological: _unused, ...withoutBiological } = raw;
     expect(() =>
-      buildInterventionStatistics(withoutBiological as NullGraphListEvaluationRaw, kinds, publishedNull, 42, 200)
+      buildInterventionStatistics(
+        withoutBiological as NullGraphListEvaluationRaw,
+        info,
+        publishedNull,
+        42,
+        200,
+        SCRATCH_INPUTS
+      )
     ).toThrow(/no biological section/);
   });
 
-  it('throws when a graph id has no matching kind', () => {
+  it('throws when the index lists an id that authored.json has no entry for', () => {
     const { raw, publishedNull } = buildFixture();
-    const kinds = new Map<string, GraphKind>([['P', 'P']]); // missing every other id
-    expect(() => buildInterventionStatistics(raw, kinds, publishedNull, 42, 200)).toThrow(/no kind found/);
+    // Every real id from buildFixture, plus one the index expects but
+    // authored.json never scored.
+    const info = infoFor([
+      ['P', 'P'],
+      ['Q', 'Q'],
+      ['C000', 'C'],
+      ['C001', 'C'],
+      ['C002', 'C'],
+      ['C003', 'C'],
+      ['M1000', 'M'],
+      ['M1001', 'M'],
+      ['M1002', 'M'],
+      ['M1003', 'M'],
+      ['MQ2000', 'MQ'],
+      ['MQ2001', 'MQ'],
+      ['MQ2002', 'MQ'],
+      ['MQ2003', 'MQ'],
+      ['MQ2004', 'MQ'] // authored.json has no entry for this one
+    ]);
+    expect(() => buildInterventionStatistics(raw, info, publishedNull, 42, 200, SCRATCH_INPUTS)).toThrow(
+      /missing 1 index id\(s\): MQ2004/
+    );
+  });
+
+  it('throws when a graph id in authored.json has no matching index entry', () => {
+    const { raw, publishedNull } = buildFixture();
+    const info = infoFor([['P', 'P']]); // authored.json's other 13 ids are absent from the index
+    expect(() => buildInterventionStatistics(raw, info, publishedNull, 42, 200, SCRATCH_INPUTS)).toThrow(
+      /no kind found for graph id/
+    );
+  });
+
+  it('throws when raw.decoder is not "authored"', () => {
+    const { raw, info, publishedNull } = buildFixture();
+    const wrongDecoder = { ...raw, decoder: 'authored-flip-both' as const };
+    expect(() => buildInterventionStatistics(wrongDecoder, info, publishedNull, 42, 200, SCRATCH_INPUTS)).toThrow(
+      /authored-decoder only/
+    );
+  });
+
+  it('throws when authored.json and the published null were scored against different source graphs', () => {
+    const { raw, info, publishedNull } = buildFixture();
+    const mismatched = { ...publishedNull, sourceGraphSha256: 'y'.repeat(64) };
+    expect(() => buildInterventionStatistics(raw, info, mismatched, 42, 200, SCRATCH_INPUTS)).toThrow(
+      /different biological graphs/
+    );
+  });
+
+  it('throws when authored.json seeds differ from the published null', () => {
+    const { raw, info, publishedNull } = buildFixture();
+    const mismatched = { ...publishedNull, seeds: { start: 1, count: seeds.length } };
+    expect(() => buildInterventionStatistics(raw, info, mismatched, 42, 200, SCRATCH_INPUTS)).toThrow(
+      /seeds\/ticks differ/
+    );
+  });
+
+  it('throws when authored.json ticks differ from the published null', () => {
+    const { raw, info, publishedNull } = buildFixture();
+    const mismatched = { ...publishedNull, ticks: 9999 };
+    expect(() => buildInterventionStatistics(raw, info, mismatched, 42, 200, SCRATCH_INPUTS)).toThrow(
+      /seeds\/ticks differ/
+    );
+  });
+
+  it('throws when authored.json has a duplicate graph id', () => {
+    const { raw, info, publishedNull } = buildFixture();
+    const dup = { ...raw, graphs: [...raw.graphs, raw.graphs[0]] };
+    expect(() => buildInterventionStatistics(dup, info, publishedNull, 42, 200, SCRATCH_INPUTS)).toThrow(
+      /duplicate graph id/
+    );
+  });
+
+  it('throws when a graph\'s gzipSha256 does not match the index (stale authored.json)', () => {
+    const { raw, info, publishedNull } = buildFixture();
+    const staleGraphs = raw.graphs.map((g, i) => (i === 0 ? { ...g, gzipSha256: 'stale'.padEnd(64, '0') } : g));
+    const stale = { ...raw, graphs: staleGraphs };
+    expect(() => buildInterventionStatistics(stale, info, publishedNull, 42, 200, SCRATCH_INPUTS)).toThrow(
+      /different graph file than index\.json/
+    );
+  });
+
+  it('throws when a graph was scored on different held-out seeds than biological', () => {
+    const { raw, info, publishedNull } = buildFixture();
+    const misaligned = raw.graphs.map((g, i) => (i === 0 ? { ...g, heldOutSeeds: [1, 2, 3] } : g));
+    const bad = { ...raw, graphs: misaligned };
+    expect(() => buildInterventionStatistics(bad, info, publishedNull, 42, 200, SCRATCH_INPUTS)).toThrow(
+      /different held-out seeds than biological/
+    );
+  });
+
+  it('throws when a graph has a non-finite movementScore', () => {
+    const { raw, info, publishedNull } = buildFixture();
+    const badGraphs = raw.graphs.map((g, i) => (i === 0 ? { ...g, movementScore: [NaN, 0, 0] } : g));
+    const bad = { ...raw, graphs: badGraphs };
+    expect(() => buildInterventionStatistics(bad, info, publishedNull, 42, 200, SCRATCH_INPUTS)).toThrow(
+      /is not a finite number/
+    );
+  });
+
+  it('throws when there is not exactly one graph of kind P', () => {
+    const { raw, publishedNull } = buildFixture();
+    const cIds = ['C000', 'C001', 'C002', 'C003'];
+    const mIds = ['M1000', 'M1001', 'M1002', 'M1003'];
+    const mqIds = ['MQ2000', 'MQ2001', 'MQ2002', 'MQ2003'];
+    // Mislabel P's kind as C in the index -- zero graphs now have kind 'P'.
+    const info = infoFor([
+      ['P', 'C'],
+      ['Q', 'Q'],
+      ...cIds.map((id) => [id, 'C'] as const),
+      ...mIds.map((id) => [id, 'M'] as const),
+      ...mqIds.map((id) => [id, 'MQ'] as const)
+    ]);
+    expect(() => buildInterventionStatistics(raw, info, publishedNull, 42, 200, SCRATCH_INPUTS)).toThrow(
+      /expected exactly one graph of kind "P"/
+    );
+  });
+});
+
+describe('runInterventionReport (CLI layer)', () => {
+  const seeds = [30001, 30002, 30003];
+  const SOURCE_SHA = 'x'.repeat(64);
+
+  const writeFixtureFiles = (root: string, biologicalScore: number, publishedBiologicalScore: number) => {
+    const graphs = [
+      { id: 'P', kind: 'P', score: 10 },
+      { id: 'Q', kind: 'Q', score: 8 },
+      { id: 'C000', kind: 'C', score: 1 },
+      { id: 'M1000', kind: 'M', score: 2 },
+      { id: 'MQ2000', kind: 'MQ', score: 1 }
+    ];
+    const authored: NullGraphListEvaluationRaw = {
+      version: 1,
+      sourceGraphSha256: SOURCE_SHA,
+      seeds: { start: 30001, count: seeds.length },
+      ticks: 20,
+      substeps: 4,
+      decoder: 'authored',
+      biological: {
+        heldOutSeeds: seeds,
+        movementScore: seeds.map(() => biologicalScore),
+        foodPickups: [0, 0, 0],
+        hazardContacts: [0, 0, 0]
+      },
+      graphs: graphs.map((g) => ({
+        id: g.id,
+        gzipSha256: `gz-${g.id}`.padEnd(64, '0'),
+        binarySha256: 'z'.repeat(64),
+        heldOutSeeds: seeds,
+        movementScore: seeds.map(() => g.score),
+        foodPickups: [0, 0, 0],
+        hazardContacts: [0, 0, 0]
+      })),
+      host: { arch: 'arm64', node: 'v22.0.0' }
+    };
+    writeFileSync(join(root, 'authored.json'), JSON.stringify(authored));
+
+    const index = {
+      sourceArtifact: 'src.bin.gz',
+      sourceSha256: SOURCE_SHA,
+      entries: graphs.map((g) => ({ id: g.id, kind: g.kind, gzipSha256: `gz-${g.id}`.padEnd(64, '0') }))
+    };
+    writeFileSync(join(root, 'index.json'), JSON.stringify(index));
+
+    const publishedNull = {
+      biological: { score: publishedBiologicalScore },
+      rewired: Array.from({ length: 20 }, (_, i) => ({ score: -5 + i * 0.1 })),
+      sourceGraphSha256: SOURCE_SHA,
+      seeds: { start: 30001, count: seeds.length },
+      ticks: 20
+    };
+    writeFileSync(join(root, 'null.json'), JSON.stringify(publishedNull));
+  };
+
+  const argsFor = (root: string, overrides: Partial<InterventionReportArgs> = {}): InterventionReportArgs => ({
+    authored: join(root, 'authored.json'),
+    index: join(root, 'index.json'),
+    publishedNull: join(root, 'null.json'),
+    out: join(root, 'nested', 'statistics.json'),
+    bootstrapSeed: 42,
+    bootstrapResamples: 200,
+    allowReproductionMismatch: false,
+    ...overrides
+  });
+
+  it('creates the output directory if it does not exist (mkdir before write)', () => {
+    const root = mkdtempSync(join(tmpdir(), 'intervention-report-cli-mkdir-'));
+    writeFixtureFiles(root, 0, 0);
+    const { out } = runInterventionReport(argsFor(root));
+    expect(JSON.parse(readFileSync(out, 'utf8')).biologicalReproduction.matches).toBe(true);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('records sha256 of each input file under statistics.inputs', () => {
+    const root = mkdtempSync(join(tmpdir(), 'intervention-report-cli-shas-'));
+    writeFixtureFiles(root, 0, 0);
+    const { statistics } = runInterventionReport(argsFor(root));
+    expect(statistics.inputs.authoredSha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(statistics.inputs.indexSha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(statistics.inputs.publishedNullSha256).toMatch(/^[0-9a-f]{64}$/);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('refuses to write when the biological reproduction check fails (fail-closed by default)', () => {
+    const root = mkdtempSync(join(tmpdir(), 'intervention-report-cli-repro-fail-'));
+    writeFixtureFiles(root, 0, 999); // computed 0 != published 999
+    expect(() => runInterventionReport(argsFor(root))).toThrow(/biological reproduction check failed/);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('writes anyway when --allow-reproduction-mismatch is set, for diagnosis', () => {
+    const root = mkdtempSync(join(tmpdir(), 'intervention-report-cli-repro-allow-'));
+    writeFixtureFiles(root, 0, 999);
+    const { statistics } = runInterventionReport(argsFor(root, { allowReproductionMismatch: true }));
+    expect(statistics.biologicalReproduction.matches).toBe(false);
+    rmSync(root, { recursive: true, force: true });
   });
 });
