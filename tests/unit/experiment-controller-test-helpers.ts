@@ -6,7 +6,7 @@ import type { ArenaManifest, TrainedReadoutLoadResult } from '../../src/lib/expe
 import type { RewiringNullLoadResult } from '../../src/lib/experiment/rewiringNull';
 import type { NullExplanationLoadResult } from '../../src/lib/experiment/nullExplanation';
 import type { PathwayInterventionsLoadResult } from '../../src/lib/experiment/pathwayInterventions';
-import type { RepertoireNullLoadResult } from '../../src/lib/atlas/repertoire';
+import type { RepertoireNullLoadResult } from '../../src/lib/experiment/repertoireNull';
 import type { ExperimentStatus } from '../../src/lib/experiment/state';
 import type { DecoderKind } from '../../src/lib/worker/protocol';
 import { createPublicDataFetch, FakeNeuralWorker } from '../helpers/fake-worker';

@@ -13,7 +13,7 @@ import {
 import { loadRewiringNull, type RewiringNullLoadResult } from './rewiringNull';
 import { loadNullExplanation, type NullExplanationLoadResult } from './nullExplanation';
 import { loadPathwayInterventions, type PathwayInterventionsLoadResult } from './pathwayInterventions';
-import { loadRepertoireNull, type RepertoireNullLoadResult } from '../atlas/repertoire';
+import { loadRepertoireNull, type RepertoireNullLoadResult } from './repertoireNull';
 import { buildGraphBufferForMode, createWorkerAgentBinding } from './bindings';
 import { ExperimentRunner, isNotInitializedRejection, type ExperimentTelemetry } from './runner';
 import { transition, type ExperimentStatus } from './state';

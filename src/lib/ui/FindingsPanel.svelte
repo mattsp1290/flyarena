@@ -4,7 +4,7 @@
   import type { RewiringNullLoadResult } from '../experiment/rewiringNull';
   import type { NullExplanationLoadResult } from '../experiment/nullExplanation';
   import type { PathwayInterventionsLoadResult } from '../experiment/pathwayInterventions';
-  import type { RepertoireNullLoadResult } from '../atlas/repertoire';
+  import type { RepertoireNullLoadResult } from '../experiment/repertoireNull';
   import { buildFindingSteps, findingStepStatusLabel, type FindingStep } from '../findings/steps';
 
   /**
@@ -140,11 +140,26 @@
           {#if step.id === 'behavior-repertoire'}
             <p class="see-also">
               {#if step.status === 'ok'}
-                See the full comparison, including the occupancy map and audit table, in the
-                <a href="#atlas">behavior atlas</a>.
-              {:else}
+                <!-- A dual review (Important) caught this claiming content
+                     the atlas view does not show -- `Atlas.svelte` renders
+                     only the one-line comparison and a "Full report" link;
+                     the occupancy map and per-graph audit table exist only
+                     in `docs/behavior-repertoire-null-report.md` (see
+                     `repertoireNull.ts`'s own doc comment: that detail is
+                     "intentionally not carried into this browser-side
+                     shape"). -->
+                See the one-line comparison in the <a href="#atlas">behavior atlas</a>; the occupancy map and
+                per-graph audit table are in the full report (linked below).
+              {:else if step.status === 'missing' || step.status === 'loading'}
                 Once published, this step will compare the measured topology's behavior repertoire against the
                 rewired null. See the <a href="#atlas">behavior atlas</a> in the meantime.
+              {:else}
+                <!-- `unavailable`/`invalid`: the artifact *is* published but
+                     failed to load or verify -- the step's own status line
+                     above already says so; this line only adds the atlas
+                     link, not a "not yet published" claim that would be
+                     false here (a maintainability review, Suggestion). -->
+                See the <a href="#atlas">behavior atlas</a> in the meantime.
               {/if}
             </p>
           {/if}

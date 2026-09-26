@@ -36,12 +36,9 @@ import {
   type PathwayInterventionsLoadResult,
   type PathwayInterventionsTrainedCategory
 } from '../experiment/pathwayInterventions';
-import type { RepertoireNullLoadResult } from '../atlas/repertoire';
-import { COVERAGE_EDGES, TURN_EDGES } from '../atlas/types';
+import type { RepertoireNullLoadResult } from '../experiment/repertoireNull';
+import { CELL_COUNT } from '../atlas/types';
 import { githubDocUrl } from '../ui/links';
-
-/** The atlas's fixed coverage x turning grid size — never a bare numeric literal in a step sentence (see `buildBehaviorRepertoireStep`). */
-const TOTAL_CELLS = (COVERAGE_EDGES.length - 1) * (TURN_EDGES.length - 1);
 import { describeTrainedCategory, formatPercentile, formatRho } from './format';
 
 /**
@@ -510,14 +507,31 @@ const buildBehaviorRepertoireStep = (inputs: BuildFindingStepsInputs): FindingSt
   const robustnessClause = repertoireRobustness.robust
     ? `robust across all ${seeds.length} search seeds`
     : `not robust across search seeds (${seeds.map((seed) => `seed ${seed}: ${repertoireRobustness.perSeed[seed]}`).join(', ')})`;
-  // `TOTAL_CELLS` (never a bare `36` literal — the template-lint test below
+  // `primary.tie` (a maintainability review, Suggestion): validated by the
+  // loader but previously never surfaced anywhere -- a future run whose
+  // "typical" category is only "typical" because of a degenerate rewired
+  // distribution (the predeclared tie rule) would otherwise read as an
+  // ordinary typical result, with no hint that either metric's rewired
+  // distribution happened to equal biological exactly.
+  const tieSuffix = primary.tie ? ' (tie)' : '';
+  // `CELL_COUNT` (never a bare `36` literal — the template-lint test below
   // forbids a hard-coded numeric literal in this file's own source): the
-  // atlas's fixed 6x6 coverage x turning grid (`COVERAGE_EDGES`/`TURN_EDGES`,
-  // `src/lib/atlas/types.ts`), not a field this artifact itself carries.
+  // atlas's fixed 6x6 coverage x turning grid (`src/lib/atlas/types.ts`),
+  // not a field this artifact itself carries.
+  //
+  // `primary.rewiredDistribution.occupied.n` (a maintainability review,
+  // Suggestion), not `search.rewiredCount` — the sample size printed next
+  // to a median should be the size of the sample that median was actually
+  // taken over, matching `repertoire-report.ts`'s own report (which prints
+  // its measured `rewiredGraphCountAtPrimary`, never the study-wide count,
+  // in this exact spot). Only one trailing "under this model." (a
+  // maintainability review, Suggestion: an earlier version also opened
+  // with "this model's", stating the same disclosure twice).
   const sentence =
-    `Under this model's shipped MAP-Elites search, biological occupies ${primary.bio.occupied} of ${TOTAL_CELLS} ` +
-    `behavior cells against a rewired median of ${primary.rewiredDistribution.occupied.p50} (n=${search.rewiredCount}) — ` +
-    `${primary.category} at search seed ${search.primarySearchSeed}, ${robustnessClause}, under this model.`;
+    `Under the shipped MAP-Elites search, biological occupies ${primary.bio.occupied} of ${CELL_COUNT} ` +
+    `behavior cells against a rewired median of ${primary.rewiredDistribution.occupied.p50} ` +
+    `(n=${primary.rewiredDistribution.occupied.n}) — ${primary.category}${tieSuffix} at search seed ` +
+    `${search.primarySearchSeed}, ${robustnessClause}, under this model.`;
   return { ...base, status: 'ok', sentence };
 };
 

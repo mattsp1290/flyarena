@@ -12,7 +12,7 @@
   import type { RewiringNullLoadResult } from './lib/experiment/rewiringNull';
   import type { NullExplanationLoadResult } from './lib/experiment/nullExplanation';
   import type { PathwayInterventionsLoadResult } from './lib/experiment/pathwayInterventions';
-  import type { RepertoireNullLoadResult } from './lib/atlas/repertoire';
+  import type { RepertoireNullLoadResult } from './lib/experiment/repertoireNull';
   import { ExperimentController } from './lib/experiment/controller';
   import type { ExperimentRunner, ExperimentTelemetry } from './lib/experiment/runner';
   import type { ExperimentStatus } from './lib/experiment/state';

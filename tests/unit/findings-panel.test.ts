@@ -12,7 +12,7 @@ import {
   type PathwayInterventionsArtifact,
   type PathwayInterventionsLoadResult
 } from '../../src/lib/experiment/pathwayInterventions';
-import { loadRepertoireNull, type RepertoireNullArtifact, type RepertoireNullLoadResult } from '../../src/lib/atlas/repertoire';
+import { loadRepertoireNull, type RepertoireNullArtifact, type RepertoireNullLoadResult } from '../../src/lib/experiment/repertoireNull';
 import { createPublicDataFetch } from '../helpers/fake-worker';
 
 /**
