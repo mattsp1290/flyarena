@@ -193,15 +193,32 @@ Every recorded deploy entry below should end with a structured marker pair,
 each on its own line, with no other text on that line:
 
 ```text
-Release: <release id, e.g. 20260924T141451Z-e994aaab005c>
-Commit: <short sha the release was built from, e.g. bc10c22>
+Release: RELEASE_ID
+Commit: SHORT_SHA
 ```
 
-`deploy-lock.sh` parses only `Release:` lines (`Commit:` is for a human
-reader correlating the release id back to source); it always uses the last
-one in the file. Add a fresh `Release:`/`Commit:` pair to every new deploy
-entry -- never edit an old one in place, so this file stays an append-only
-log the guard can trust.
+`RELEASE_ID` is the exact shape `deploy.sh` generates -- `date -u
++%Y%m%dT%H%M%SZ` (8 digits, `T`, 6 digits, `Z`), a dash, then 12 lowercase
+hex characters (`node -e 'console.log(require("node:crypto").randomBytes(6).toString("hex"))'`)
+-- and the exact shape `deploy-lock.sh`'s parser now requires (see "Deploy
+lock and `Release:` marker" above); `SHORT_SHA` is a short git commit hash.
+For example, the anchor entry above uses `20260924T141451Z-e994aaab005c`
+and `bc10c22`.
+
+(This template line is deliberately written as `RELEASE_ID`/`SHORT_SHA`,
+never as a line starting with a real-id-shaped `Release: ...` token: a
+previous version of this section used the real anchor value as its own
+example, which `deploy-lock.sh`'s `grep -oE '^Release: ...'` + `tail -n1`
+parser picked up as though it were the actual last marker -- since it
+appeared later in the file than the real one -- and made every guarded
+deploy abort as a false "unrecorded deploy." Keep any future example in
+this non-matching placeholder form.)
+
+`deploy-lock.sh` parses only `Release:` lines matching the exact id shape
+above (`Commit:` is for a human reader correlating the release id back to
+source); it always uses the last one in the file. Add a fresh
+`Release:`/`Commit:` pair to every new deploy entry -- never edit an old one
+in place, so this file stays an append-only log the guard can trust.
 
 ### Rollback orchestration (verification/smoke failure)
 
