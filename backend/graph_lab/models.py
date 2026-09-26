@@ -38,7 +38,16 @@ NEURON_COUNT = 1008
 
 MAX_REWIRED_SEED = 499
 
-GRAPH_PATTERN = re.compile(r"^(biological|disconnected|rewired:(\d{1,3}))$")
+# `\Z` (absolute end of string), never a bare `$`: Python's `$` also
+# matches immediately before a single trailing "\n", so `$` alone would let
+# "biological\n" (or "rewired:5\n") through this check while `mode` still
+# carries the trailing newline into the job -- and `graphFromTaskMode` on
+# the Node side does an exact `===` string comparison against the literal
+# `'biological'`, which a value with a stray trailing newline would fail,
+# silently falling through to the `disconnected` branch instead of erroring.
+# Verified empirically before this fix: `GRAPH_PATTERN.match("biological\n")`
+# matched with a bare `$`.
+GRAPH_PATTERN = re.compile(r"\A(biological|disconnected|rewired:(\d{1,3}))\Z")
 
 
 def validate_graph_id(value: str) -> str:
@@ -68,7 +77,7 @@ def _validate_unique_indices(indices: list[int], *, min_len: int, max_len: int, 
 class LesionJobRequest(BaseModel):
     """`kind: "lesion"` -- `02-job-engines.md`'s lesion sweep bounds."""
 
-    model_config = ConfigDict(extra="forbid", strict=True, populate_by_name=True)
+    model_config = ConfigDict(extra="forbid", strict=True)
 
     kind: Literal["lesion"]
     graph: str
@@ -94,7 +103,7 @@ class LesionJobRequest(BaseModel):
 class AtlasJobRequest(BaseModel):
     """`kind: "atlas"` -- `02-job-engines.md`'s atlas search bounds."""
 
-    model_config = ConfigDict(extra="forbid", strict=True, populate_by_name=True)
+    model_config = ConfigDict(extra="forbid", strict=True)
 
     kind: Literal["atlas"]
     graph: str
@@ -124,7 +133,7 @@ class SwapsetJobRequest(BaseModel):
     """`kind: "swapset"` -- `02-job-engines.md`'s swap-set intervention bounds.
     The base graph is always `biological` (the plan does not offer a choice)."""
 
-    model_config = ConfigDict(extra="forbid", strict=True, populate_by_name=True)
+    model_config = ConfigDict(extra="forbid", strict=True)
 
     kind: Literal["swapset"]
     graph: Literal["biological"] = "biological"

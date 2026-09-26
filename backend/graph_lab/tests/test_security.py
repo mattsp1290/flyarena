@@ -219,6 +219,20 @@ class GraphIdValidationTests(unittest.TestCase):
             response = client.post("/api/graph/v1/jobs", json=body, headers=HEADERS)
             self.assertEqual(response.status_code, 422)
 
+    def test_rejects_a_trailing_newline(self):
+        """Python's bare `$` matches immediately before a trailing "\\n",
+        so a naive `^...$` pattern would accept "biological\\n" -- which
+        would then silently mismatch the Node side's exact `===`
+        `'biological'` comparison and fall through to a different graph
+        entirely. `GRAPH_PATTERN` uses `\\A`/`\\Z` specifically to close
+        this."""
+        app = make_app()
+        with TestClient(app) as client:
+            for graph in ("biological\n", "rewired:5\n"):
+                body = dict(LESION_BODY, graph=graph)
+                response = client.post("/api/graph/v1/jobs", json=body, headers=HEADERS)
+                self.assertEqual(response.status_code, 422, graph)
+
     def test_every_closed_set_member_passes_validation_through_the_real_default_runner(self):
         """Uses the real `default_runner` (not a test fake): `biological`/
         `disconnected` pass validation and dispatch (202) -- `rewired:*`
