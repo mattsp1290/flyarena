@@ -19,6 +19,10 @@
     "sha256": "e33e299148ca9975ead56cacc77844ae374ac4d98f62f0a59f2052e04b16ffd9"
   },
   "outputPopulationCount": 3,
+  "pathwayInterventions": {
+    "artifact": "pathway-interventions-v1.json",
+    "sha256": "6c789044d58b2a242fa8ca4c863a6a0d2bf43a494467fa5db29356f31962ff3b"
+  },
   "positions": {
     "artifact": "malecns-arena-v1.positions.json",
     "coverage": {
