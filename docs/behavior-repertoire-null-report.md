@@ -186,5 +186,5 @@ against the predeclared categories above.
 - `sources.evaluatedSha256`: `a1f18138a26f64fe569a0ca8a0aad4b01ea4f2a32089e088db88079932682ba5`
 - `sources.atlasSha256`: `3cf39f80d017655a425d89416f989a093474a6628d2221eb91c839e36033b276`
 - `sources.graphsIndexSha256`: `c887b555c559be56ef3b7c733609a5b672bd4e7e7db5ad3f2c23d1591574f812`
-- Producer: `scripts/atlas/repertoire-report.ts`, sourceSha256 `57a8a76edf038e4843b8e6cb4d99ccee6d374e664de1dfe0f4a4c6575cd98971` (59 files)
+- Producer: `scripts/atlas/repertoire-report.ts`, sourceSha256 `1acf3036f5d4cd85bd0dfa4ecde7e0227e4eee740fa82f85d949dd094e028585` (63 files)
 - Host: arm64 / node v22.22.3
