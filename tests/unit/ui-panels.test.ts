@@ -497,7 +497,7 @@ describe('LedgerPanel', () => {
     // (2 and 100 here), not a hardcoded "500" — regression coverage for the
     // dual review finding that an earlier version hardcoded these numbers.
     const figcaption = container.querySelector('figcaption');
-    expect(figcaption).toHaveTextContent(/ranks at the 0\.0% percentile.*among 2 degree-preserving rewirings/i);
+    expect(figcaption).toHaveTextContent(/ranks at the 0\.0th percentile.*among 2 degree-preserving rewirings/i);
     expect(figcaption).toHaveTextContent(/opponent parked/i);
     // Thermo review I1: the static disclaimer is visible in-product, not
     // only in the linked report.

@@ -87,7 +87,7 @@ describe('NullHistogram', () => {
     // actual `null.n`/`seeds.count` (3 and 100 here) — this fixture
     // deliberately uses n=3, not 500, so a hardcoded "500" would fail this.
     expect(figcaption).toHaveTextContent(
-      'Biological ranks at the 0.0% percentile (0% = lowest score, 100% = highest) among 3 degree-preserving ' +
+      'Biological ranks at the 0.0th percentile (0% = lowest score, 100% = highest) among 3 degree-preserving ' +
         'rewirings (authored, opponent parked, 100 held-out seeds).'
     );
     // Thermo review I1: the static disclaimer must be visible in-product
@@ -120,7 +120,7 @@ describe('NullHistogram', () => {
   it('formats a nonzero percentile correctly', () => {
     const { container } = render(NullHistogram, { data: { ...fixture, bioPercentile: 0.337 } });
     const figcaption = container.querySelector('figcaption');
-    expect(figcaption).toHaveTextContent('Biological ranks at the 33.7% percentile');
+    expect(figcaption).toHaveTextContent('Biological ranks at the 33.7th percentile');
     expect(figcaption).toHaveTextContent('among 3 degree-preserving rewirings');
   });
 
@@ -130,7 +130,7 @@ describe('NullHistogram', () => {
     expect(svg).toBeTruthy();
     expect(svg).toHaveAttribute(
       'aria-label',
-      'Biological ranks at the 0.0% percentile (0% = lowest score, 100% = highest) among 3 degree-preserving ' +
+      'Biological ranks at the 0.0th percentile (0% = lowest score, 100% = highest) among 3 degree-preserving ' +
         'rewirings (authored, opponent parked, 100 held-out seeds). The "authored" decoder is a fixed, ' +
         'hand-written mapping — not biology and not trained. This is a descriptive comparison within this ' +
         'model, not a claim that any topology is better or worse.'

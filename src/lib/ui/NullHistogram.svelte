@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { RewiringNullArtifact } from '../experiment/rewiringNull';
   import { githubDocUrl } from './links';
+  import { formatPercentile } from '../findings/format';
 
   /**
    * WP4: pure SVG histogram of the authored-decoder rewiring null
@@ -135,7 +136,13 @@
     ].filter((marker): marker is Marker => marker !== undefined)
   );
 
-  const percentileLabel = $derived(`${(data.bioPercentile * 100).toFixed(1)}%`);
+  /**
+   * WP1 of `.agents/plans/findings-tour`: switched from a bare `…%` label to
+   * the shared `formatPercentile` (`src/lib/findings/format.ts`) so this
+   * field reads identically here and in the Findings panel's step 1
+   * sentence — both render `rewiringNull.data.bioPercentile` verbatim.
+   */
+  const percentileLabel = $derived(formatPercentile(data.bioPercentile));
 
   /**
    * Thermo-nuclear review (Important, "public honesty gap"): the earlier
@@ -153,7 +160,7 @@
    * describing the wrong run.
    */
   const captionSentence = $derived(
-    `Biological ranks at the ${percentileLabel} percentile (0% = lowest score, 100% = highest) ` +
+    `Biological ranks at the ${percentileLabel} (0% = lowest score, 100% = highest) ` +
       `among ${data.null.n} degree-preserving rewirings (${data.condition}, ${data.seeds.count} held-out seeds).`
   );
 

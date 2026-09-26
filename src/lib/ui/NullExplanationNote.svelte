@@ -7,6 +7,7 @@
     type PathwayInterventionsTrainedCategory
   } from '../experiment/pathwayInterventions';
   import { githubDocUrl } from './links';
+  import { formatPercentile } from '../findings/format';
 
   /**
    * WP4 of `.agents/plans/null-explanation` (`04-ledger-note.md`): the
@@ -134,17 +135,6 @@
   const leadSentence = $derived(
     `Biological's low score lines up with ${qualifyingMetricLines.length} metric${qualifyingMetricLines.length === 1 ? '' : 's'} that fall outside the range seen across the graph's ${rewiringCount} rewired versions:`
   );
-
-  /**
-   * Single shared formatter (thermo-maintainability review, carried-over
-   * correctness Suggestion) for every percentile label this note renders —
-   * an earlier version hand-wrote "0th percentile" in the mirrored-decoder
-   * clause's early-return branch while the generic branch below built
-   * "0.0th percentile" for the same value via a separate inline formatter,
-   * an inconsistent label for the same number depending on which branch
-   * happened to render it.
-   */
-  const formatPercentile = (value: number): string => `${(value * 100).toFixed(1)}th percentile`;
 
   /**
    * States the mirrored decoder-convention check's result (`variants.flipBoth`,
