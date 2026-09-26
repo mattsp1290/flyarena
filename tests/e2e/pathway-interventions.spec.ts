@@ -24,7 +24,7 @@ test.describe('model ledger and provenance (pathway interventions)', () => {
     const ledgerRow = (term: string) => page.locator('.ledger li', { hasText: term });
     await expect(ledgerRow('Pathway intervention test')).toContainText('Computed (offline)');
 
-    const detail = page.locator('.null-explanation-detail');
+    const detail = page.locator('.pathway-interventions-detail');
     await expect(detail).toContainText(/tested under this model/i);
     // The real shipped artifact's own category/modifier/trained result —
     // not a hardcoded placeholder (mirrors arena.spec.ts's own
@@ -73,6 +73,35 @@ test.describe('pathway-interventions hash-mismatch integrity check', () => {
     await startOrResumeButton(page).click();
     await waitForTick(page, 10);
     await expect(statusRegion(page)).toHaveText('running');
+  });
+
+  test('shows the pathway-intervention sentence even when the null-explanation note itself fails verification (independent loads, thermo-methodology review)', async ({
+    page
+  }) => {
+    const original = readFileSync(resolve(publicDataDir, 'null-explanation-v1.json'));
+    const tampered = Buffer.from(original);
+    tampered[10] ^= 0xff;
+
+    await page.route('**/data/null-explanation-v1.json', (route) =>
+      route.fulfill({ status: 200, contentType: 'application/json', body: tampered })
+    );
+
+    await page.goto('/');
+    await waitForReady(page);
+
+    // The explanation note fails verification...
+    await expect(page.locator('.ledger')).toContainText(/explanation failed verification/i);
+    await expect(page.locator('.null-explanation-detail')).toHaveCount(0);
+
+    // ...but the pathway-interventions sentence (a wholly independent load)
+    // still renders, with its own report link.
+    const detail = page.locator('.pathway-interventions-detail');
+    await expect(detail).toContainText(/tested under this model/i);
+    await expect(detail).toContainText(/the pathway-supported category holds/i);
+    await expect(detail.getByRole('link', { name: /intervention report/i })).toHaveAttribute(
+      'href',
+      'https://github.com/mattsp1290/flyarena/blob/main/docs/pathway-interventions-report.md'
+    );
   });
 
   test('a missing pathwayInterventions manifest entry hides the sentence entirely, with no failure message, while the explanation note keeps working', async ({

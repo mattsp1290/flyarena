@@ -1,11 +1,10 @@
-import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import { requireNonNegativeInt, requirePositiveInt, requireValue } from '../training/cli';
-import { atomicWriteFileSync, sha256Hex } from '../training/fsio';
+import { atomicWriteFileSync, gitRev, sha256Hex } from '../training/fsio';
 import { CEM_CONFIG_FIELDS, isEmptyCemConfig, readRunDir } from '../training/run-dir';
 import { runCliMain, runMetaPathFor, runShardedEvaluation, toGraphRaw, type NullGraphRaw } from './null-evaluate';
 import type { NullSeedResult, NullWorkerMessage } from './null-worker';
@@ -383,14 +382,6 @@ export interface NullTrainedEvaluationRaw {
   readonly cemConfigWarnings: readonly string[];
 }
 
-/** `git rev-parse HEAD`, `null` on any failure (not a git checkout, `git` missing) -- informational, matches `training/src/flyarena_training/cli.py`'s `_git_rev` convention. */
-export const gitRev = (): string | null => {
-  try {
-    return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoRoot, encoding: 'utf8' }).trim();
-  } catch {
-    return null;
-  }
-};
 
 /**
  * `run-dir.ts`'s `CEM_CONFIG_FIELDS` plus `ticks` (T -- written by
@@ -514,7 +505,7 @@ export const assembleRaw = (
     host: { arch: process.arch, node: process.version },
     d: readBundleD(tasks[0].armBundlePath),
     bigqMergeCommit: BIGQ_MERGE_COMMIT,
-    evaluatorGitRev: gitRev(),
+    evaluatorGitRev: gitRev(repoRoot),
     cemConfig,
     cemConfigWarnings
   };
@@ -571,7 +562,9 @@ const main = runCliMain('null-trained-evaluate', 'runs', parseNullTrainedEvaluat
  * A dynamic (not static top-level) import: `./null-trained-evaluate-graph-list.ts`
  * imports several of this file's own exports (`repoRoot`, `DEFAULT_*`,
  * `findSingleSubdirectory`, `readBundleD`/`assertMatchingD`,
- * `reconcileCemConfig`, `gitRev`) -- a static top-of-file import here would
+ * `reconcileCemConfig` -- `gitRev` now lives in `../training/fsio.ts`,
+ * imported directly by both files, see that module's own doc comment) --
+ * a static top-of-file import here would
  * create a load-time circular import (this file's own module-level `const`s
  * would still be `undefined` while that module's top-level code runs). The
  * dynamic import below only resolves once `dispatchMain` actually runs,

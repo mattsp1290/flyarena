@@ -43,8 +43,15 @@ const isAuthoredCategory = (value: unknown): value is PathwayInterventionsAuthor
 const isTrainedCategory = (value: unknown): value is PathwayInterventionsTrainedCategory =>
   value === 'pathway-supported' || value === 'edge-class-effect' || value === 'no-specific-effect';
 
-/** This study's fixed trainer seeds — `scripts/null/intervention-report-trained.ts`'s `P_TRAINER_SEEDS`, restated here (a Node-only module, not importable into the browser bundle). */
-const P_TRAINER_SEEDS = ['101', '202', '303'] as const;
+/**
+ * This study's fixed trainer seeds — `scripts/null/intervention-report-trained.ts`'s
+ * `P_TRAINER_SEEDS`, restated here as strings (a Node-only module, not
+ * importable into the browser bundle). Exported (thermo-maintainability
+ * review, Suggestion) so `NullExplanationNote.svelte` — already a consumer
+ * of this module's types — can import this constant too, instead of
+ * hand-copying it a third time.
+ */
+export const P_TRAINER_SEEDS = ['101', '202', '303'] as const;
 
 export interface PathwayInterventionsArtifact {
   readonly version: number;

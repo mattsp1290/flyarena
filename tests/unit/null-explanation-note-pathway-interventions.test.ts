@@ -127,3 +127,71 @@ describe('NullExplanationNote: pathway-interventions tested-outcome sentence', (
     expect(screen.queryByText(/tested under this model/i)).not.toBeInTheDocument();
   });
 });
+
+/**
+ * Thermo-methodology review, Important: `pathwayInterventions` is a wholly
+ * separate load from `nullExplanation` (its own artifact, its own manifest
+ * entry, its own cross-checks against the manifest rather than against any
+ * live-loaded `NullExplanationLoadResult`) — the pathway sentence/link/
+ * invalid-state must render regardless of `nullExplanation`'s own status.
+ * An earlier version nested the whole pathway block inside
+ * `nullExplanation?.status === 'ok'`, so a failed/loading/absent
+ * explanation silently hid an otherwise successfully verified
+ * pathway-interventions result too.
+ */
+describe('NullExplanationNote: pathwayInterventions renders independently of nullExplanation status', () => {
+  const pathwayOk: PathwayInterventionsLoadResult = {
+    status: 'ok',
+    data: {
+      version: 1,
+      sources: { biologicalSha: 'c'.repeat(64), rewiringNullSha: 'a'.repeat(64), nullExplanationSha: 'b'.repeat(64) },
+      authored: { category: 'pathway-supported', channelSpecific: true },
+      trained: {
+        trainedRobust: true,
+        perSeedCategory: { '101': 'no-specific-effect', '202': 'no-specific-effect', '303': 'no-specific-effect' }
+      }
+    }
+  };
+
+  it('shows the sentence and report link when nullExplanation is undefined (still loading)', () => {
+    render(NullExplanationNote, { nullExplanation: undefined, baselinePercentile: 0, rewiringCount: 500, pathwayInterventions: pathwayOk });
+    expect(screen.getByText(/tested under this model/i)).toBeInTheDocument();
+    expect(screen.getByText(/the pathway-supported category holds/i)).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /intervention report/i })).toBeInTheDocument();
+  });
+
+  it('shows the sentence and report link when nullExplanation is "unavailable"', () => {
+    render(NullExplanationNote, {
+      nullExplanation: { status: 'unavailable', reason: 'network error (test)' },
+      baselinePercentile: 0,
+      rewiringCount: 500,
+      pathwayInterventions: pathwayOk
+    });
+    expect(screen.getByText(/explanation could not be loaded/i)).toBeInTheDocument();
+    expect(screen.getByText(/tested under this model/i)).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /intervention report/i })).toBeInTheDocument();
+  });
+
+  it('shows the sentence and report link when nullExplanation is "invalid"', () => {
+    render(NullExplanationNote, {
+      nullExplanation: { status: 'invalid', reason: 'null-explanation artifact sha256 mismatch' },
+      baselinePercentile: 0,
+      rewiringCount: 500,
+      pathwayInterventions: pathwayOk
+    });
+    expect(screen.getByText(/explanation failed verification/i)).toBeInTheDocument();
+    expect(screen.getByText(/tested under this model/i)).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /intervention report/i })).toBeInTheDocument();
+  });
+
+  it('shows the pathway-interventions verification-failure line when nullExplanation is "ok" but pathwayInterventions is "invalid"', () => {
+    render(NullExplanationNote, {
+      nullExplanation: nullExplanationOk,
+      baselinePercentile: 0,
+      rewiringCount: 500,
+      pathwayInterventions: { status: 'invalid', reason: 'pathway-interventions artifact sha256 mismatch' }
+    });
+    expect(screen.getByText(/what biological's low score is associated with/i)).toBeInTheDocument();
+    expect(screen.getByText(/intervention test failed verification/i)).toBeInTheDocument();
+  });
+});

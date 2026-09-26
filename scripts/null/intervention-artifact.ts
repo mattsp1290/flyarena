@@ -113,6 +113,21 @@ export interface PathwayInterventionsSources {
   readonly rewiringNullSha: string;
   readonly nullExplanationSha: string;
   readonly indexSha: string;
+  /**
+   * `git rev-parse HEAD` at the moment the authored (`null-evaluate.ts
+   * --graph-list`) and trained (`null-trained-evaluate.ts --graph-list`)
+   * runs actually executed — `null` when either evaluator ran outside a git
+   * checkout. Thermo-methodology review I2: `producer.sourceSha256` below
+   * is a build-time snapshot of the producer's own dependency files on
+   * disk, not a stamp from the moment either multi-hour simulation run
+   * itself produced its scores; these two fields close that gap. The two
+   * commonly differ (the authored run is re-run closer to publish time than
+   * the trained rescore, which is expensive to redo) — this is expected and
+   * not cross-asserted equal; each is independently meaningful provenance
+   * for its own run.
+   */
+  readonly authoredEvaluatorGitRev: string | null;
+  readonly trainedEvaluatorGitRev: string | null;
   readonly producer: PathwayInterventionsProducer;
 }
 
@@ -316,6 +331,8 @@ export const buildPathwayInterventionsArtifact = (inputs: Readonly<BuildArtifact
       rewiringNullSha,
       nullExplanationSha: inputs.manifestNullExplanationSha,
       indexSha,
+      authoredEvaluatorGitRev: statistics.evaluatorGitRev,
+      trainedEvaluatorGitRev: trained.evaluatorGitRev,
       producer: pathwayInterventionsProducer()
     },
     k: attribution.P.swaps,
@@ -396,11 +413,22 @@ const renderTransferTable = (table: Transfer3x8): string => {
   return [header, divider, ...rows].join('\n');
 };
 
+/**
+ * `00-overview.md`'s "Predeclared outcome categories (authored decoder)"
+ * bullets, quoted byte-verbatim (thermo-methodology review, Suggestion: an
+ * earlier version substituted ASCII `--` for the plan's real em dash and
+ * dropped its mid-sentence `**and**`/`**but**` emphasis — this is now a
+ * direct copy of the plan's own markdown, not a paraphrase). Only the
+ * leading `- ` list-item marker and the bullet label's own bold/colon
+ * styling are supplied by the call site below (`00-overview.md` writes
+ * `- **Pathway supported:** ...`; this record holds everything from
+ * `**Pathway supported:**` onward, unchanged).
+ */
 const AUTHORED_CATEGORY_PROSE: Record<OutcomeCategory, string> = {
-  'pathway-supported': "**Pathway supported**: P's score is at or above the null's 25th percentile and above the 95th percentile of both the C and M distributions.",
-  'edge-class-effect': "**Edge-class effect**: P is at or above the null's 25th percentile and above C's 95th percentile, but at or below M's 95th percentile. Any input->thrust edges of this class help about equally, and the specific optimized edges do not matter.",
-  'generic-rewiring-effect': "**Generic rewiring effect**: P is at or above the null's 25th percentile but at or below C's 95th percentile. Any k swaps help about equally.",
-  'not-supported': "**Not supported**: P stays below the null's 25th percentile."
+  'pathway-supported': "**Pathway supported:** P's score is at or above the null's 25th percentile **and** above the 95th percentile of both the C and M distributions.",
+  'edge-class-effect': "**Edge-class effect:** P is at or above the null's 25th percentile and above C's 95th percentile, **but** at or below M's 95th percentile. Any input→thrust edges of this class help about equally, and the specific optimized edges do not matter.",
+  'generic-rewiring-effect': "**Generic rewiring effect:** P is at or above the null's 25th percentile **but** at or below C's 95th percentile. Any `k` swaps help about equally.",
+  'not-supported': "**Not supported:** P stays below the null's 25th percentile."
 };
 
 const TRAINED_CATEGORY_LABEL: Record<TrainedOutcomeCategory, string> = {
@@ -465,25 +493,16 @@ and CEM-retrained readouts.
 
 ## Method
 
-**Primary -- targeted degree-preserving swaps (P):** starting from the biological graph, repeatedly apply double-edge
-swaps \`(a->b, c->d) -> (a->d, c->b)\` where \`a\` is input-labeled, \`d\` is a thrust-population neuron, and both
-collateral endpoints \`b\` and \`c\` are bridge neurons (neither input nor output assigned). Choose greedily by the
-largest first-order increase of \`T:rightClearance->thrust + T:forwardClearance->thrust\`. Stop when both entries
-reach at least the null's 25th percentile, or at 200 swaps. This preserves in-degree, out-degree, the weight
-multiset, and the presynaptic signs (per-neuron, \`presynapticSigns\`). \`k\` is the number of accepted swaps.
+The interventions below are quoted byte-verbatim from \`.agents/plans/pathway-interventions/00-overview.md\`'s
+"Predeclared interventions and prediction" section (thermo-methodology review, Suggestion: an earlier version of
+this report substituted ASCII \`->\`/\`--\` for the plan's real \`→\`/\`—\` characters and dropped its mid-sentence
+bold emphasis; this section and "Predeclared outcome categories" below are now direct copies).
 
-**Control -- random degree-preserving swaps (C):** 100 graphs, each with exactly \`k\` uniformly random valid
-double-edge swaps anywhere in the graph (seeds 0-99). This tests "any perturbation of this size".
-
-**Control -- class-matched random swaps (M):** 100 graphs, each with exactly \`k\` valid swaps drawn uniformly (not
-greedily) from the same candidate class as P (\`a\` input-labeled, \`d\` thrust, \`b\`/\`c\` bridge), seeds 1000-1099.
-
-**Secondary -- magnitude-matched removal (R):** remove the attributed edges into thrust neurons from the input
-side that carry at least 50% of the first-order transfer. Because the biological graph has none, R is expected
-to be empty. If so, it is reported as not applicable.
-
-**Secondary -- clearance-only targeting (Q):** the same as P, but only \`rightClearance\` and \`forwardClearance\`
-input neurons may be the source \`a\`. This tests channel specificity rather than generic input->thrust wiring.
+- **Primary — targeted degree-preserving swaps (P):** starting from the biological graph, repeatedly apply double-edge swaps \`(a→b, c→d) → (a→d, c→b)\` where \`a\` is input-labeled, \`d\` is a thrust-population neuron, and both collateral endpoints \`b\` and \`c\` are **bridge** neurons (neither input nor output assigned). That keeps the collateral edges added and removed away from the output populations, and every control arm shares the same class restriction. Choose greedily by the largest first-order increase of \`T:rightClearance→thrust + T:forwardClearance→thrust\`. Stop when both entries reach at least the null's 25th percentile, or at 200 swaps. This preserves in-degree, out-degree, the weight multiset, and the presynaptic signs (per-neuron, \`presynapticSigns\`). Record the number of swaps \`k\`.
+- **Control — random degree-preserving swaps (C):** 100 graphs, each with exactly \`k\` uniformly random valid double-edge swaps anywhere in the graph (seeds \`0…99\`), under the same validity rules. This tests "any perturbation of this size".
+- **Control — class-matched random swaps (M):** 100 graphs, each with exactly \`k\` valid swaps drawn **uniformly** (not greedily) from the same candidate class as P (\`a\` input-labeled, \`d\` thrust, \`b\` and \`c\` bridge), seeds \`1000…1099\`. This separates "these specific, optimized edges" from "any edges of this class", and it matches P's collateral-edge class.
+- **Secondary — magnitude-matched removal (R):** remove the attributed edges into thrust neurons from the input side that carry at least 50% of the first-order transfer. Because the biological graph has none, R is expected to be empty. If so, it is reported as not applicable. It is kept only to check the premise.
+- **Secondary — clearance-only targeting (Q):** the same as P, but only \`rightClearance\` and \`forwardClearance\` input neurons may be the source \`a\`. This tests channel specificity rather than generic input→thrust wiring.
 
 ### Predeclared outcome categories (authored decoder)
 
@@ -491,23 +510,17 @@ input neurons may be the source \`a\`. This tests channel specificity rather tha
 - ${AUTHORED_CATEGORY_PROSE['edge-class-effect']}
 - ${AUTHORED_CATEGORY_PROSE['generic-rewiring-effect']}
 - ${AUTHORED_CATEGORY_PROSE['not-supported']}
-- **Channel-specific (modifier, authored decoder only)**: Q (clearance-channel sources only) is above the null's
-  25th percentile and above the 95th percentile of its own size-matched class control MQ: 100 graphs, each with
-  exactly \`k_Q = |Q swaps|\` uniform valid swaps from Q's candidate class, seeds 2000-2099. Q is never compared
-  against the P-sized C or M arms. Q is not evaluated with trained readouts, and this report states this.
+- **Channel-specific (modifier, authored decoder only):** Q (clearance-channel sources only) is above the null's 25th percentile and above the 95th percentile of **its own** size-matched class control MQ: 100 graphs, each with exactly \`k_Q = |Q swaps|\` uniform valid swaps from Q's candidate class, seeds \`2000…2099\`. Q is never compared against the P-sized C or M arms. Q is not evaluated with trained readouts, and the report states this.
 
-Claim language: a positive result means "the net effect of this accepted swap set", not an isolated single-edge
-causal effect.
+Claim language: a positive result means "the net effect of this accepted swap set", not an isolated single-edge causal effect. The report states this.
 
 ### Trained decoder
 
-The same C/M comparisons apply, but the **governing reference** is the freshly trained controls: 5 C graphs
-(C000-C004) and 5 M graphs (M1000-M1004), each at trainer seed 101 -- not the published 500-graph authored null,
-and the authored floor's null-percentile prong is not applied on this side (see the disclosure below for why).
-The published trained null (\`rewiring-null-v1.json\` \`trained\`, 20 full rewirings) is reported for context only
-and does not decide the category. With 5 graphs per arm, the trained cutoff is "above the maximum of that arm's
-5". The result is robust only if all three P trainer seeds (101/202/303) agree on the category, because the
-trained null was trainer-seed-sensitive.
+Trained decoder: the same categories. The **governing reference** is the freshly trained controls: 5 C graphs (C000–C004) and 5 M graphs (M1000–M1004), each at trainer seed 101. The published trained null (\`rewiring-null-v1.json\` \`trained\`, 20 full rewirings) is reported for context only and does not decide the category. With 5 graphs per arm, the trained cutoff is "above the maximum of that arm's 5". The report states that this resolution is coarse. The result is robust only if all three P trainer seeds (101/202/303) agree on the category, because the trained null was trainer-seed-sensitive.
+
+The C/M comparisons above are the same ones the authored side uses; the authored floor's own null-percentile
+prong is not applied on the trained side (the trained null is context-only, not a decisive threshold — see the
+disclosure immediately below, which is this report's own addition, not part of the quoted plan text above).
 
 ${trained.note}
 

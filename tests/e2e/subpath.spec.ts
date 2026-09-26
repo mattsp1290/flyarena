@@ -20,7 +20,7 @@ test('all views work beneath /fly/ with root asset routes deliberately unavailab
   // under this same /fly/-prefixed `dataBaseUrl`) must resolve to its real
   // "ok" tested-outcome sentence here too, not silently 404 against the
   // deliberately-unavailable root /data/ path.
-  await expect(page.locator('.null-explanation-detail')).toContainText(/tested under this model.*the pathway-supported category holds/is);
+  await expect(page.locator('.pathway-interventions-detail')).toContainText(/tested under this model.*the pathway-supported category holds/is);
   await expect(page.getByRole('link',{name:/intervention report/i})).toHaveAttribute('href','https://github.com/mattsp1290/flyarena/blob/main/docs/pathway-interventions-report.md');
   // WP3: `loadPositions` fetches the positions sidecar under this same
   // /fly/ base path — if it fell back to the (deliberately 404ing) root

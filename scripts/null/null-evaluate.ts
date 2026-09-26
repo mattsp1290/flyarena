@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 
 import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import { requireNonNegativeInt, requirePositiveInt, requireValue } from '../training/cli';
-import { atomicWriteFileSync, sha256Hex } from '../training/fsio';
+import { atomicWriteFileSync, gitRev, sha256Hex } from '../training/fsio';
 import {
   readGraphListIndex,
   sortedGraphListEntries,
@@ -708,6 +708,21 @@ export interface NullGraphListEvaluationRaw {
   /** Sorted by `id` ascending — see `sortedGraphListEntries`. */
   readonly graphs: readonly NullGraphListGraphRaw[];
   readonly host: { readonly arch: string; readonly node: string };
+  /**
+   * `git rev-parse HEAD` at the moment this run executed, `null` on any
+   * failure (not a git checkout, `git` missing) — additive (WP4 of
+   * `.agents/plans/pathway-interventions`, thermo-methodology review I2):
+   * this `--graph-list` mode previously stamped no code-identity at all,
+   * unlike `null-trained-evaluate.ts`'s own `evaluatorGitRev`, which is
+   * exactly the gap `intervention-artifact.ts`'s own `producer.sourceSha256`
+   * (a build-time snapshot of the dependency files on disk, not a stamp
+   * from the moment the 30,300-episode authored run itself executed) cannot
+   * substitute for. Scoped to `--graph-list` mode only — `NullEvaluationRaw`
+   * (`--rewired-index` mode, `rewiring-null-v1.json`'s own producer) is
+   * deliberately left unchanged, so no already-published artifact's shape
+   * or bytes are affected by this addition.
+   */
+  readonly evaluatorGitRev: string | null;
 }
 
 export const assembleGraphListRaw = (
@@ -739,7 +754,8 @@ export const assembleGraphListRaw = (
       ? { biological: toGraphRaw(require('biological')), disconnected: toGraphRaw(require('disconnected')) }
       : {}),
     graphs,
-    host: { arch: process.arch, node: process.version }
+    host: { arch: process.arch, node: process.version },
+    evaluatorGitRev: gitRev(repoRoot)
   };
 };
 

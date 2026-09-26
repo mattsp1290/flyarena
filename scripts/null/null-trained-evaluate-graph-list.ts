@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 
 import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import { requireNonNegativeInt, requirePositiveInt, requireValue } from '../training/cli';
-import { atomicWriteFileSync, sha256Hex } from '../training/fsio';
+import { atomicWriteFileSync, gitRev, sha256Hex } from '../training/fsio';
 import { MANIFEST_TRACKED_FIELDS, readRunDir } from '../training/run-dir';
 import { readGraphListIndex, verifyGraphListFiles } from './graph-list-index';
 import { runCliMain, runMetaPathFor, runShardedEvaluation, toGraphRaw } from './null-evaluate';
@@ -16,7 +16,6 @@ import {
   DEFAULT_SHARDS,
   DEFAULT_TICKS,
   findSingleSubdirectory,
-  gitRev,
   readBundleD,
   reconcileCemConfig,
   repoRoot,
@@ -418,7 +417,7 @@ export const assembleInterventionRaw = (
     runs,
     host: { arch: process.arch, node: process.version },
     d: readBundleD(tasks[0].armBundlePath),
-    evaluatorGitRev: gitRev(),
+    evaluatorGitRev: gitRev(repoRoot),
     cemConfig,
     cemConfigWarnings
   };

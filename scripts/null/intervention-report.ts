@@ -438,6 +438,16 @@ export interface InterventionStatistics {
   readonly q: QArmResult;
   readonly host: { readonly arch: string; readonly node: string };
   /**
+   * `raw.evaluatorGitRev` passed through — see `NullGraphListEvaluationRaw.evaluatorGitRev`'s
+   * own doc comment (`null-evaluate.ts`) for why this exists (WP4 of
+   * `.agents/plans/pathway-interventions`, thermo-methodology review I2).
+   * Defaults to `null` (not a throw) when reading an `authored.json`
+   * produced before this field existed — additive, matching this module's
+   * own tolerant-of-older-inputs precedent elsewhere (e.g. `NullEvaluationRaw.decoder`'s
+   * "absent on any file produced before this field existed" convention).
+   */
+  readonly evaluatorGitRev: string | null;
+  /**
    * Present (and `true`) only when `runInterventionReport` wrote this file
    * despite a failed `biologicalReproduction` check, via
    * `--allow-reproduction-mismatch` — never set by `buildInterventionStatistics`
@@ -568,7 +578,8 @@ export const buildInterventionStatistics = (
       qRankAmongMQ,
       channelSpecific
     },
-    host: { arch: raw.host.arch, node: raw.host.node }
+    host: { arch: raw.host.arch, node: raw.host.node },
+    evaluatorGitRev: raw.evaluatorGitRev ?? null
   };
 };
 

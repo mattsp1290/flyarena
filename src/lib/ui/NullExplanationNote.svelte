@@ -1,9 +1,10 @@
 <script lang="ts">
   import type { NullExplanationLoadResult, NullExplanationQualifyingMetric } from '../experiment/nullExplanation';
-  import type {
-    PathwayInterventionsAuthoredCategory,
-    PathwayInterventionsLoadResult,
-    PathwayInterventionsTrainedCategory
+  import {
+    P_TRAINER_SEEDS,
+    type PathwayInterventionsAuthoredCategory,
+    type PathwayInterventionsLoadResult,
+    type PathwayInterventionsTrainedCategory
   } from '../experiment/pathwayInterventions';
   import { githubDocUrl } from './links';
 
@@ -244,9 +245,6 @@
       : ''
   );
 
-  /** The seeds this study tests P at — mirrors `scripts/null/intervention-report-trained.ts`'s `P_TRAINER_SEEDS` (a Node-only module, not importable here). */
-  const PATHWAY_TRAINER_SEEDS = ['101', '202', '303'] as const;
-
   const pathwayTrainedClause = $derived(
     pathwayInterventions?.status === 'ok'
       ? pathwayInterventions.data.trained.trainedRobust
@@ -255,7 +253,7 @@
           // not agree" (thermo review, Suggestion — the per-seed data is
           // already carried on the artifact, and hiding it here would leave
           // a reader with no way to see how the seeds actually diverged).
-          `Under trained readouts, the three trainer seeds do not agree on a category (${PATHWAY_TRAINER_SEEDS.map((seed) => `seed ${seed}: ${pathwayInterventions.data.trained.perSeedCategory[seed]}`).join(', ')}; not robust)`
+          `Under trained readouts, the three trainer seeds do not agree on a category (${P_TRAINER_SEEDS.map((seed) => `seed ${seed}: ${pathwayInterventions.data.trained.perSeedCategory[seed]}`).join(', ')}; not robust)`
       : ''
   );
 
@@ -286,31 +284,6 @@
     <ul class="links">
       <li><a href={NULL_EXPLANATION_REPORT_URL} target="_blank" rel="noreferrer">Full explanation report</a></li>
     </ul>
-
-    <!-- WP4 of `.agents/plans/pathway-interventions`: the tested-outcome
-         sentence, under this same explanation paragraph. `pathwayInterventions`
-         is a wholly separate load from `nullExplanation` above (its own
-         artifact, its own manifest entry) — `'missing'` hides this sentence
-         entirely (nothing was ever shipped); `'unavailable'` and `'invalid'`
-         each show their own honestly-worded message, mirroring every other
-         sidecar artifact in this panel. -->
-    {#if pathwayInterventions?.status === 'ok'}
-      <p class="pathway-interventions-sentence">
-        Tested under this model, with the authored (hand-written) decoder: {PATHWAY_AUTHORED_CLAUSE[pathwayInterventions.data.authored.category]}, and {pathwayChannelSpecificClause}. This authored-decoder result is bound to the hand-written decoder; it is not necessarily the overall finding.
-        {pathwayTrainedClause}.
-      </p>
-      <ul class="links">
-        <li><a href={PATHWAY_INTERVENTIONS_REPORT_URL} target="_blank" rel="noreferrer">Intervention report</a></li>
-      </ul>
-    {:else if pathwayInterventions?.status === 'unavailable'}
-      <p class="error-message">
-        Intervention test could not be loaded: {pathwayInterventions.reason}
-      </p>
-    {:else if pathwayInterventions?.status === 'invalid'}
-      <p class="error-message">
-        Intervention test failed verification: {pathwayInterventions.reason}
-      </p>
-    {/if}
   </div>
 {:else if nullExplanation?.status === 'unavailable'}
   <!-- A fetch/network failure or an unexpected runtime error — not a
@@ -323,6 +296,52 @@
 {:else if nullExplanation?.status === 'invalid'}
   <p class="error-message">
     Explanation failed verification: {nullExplanation.reason}
+  </p>
+{/if}
+
+<!-- WP4 of `.agents/plans/pathway-interventions`: the tested-outcome
+     sentence, in its own box below the explanation note. `pathwayInterventions`
+     is a wholly separate load from `nullExplanation` above (its own
+     artifact, its own manifest entry, its own cross-checks against the
+     manifest rather than against any live-loaded `NullExplanationLoadResult`)
+     — this block is therefore a top-level sibling of the `{#if
+     nullExplanation...}` block above, not nested inside it, so it renders
+     independently of whatever `nullExplanation` itself resolved to
+     (thermo-methodology review, Important — an earlier version nested this
+     entirely inside `nullExplanation?.status === 'ok'`, so a
+     failed/loading/absent explanation silently hid an otherwise
+     successfully verified pathway-interventions result too, contradicting
+     both `controller.ts`'s "attempted unconditionally, independent of
+     whichever status the explanation load itself resolved to" design and
+     this component's own doc comment). `'missing'` hides this block
+     entirely (nothing was ever shipped); `'unavailable'` and `'invalid'`
+     each show their own honestly-worded message, mirroring every other
+     sidecar artifact in this panel. -->
+{#if pathwayInterventions?.status === 'ok'}
+  <!-- `pathway-interventions-detail`, not `null-explanation-detail` (thermo-
+       methodology review, Important fix): this box is a sibling of the
+       explanation box above, not its content, and now that both can be on
+       screen at once (the whole point of the independence fix) a shared
+       class would make `.null-explanation-detail` match two elements —
+       ambiguous for both e2e locators and any future query. Its own rule
+       below (`.pathway-interventions-detail p`) reuses the identical `p`
+       styling `.null-explanation-detail p` already declares. -->
+  <div class="detail-box pathway-interventions-detail">
+    <p>
+      Tested under this model, with the authored (hand-written) decoder: {PATHWAY_AUTHORED_CLAUSE[pathwayInterventions.data.authored.category]}, and {pathwayChannelSpecificClause}.
+    </p>
+    <p>{pathwayTrainedClause}.</p>
+    <ul class="links">
+      <li><a href={PATHWAY_INTERVENTIONS_REPORT_URL} target="_blank" rel="noreferrer">Intervention report</a></li>
+    </ul>
+  </div>
+{:else if pathwayInterventions?.status === 'unavailable'}
+  <p class="error-message">
+    Intervention test could not be loaded: {pathwayInterventions.reason}
+  </p>
+{:else if pathwayInterventions?.status === 'invalid'}
+  <p class="error-message">
+    Intervention test failed verification: {pathwayInterventions.reason}
   </p>
 {/if}
 
@@ -340,7 +359,8 @@
     font-weight: 700;
   }
 
-  .null-explanation-detail p {
+  .null-explanation-detail p,
+  .pathway-interventions-detail p {
     margin: 0.5rem 0;
     color: #cbd8e7;
     font-size: 0.8rem;

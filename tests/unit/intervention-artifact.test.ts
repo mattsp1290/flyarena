@@ -112,7 +112,8 @@ const statisticsFixture = (): InterventionStatistics => ({
   publishedNullFloor: 1.5,
   p: { id: 'P', score: 3.6, percentileInPublishedNull: 0.856, pRankAmongC: 0.01, pRankAmongM: 0.01, category: 'pathway-supported' },
   q: { id: 'Q', score: 3.4, percentileInPublishedNull: 0.816, qRankAmongMQ: 0.01, channelSpecific: true },
-  host: { arch: 'arm64', node: 'v22.0.0' }
+  host: { arch: 'arm64', node: 'v22.0.0' },
+  evaluatorGitRev: 'a'.repeat(40)
 });
 
 const trainedGraphRaw = (id: string, trainerSeed: number, score: number): NullTrainedInterventionGraphRaw => ({
@@ -201,6 +202,17 @@ describe('buildPathwayInterventionsArtifact', () => {
     expect(artifact.interventions.R.applicable).toBe(false);
     expect(artifact.sources.biologicalSha).toBe(SHA('bio'));
     expect(artifact.transferBeforeAfter.biological).toEqual(transfer3x8());
+    // Thermo-methodology review I2: both evaluator revs carried through to
+    // `sources`, independently of each other (never asserted equal -- see
+    // `PathwayInterventionsSources.authoredEvaluatorGitRev`'s own doc comment).
+    expect(artifact.sources.authoredEvaluatorGitRev).toBe('a'.repeat(40));
+    expect(artifact.sources.trainedEvaluatorGitRev).toBe('deadbeef');
+  });
+
+  it('carries a null authoredEvaluatorGitRev through when statistics.json predates the field', () => {
+    const statistics = { ...statisticsFixture(), evaluatorGitRev: null };
+    const artifact = buildPathwayInterventionsArtifact(buildInputs({ statistics }));
+    expect(artifact.sources.authoredEvaluatorGitRev).toBeNull();
   });
 
   it('running twice on the same input is byte-identical (JSON.stringify)', () => {
@@ -370,6 +382,26 @@ describe('renderPathwayInterventionsReportMarkdown', () => {
     expect(markdown).toContain('| yaw |');
     expect(markdown).toContain('| brake |');
   });
+
+  /**
+   * Thermo-methodology review, Suggestion: the predeclared-category quote
+   * must be byte-verbatim against `00-overview.md`, not an ASCII-substituted
+   * paraphrase -- asserts the plan's own real characters (em dash, right
+   * arrow, ellipsis, en dash) and bold emphasis survive into the published
+   * report exactly.
+   */
+  it('quotes the predeclared categories and interventions byte-verbatim, with the plan\'s own unicode characters and bold emphasis', () => {
+    const artifact = buildPathwayInterventionsArtifact(buildInputs());
+    const markdown = renderPathwayInterventionsReportMarkdown(artifact);
+    expect(markdown).toContain("**Pathway supported:** P's score is at or above the null's 25th percentile **and** above the 95th percentile of both the C and M distributions.");
+    expect(markdown).toContain('Any input→thrust edges of this class help about equally');
+    expect(markdown).toContain("**Primary — targeted degree-preserving swaps (P):**");
+    expect(markdown).toContain('`(a→b, c→d) → (a→d, c→b)`');
+    expect(markdown).toContain('seeds `0…99`');
+    expect(markdown).toContain('seeds `1000…1099`');
+    expect(markdown).toContain('seeds `2000…2099`');
+    expect(markdown).toContain('5 C graphs (C000–C004) and 5 M graphs (M1000–M1004)');
+  });
 });
 
 describe('parseIntoArtifactArgs', () => {
@@ -384,6 +416,27 @@ describe('parseIntoArtifactArgs', () => {
 
   it('rejects an unknown flag', () => {
     expect(() => parseIntoArtifactArgs(['--bogus'])).toThrow(/Unknown argument/);
+  });
+
+  // Thermo-maintainability review, Suggestion: `parseIntoArtifactArgs` checks
+  // both write targets (`--out`/`--report-md`) against every one of the six
+  // input flags, plus `--out === --report-md` directly -- thirteen branches
+  // in total. Only `--out` vs `--statistics` had a test; this closes the
+  // remaining twelve.
+  const INPUT_FLAGS = ['--statistics', '--attribution', '--trained', '--index', '--rewiring-null', '--manifest'] as const;
+
+  it.each(INPUT_FLAGS)('rejects --out colliding with %s', (inputFlag) => {
+    expect(() => parseIntoArtifactArgs([inputFlag, 'shared.json', '--out', 'shared.json'])).toThrow(/--out must not overwrite an input file/);
+  });
+
+  it.each(INPUT_FLAGS)('rejects --report-md colliding with %s', (inputFlag) => {
+    expect(() => parseIntoArtifactArgs([inputFlag, 'shared.json', '--report-md', 'shared.json'])).toThrow(/--report-md must not overwrite an input file/);
+  });
+
+  it('rejects --out and --report-md being the same path', () => {
+    expect(() => parseIntoArtifactArgs(['--out', 'same.json', '--report-md', 'same.json'])).toThrow(
+      /--out and --report-md must not be the same path/
+    );
   });
 });
 

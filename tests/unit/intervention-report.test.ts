@@ -380,7 +380,8 @@ describe('buildInterventionStatistics: end-to-end on synthetic data', () => {
       foodPickups: [0, 0, 0],
       hazardContacts: [0, 0, 0]
     })),
-    host: { arch: 'arm64', node: 'v22.0.0' }
+    host: { arch: 'arm64', node: 'v22.0.0' },
+    evaluatorGitRev: null
   });
 
   const infoFor = (
@@ -829,7 +830,8 @@ describe('runInterventionReport (CLI layer)', () => {
         foodPickups: [0, 0, 0],
         hazardContacts: [0, 0, 0]
       })),
-      host: { arch: 'arm64', node: 'v22.0.0' }
+      host: { arch: 'arm64', node: 'v22.0.0' },
+      evaluatorGitRev: null
     };
     writeFileSync(join(root, 'authored.json'), JSON.stringify(authored));
 
