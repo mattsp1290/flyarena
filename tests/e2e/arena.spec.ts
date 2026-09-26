@@ -302,7 +302,7 @@ test.describe('model ledger and provenance', () => {
     // not biology, not trained" disclaimer.
     await expect(histogram.locator('svg[role="img"]')).toHaveAttribute(
       'aria-label',
-      /Biological ranks at the \d+(\.\d+)?% percentile \(0% = lowest score, 100% = highest\) among 500 degree-preserving rewirings \(authored, opponent parked, 100 held-out seeds\)\. The "authored" decoder is a fixed, hand-written mapping — not biology and not trained\./
+      /Biological ranks at the \d+(\.\d+)?th percentile \(0% = lowest score, 100% = highest\) among 500 degree-preserving rewirings \(authored, opponent parked, 100 held-out seeds\)\. The "authored" decoder is a fixed, hand-written mapping — not biology and not trained\./
     );
     // The markers are labeled in a visible legend, never color alone —
     // scoped to the legend list specifically, since the same words also
