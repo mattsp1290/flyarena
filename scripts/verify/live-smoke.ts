@@ -81,8 +81,15 @@ const main = async (): Promise<void> => {
       'live-smoke: Findings toggle never became enabled.'
     );
     await toggle.click();
+    // (thermo review, Important I3/ops-safety) `.catch(() => null)`, matching
+    // every other DOM read in this file: without it, a transient exception
+    // right after `.click()` (e.g. the toggle briefly detaching during a
+    // Svelte re-render) propagates straight out instead of being retried by
+    // `waitUntil`'s own polling loop within its timeout budget -- and in
+    // deploy.sh a smoke-check failure triggers a rollback, so a spurious
+    // failure here has real operational cost, not just log noise.
     await waitUntil(
-      async () => /collapse/i.test((await toggle.textContent()) ?? ''),
+      async () => /collapse/i.test((await toggle.textContent().catch(() => null)) ?? ''),
       STEP_TIMEOUT_MS,
       'live-smoke: Findings panel did not expand.'
     );

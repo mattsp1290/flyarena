@@ -52,6 +52,11 @@ done
 command -v tar >/dev/null || die 'Missing command: tar'
 
 if [[ "$mode" == --deploy ]]; then
+  # (thermo review, Critical) Must be the very first thing this branch does,
+  # before any other check: see scripts/deploy-trap.sh's own doc comment on
+  # deploy_refuse_test_overrides for why a leftover test-only override must
+  # never be allowed to silently reach a real deploy.
+  deploy_refuse_test_overrides
   for command in ssh scp curl cmp; do
     command -v "$command" >/dev/null || die "Missing command: $command"
   done
@@ -85,7 +90,9 @@ REMOTE
   # after the SSH preflight above. See scripts/deploy-lock.sh for the lock,
   # marker-check, and rollback implementation (sourced, not executed, so it
   # shares this shell's `set -euo pipefail`, `die`, `ssh_options`, and the
-  # `release` id just generated).
+  # `release` id just generated). (thermo review, Suggestion S2/maintainability)
+  # Sourcing this also silently overrides scripts/deploy-trap.sh's no-op
+  # `deploy_lock_release()` stub with the real implementation below.
   # shellcheck source=scripts/deploy-lock.sh
   source "$(dirname -- "${BASH_SOURCE[0]}")/deploy-lock.sh"
   deploy_lock_acquire "$release"
@@ -133,8 +140,15 @@ REMOTE
 # holding the lock (`02-verified-redeploy.md` step 7).
 verify_dir=$(mktemp -d)
 cleanup_paths+=("$verify_dir")
+# (thermo review, Important I4/ops-safety) `--show-error` deliberately
+# omitted on every curl call below (here and in report_failure_and_roll_back):
+# it prints curl's own native diagnostic -- which includes the request
+# target -- to stderr on a real connection failure, independent of and in
+# addition to this script's own fixed, secret-free failure messages below.
+# `--silent` alone suppresses both the progress meter and that diagnostic;
+# every failure path here already has its own message, so nothing is lost.
 verify_assets() {
-  curl --fail --silent --show-error --location --connect-timeout 10 --max-time 60 \
+  curl --fail --silent --location --connect-timeout 10 --max-time 60 \
     -H 'Cache-Control: no-cache' "${DEPLOY_URL%/}" -o "$verify_dir/response" || {
     printf 'deploy: public entry URL request failed.\n' >&2
     return 1
@@ -146,7 +160,7 @@ verify_assets() {
   while IFS= read -r -d '' file; do
     relative=${file#dist/}
     url="${DEPLOY_URL%/}/$relative"
-    curl --fail --silent --show-error --location --connect-timeout 10 --max-time 60 \
+    curl --fail --silent --location --connect-timeout 10 --max-time 60 \
       -H 'Cache-Control: no-cache' "$url" -o "$verify_dir/response" || {
       printf 'deploy: public content request failed: %s\n' "$relative" >&2
       return 1
@@ -187,7 +201,7 @@ report_failure_and_roll_back() {
     return
   fi
   printf 'deploy: rolled back current -> %s.\n' "$previous_release" >&2
-  if curl --fail --silent --show-error --location --connect-timeout 10 --max-time 60 \
+  if curl --fail --silent --location --connect-timeout 10 --max-time 60 \
     -H 'Cache-Control: no-cache' "${DEPLOY_URL%/}" -o /dev/null; then
     printf 'deploy: post-rollback check: entry URL returns HTTP 200.\n' >&2
   else

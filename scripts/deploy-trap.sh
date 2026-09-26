@@ -1,3 +1,8 @@
+# shellcheck shell=bash
+# (thermo review, Suggestion S2/ops-safety) this file has no shebang -- it is
+# always sourced, never executed -- so shellcheck can't infer the target
+# shell on its own (SC2148) without this directive.
+#
 # Sourced library (not executed directly): the generic "run every
 # registered cleanup path, then release the deploy lock, on ANY exit --
 # success, `die`, or an unexpected failure" trap `scripts/deploy.sh`
@@ -31,3 +36,22 @@ on_exit() {
   exit "$status"
 }
 trap on_exit EXIT
+
+# (thermo review, Critical/maintainability C2 + Suggestion S1/ops-safety)
+# `DEPLOY_LOCK_ROOT_OVERRIDE` and `DEPLOY_DEPLOYMENT_DOC` are test-only hooks
+# (scripts/deploy-lock.sh's own header comment): the former redirects every
+# "remote" lock operation to a local directory instead of the real host over
+# SSH, and the latter redirects which local file the Release: marker is read
+# from. Neither is checked anywhere else, so a leftover exported value (a
+# stale shell session, or accidentally landing in `.env`, which deploy.sh
+# sources wholesale) would silently defeat the concurrency guard against the
+# real host during an actual `--deploy` run -- the one thing this whole
+# mechanism exists to prevent. deploy.sh calls this as the very first
+# statement on entering `--deploy` mode, before anything else. Defined here
+# (not in scripts/deploy-lock.sh, which isn't sourced until later in that
+# same mode block) so it can run first and so
+# scripts/verify/deploy-lock.test.sh can call this exact function directly.
+deploy_refuse_test_overrides() {
+  [[ -z "${DEPLOY_LOCK_ROOT_OVERRIDE:-}" ]] || die 'DEPLOY_LOCK_ROOT_OVERRIDE is set; this is a test-only hook for scripts/verify/deploy-lock.test.sh and must never be set for a real --deploy run. Unset it and retry.'
+  [[ -z "${DEPLOY_DEPLOYMENT_DOC:-}" ]] || die 'DEPLOY_DEPLOYMENT_DOC is set; this is a test-only hook for scripts/verify/deploy-lock.test.sh and must never be set for a real --deploy run. Unset it and retry.'
+}

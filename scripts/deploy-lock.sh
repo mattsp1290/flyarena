@@ -1,3 +1,8 @@
+# shellcheck shell=bash
+# (thermo review, Suggestion S2/ops-safety) this file has no shebang -- it is
+# always sourced, never executed -- so shellcheck can't infer the target
+# shell on its own (SC2148) without this directive.
+#
 # Sourced library (not executed directly): `scripts/deploy.sh`'s stale-aware
 # deploy lock, `Release:` marker check, and post-verification rollback.
 #
@@ -37,22 +42,47 @@ _deploy_lock_run() {
   if [[ -n "${DEPLOY_LOCK_ROOT_OVERRIDE:-}" ]]; then
     bash -c "$script" _deploy_lock_run "$@"
   else
+    # (thermo review, Suggestion S4/ops-safety) `%q`'s round-trip quoting
+    # guarantee is specifically a *bash* guarantee; the string is parsed
+    # remotely by whatever shell sshd invokes for the deploy account's login
+    # shell, not necessarily bash. Every value that actually flows through
+    # here today is already constrained (a validated `DEPLOY_ROOT`, a
+    # generated release id, numeric `ts`/`pid`, a `hostname` value), so this
+    # is not exploitable currently -- noted for a future caller that might
+    # pass a less-constrained value through this same helper.
     local quoted
     quoted=$(printf '%q ' "$@")
+    # shellcheck disable=SC2154 # ssh_options is supplied by every caller (deploy.sh, deploy-lock.test.sh) -- see this file's own header comment.
+    # shellcheck disable=SC2087 # intentional: this heredoc's body is the single token $script and IS meant to expand client-side, substituting in the actual script text before it reaches ssh's stdin -- quoting the delimiter would send the literal 7 characters "$script" instead.
     ssh "${ssh_options[@]}" "$DEPLOY_SSH" "bash -s -- $quoted" <<SCRIPT
 $script
 SCRIPT
   fi
 }
 
-# (dual review, Important) The first line of stdout is always one of
-# ACQUIRED / HELD / ERROR, so `deploy_lock_acquire` below can tell "the lock
-# is genuinely held by someone else" (HELD, with the owner file on the
-# following lines) apart from "this run's own `mkdir -- \"\$lock\"` failed
-# for an unrelated reason" (ERROR -- permission denied, a read-only or full
-# filesystem, a bad path) -- without this, both looked identical (a nonzero
-# exit with no usable output) and an infrastructure failure was reported to
-# the operator as a fabricated "stale lock," with wrong recovery advice.
+# (thermo review, Important I2/ops-safety) Sentinel lines, not "the first
+# line of stdout": a stray banner or profile-hook line some sshd
+# configurations emit on a non-interactive `bash -s` session could otherwise
+# land ahead of the real ACQUIRED/HELD/ERROR marker. `deploy_lock_acquire`
+# below scans the *whole* output for a line matching one of these sentinels
+# exactly, wherever it falls, rather than assuming position 1 -- this
+# matters most for ACQUIRED: if banner noise made a genuinely successful
+# mkdir+owner-write look unrecognized, `DEPLOY_LOCK_HELD` would never get
+# set, and the lock this run actually holds on the remote host would never
+# be released by the EXIT trap.
+_DEPLOY_LOCK_SENTINEL_ACQUIRED='##DEPLOY-LOCK:ACQUIRED##'
+_DEPLOY_LOCK_SENTINEL_HELD='##DEPLOY-LOCK:HELD##'
+
+# (thermo review, Important I1/ops-safety) The owner file is written to a
+# temp name inside $root and renamed into place -- never written in place --
+# so a concurrent HELD reader can never observe "the lock directory exists
+# but the owner file does not yet" (a `mkdir`-then-write TOCTOU window) and
+# default to treating a lock that is genuinely milliseconds old as though it
+# were fully absent. If the rename has not happened yet, the reader still
+# gets nothing and can't know the real timestamp -- see the
+# "timestamp=INDETERMINATE" fallback below, which `deploy_lock_acquire`
+# treats as "not confirmed stale," never as "instantly stale," precisely
+# because this window, while now much narrower, is not literally zero.
 _DEPLOY_LOCK_ACQUIRE_SCRIPT='
 set -euo pipefail
 root=$1; release=$2; ts=$3; host=$4; pid=$5
@@ -61,29 +91,32 @@ owner_file="$root/.deploy.lock.owner"
 mkdir_err=$(mktemp)
 trap "rm -f -- \"\$mkdir_err\"" EXIT
 if mkdir -- "$lock" 2>"$mkdir_err"; then
+  owner_tmp=$(mktemp "$root/.deploy.lock.owner.XXXXXX")
   {
     printf "timestamp=%s\n" "$ts"
     printf "hostname=%s\n" "$host"
     printf "pid=%s\n" "$pid"
     printf "release=%s\n" "$release"
-  } > "$owner_file"
-  printf "ACQUIRED\n"
+  } > "$owner_tmp"
+  mv -- "$owner_tmp" "$owner_file"
+  printf "SENTINEL_ACQUIRED\n"
   exit 0
 fi
 if grep -qi "file exists" -- "$mkdir_err"; then
-  printf "HELD\n"
+  printf "SENTINEL_HELD\n"
   if [[ -f "$owner_file" ]]; then
     cat -- "$owner_file"
   else
-    printf "timestamp=0\n"
+    printf "timestamp=INDETERMINATE\n"
   fi
   exit 1
 fi
-printf "ERROR\n" >&2
 printf "deploy: lock host mkdir failed (not lock contention):\n" >&2
 cat -- "$mkdir_err" >&2
 exit 2
 '
+_DEPLOY_LOCK_ACQUIRE_SCRIPT=${_DEPLOY_LOCK_ACQUIRE_SCRIPT//SENTINEL_ACQUIRED/$_DEPLOY_LOCK_SENTINEL_ACQUIRED}
+_DEPLOY_LOCK_ACQUIRE_SCRIPT=${_DEPLOY_LOCK_ACQUIRE_SCRIPT//SENTINEL_HELD/$_DEPLOY_LOCK_SENTINEL_HELD}
 
 _DEPLOY_LOCK_RELEASE_SCRIPT='
 set -euo pipefail
@@ -134,14 +167,18 @@ mv -Tf -- "$root/.rollback-current" "$root/current"
 #   - a fresh lock (owner timestamp < 30 minutes old): abort, no changes.
 #   - a stale lock: abort, reported as stale, with the manual-clear command.
 #     Never broken automatically.
-#   - (dual review, Important) anything else -- SSH/connectivity failure,
-#     permission denied, a full or read-only filesystem on the lock host --
-#     is its own distinct die message, never misreported as a stale lock.
-#     `_DEPLOY_LOCK_ACQUIRE_SCRIPT`'s first stdout line is the only signal
-#     trusted for this: exactly "HELD" means genuine contention (with the
-#     owner file on the following lines); anything else (including no
-#     output at all, e.g. ssh itself never reached the remote host) means
-#     the attempt did not actually determine the lock's state.
+#   - the owner file is missing or unreadable despite the lock directory
+#     existing (the narrow TOCTOU window between `mkdir` and the owner
+#     file's rename-into-place elsewhere): treated as indeterminate, never
+#     as instantly stale -- see `_DEPLOY_LOCK_ACQUIRE_SCRIPT`'s own comment.
+#   - anything else -- SSH/connectivity failure, permission denied, a full
+#     or read-only filesystem on the lock host -- is its own distinct die
+#     message, never misreported as a stale lock. The only signal trusted
+#     for "genuine contention" is the `_DEPLOY_LOCK_SENTINEL_HELD` line
+#     appearing *anywhere* in stdout (not assumed to be line 1 -- see that
+#     sentinel's own comment on why); anything else (including no output at
+#     all, e.g. ssh itself never reached the remote host) means the attempt
+#     did not actually determine the lock's state.
 # Sets DEPLOY_LOCK_HELD=1 and DEPLOY_LOCK_ACQUIRED_RELEASE on success so
 # `deploy_lock_release` (registered on deploy.sh's EXIT trap) knows it owns
 # the lock and must release it, including on failure.
@@ -156,19 +193,24 @@ deploy_lock_acquire() {
   output=$(_deploy_lock_run "$_DEPLOY_LOCK_ACQUIRE_SCRIPT" "$root" "$release_id" "$ts" "$host" "$pid")
   status=$?
   set -e
-  local first_line=${output%%$'\n'*}
-  if [[ $status -eq 0 && "$first_line" == "ACQUIRED" ]]; then
+  if [[ $status -eq 0 ]] && grep -qxF "$_DEPLOY_LOCK_SENTINEL_ACQUIRED" <<<"$output"; then
     DEPLOY_LOCK_HELD=1
     DEPLOY_LOCK_ACQUIRED_RELEASE=$release_id
     return 0
   fi
-  if [[ "$first_line" != "HELD" ]]; then
+  if ! grep -qxF "$_DEPLOY_LOCK_SENTINEL_HELD" <<<"$output"; then
     die "Could not determine the deploy lock's state at $root/.deploy.lock: the lock check itself failed (SSH connectivity, permissions, or disk space on the deploy host -- see any error output above this line), not confirmed lock contention. Aborting with no changes."
   fi
-  local owner=${output#*$'\n'}
+  # Everything after the HELD sentinel line is the owner payload, wherever
+  # that sentinel actually fell in the output (see the sentinel's comment).
+  local owner
+  owner=$(awk -v sentinel="$_DEPLOY_LOCK_SENTINEL_HELD" 'found{print} $0==sentinel{found=1}' <<<"$output")
   local owner_ts now age
   owner_ts=$(printf '%s\n' "$owner" | sed -n 's/^timestamp=//p' | head -n1)
-  owner_ts=${owner_ts:-0}
+  if [[ -z "$owner_ts" || ! "$owner_ts" =~ ^[0-9]+$ ]]; then
+    die "Deploy lock at $root/.deploy.lock exists, but its owner file is missing or unreadable (likely a concurrent acquire in progress, mid-write). Not confirmed stale -- retry shortly rather than clearing the lock manually. Owner:
+$owner"
+  fi
   now=$(date -u +%s)
   age=$(( now - owner_ts ))
   if (( age < DEPLOY_LOCK_STALE_SECONDS )); then
@@ -177,7 +219,7 @@ $owner"
   else
     die "Deploy lock at $root/.deploy.lock is STALE (age ${age}s). Refusing to break it automatically. Owner:
 $owner
-After confirming no deploy is actually running, clear it manually: ssh $DEPLOY_SSH \"rm -f '$root/.deploy.lock.owner'; rmdir '$root/.deploy.lock'\" (or, run directly on the host: rm -f '$root/.deploy.lock.owner'; rmdir '$root/.deploy.lock')."
+After confirming no deploy is actually running, clear it manually, either directly on the host or over SSH to the configured deploy destination: rm -f '$root/.deploy.lock.owner'; rmdir '$root/.deploy.lock'"
   fi
 }
 
@@ -222,6 +264,31 @@ deploy_current_release() {
 # The release id in the last `Release:` marker line of `.agents/deployment.md`
 # (always the local, git-tracked file -- never remote). Empty if the file or
 # marker is missing.
+#
+# (thermo review, Critical C1, both reviewers) The pattern is anchored to
+# the *exact* shape `deploy.sh` generates -- `date -u +%Y%m%dT%H%M%SZ`
+# (8 digits, "T", 6 digits, "Z") + "-" + 12 lowercase hex characters (a
+# 6-byte `node:crypto` `randomBytes(6).toString("hex")`), confirmed against
+# `scripts/deploy.sh`'s own `release="$(date -u +%Y%m%dT%H%M%SZ)-$(node -e
+# ...)"` line and the real anchor value
+# (`20260924T141451Z-e994aaab005c`) -- deliberately *not* the original
+# `[^[:space:]]+` (any non-whitespace token). A permissive pattern let
+# `.agents/deployment.md`'s own "Release:`/`Commit:` marker format"
+# documentation example (a line literally starting `Release: ` for
+# illustration) be picked up by `tail -n1` as though it were the real last
+# marker, since it appears later in the file than the real anchor --
+# confirmed to reproduce against the committed file before this fix, and
+# it would have made every guarded `--deploy` run abort as though an
+# unrecorded deploy had happened. The doc's own example was also reworded
+# (see `.agents/deployment.md`'s "marker format" section) so it can never
+# start a line with a real-shaped `Release: ` token even if this regex is
+# ever loosened again later -- defense in depth on both sides, per the
+# review's own "fix must do both" guidance. Deliberately not attempting to
+# strip Markdown code fences here (`if practical` per the task): the strict
+# id-shape anchor already makes an accidental false match need an actual,
+# correctly-shaped fake release id typed into prose, which the reworded
+# example above no longer does, and fence-tracking would add real
+# complexity for that already-closed residual case.
 deploy_last_release_marker() {
   local doc=${DEPLOY_DEPLOYMENT_DOC:-.agents/deployment.md}
   [[ -f "$doc" ]] || { printf ''; return 0; }
@@ -230,7 +297,7 @@ deploy_last_release_marker() {
   # the whole thing is the value side of `marker=$(deploy_last_release_marker)`,
   # trip the caller's `set -e` -- a legitimate "no marker yet" case must
   # return an empty string, not abort the script here.
-  grep -oE '^Release: [^[:space:]]+' -- "$doc" | tail -n1 | sed -E 's/^Release: //' || true
+  grep -oE '^Release: [0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$' -- "$doc" | tail -n1 | sed -E 's/^Release: //' || true
 }
 
 # Confirms the live `current` target equals the last recorded `Release:`
