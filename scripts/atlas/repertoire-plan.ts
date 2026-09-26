@@ -238,6 +238,7 @@ interface RewiringNullDoc {
 const verifyRewireIndexAgainstShippedNull = (
   rewireIndex: Readonly<RewireIndex>,
   biologicalBinarySha256: string,
+  rewiringNullManifestEntry: Readonly<{ artifact: string; sha256: string }> | undefined,
   data: string
 ): void => {
   if (rewireIndex.sourceSha256 !== biologicalBinarySha256) {
@@ -247,8 +248,18 @@ const verifyRewireIndexAgainstShippedNull = (
     );
   }
 
+  if (!rewiringNullManifestEntry) {
+    throw new Error(`repertoire-plan: manifest has no rewiringNull entry to sha-pin ${REWIRING_NULL_FILE} against`);
+  }
   const rewiringNullPath = resolve(data, REWIRING_NULL_FILE);
   const rewiringNullBytes = readFileSync(rewiringNullPath);
+  const actualRewiringNullSha256 = sha256Hex(rewiringNullBytes);
+  if (actualRewiringNullSha256 !== rewiringNullManifestEntry.sha256) {
+    throw new Error(
+      `repertoire-plan: ${rewiringNullPath} does not match manifest.rewiringNull.sha256 ` +
+        `(expected ${rewiringNullManifestEntry.sha256}, got ${actualRewiringNullSha256})`
+    );
+  }
   const rewiringNull = JSON.parse(rewiringNullBytes.toString('utf8')) as RewiringNullDoc;
   if (rewiringNull.sourceGraphSha256 !== biologicalBinarySha256) {
     throw new Error(
@@ -307,7 +318,7 @@ export const loadPlanInputs = async (
     Promise.resolve(readRewireIndex(graphsIndexPath))
   ]);
 
-  verifyRewireIndexAgainstShippedNull(rewireIndex, assets.manifest.binarySha256, data);
+  verifyRewireIndexAgainstShippedNull(rewireIndex, assets.manifest.binarySha256, assets.manifest.rewiringNull, data);
 
   const disconnectedBinarySha256 = sha256Hex(
     new Uint8Array(encodeGraphBinary(createDisconnectedGraph(assets.parsedBiological)))

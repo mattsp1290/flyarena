@@ -136,6 +136,36 @@ describe('repertoire-plan: planEntryKey', () => {
   });
 });
 
+describe('repertoire-evaluate: buildRepertoireTasks', () => {
+  // Regression coverage for the dual-review finding that a task's wire `key`
+  // (composite `<graphId>@<seed>`) and its plain `graphId` were once the
+  // same field, and that a task's `expectedOptions.seed` must always equal
+  // its own plan entry's `searchSeed` -- both properties this function
+  // itself is responsible for, over the real 46-entry plan (not a 3-entry
+  // fixture), so a regression on any one of the 46 pairs is caught.
+  it('every task has key === planEntryKey(entry), graphId === entry.graphId (never the composite key), and expectedOptions.seed === searchSeed', () => {
+    const plan = buildRepertoirePlan({
+      rewireIndex: fakeRewireIndex(20),
+      biologicalBinarySha256: 'bio-binary-sha',
+      biologicalGzipSha256: 'bio-gzip-sha',
+      disconnectedBinarySha256: 'disc-binary-sha',
+      armsDir: '/arms',
+      searchDir: '/search',
+      searchOptions: FAKE_SEARCH_OPTIONS
+    });
+    const tasks = buildRepertoireTasks(plan);
+    expect(tasks).toHaveLength(46);
+    for (const [i, task] of tasks.entries()) {
+      const entry = plan[i];
+      expect(task.key).toBe(planEntryKey(entry));
+      expect(task.graphId).toBe(entry.graphId);
+      expect(task.key).not.toBe(task.graphId); // every entry has a non-empty searchSeed suffix
+      expect(task.expectedOptions.seed).toBe(entry.searchSeed);
+      expect(task.expectedOptions).toMatchObject(FAKE_SEARCH_OPTIONS);
+    }
+  });
+});
+
 describe('repertoire-plan: verifyBundleIdentity', () => {
   let root: string;
   let biological: SerializedArmBundle;
@@ -583,7 +613,12 @@ describe('repertoire-evaluate: runWorkerScheduler shard determinism / failure pa
       expected: { arm: 'rewired' as const, binarySha256: 'unused', parentGzipSha256: 'unused' },
       expectedSearchOptions: { population: 4, generations: 1, ticks: 30 }
     }));
-    const tasks = plan.map((entry, i) => task(planEntryKey(entry), (3 - i) * 10));
+    // `buildRepertoireTasks` -- the real production function, not this
+    // section's own ad-hoc `task()` helper -- so this test actually
+    // exercises the plain-`graphId`-vs-composite-`key` split it builds,
+    // with per-task `delayMs` added only for the stub's own timing
+    // extension to the wire protocol.
+    const tasks = buildRepertoireTasks(plan).map((t, i) => ({ ...t, delayMs: (3 - i) * 10 }));
 
     const results1 = await runWorkerScheduler(tasks, 1, stubWorkerPath);
     const results3 = await runWorkerScheduler(tasks, 3, stubWorkerPath);
@@ -592,11 +627,12 @@ describe('repertoire-evaluate: runWorkerScheduler shard determinism / failure pa
     const artifact3 = assembleEvaluatedArtifact(plan, results3);
 
     expect(JSON.stringify(artifact1)).toBe(JSON.stringify(artifact3));
-    // The persisted `graphId` on each entry is the plain id (from the stub's
-    // own response), never the composite `key` -- pins the fix for the
-    // dual-review finding that an earlier version leaked the composite key
-    // into this field.
-    expect(artifact1.graphs.map((g) => g.graphId)).toEqual(['fixture-0@1', 'fixture-1@1', 'fixture-2@1']);
+    // The persisted `graphId` on each entry is the plain id `buildRepertoireTasks`
+    // set (`entry.graphId`), never the composite `key` (`planEntryKey(entry)`)
+    // -- pins the fix for the dual-review finding that an earlier version
+    // leaked the composite key into this field.
+    expect(artifact1.graphs.map((g) => g.graphId)).toEqual(['fixture-0', 'fixture-1', 'fixture-2']);
+    expect(tasks.map((t) => t.key)).toEqual(['fixture-0@1', 'fixture-1@1', 'fixture-2@1']);
   });
 
   it('a task-level error aborts the whole run quickly, not after the full queue drains', async () => {

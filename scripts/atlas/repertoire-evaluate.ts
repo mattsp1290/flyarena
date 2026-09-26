@@ -141,7 +141,12 @@ export const buildRepertoireTasks = (plan: readonly RepertoirePlanEntry[]): read
     graphId: entry.graphId,
     searchPath: entry.searchOutputPath,
     expected: entry.expected,
-    expectedOptions: { seed: entry.searchSeed, ...entry.expectedSearchOptions },
+    // `seed` spread last: `entry.expectedSearchOptions` only ever carries
+    // population/generations/ticks (`loadPlanInputs` destructures just
+    // those three), but ordering it this way makes a stray `seed` field
+    // inside it structurally unable to silently override the plan's own
+    // `searchSeed`, rather than merely happening not to today.
+    expectedOptions: { ...entry.expectedSearchOptions, seed: entry.searchSeed },
     arm: entry.arm,
     rewiringSeed: entry.rewiringSeed,
     searchSeed: entry.searchSeed
