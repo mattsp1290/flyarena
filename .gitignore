@@ -46,3 +46,8 @@ scripts/experiments/out/
 *.egg-info/
 backend/build/
 lab-results/
+
+# scripts/graph-lab/bundle.mjs output: esbuild bundles of the graph-lab
+# entries/workers, copied into the graph-lab image by its Dockerfile.
+# Regenerable on demand (npm run graph-lab:bundle); never committed.
+backend/graph_lab/js/
