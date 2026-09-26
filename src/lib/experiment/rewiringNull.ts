@@ -403,3 +403,92 @@ export const loadRewiringNull = async (
 
   return { status: 'ok', data };
 };
+
+/**
+ * WP1 of `.agents/plans/findings-tour`: one biological replica's own
+ * percentile among the trained-sample's rewired trained scores — the
+ * per-trainer-seed subset of `null-report-trained.ts`'s
+ * `TrainedBiologicalReplicaPercentile` (`scripts/null/null-report-trained.ts`)
+ * the Findings panel's step 5 actually renders.
+ */
+export interface RewiringNullTrainedReplicaPercentile {
+  readonly trainerSeed: number;
+  readonly percentile: number;
+}
+
+/**
+ * The subset of `null-report-trained.ts`'s `TrainedSection` (the real
+ * producer of `RewiringNullArtifact.trained`, confirmed against the shipped
+ * `public/data/rewiring-null-v1.json`'s own `trained` object) the Findings
+ * panel's step 5 needs: the headline trainer seed and percentile, and every
+ * biological replica's own percentile (`bioReplicaPercentiles`) — the field
+ * `TrainedSection`'s own doc comment says the headline number "is ONE
+ * sample from a noisy trainer-seed-dependent quantity," so step 5's
+ * seed-sensitivity sentence is built from the full per-seed list, never
+ * from `bioPercentile` alone.
+ */
+export interface RewiringNullTrainedSection {
+  readonly replicaSeed: number;
+  readonly bioPercentile: number;
+  readonly bioReplicaPercentiles: readonly RewiringNullTrainedReplicaPercentile[];
+  /** `trained.rewired.length` — the trained sample's own rewired-graph count (n=20 in the published data), distinct from the authored null's `null.n` (500). */
+  readonly rewiredCount: number;
+}
+
+const RANK_STATISTIC_MATCH_EPSILON = 1e-9;
+
+/**
+ * `RewiringNullArtifact.trained` is deliberately typed `unknown` (see that
+ * field's own doc comment): no real producer output existed to verify a
+ * shape against until `null-report-trained.ts#buildTrainedSection` landed.
+ * This validates just the subset `RewiringNullTrainedSection` above
+ * documents, against the real shape now shipped in
+ * `public/data/rewiring-null-v1.json`'s `trained` object — structurally
+ * permissive of every field this component does not render (`rewired`,
+ * `biological`, `cemConfig`, `bootstrap`, `timing`, …), the same
+ * "reimplemented, not imported" / "validate only what's rendered"
+ * discipline `./nullExplanation.ts`/`./pathwayInterventions.ts` already
+ * document for their own artifacts.
+ *
+ * Returns `undefined` (never throws) on any structural failure — a
+ * malformed/missing `trained` section only ever fails the Findings panel's
+ * own step 5 (`./findings/steps.ts`), never the rest of the rewiring-null
+ * artifact (`loadRewiringNull`'s existing "trained is deliberately left
+ * unchecked" contract is unchanged by this function's existence).
+ *
+ * Cross-checks the headline `bioPercentile` against the matching entry in
+ * `bioReplicaPercentiles` (mirrors `validateRewiringNullShape`'s own
+ * recomputed-rank-statistics precedent above): the real producer always
+ * derives both from the same rank computation at `replicaSeed`, so a
+ * hand-edited or corrupted fixture where they disagree is itself a sign of
+ * a malformed artifact, not a legitimate variant to render.
+ */
+export const validateRewiringNullTrained = (value: unknown): RewiringNullTrainedSection | undefined => {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const v = value as Record<string, unknown>;
+  if (!isFiniteNumber(v.replicaSeed)) return undefined;
+  if (!isFiniteNumber(v.bioPercentile) || v.bioPercentile < 0 || v.bioPercentile > 1) return undefined;
+  if (!Array.isArray(v.rewired) || v.rewired.length === 0) return undefined;
+  if (!Array.isArray(v.bioReplicaPercentiles) || v.bioReplicaPercentiles.length === 0) return undefined;
+
+  const bioReplicaPercentiles: RewiringNullTrainedReplicaPercentile[] = [];
+  for (const entry of v.bioReplicaPercentiles) {
+    if (typeof entry !== 'object' || entry === null) return undefined;
+    const e = entry as Record<string, unknown>;
+    if (!isFiniteNumber(e.trainerSeed)) return undefined;
+    if (!isFiniteNumber(e.percentile) || e.percentile < 0 || e.percentile > 1) return undefined;
+    bioReplicaPercentiles.push({ trainerSeed: e.trainerSeed, percentile: e.percentile });
+  }
+
+  const headline = bioReplicaPercentiles.find((entry) => entry.trainerSeed === v.replicaSeed);
+  if (!headline || Math.abs(headline.percentile - (v.bioPercentile as number)) > RANK_STATISTIC_MATCH_EPSILON) {
+    return undefined;
+  }
+
+  return {
+    replicaSeed: v.replicaSeed as number,
+    bioPercentile: v.bioPercentile as number,
+    bioReplicaPercentiles,
+    rewiredCount: (v.rewired as unknown[]).length
+  };
+};
