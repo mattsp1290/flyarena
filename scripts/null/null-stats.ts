@@ -15,6 +15,19 @@ import { conditionRng, conditionStats, type ConditionStats } from '../training/s
  * — see `graphStats` below.
  */
 
+/**
+ * `a` and `b` name the same held-out seeds in the same order. Exported (a
+ * thermo-maintainability review finding): `null-report.ts` and
+ * `intervention-report.ts` each carried a byte-identical hand-duplicated
+ * copy of this exact function, with `intervention-report.ts`'s own doc
+ * comment even noting the duplication ("matches `null-report.ts`'s
+ * identically-named/-shaped helper") instead of removing it — the same
+ * pattern `quantileIndex`'s own export below already fixed for that
+ * function.
+ */
+export const sameSeeds = (a: readonly number[], b: readonly number[]): boolean =>
+  a.length === b.length && a.every((seed, i) => seed === b[i]);
+
 /** `IQR < DEGENERATE_IQR_THRESHOLD` marks the null distribution as degenerate (the plan's "authored path insensitive to topology" case). */
 export const DEGENERATE_IQR_THRESHOLD = 1e-9;
 

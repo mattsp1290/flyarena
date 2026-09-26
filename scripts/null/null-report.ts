@@ -12,6 +12,7 @@ import {
   graphStats,
   nullSummary,
   rankStatistics,
+  sameSeeds,
   type Histogram,
   type NullSummary
 } from './null-stats';
@@ -362,10 +363,6 @@ export interface RunNullReportResult {
   readonly artifactSha256: string;
   readonly artifact: RewiringNullArtifact;
 }
-
-/** `a` and `b` name the same held-out seeds in the same order. */
-const sameSeeds = (a: readonly number[], b: readonly number[]): boolean =>
-  a.length === b.length && a.every((seed, i) => seed === b[i]);
 
 export const buildArtifact = (
   raw: Readonly<NullEvaluationRaw>,

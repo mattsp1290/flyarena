@@ -1,12 +1,18 @@
 import { fork } from 'node:child_process';
-import { mkdirSync, readFileSync } from 'node:fs';
-import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { mkdirSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { gunzipSync } from 'node:zlib';
 
 import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import { requireNonNegativeInt, requirePositiveInt, requireValue } from '../training/cli';
 import { atomicWriteFileSync, sha256Hex } from '../training/fsio';
+import {
+  readGraphListIndex,
+  sortedGraphListEntries,
+  verifyGraphListFiles,
+  type GraphListEntry,
+  type GraphListIndex
+} from './graph-list-index';
 import {
   NULL_DECODER_KINDS,
   type NullDecoderKind,
@@ -15,6 +21,37 @@ import {
   type NullWorkerMessage,
   type NullWorkerTask
 } from './null-worker';
+import {
+  readRewireIndex,
+  sortedRewireSeeds,
+  verifyBiologicalSource,
+  verifyRewiredFiles,
+  type RewireIndex,
+  type RewireIndexSeedEntry
+} from './rewire-index';
+
+/**
+ * Re-exported so every existing importer of these symbols from
+ * `./null-evaluate` (`regime-check.ts`, `lookup-rewired-artifact.ts`,
+ * `null-report.ts`, this branch's own tests, and the concurrent
+ * `feat/hbru-trained-interventions` branch) keeps working unchanged --
+ * `rewire-index.ts` and `graph-list-index.ts` are where these are now
+ * defined and documented (a thermo-maintainability review finding: this
+ * file crossed the 1000-line threshold; those two sections, each
+ * self-contained and mirroring the other in shape, were the extraction).
+ */
+export {
+  readGraphListIndex,
+  sortedGraphListEntries,
+  verifyGraphListFiles,
+  type GraphListEntry,
+  type GraphListIndex,
+  readRewireIndex,
+  verifyBiologicalSource,
+  verifyRewiredFiles,
+  type RewireIndex,
+  type RewireIndexSeedEntry
+};
 
 /**
  * `.agents/plans/rewiring-null/02-authored-null-evaluation.md`'s WP2 driver:
@@ -59,296 +96,6 @@ const DEFAULT_DECODER: NullDecoderKind = 'authored';
  */
 const isNullDecoderKind = (value: string): value is NullDecoderKind =>
   (NULL_DECODER_KINDS as readonly string[]).includes(value);
-
-// ---------------------------------------------------------------------------
-// rewire_batch.py index.json
-// ---------------------------------------------------------------------------
-
-export interface RewireIndexSeedEntry {
-  readonly seed: number;
-  readonly artifact: string;
-  readonly binarySha256: string;
-  readonly binaryBytes: number;
-  readonly gzipSha256: string;
-  readonly gzipBytes: number;
-  readonly stats: {
-    readonly acceptedSwaps: number;
-    readonly attempts: number;
-  };
-}
-
-export interface RewireIndex {
-  readonly sourceArtifact: string;
-  readonly sourceSha256: string;
-  readonly rewireSourceSha256: string;
-  readonly seeds: readonly RewireIndexSeedEntry[];
-}
-
-/**
- * `index.seeds` sorted by numeric seed ascending — the single source of
- * this module's "canonical task order" invariant (see the module doc
- * comment above). `buildTasks` and `assembleRaw` both need this exact
- * order for the same reason (byte-identical output independent of shard
- * count/timing); previously each independently re-sorted, which let the
- * two copies drift out of agreement by convention alone. Never a sort over
- * `graphId` strings, which would put `rewired-10` before `rewired-2`.
- */
-const sortedRewireSeeds = (index: Readonly<RewireIndex>): readonly RewireIndexSeedEntry[] =>
-  [...index.seeds].sort((a, b) => a.seed - b.seed);
-
-/**
- * Parse and lightly validate `rewire_batch.py`'s `index.json`. Deliberately
- * tolerant of extra/missing provenance fields beyond the ones this script
- * reads (`binfmtSourceSha256`/`numpyVersion`/`params` are recorded by
- * `rewire_batch.py` but not consumed here) — this script only depends on
- * the fields it actually uses.
- */
-export const readRewireIndex = (path: string): RewireIndex => {
-  const parsed = JSON.parse(readFileSync(path, 'utf8')) as Partial<RewireIndex>;
-  if (typeof parsed.sourceArtifact !== 'string' || typeof parsed.sourceSha256 !== 'string') {
-    throw new Error(`null-evaluate: ${path} is missing sourceArtifact/sourceSha256`);
-  }
-  if (typeof parsed.rewireSourceSha256 !== 'string') {
-    throw new Error(`null-evaluate: ${path} is missing rewireSourceSha256`);
-  }
-  if (!Array.isArray(parsed.seeds) || parsed.seeds.length === 0) {
-    throw new Error(`null-evaluate: ${path} has no seeds`);
-  }
-  const seenSeeds = new Set<number>();
-  for (const entry of parsed.seeds) {
-    if (
-      typeof entry.seed !== 'number' ||
-      !Number.isInteger(entry.seed) ||
-      entry.seed < 0 ||
-      typeof entry.artifact !== 'string' ||
-      typeof entry.binarySha256 !== 'string' ||
-      typeof entry.gzipSha256 !== 'string' ||
-      typeof entry.gzipBytes !== 'number' ||
-      typeof entry.stats?.acceptedSwaps !== 'number' ||
-      typeof entry.stats?.attempts !== 'number'
-    ) {
-      throw new Error(`null-evaluate: ${path} has a malformed seed entry: ${JSON.stringify(entry)}`);
-    }
-    // A duplicate seed would create two tasks with the same graphId
-    // (`rewired-${seed}`); which result "wins" then depends on completion
-    // order, which is exactly what the shard byte-identity guarantee
-    // promises can never happen — reject it here instead (a dual-review
-    // finding; `rewire_batch.py` itself can't produce this, since it
-    // iterates a `range`, but a hand-merged or hand-edited index.json can).
-    if (seenSeeds.has(entry.seed)) {
-      throw new Error(`null-evaluate: ${path} lists rewiring seed ${entry.seed} more than once`);
-    }
-    seenSeeds.add(entry.seed);
-  }
-  return parsed as RewireIndex;
-};
-
-/**
- * Verify every rewired file's raw gzip bytes against `index.json` before
- * any shard is forked, so a corrupted or stale batch (a smaller local disk
- * problem, a partially-copied directory) fails in seconds rather than
- * after however much of an 8-hour run has already completed. `null-worker.ts`
- * independently re-verifies the *decompressed* sha256 of whatever file it
- * actually loads, closer to where scoring happens.
- */
-export const verifyRewiredFiles = (index: Readonly<RewireIndex>, graphsDir: string): void => {
-  const mismatches: string[] = [];
-  for (const entry of index.seeds) {
-    const path = resolve(graphsDir, entry.artifact);
-    let bytes: Buffer;
-    try {
-      bytes = readFileSync(path);
-    } catch (error) {
-      mismatches.push(`seed ${entry.seed}: cannot read ${path} (${error instanceof Error ? error.message : String(error)})`);
-      continue;
-    }
-    if (bytes.byteLength !== entry.gzipBytes) {
-      mismatches.push(`seed ${entry.seed}: ${path} is ${bytes.byteLength} bytes, index.json expects ${entry.gzipBytes}`);
-      continue;
-    }
-    const actual = sha256Hex(bytes);
-    if (actual !== entry.gzipSha256) {
-      mismatches.push(`seed ${entry.seed}: ${path} gzip sha256 ${actual} does not match index.json (${entry.gzipSha256})`);
-    }
-  }
-  if (mismatches.length > 0) {
-    throw new Error(`null-evaluate: ${mismatches.length} rewired file(s) failed verification:\n${mismatches.join('\n')}`);
-  }
-};
-
-/**
- * Verify the biological source graph's decompressed sha256 against
- * `index.json`'s own `sourceSha256`. Exported (a thermo-maintainability
- * review finding): `regime-check.ts` (WP2) needs the exact same check and
- * previously carried a hand-duplicated copy because this was private.
- * `source` is the calling CLI's own name (`"null-evaluate"`/
- * `"regime-check"`), matching `null-worker-shared.ts`'s
- * `assertFiniteScores`/`loadVerifiedGraphBinary` `source`-prefixed-message
- * convention, so the thrown message still identifies which CLI raised it.
- */
-export const verifyBiologicalSource = (source: string, path: string, expectedSha256: string): void => {
-  const gzipBytes = readFileSync(path);
-  const binary = gunzipSync(gzipBytes);
-  const actual = sha256Hex(binary);
-  if (actual !== expectedSha256) {
-    throw new Error(`${source}: ${path} decompressed sha256 ${actual} does not match index.json's sourceSha256 (${expectedSha256})`);
-  }
-};
-
-// ---------------------------------------------------------------------------
-// scripts/analysis/interventions.py index.json (--graph-list mode)
-// ---------------------------------------------------------------------------
-
-/**
- * `.agents/plans/pathway-interventions/03-evaluation.md`'s WP2 `--graph-list`
- * mode: one entry per predeclared intervention/control graph
- * (`scripts/analysis/interventions.py`'s `index.json` — P, Q, C000..C099,
- * M1000..M1099, MQ2000..MQ2099). The plan states the entry contract as
- * `{ id, path, gzipSha256 }`; `binarySha256` is additionally required here
- * (present on every real `interventions.py` entry) so this mode gets the
- * same two-layer verification `--rewired-index` mode already has: the gzip
- * bytes checked up front by `verifyGraphListFiles` (mirroring
- * `verifyRewiredFiles`), and the *decompressed* bytes independently
- * re-checked inside the worker by `loadVerifiedGraphBinary` (mirroring every
- * `RewireIndexSeedEntry` task's `expectedSha256`) — never trusting a single
- * check across the parent/worker process boundary.
- */
-export interface GraphListEntry {
-  readonly id: string;
-  /** Path to the gzip-compressed graph binary, relative to the graph-list index.json's own directory. */
-  readonly path: string;
-  readonly gzipSha256: string;
-  /** Expected sha256 of the *decompressed* binary — see this interface's doc comment. */
-  readonly binarySha256: string;
-}
-
-export interface GraphListIndex {
-  readonly sourceArtifact: string;
-  readonly sourceSha256: string;
-  readonly entries: readonly GraphListEntry[];
-}
-
-/**
- * `buildGraphListTasks` synthesizes tasks with `graphId: 'biological'`/
- * `'disconnected'` when `--biological` is set (see `biologicalAndDisconnectedTasks`).
- * A graph-list entry using either id would collide with those tasks:
- * `runShardedEvaluation` keeps whichever result arrives first for a given
- * `graphId` and silently discards the other, so which graph's scores end up
- * in the output (and in the reproduction check `intervention-report.ts`
- * depends on) would depend on shard completion timing — the exact
- * determinism failure `readGraphListIndex`'s duplicate-id check exists to
- * prevent, just via a different id source (a dual-review finding).
- */
-const RESERVED_GRAPH_IDS: ReadonlySet<string> = new Set(['biological', 'disconnected']);
-
-/**
- * Parse and lightly validate `scripts/analysis/interventions.py`'s
- * `index.json`. Deliberately tolerant of extra fields beyond the ones this
- * script reads (`kind`, `swaps`, `targetReached`, `transfer`, `producer`,
- * `kP`/`kQ`/`maxSwaps`/`controlCount` are all recorded by `interventions.py`
- * but not consumed here) — the same tolerance `readRewireIndex` already
- * applies to `rewire_batch.py`'s own index.json.
- */
-export const readGraphListIndex = (path: string): GraphListIndex => {
-  const parsed = JSON.parse(readFileSync(path, 'utf8')) as Partial<GraphListIndex>;
-  if (typeof parsed.sourceArtifact !== 'string' || typeof parsed.sourceSha256 !== 'string') {
-    throw new Error(`null-evaluate: ${path} is missing sourceArtifact/sourceSha256`);
-  }
-  if (!Array.isArray(parsed.entries) || parsed.entries.length === 0) {
-    throw new Error(`null-evaluate: ${path} has no entries`);
-  }
-  const seenIds = new Set<string>();
-  for (const entry of parsed.entries) {
-    if (
-      typeof entry.id !== 'string' ||
-      entry.id.length === 0 ||
-      typeof entry.path !== 'string' ||
-      typeof entry.gzipSha256 !== 'string' ||
-      typeof entry.binarySha256 !== 'string'
-    ) {
-      throw new Error(`null-evaluate: ${path} has a malformed graph-list entry: ${JSON.stringify(entry)}`);
-    }
-    if (RESERVED_GRAPH_IDS.has(entry.id)) {
-      throw new Error(
-        `null-evaluate: ${path} uses reserved graph id "${entry.id}" (reserved for --biological's own tasks)`
-      );
-    }
-    // A path escaping index.json's own directory (an absolute path, or a
-    // "../" traversal) would break this mode's documented contract ("every
-    // entry's path is relative to the graph-list index.json's own
-    // directory" — see `GraphListEntry.path`'s doc comment) and let a
-    // mis-generated index silently read a file outside the run's own graph
-    // set. Content integrity is still independently enforced by both sha
-    // layers either way, so this is a fail-fast/contract check, not the
-    // primary integrity guard. Resolution-based (not a raw string check on
-    // `entry.path` for a leading `/` or a `..` path segment): a string check
-    // both under- and over-rejects -- it would miss a Windows-style
-    // drive-absolute path, and it would reject an in-bounds path like
-    // `"graphs/../graphs/P.bin.gz"` that a resolution-based check correctly
-    // allows (a dual-review finding).
-    const indexDir = dirname(path);
-    const relativeToIndexDir = relative(indexDir, resolve(indexDir, entry.path));
-    if (
-      isAbsolute(entry.path) ||
-      relativeToIndexDir === '' ||
-      relativeToIndexDir === '..' ||
-      relativeToIndexDir.startsWith(`..${sep}`) ||
-      isAbsolute(relativeToIndexDir)
-    ) {
-      throw new Error(
-        `null-evaluate: ${path} entry "${entry.id}" has a path outside index.json's own directory: "${entry.path}"`
-      );
-    }
-    // Two tasks sharing the same graphId would let whichever result arrives
-    // last silently win (the same reasoning as readRewireIndex's duplicate-
-    // seed rejection above) — reject it here rather than at result-assembly
-    // time.
-    if (seenIds.has(entry.id)) {
-      throw new Error(`null-evaluate: ${path} lists graph id "${entry.id}" more than once`);
-    }
-    seenIds.add(entry.id);
-  }
-  return parsed as GraphListIndex;
-};
-
-/**
- * `entries` sorted by `id` ascending (plain string comparison) — the single
- * source of this mode's "results keyed by id, sorted" output guarantee
- * (`03-evaluation.md`'s own wording), matching `sortedRewireSeeds`'s role
- * for `--rewired-index` mode. Never a sort over collected results or
- * completion order.
- */
-export const sortedGraphListEntries = (index: Readonly<GraphListIndex>): readonly GraphListEntry[] =>
-  [...index.entries].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-
-/**
- * Verify every graph-list file's raw gzip bytes against `index.json` before
- * any shard is forked — mirrors `verifyRewiredFiles`'s reasoning exactly
- * (fail in seconds on a corrupted/stale/partial copy, not hours into a run).
- * `indexDir` is the graph-list index.json's own directory: every entry's
- * `path` is relative to it (e.g. `"graphs/P.bin.gz"`), not to `--graphs-dir`
- * (there is no separate `--graphs-dir` in this mode).
- */
-export const verifyGraphListFiles = (index: Readonly<GraphListIndex>, indexDir: string): void => {
-  const mismatches: string[] = [];
-  for (const entry of index.entries) {
-    const path = resolve(indexDir, entry.path);
-    let bytes: Buffer;
-    try {
-      bytes = readFileSync(path);
-    } catch (error) {
-      mismatches.push(`id ${entry.id}: cannot read ${path} (${error instanceof Error ? error.message : String(error)})`);
-      continue;
-    }
-    const actual = sha256Hex(bytes);
-    if (actual !== entry.gzipSha256) {
-      mismatches.push(`id ${entry.id}: ${path} gzip sha256 ${actual} does not match index.json (${entry.gzipSha256})`);
-    }
-  }
-  if (mismatches.length > 0) {
-    throw new Error(`null-evaluate: ${mismatches.length} graph-list file(s) failed verification:\n${mismatches.join('\n')}`);
-  }
-};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -1076,27 +823,26 @@ const writeEvaluationOutput = (
 };
 
 /**
- * `--graph-list` mode (`03-evaluation.md`'s WP2): score every entry in
- * `scripts/analysis/interventions.py`'s `index.json` (P, Q, and the
- * C/M/MQ control arms) instead of a `rewire_batch.py` seed-indexed batch.
- * Mirrors the `--rewired-index` path in `runNullEvaluate` below step for
- * step (verify-before-fork, sharded evaluation, atomic write) — the only
- * differences are the index shape, the task-id source (`entry.id` vs.
- * `rewired-${seed}`), and the output shape (`NullGraphListEvaluationRaw`,
- * keyed by `id`).
+ * The shared run shape both `--rewired-index` and `--graph-list` modes
+ * reduce to, once each has read and verified its own index format
+ * (a thermo-maintainability review finding: round 1 asked for exactly this
+ * extraction and only `writeEvaluationOutput` was actually shared then).
+ * `buildTasksFor`/`assemble` are the only two things that differ between the
+ * modes -- everything else (biological path resolution/verification, the
+ * worker path, timed sharded execution, the atomic write) is identical
+ * control flow, parameterized here rather than duplicated.
  */
-const runNullEvaluateGraphList = async (
+const runEvaluationMode = async (
   args: Readonly<NullEvaluateArgs>,
-  graphList: string
+  sourceArtifact: string,
+  sourceSha256: string,
+  buildTasksFor: (biologicalPath: string) => NullWorkerTask[],
+  assemble: (results: ReadonlyMap<string, readonly NullSeedResult[]>) => unknown
 ): Promise<{ out: string; runMetaOut: string; taskCount: number; elapsedMs: number }> => {
-  const index = readGraphListIndex(graphList);
-  const indexDir = dirname(graphList);
-  verifyGraphListFiles(index, indexDir);
+  const biologicalPath = args.biological ? args.graph ?? resolve(PUBLIC_DATA_DIR, sourceArtifact) : '';
+  if (args.biological) verifyBiologicalSource('null-evaluate', biologicalPath, sourceSha256);
 
-  const biologicalPath = args.biological ? args.graph ?? resolve(PUBLIC_DATA_DIR, index.sourceArtifact) : '';
-  if (args.biological) verifyBiologicalSource('null-evaluate', biologicalPath, index.sourceSha256);
-
-  const tasks = buildGraphListTasks(index, args, indexDir, biologicalPath);
+  const tasks = buildTasksFor(biologicalPath);
   const workerPath = fileURLToPath(new URL('./null-worker.ts', import.meta.url));
 
   const started = performance.now();
@@ -1108,9 +854,35 @@ const runNullEvaluateGraphList = async (
   const elapsedMs = performance.now() - started;
   const perEpisodeMs = elapsedMs / (tasks.length * args.heldOutCount);
 
-  const raw = assembleGraphListRaw(index, args, results);
+  const raw = assemble(results);
   const { out, runMetaOut } = writeEvaluationOutput(args, raw, elapsedMs, perEpisodeMs);
   return { out, runMetaOut, taskCount: tasks.length, elapsedMs };
+};
+
+/**
+ * `--graph-list` mode (`03-evaluation.md`'s WP2): score every entry in
+ * `scripts/analysis/interventions.py`'s `index.json` (P, Q, and the
+ * C/M/MQ control arms) instead of a `rewire_batch.py` seed-indexed batch.
+ * Reads and verifies this mode's own index format, then hands off to
+ * `runEvaluationMode` for the shared run shape -- the only differences from
+ * `--rewired-index` mode are the index shape, the task-id source (`entry.id`
+ * vs. `rewired-${seed}`), and the output shape (`NullGraphListEvaluationRaw`,
+ * keyed by `id`), all captured in `buildGraphListTasks`/`assembleGraphListRaw`.
+ */
+const runNullEvaluateGraphList = async (
+  args: Readonly<NullEvaluateArgs>,
+  graphList: string
+): Promise<{ out: string; runMetaOut: string; taskCount: number; elapsedMs: number }> => {
+  const index = readGraphListIndex(graphList);
+  const indexDir = dirname(graphList);
+  verifyGraphListFiles(index, indexDir);
+  return runEvaluationMode(
+    args,
+    index.sourceArtifact,
+    index.sourceSha256,
+    (biologicalPath) => buildGraphListTasks(index, args, indexDir, biologicalPath),
+    (results) => assembleGraphListRaw(index, args, results)
+  );
 };
 
 export const runNullEvaluate = async (
@@ -1140,25 +912,13 @@ export const runNullEvaluate = async (
 
   const index = readRewireIndex(args.rewiredIndex);
   verifyRewiredFiles(index, args.graphsDir);
-
-  const biologicalPath = args.biological ? args.graph ?? resolve(PUBLIC_DATA_DIR, index.sourceArtifact) : '';
-  if (args.biological) verifyBiologicalSource('null-evaluate', biologicalPath, index.sourceSha256);
-
-  const tasks = buildTasks(index, args, biologicalPath);
-  const workerPath = fileURLToPath(new URL('./null-worker.ts', import.meta.url));
-
-  const started = performance.now();
-  const results = await runShardedEvaluation<NullWorkerTask, NullSeedResult, NullWorkerMessage>(
-    tasks,
-    args.shards,
-    workerPath
+  return runEvaluationMode(
+    args,
+    index.sourceArtifact,
+    index.sourceSha256,
+    (biologicalPath) => buildTasks(index, args, biologicalPath),
+    (results) => assembleRaw(index, args, results)
   );
-  const elapsedMs = performance.now() - started;
-  const perEpisodeMs = elapsedMs / (tasks.length * args.heldOutCount);
-
-  const raw = assembleRaw(index, args, results);
-  const { out, runMetaOut } = writeEvaluationOutput(args, raw, elapsedMs, perEpisodeMs);
-  return { out, runMetaOut, taskCount: tasks.length, elapsedMs };
 };
 
 /** Every `runNullEvaluate`/`runNullTrainedEvaluate`-shaped CLI driver's return value: what `runCliMain` needs to log its summary line. */

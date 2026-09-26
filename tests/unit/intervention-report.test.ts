@@ -2,7 +2,7 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   armDistribution,
@@ -197,6 +197,9 @@ describe('readGraphListIndexInfo', () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), 'intervention-report-info-'));
   });
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
 
   it('parses id -> {kind, gzipSha256} plus controlCount from index.json entries', () => {
     const path = join(root, 'index.json');
@@ -273,6 +276,9 @@ describe('readPublishedNull', () => {
   let root: string;
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), 'intervention-report-null-'));
+  });
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
   });
 
   it('parses biological.score, rewired[].score, sourceGraphSha256, seeds, ticks, substeps', () => {
@@ -778,8 +784,22 @@ describe('buildInterventionStatistics: end-to-end on synthetic data', () => {
 describe('runInterventionReport (CLI layer)', () => {
   const seeds = [30001, 30002, 30003];
   const SOURCE_SHA = 'x'.repeat(64);
+  let root: string;
 
-  const writeFixtureFiles = (root: string, biologicalScore: number, publishedBiologicalScore: number) => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'intervention-report-cli-'));
+  });
+
+  afterEach(() => {
+    // Exception-safe cleanup (a thermo-maintainability review finding,
+    // flagged in rounds 2 and 3): a trailing `rmSync` at the end of each
+    // test body skips cleanup whenever an assertion inside that body fails
+    // (not just when the code under test throws), leaking the temp
+    // directory into `$TMPDIR`. `afterEach` always runs, pass or fail.
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const writeFixtureFiles = (biologicalScore: number, publishedBiologicalScore: number) => {
     const graphs = [
       { id: 'P', kind: 'P', score: 10 },
       { id: 'Q', kind: 'Q', score: 8 },
@@ -832,7 +852,7 @@ describe('runInterventionReport (CLI layer)', () => {
     writeFileSync(join(root, 'null.json'), JSON.stringify(publishedNull));
   };
 
-  const argsFor = (root: string, overrides: Partial<InterventionReportArgs> = {}): InterventionReportArgs => ({
+  const argsFor = (overrides: Partial<InterventionReportArgs> = {}): InterventionReportArgs => ({
     authored: join(root, 'authored.json'),
     index: join(root, 'index.json'),
     publishedNull: join(root, 'null.json'),
@@ -844,65 +864,53 @@ describe('runInterventionReport (CLI layer)', () => {
   });
 
   it('creates the output directory if it does not exist (mkdir before write)', () => {
-    const root = mkdtempSync(join(tmpdir(), 'intervention-report-cli-mkdir-'));
-    writeFixtureFiles(root, 0, 0);
-    const { out } = runInterventionReport(argsFor(root));
+    writeFixtureFiles(0, 0);
+    const { out } = runInterventionReport(argsFor());
     expect(JSON.parse(readFileSync(out, 'utf8')).biologicalReproduction.matches).toBe(true);
-    rmSync(root, { recursive: true, force: true });
   });
 
   it('records sha256 of each input file under statistics.inputs', () => {
-    const root = mkdtempSync(join(tmpdir(), 'intervention-report-cli-shas-'));
-    writeFixtureFiles(root, 0, 0);
-    const { statistics } = runInterventionReport(argsFor(root));
+    writeFixtureFiles(0, 0);
+    const { statistics } = runInterventionReport(argsFor());
     expect(statistics.inputs.authoredSha256).toMatch(/^[0-9a-f]{64}$/);
     expect(statistics.inputs.indexSha256).toMatch(/^[0-9a-f]{64}$/);
     expect(statistics.inputs.publishedNullSha256).toMatch(/^[0-9a-f]{64}$/);
-    rmSync(root, { recursive: true, force: true });
   });
 
   it('refuses to write when the biological reproduction check fails (fail-closed by default)', () => {
-    const root = mkdtempSync(join(tmpdir(), 'intervention-report-cli-repro-fail-'));
-    writeFixtureFiles(root, 0, 999); // computed 0 != published 999
-    const args = argsFor(root);
+    writeFixtureFiles(0, 999); // computed 0 != published 999
+    const args = argsFor();
     expect(() => runInterventionReport(args)).toThrow(/biological reproduction check failed/);
     expect(existsSync(args.out)).toBe(false);
-    rmSync(root, { recursive: true, force: true });
   });
 
   it('writes anyway when --allow-reproduction-mismatch is set, for diagnosis, and marks the output diagnosticOnly', () => {
-    const root = mkdtempSync(join(tmpdir(), 'intervention-report-cli-repro-allow-'));
-    writeFixtureFiles(root, 0, 999);
-    const { statistics } = runInterventionReport(argsFor(root, { allowReproductionMismatch: true }));
+    writeFixtureFiles(0, 999);
+    const { statistics } = runInterventionReport(argsFor({ allowReproductionMismatch: true }));
     expect(statistics.biologicalReproduction.matches).toBe(false);
     expect(statistics.diagnosticOnly).toBe(true);
-    rmSync(root, { recursive: true, force: true });
   });
 
   it('does not mark diagnosticOnly when --allow-reproduction-mismatch is passed but the check actually passes', () => {
-    const root = mkdtempSync(join(tmpdir(), 'intervention-report-cli-repro-clean-'));
-    writeFixtureFiles(root, 0, 0); // matches
-    const { statistics } = runInterventionReport(argsFor(root, { allowReproductionMismatch: true }));
+    writeFixtureFiles(0, 0); // matches
+    const { statistics } = runInterventionReport(argsFor({ allowReproductionMismatch: true }));
     expect(statistics.biologicalReproduction.matches).toBe(true);
     expect(statistics.diagnosticOnly).toBeUndefined();
-    rmSync(root, { recursive: true, force: true });
   });
 
   it('refuses to write a diagnosticOnly result to the default --out', () => {
-    const root = mkdtempSync(join(tmpdir(), 'intervention-report-cli-repro-default-out-'));
-    writeFixtureFiles(root, 0, 999); // reproduction fails
-    const args = { ...argsFor(root, { allowReproductionMismatch: true }), out: DEFAULT_OUT };
+    writeFixtureFiles(0, 999); // reproduction fails
+    const args = { ...argsFor({ allowReproductionMismatch: true }), out: DEFAULT_OUT };
     expect(() => runInterventionReport(args)).toThrow(/refusing to write a diagnosticOnly result to the default --out/);
-    rmSync(root, { recursive: true, force: true });
   });
 
   it('does not block a clean (non-diagnosticOnly) run targeting the default --out for an unrelated reason', () => {
     // Proves the guard is scoped to diagnosticOnly specifically -- a plain
     // run at the default --out is legitimate and must not be blocked by
     // this check. It still fails here, for the unrelated, expected reason
-    // that the fixture's default --authored/--index/--null paths don't
-    // exist on disk in this test environment.
-    const args = { ...argsFor(mkdtempSync(join(tmpdir(), 'intervention-report-cli-unused-'))), out: DEFAULT_OUT };
+    // that --authored/--index/--null don't exist on disk (writeFixtureFiles
+    // was never called in this test).
+    const args = { ...argsFor(), out: DEFAULT_OUT };
     expect(() => runInterventionReport(args)).not.toThrow(/refusing to write a diagnosticOnly result/);
   });
 });

@@ -5,7 +5,7 @@ import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -513,35 +513,41 @@ describe('null-evaluate CLI: --graph-list mode (trace-graph fixture)', () => {
 
   it('rejects a graph-list file whose bytes do not match index.json (sha mismatch)', () => {
     const tamperedRoot = mkdtempSync(join(tmpdir(), 'null-evaluate-graph-list-tampered-'));
-    cpSync(root, tamperedRoot, { recursive: true });
-    const victim = join(tamperedRoot, 'graphs', 'C000.bin.gz');
-    const bytes = readFileSync(victim);
-    bytes[bytes.length - 5] ^= 0xff;
-    writeFileSync(victim, bytes);
+    try {
+      cpSync(root, tamperedRoot, { recursive: true });
+      const victim = join(tamperedRoot, 'graphs', 'C000.bin.gz');
+      const bytes = readFileSync(victim);
+      bytes[bytes.length - 5] ^= 0xff;
+      writeFileSync(victim, bytes);
 
-    const out = join(tamperedRoot, 'authored-tampered.json');
-    const result = spawnSync(
-      process.execPath,
-      [
-        '--import',
-        'tsx',
-        'scripts/null/null-evaluate.ts',
-        '--graph-list',
-        join(tamperedRoot, 'index.json'),
-        '--held-out-count',
-        '1',
-        '--ticks',
-        String(TICKS),
-        '--shards',
-        '1',
-        '--out',
-        out
-      ],
-      { encoding: 'utf8', timeout: 60_000 }
-    );
-    expect(result.status).not.toBe(0);
-    expect(result.stderr).toMatch(/gzip sha256/);
-    rmSync(tamperedRoot, { recursive: true, force: true });
+      const out = join(tamperedRoot, 'authored-tampered.json');
+      const result = spawnSync(
+        process.execPath,
+        [
+          '--import',
+          'tsx',
+          'scripts/null/null-evaluate.ts',
+          '--graph-list',
+          join(tamperedRoot, 'index.json'),
+          '--held-out-count',
+          '1',
+          '--ticks',
+          String(TICKS),
+          '--shards',
+          '1',
+          '--out',
+          out
+        ],
+        { encoding: 'utf8', timeout: 60_000 }
+      );
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toMatch(/gzip sha256/);
+    } finally {
+      // Exception-safe cleanup (a thermo-maintainability review finding,
+      // flagged in rounds 2 and 3): a trailing rmSync skips cleanup whenever
+      // an assertion above throws, leaking the temp directory into $TMPDIR.
+      rmSync(tamperedRoot, { recursive: true, force: true });
+    }
   });
 
   it('rejects a graph-list entry whose binarySha256 does not match the decompressed bytes (worker-side check, correct gzipSha256)', () => {
@@ -554,35 +560,38 @@ describe('null-evaluate CLI: --graph-list mode (trace-graph fixture)', () => {
     // (parent, pre-fork) still passes, and only null-worker.ts's
     // loadVerifiedGraphBinary (decompressed, in-worker) can catch this.
     const tamperedRoot = mkdtempSync(join(tmpdir(), 'null-evaluate-graph-list-binary-sha-'));
-    cpSync(root, tamperedRoot, { recursive: true });
-    const indexPath = join(tamperedRoot, 'index.json');
-    const index = JSON.parse(readFileSync(indexPath, 'utf8'));
-    index.entries[0].binarySha256 = '0'.repeat(64);
-    writeFileSync(indexPath, JSON.stringify(index));
+    try {
+      cpSync(root, tamperedRoot, { recursive: true });
+      const indexPath = join(tamperedRoot, 'index.json');
+      const index = JSON.parse(readFileSync(indexPath, 'utf8'));
+      index.entries[0].binarySha256 = '0'.repeat(64);
+      writeFileSync(indexPath, JSON.stringify(index));
 
-    const out = join(tamperedRoot, 'authored-binary-sha-tampered.json');
-    const result = spawnSync(
-      process.execPath,
-      [
-        '--import',
-        'tsx',
-        'scripts/null/null-evaluate.ts',
-        '--graph-list',
-        indexPath,
-        '--held-out-count',
-        '1',
-        '--ticks',
-        String(TICKS),
-        '--shards',
-        '1',
-        '--out',
-        out
-      ],
-      { encoding: 'utf8', timeout: 60_000 }
-    );
-    expect(result.status).not.toBe(0);
-    expect(result.stderr).toMatch(/decompressed sha256/);
-    rmSync(tamperedRoot, { recursive: true, force: true });
+      const out = join(tamperedRoot, 'authored-binary-sha-tampered.json');
+      const result = spawnSync(
+        process.execPath,
+        [
+          '--import',
+          'tsx',
+          'scripts/null/null-evaluate.ts',
+          '--graph-list',
+          indexPath,
+          '--held-out-count',
+          '1',
+          '--ticks',
+          String(TICKS),
+          '--shards',
+          '1',
+          '--out',
+          out
+        ],
+        { encoding: 'utf8', timeout: 60_000 }
+      );
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toMatch(/decompressed sha256/);
+    } finally {
+      rmSync(tamperedRoot, { recursive: true, force: true });
+    }
   });
 
   it('--graph-list combined with --rewired-index fails at the CLI', () => {
@@ -610,9 +619,17 @@ describe('null-evaluate CLI: --graph-list mode (trace-graph fixture)', () => {
 });
 
 describe('readGraphListIndex: duplicate/malformed entry rejection', () => {
+  let root: string;
+  let indexPath: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'null-evaluate-graph-list-malformed-'));
+    indexPath = join(root, 'index.json');
+  });
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
   it('rejects a duplicate graph id', () => {
-    const root = mkdtempSync(join(tmpdir(), 'null-evaluate-graph-list-dup-id-'));
-    const indexPath = join(root, 'index.json');
     const entry = { id: 'P', path: 'x.bin.gz', gzipSha256: 'a'.repeat(64), binarySha256: 'b'.repeat(64) };
     writeFileSync(
       indexPath,
@@ -623,12 +640,9 @@ describe('readGraphListIndex: duplicate/malformed entry rejection', () => {
       })
     );
     expect(() => readGraphListIndex(indexPath)).toThrow(/more than once/);
-    rmSync(root, { recursive: true, force: true });
   });
 
   it('rejects a malformed entry', () => {
-    const root = mkdtempSync(join(tmpdir(), 'null-evaluate-graph-list-bad-entry-'));
-    const indexPath = join(root, 'index.json');
     writeFileSync(
       indexPath,
       JSON.stringify({
@@ -638,12 +652,9 @@ describe('readGraphListIndex: duplicate/malformed entry rejection', () => {
       })
     );
     expect(() => readGraphListIndex(indexPath)).toThrow(/malformed graph-list entry/);
-    rmSync(root, { recursive: true, force: true });
   });
 
   it.each(['biological', 'disconnected'])('rejects an entry using the reserved id "%s"', (reservedId) => {
-    const root = mkdtempSync(join(tmpdir(), 'null-evaluate-graph-list-reserved-id-'));
-    const indexPath = join(root, 'index.json');
     writeFileSync(
       indexPath,
       JSON.stringify({
@@ -653,12 +664,9 @@ describe('readGraphListIndex: duplicate/malformed entry rejection', () => {
       })
     );
     expect(() => readGraphListIndex(indexPath)).toThrow(/reserved graph id/);
-    rmSync(root, { recursive: true, force: true });
   });
 
   it('rejects an entry path that escapes index.json\'s own directory (absolute path)', () => {
-    const root = mkdtempSync(join(tmpdir(), 'null-evaluate-graph-list-abs-path-'));
-    const indexPath = join(root, 'index.json');
     writeFileSync(
       indexPath,
       JSON.stringify({
@@ -668,12 +676,9 @@ describe('readGraphListIndex: duplicate/malformed entry rejection', () => {
       })
     );
     expect(() => readGraphListIndex(indexPath)).toThrow(/path outside index\.json's own directory/);
-    rmSync(root, { recursive: true, force: true });
   });
 
   it('rejects an entry path that traverses above index.json\'s own directory ("..")', () => {
-    const root = mkdtempSync(join(tmpdir(), 'null-evaluate-graph-list-traversal-'));
-    const indexPath = join(root, 'index.json');
     writeFileSync(
       indexPath,
       JSON.stringify({
@@ -683,7 +688,6 @@ describe('readGraphListIndex: duplicate/malformed entry rejection', () => {
       })
     );
     expect(() => readGraphListIndex(indexPath)).toThrow(/path outside index\.json's own directory/);
-    rmSync(root, { recursive: true, force: true });
   });
 });
 
@@ -720,9 +724,17 @@ describe('buildGraphListTasks: --decoder propagation', () => {
 });
 
 describe('readRewireIndex: duplicate/malformed seed rejection', () => {
+  let root: string;
+  let indexPath: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'null-evaluate-malformed-seed-'));
+    indexPath = join(root, 'index.json');
+  });
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
   it('rejects a duplicate rewiring seed', () => {
-    const root = mkdtempSync(join(tmpdir(), 'null-evaluate-dup-seed-'));
-    const indexPath = join(root, 'index.json');
     const seedEntry = {
       seed: 0,
       artifact: 'x.bin.gz',
@@ -742,12 +754,9 @@ describe('readRewireIndex: duplicate/malformed seed rejection', () => {
       })
     );
     expect(() => readRewireIndex(indexPath)).toThrow(/more than once/);
-    rmSync(root, { recursive: true, force: true });
   });
 
   it('rejects a non-integer seed', () => {
-    const root = mkdtempSync(join(tmpdir(), 'null-evaluate-bad-seed-'));
-    const indexPath = join(root, 'index.json');
     writeFileSync(
       indexPath,
       JSON.stringify({
@@ -768,7 +777,6 @@ describe('readRewireIndex: duplicate/malformed seed rejection', () => {
       })
     );
     expect(() => readRewireIndex(indexPath)).toThrow(/malformed seed entry/);
-    rmSync(root, { recursive: true, force: true });
   });
 });
 
