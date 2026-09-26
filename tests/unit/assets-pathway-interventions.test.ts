@@ -38,6 +38,10 @@ describe('loadPathwayInterventions (against the real committed WP4 artifact)', (
     expect(result.data.authored.channelSpecific).toBe(true);
     expect(result.data.trained.trainedRobust).toBe(true);
     expect(result.data.trained.perSeedCategory['101']).toBe('no-specific-effect');
+    // (thermo review, methodology I2) The real shipped artifact discloses
+    // why "no-specific-effect" exists as a category name -- the loader now
+    // exposes it so the Findings panel's step 6 can surface a short caveat.
+    expect(result.data.trained.note).toContain('reporting convention');
     expect(result.data.sources.rewiringNullSha).toBe(manifest.rewiringNull?.sha256);
     expect(result.data.sources.nullExplanationSha).toBe(manifest.nullExplanation?.sha256);
   });
@@ -95,6 +99,29 @@ describe('loadPathwayInterventions (shape validation, with a synthetic manifest 
     const { manifest: manifestForBody } = manifestServing(validArtifact);
     const result = await loadPathwayInterventions(manifestForBody, '/data');
     expect(result.status).toBe('ok');
+    // `note` is optional and absent from this fixture -- never required for validation.
+    if (result.status === 'ok') expect(result.data.trained.note).toBeUndefined();
+  });
+
+  it('exposes trained.note when the artifact carries it, and rejects a non-string note', async () => {
+    const { manifest: withNote } = manifestServing({
+      ...validArtifact,
+      trained: { ...validArtifact.trained, note: 'a reporting convention adopted after the trained scores were known' }
+    });
+    const withNoteResult = await loadPathwayInterventions(withNote, '/data');
+    expect(withNoteResult.status).toBe('ok');
+    if (withNoteResult.status === 'ok') {
+      expect(withNoteResult.data.trained.note).toBe('a reporting convention adopted after the trained scores were known');
+    }
+
+    // A non-string `note` is simply dropped (optional field), not a validation failure.
+    const { manifest: withBadNote } = manifestServing({
+      ...validArtifact,
+      trained: { ...validArtifact.trained, note: 42 }
+    });
+    const withBadNoteResult = await loadPathwayInterventions(withBadNote, '/data');
+    expect(withBadNoteResult.status).toBe('ok');
+    if (withBadNoteResult.status === 'ok') expect(withBadNoteResult.data.trained.note).toBeUndefined();
   });
 
   it('is "invalid" for the wrong version', async () => {

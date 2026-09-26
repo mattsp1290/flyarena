@@ -66,8 +66,13 @@ test.describe('Findings panel', () => {
     // real shipped data has authored=pathway-supported, trained (robust)
     // =no-specific-effect, so this must say "does not reproduce", never
     // "matches" (the bean's own "fix the step-6 polarity sentence" ask).
+    // Rendered through the shared `describeTrainedCategory` helper (thermo
+    // review, methodology I1/I2), never the raw enum slug, plus the
+    // artifact's own disclosed reporting-convention caveat.
     const step6 = panel.locator('li.step').nth(5);
-    await expect(step6).toContainText(/all 3 seeds agree: no-specific-effect/);
+    await expect(step6).not.toContainText(/no-specific-effect/);
+    await expect(step6).toContainText(/all 3 seeds agree: no specific effect \(neither pathway-supported nor edge-class/);
+    await expect(step6).toContainText(/reporting convention adopted after the trained scores were known/);
     await expect(step6).toContainText(/does not reproduce/);
     await expect(step6).not.toContainText(/this matches/);
 
@@ -144,6 +149,60 @@ test.describe('Findings panel', () => {
     await waitForReady(page);
     await expect(startOrResumeButton(page)).toBeEnabled();
     await expect(page.locator('section.findings ol.steps')).toHaveCount(0);
+  });
+
+  /**
+   * (thermo review, maintainability Important) A real Tab-key session,
+   * driving actual `document.activeElement`, not `fireEvent.click` on the
+   * buttons directly (the unit tests' own coverage) — proves the guarantee
+   * the code comment above `.stepper-controls` in `FindingsPanel.svelte`
+   * actually makes: after `Next` moves focus to a step's heading, Tab no
+   * longer walks through *every earlier step's* own links (the DOM-order
+   * placement this branch fixed), only the *current* step's own provenance
+   * links, in order, before reaching `Previous`/`Next`. Step 2 is used
+   * because it has two provenance entries (four links) — the deepest case
+   * in the panel — so this also pins down the real, narrower Tab count the
+   * comment's prior "reaches Next directly" claim overstated.
+   */
+  test('real Tab order from a step heading walks that step\'s own provenance links, then Previous, then Next — never an earlier step\'s links', async ({
+    page
+  }) => {
+    await page.goto('/');
+    await waitForReady(page);
+    await expandFindingsPanel(page);
+    await page.getByRole('button', { name: /^next$/i }).click();
+
+    const step2 = page.locator('section.findings li.step').nth(1);
+    await expect(step2.locator('h3')).toBeFocused();
+
+    const focusedSummary = async (): Promise<string> =>
+      page.evaluate(() => {
+        const el = document.activeElement;
+        if (!el) return '(none)';
+        return `${el.tagName}:${(el.textContent ?? '').trim().slice(0, 40)}`;
+      });
+
+    const jsonLinks = step2.getByRole('link', { name: 'Pinned JSON' });
+    const reportLinks = step2.getByRole('link', { name: 'Report' });
+    await expect(jsonLinks).toHaveCount(2);
+    await expect(reportLinks).toHaveCount(2);
+
+    // Four provenance links (one pair per source artifact), in DOM order.
+    await page.keyboard.press('Tab');
+    expect(await focusedSummary()).toContain('Pinned JSON');
+    await page.keyboard.press('Tab');
+    expect(await focusedSummary()).toContain('Report');
+    await page.keyboard.press('Tab');
+    expect(await focusedSummary()).toContain('Pinned JSON');
+    await page.keyboard.press('Tab');
+    expect(await focusedSummary()).toContain('Report');
+
+    // Then, and only then, Previous and Next — never an earlier step's own
+    // links (the bug the prior placement above the `<ol>` had).
+    await page.keyboard.press('Tab');
+    expect(await focusedSummary()).toContain('Previous');
+    await page.keyboard.press('Tab');
+    expect(await focusedSummary()).toContain('Next');
   });
 });
 

@@ -220,7 +220,13 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     expect(step.status).toBe('ok');
     expect(step.condition).toBe('both');
     expect(step.sentence).toContain('all 3 seeds agree:');
-    expect(step.sentence).toContain('no-specific-effect');
+    // (thermo review, methodology I1/I2) Rendered through the shared
+    // `describeTrainedCategory` helper -- never the raw "no-specific-effect"
+    // enum slug -- and, since the real shipped artifact's `trained.note`
+    // field discloses the reporting-convention caveat, that caveat text too.
+    expect(step.sentence).not.toContain('no-specific-effect');
+    expect(step.sentence).toContain('no specific effect (neither pathway-supported nor edge-class');
+    expect(step.sentence).toContain('a reporting convention adopted after the trained scores were known, not a predeclared category');
     expect(step.sentence).toContain('does not reproduce');
     expect(step.sentence).not.toContain('this matches');
     expect(step.sentence).toContain(`authored decoder's ${realPathwayInterventions.authored.category} result`);
@@ -256,7 +262,14 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     expect(step.sentence).toContain('seeds disagree:');
     expect(step.sentence).toContain('seed 101: pathway-supported');
     expect(step.sentence).toContain('seed 202: edge-class-effect');
-    expect(step.sentence).toContain('seed 303: no-specific-effect');
+    // The dissenting no-specific-effect seed reads through the same
+    // human-readable helper, without the reporting-convention caveat (which
+    // the per-seed "seeds disagree" listing deliberately omits, so it isn't
+    // repeated once per dissenting seed -- see `describeTrainedCategory`'s
+    // own doc comment).
+    expect(step.sentence).not.toContain('seed 303: no-specific-effect');
+    expect(step.sentence).toContain('seed 303: no specific effect (neither pathway-supported nor edge-class)');
+    expect(step.sentence).not.toContain('reporting convention');
     expect(step.sentence).toContain('does not reproduce');
   });
 
@@ -279,6 +292,23 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
       expect(step.sentence, authoredCategory).not.toContain('does not reproduce');
       expect(step.sentence, authoredCategory).toMatch(/under this model\.$/);
     }
+  });
+
+  it('step 6 never appends the reporting-convention caveat when the artifact carries no trained.note field (never unconditional)', () => {
+    const noNote: PathwayInterventionsArtifact = {
+      ...realPathwayInterventions,
+      trained: {
+        trainedRobust: true,
+        perSeedCategory: { '101': 'no-specific-effect', '202': 'no-specific-effect', '303': 'no-specific-effect' }
+        // no `note` field
+      }
+    };
+    const step = findStep(
+      buildFindingSteps({ ...baseInputs(), pathwayInterventions: pathwayInterventionsOk(noNote) }),
+      'trained-interventions'
+    );
+    expect(step.sentence).toContain('no specific effect (neither pathway-supported nor edge-class)');
+    expect(step.sentence).not.toContain('reporting convention');
   });
 
   it('step 7 (behavior repertoire) is always "missing" with "Not yet published" in this WP (repertoire-null has not landed)', () => {

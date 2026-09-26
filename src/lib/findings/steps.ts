@@ -37,7 +37,7 @@ import {
   type PathwayInterventionsTrainedCategory
 } from '../experiment/pathwayInterventions';
 import { githubDocUrl } from '../ui/links';
-import { formatPercentile, formatRho } from './format';
+import { describeTrainedCategory, formatPercentile, formatRho } from './format';
 
 /**
  * The step's own display status — a normalized view over whichever status
@@ -92,7 +92,11 @@ export const findingStepStatusLabel = (status: Exclude<FindingStepStatus, 'ok'>)
 
 const provenanceFor = (
   manifest: ArenaManifest | undefined,
-  entry: SidecarManifestEntry | { artifact: string; sha256: string } | undefined,
+  // `SidecarManifestEntry` (`{ artifact: string; sha256: string }`) alone
+  // already covers `manifest.rewiringNull`'s own inline type structurally
+  // (thermo review, maintainability Suggestion) — no second union member
+  // needed.
+  entry: SidecarManifestEntry | undefined,
   label: string,
   reportSlug: string,
   dataBaseUrl: string
@@ -416,9 +420,18 @@ const buildTrainedInterventionsStep = (inputs: BuildFindingStepsInputs): Finding
   // robustly-reproduced category, so neither "matches" nor "is consistent
   // with" is ever claimed in that branch.
   const agreementPrefix = trained.trainedRobust ? `all ${P_TRAINER_SEEDS.length} seeds agree:` : 'seeds disagree:';
+  // (thermo review, methodology I1/I2) Rendered through `describeTrainedCategory`
+  // (`./format.ts`), never the raw enum slug — `'no-specific-effect'` reads
+  // as "no effect" to an unprimed reader, when it actually means the
+  // trained side's predeclared rules cannot decide between
+  // `generic-rewiring-effect`/`not-supported`. The robust branch also
+  // carries the short "reporting convention" caveat, but only when the
+  // artifact's own `trained.note` field actually discloses it (never
+  // unconditionally) — the per-seed "seeds disagree" listing omits it so a
+  // dissenting no-specific-effect seed doesn't repeat the same caveat.
   const categoryText = trained.trainedRobust
-    ? trained.perSeedCategory[P_TRAINER_SEEDS[0]]
-    : P_TRAINER_SEEDS.map((seed) => `seed ${seed}: ${trained.perSeedCategory[seed]}`).join(', ');
+    ? describeTrainedCategory(trained.perSeedCategory[P_TRAINER_SEEDS[0]], { withCaveat: Boolean(trained.note) })
+    : P_TRAINER_SEEDS.map((seed) => `seed ${seed}: ${describeTrainedCategory(trained.perSeedCategory[seed])}`).join(', ');
 
   // (dual review, Important) The authored and trained categories are two
   // *different* vocabularies, not the same one — `no-specific-effect` is

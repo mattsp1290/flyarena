@@ -435,8 +435,6 @@ export interface RewiringNullTrainedSection {
   readonly rewiredCount: number;
 }
 
-const RANK_STATISTIC_MATCH_EPSILON = 1e-9;
-
 /**
  * `RewiringNullArtifact.trained` is deliberately typed `unknown` (see that
  * field's own doc comment): no real producer output existed to verify a
@@ -481,7 +479,12 @@ export const validateRewiringNullTrained = (value: unknown): RewiringNullTrained
   }
 
   const headline = bioReplicaPercentiles.find((entry) => entry.trainerSeed === v.replicaSeed);
-  if (!headline || Math.abs(headline.percentile - (v.bioPercentile as number)) > RANK_STATISTIC_MATCH_EPSILON) {
+  // Reuses `validateRewiringNullShape`'s own `RANK_STATISTIC_EPSILON`
+  // (thermo review, maintainability Suggestion) rather than a second,
+  // differently-named constant with the identical value and purpose
+  // (float-round-trip slack when comparing two independently-derived rank
+  // statistics).
+  if (!headline || Math.abs(headline.percentile - (v.bioPercentile as number)) > RANK_STATISTIC_EPSILON) {
     return undefined;
   }
 

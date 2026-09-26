@@ -100,14 +100,21 @@
     <p class="reason">Expand to walk the evidence chain: seven steps, each templated from a verified artifact.</p>
   {/if}
 
+  <!-- (thermo review, maintainability Suggestion) Mounted unconditionally
+       (present but empty before expansion), not inside `{#if expanded}` —
+       some screen readers do not reliably announce a live region's
+       *initial* content when the region and its first text arrive in the
+       same DOM update; they announce only a later mutation of an
+       already-present node. The first "Step 1 of 7" text on expand is then
+       a real mutation of an existing node, not a simultaneous insertion. -->
+  <div aria-live="polite" class="sr-only">{expanded ? `Step ${currentIndex + 1} of ${steps.length}` : ''}</div>
+
   {#if expanded}
     <p class="disclaimer">
       Every step below names its decoder condition (authored or trained) and states its result "under this
       model" — a descriptive finding about this synthetic experiment, never a claim about the real fly. The
       authored decoder is a fixed, hand-written mapping, not biology and not trained.
     </p>
-
-    <div aria-live="polite" class="sr-only">Step {currentIndex + 1} of {steps.length}</div>
 
     <ol class="steps">
       {#each steps as step, index (step.id)}
@@ -148,12 +155,21 @@
           {/if}
 
           {#if index === currentIndex}
-            <!-- (dual review, Important) Rendered inside the current step,
-                 immediately after its own content — not above the `<ol>` —
-                 so the next Tab from the just-focused heading reaches Next
-                 directly. Controls placed before the list would force a
-                 keyboard/screen-reader user to Shift+Tab backward through
-                 every earlier step's own links to reach Next again. -->
+            <!-- (dual review, Important; narrowed by thermo review,
+                 maintainability Important — the prior comment here
+                 overclaimed "the next Tab reaches Next directly," which a
+                 real Playwright/Chromium Tab-key session showed is false
+                 whenever the current step has its own provenance links:
+                 Tab lands on "Pinned JSON"/"Report" first, then Next/
+                 Previous) Rendered inside the current step, immediately
+                 after its own content — not above the `<ol>` — so Tab no
+                 longer walks through *every earlier step's* own links to
+                 reach Next again, only the *current* step's own (a normal
+                 "read the evidence, then act" order: 1-4 links, one pair
+                 per provenance entry, not the six-steps'-worth a control
+                 placed above the list would force). See
+                 `tests/e2e/findings.spec.ts`'s real-Tab-order test for the
+                 guarantee this comment actually makes. -->
             <div class="stepper-controls">
               <button type="button" onclick={goPrevious} disabled={currentIndex === 0}>Previous</button>
               <button type="button" onclick={goNext} disabled={currentIndex === steps.length - 1}>Next</button>

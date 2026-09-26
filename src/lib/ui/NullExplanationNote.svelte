@@ -1,13 +1,8 @@
 <script lang="ts">
   import type { NullExplanationLoadResult, NullExplanationQualifyingMetric } from '../experiment/nullExplanation';
-  import {
-    P_TRAINER_SEEDS,
-    type PathwayInterventionsAuthoredCategory,
-    type PathwayInterventionsLoadResult,
-    type PathwayInterventionsTrainedCategory
-  } from '../experiment/pathwayInterventions';
+  import { P_TRAINER_SEEDS, type PathwayInterventionsLoadResult } from '../experiment/pathwayInterventions';
   import { githubDocUrl } from './links';
-  import { formatPercentile } from '../findings/format';
+  import { formatPercentile, PATHWAY_AUTHORED_CLAUSE_TEXT, PATHWAY_TRAINED_CLAUSE_TEXT } from '../findings/format';
 
   /**
    * WP4 of `.agents/plans/null-explanation` (`04-ledger-note.md`): the
@@ -192,40 +187,11 @@
       : ''
   );
 
-  /**
-   * WP4 of `.agents/plans/pathway-interventions`: the tested-outcome
-   * sentence, templated from the verified artifact's own predeclared
-   * category (`00-overview.md`'s vocabulary, stated mechanically — this
-   * never reads as a stronger or weaker claim than the category itself
-   * licenses). One template per authored category, each carrying the
-   * "net effect of the accepted swap set, not a single-edge effect"
-   * framing in its own wording so a reader never mistakes this for a
-   * single-edge causal claim.
-   */
-  const PATHWAY_AUTHORED_CLAUSE: Record<PathwayInterventionsAuthoredCategory, string> = {
-    'pathway-supported':
-      "the pathway-supported category holds: the accepted swap set's net effect outperforms both the unrestricted (C) and class-matched (M) random controls",
-    'edge-class-effect':
-      "the edge-class-effect category holds: the accepted swap set's net effect outperforms the unrestricted (C) control but not the class-matched (M) control — any edge of this class helps about equally",
-    'generic-rewiring-effect':
-      "the generic-rewiring-effect category holds: the accepted swap set's net effect does not outperform the unrestricted (C) control — any perturbation of this size helps about equally",
-    'not-supported': "the not-supported category holds: the accepted swap set's net effect does not clear the null's 25th percentile"
-  };
-
-  /**
-   * One template per trained category — see
-   * `scripts/null/intervention-report-trained.ts`'s own doc comment for why
-   * `'no-specific-effect'` is not a renamed authored category (it is the
-   * deliberate merge of `'generic-rewiring-effect'`/`'not-supported'` for
-   * the trained side, where this study's predeclared rules cannot decide
-   * that finer split). Used only when `trainedRobust` is true — see
-   * `pathwayTrainedClause` below for the non-robust wording.
-   */
-  const PATHWAY_TRAINED_CLAUSE: Record<PathwayInterventionsTrainedCategory, string> = {
-    'pathway-supported': 'P also outperforms both freshly-trained control arms across all three trainer seeds tested',
-    'edge-class-effect': 'P outperforms the freshly-trained unrestricted (C) arm but not the class-matched (M) arm, across all three trainer seeds tested',
-    'no-specific-effect': 'P shows no advantage over either freshly-trained control arm, across all three trainer seeds tested'
-  };
+  // (thermo review, methodology I1) `PATHWAY_AUTHORED_CLAUSE_TEXT`/
+  // `PATHWAY_TRAINED_CLAUSE_TEXT` moved to `../findings/format.ts` (text
+  // unchanged, so this component's rendered output stays byte-identical),
+  // so `src/lib/findings/steps.ts`'s step 6 can share the same canonical
+  // category facts instead of independently rendering the raw enum slug.
 
   const pathwayChannelSpecificClause = $derived(
     pathwayInterventions?.status === 'ok'
@@ -238,7 +204,7 @@
   const pathwayTrainedClause = $derived(
     pathwayInterventions?.status === 'ok'
       ? pathwayInterventions.data.trained.trainedRobust
-        ? `Under trained readouts, ${PATHWAY_TRAINED_CLAUSE[pathwayInterventions.data.trained.perSeedCategory['101']]} (robust)`
+        ? `Under trained readouts, ${PATHWAY_TRAINED_CLAUSE_TEXT[pathwayInterventions.data.trained.perSeedCategory['101']]} (robust)`
         : // Non-robust: state each seed's own category rather than only "do
           // not agree" (thermo review, Suggestion — the per-seed data is
           // already carried on the artifact, and hiding it here would leave
@@ -318,7 +284,7 @@
        styling `.null-explanation-detail p` already declares. -->
   <div class="detail-box pathway-interventions-detail">
     <p>
-      Tested under this model, with the authored (hand-written) decoder: {PATHWAY_AUTHORED_CLAUSE[pathwayInterventions.data.authored.category]}, and {pathwayChannelSpecificClause}.
+      Tested under this model, with the authored (hand-written) decoder: {PATHWAY_AUTHORED_CLAUSE_TEXT[pathwayInterventions.data.authored.category]}, and {pathwayChannelSpecificClause}.
     </p>
     <p>{pathwayTrainedClause}.</p>
     <!-- Restored (fix-verification review finding: dropped when the sentence

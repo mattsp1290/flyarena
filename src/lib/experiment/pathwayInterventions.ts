@@ -68,6 +68,17 @@ export interface PathwayInterventionsArtifact {
      * "do not agree" boolean.
      */
     readonly perSeedCategory: Readonly<Record<(typeof P_TRAINER_SEEDS)[number], PathwayInterventionsTrainedCategory>>;
+    /**
+     * `scripts/null/intervention-artifact.ts`'s own methodological
+     * disclosure for why `'no-specific-effect'` exists as a category name
+     * (thermo review, methodology I2): it is a reporting convention this
+     * study's coordinator adopted after the trained scores were known, not
+     * itself a predeclared category. Optional — an older or hand-built
+     * fixture may simply not carry it; `src/lib/findings/steps.ts`'s step 6
+     * only shows its short caveat when this field is actually present,
+     * never unconditionally.
+     */
+    readonly note?: string;
   };
 }
 
@@ -128,7 +139,8 @@ const validateShape = (value: unknown): { ok: true; data: PathwayInterventionsAr
       authored: { category: authored.category, channelSpecific: authored.channelSpecific },
       trained: {
         trainedRobust: trained.trainedRobust,
-        perSeedCategory: perSeedCategory as Readonly<Record<(typeof P_TRAINER_SEEDS)[number], PathwayInterventionsTrainedCategory>>
+        perSeedCategory: perSeedCategory as Readonly<Record<(typeof P_TRAINER_SEEDS)[number], PathwayInterventionsTrainedCategory>>,
+        ...(typeof trained.note === 'string' ? { note: trained.note } : {})
       }
     }
   };
