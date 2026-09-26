@@ -1,6 +1,7 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
+import { resolveArenaTask } from '../../src/lib/arena/tasks';
 import { readoutParameterCount } from '../../src/lib/connectome/readout';
 import { mulberry32 } from '../../src/lib/random/mulberry32';
 import type { ArmName } from '../../scripts/training/arms';
@@ -26,6 +27,10 @@ export interface TinyRunOptions {
   readonly includeEnv?: boolean;
   /** Optional `RunConfig.armBundleSha256`, for tests exercising the arm-bundle-sha256 compatibility check. */
   readonly armBundleSha256?: string;
+  /** Arena task id this run is recorded as trained under (default `'default'`, matching every existing test's implicit assumption). */
+  readonly arenaTask?: string;
+  /** Omits `arenaTask`/`arenaTaskFingerprint` entirely, for a test of the "run directory predates arena tasks" fail-closed path. */
+  readonly omitArenaTaskFingerprint?: boolean;
   /**
    * Optional CEM-config fields (`RunConfig`'s optional properties), for
    * tests that exercise `evaluate.ts`'s manifest `training` block (the
@@ -50,6 +55,8 @@ export interface TinyRunOptions {
 
 export const writeTinyRunDir = (options: Readonly<TinyRunOptions>): void => {
   const { dir, arm, trainerSeed, D, H, substeps, weightSeed, includeEnv, armBundleSha256, cemConfig } = options;
+  const omitArenaTaskFingerprint = options.omitArenaTaskFingerprint ?? false;
+  const resolvedArenaTask = resolveArenaTask(options.arenaTask);
   mkdirSync(dir, { recursive: true });
 
   const parameterCount = readoutParameterCount(D, H);
@@ -68,6 +75,9 @@ export const writeTinyRunDir = (options: Readonly<TinyRunOptions>): void => {
     parameterCount,
     substeps,
     ...(armBundleSha256 !== undefined ? { armBundleSha256 } : {}),
+    ...(omitArenaTaskFingerprint
+      ? {}
+      : { arenaTask: resolvedArenaTask.id, arenaTaskFingerprint: resolvedArenaTask.fingerprint }),
     ...cemConfig
   };
   writeFileSync(resolve(dir, 'config.json'), JSON.stringify(config));

@@ -2,10 +2,12 @@ import { existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { resolveArenaTask } from '../../src/lib/arena/tasks';
 import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import { requireNonNegativeInt, requirePositiveInt, requireValue } from '../training/cli';
 import { atomicWriteFileSync, gitRev, sha256Hex } from '../training/fsio';
 import { CEM_CONFIG_FIELDS, isEmptyCemConfig, readRunDir } from '../training/run-dir';
+import { arenaTaskOutputFields, parseArenaTaskArg, type ArenaTaskOutputFields } from './arena-task-fields';
 import { runCliMain, runMetaPathFor, runShardedEvaluation, toGraphRaw, type NullGraphRaw } from './null-evaluate';
 import type { NullSeedResult, NullWorkerMessage } from './null-worker';
 import type { NullTrainedWorkerTask } from './null-trained-worker';
@@ -90,6 +92,7 @@ export interface NullTrainedEvaluateArgs {
   readonly hiddenSize: number;
   readonly shards: number;
   readonly out: string;
+  readonly arenaTask?: string;
 }
 
 const parseTrainerSeeds = (flag: string, value: string): readonly number[] => {
@@ -119,6 +122,7 @@ export const parseNullTrainedEvaluateArgs = (argv: readonly string[]): NullTrain
   let hiddenSize = DEFAULT_HIDDEN_SIZE;
   let shards = DEFAULT_SHARDS;
   let out = DEFAULT_OUT;
+  let arenaTask: string | undefined;
 
   let index = 0;
   while (index < argv.length) {
@@ -165,6 +169,9 @@ export const parseNullTrainedEvaluateArgs = (argv: readonly string[]): NullTrain
     } else if (flag === '--out') {
       out = resolve(process.cwd(), requireValue(flag, argv[index + 1]));
       index += 2;
+    } else if (flag === '--arena-task') {
+      arenaTask = parseArenaTaskArg(requireValue(flag, argv[index + 1]));
+      index += 2;
     } else {
       throw new Error(`Unknown argument: ${flag}`);
     }
@@ -186,7 +193,8 @@ export const parseNullTrainedEvaluateArgs = (argv: readonly string[]): NullTrain
     ticks,
     hiddenSize,
     shards,
-    out
+    out,
+    arenaTask
   };
 };
 
@@ -264,6 +272,7 @@ export const buildTasks = (args: Readonly<NullTrainedEvaluateArgs>): NullTrained
   const heldOutSeeds = Array.from({ length: args.heldOutCount }, (_, i) => args.heldOutStart + i);
   const tasks: NullTrainedWorkerTask[] = [];
   const bundlePathsByGraphId = new Map<string, string>();
+  const expectedArenaTaskFingerprint = resolveArenaTask(args.arenaTask).fingerprint;
 
   for (let seed = args.rewiredSeedStart; seed < args.rewiredSeedStart + args.rewiredSeedCount; seed += 1) {
     const runDir = resolve(args.rewiredTrainedDir, `seed${seed}`);
@@ -282,7 +291,9 @@ export const buildTasks = (args: Readonly<NullTrainedEvaluateArgs>): NullTrained
       expectedArm: 'rewired',
       expectedTrainerSeed: args.replicaSeed,
       expectedSubsteps: NEURAL_SUBSTEPS_PER_TICK,
-      expectedHiddenSize: args.hiddenSize
+      expectedHiddenSize: args.hiddenSize,
+      arenaTask: args.arenaTask,
+      expectedArenaTaskFingerprint
     });
     bundlePathsByGraphId.set(graphId, armBundlePath);
   }
@@ -305,7 +316,9 @@ export const buildTasks = (args: Readonly<NullTrainedEvaluateArgs>): NullTrained
       expectedArm: 'biological',
       expectedTrainerSeed: trainerSeed,
       expectedSubsteps: NEURAL_SUBSTEPS_PER_TICK,
-      expectedHiddenSize: args.hiddenSize
+      expectedHiddenSize: args.hiddenSize,
+      arenaTask: args.arenaTask,
+      expectedArenaTaskFingerprint
     });
     bundlePathsByGraphId.set(graphId, biologicalArmBundlePath);
   }
@@ -344,7 +357,7 @@ export interface NullTrainedBiologicalGraphRaw extends NullTrainedGraphRaw {
  * variance at fixed (biological) topology as a separate, explicitly-labeled
  * context (see `null-report.ts`'s `bioTrainerSeedSpread`).
  */
-export interface NullTrainedEvaluationRaw {
+export interface NullTrainedEvaluationRaw extends ArenaTaskOutputFields {
   readonly version: 1;
   readonly seeds: { readonly start: number; readonly count: number };
   readonly ticks: number;
@@ -507,7 +520,8 @@ export const assembleRaw = (
     bigqMergeCommit: BIGQ_MERGE_COMMIT,
     evaluatorGitRev: gitRev(repoRoot),
     cemConfig,
-    cemConfigWarnings
+    cemConfigWarnings,
+    ...arenaTaskOutputFields(args.arenaTask)
   };
 };
 

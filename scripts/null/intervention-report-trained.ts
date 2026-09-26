@@ -1,5 +1,5 @@
 import { mean, type ConditionStats } from '../training/stats';
-import { graphStats, quantileIndex } from './null-stats';
+import { DEGENERATE_IQR_THRESHOLD, graphStats, quantileIndex } from './null-stats';
 import type { GraphKind, GraphListIndexInfo } from './intervention-report';
 import type { NullTrainedInterventionEvaluationRaw, NullTrainedInterventionGraphRaw } from './null-trained-evaluate-graph-list';
 
@@ -354,4 +354,63 @@ export const buildTrainedStatistics = (
     host: raw.host,
     note: TRAINED_CATEGORY_NOTE
   };
+};
+
+// ---------------------------------------------------------------------------
+// Task-generality WP1: trainedTaskResult
+// ---------------------------------------------------------------------------
+
+/** `trainedTaskResult`'s degenerate outcome: the C or M arm's own IQR (or an all-equal arm, which has IQR 0) fails `DEGENERATE_IQR_THRESHOLD` — this task's trained result is not categorized at all. */
+export interface TrainedTaskDegenerateResult {
+  readonly degenerate: true;
+}
+
+export interface TrainedTaskCategorizedResult {
+  readonly degenerate: false;
+  readonly perSeed: Readonly<Record<PTrainerSeed, TrainedOutcomeCategory>>;
+  /** `.agents/plans/task-generality/00-overview.md`'s "robust only if all 3 seeds give the same category" — reuses `isTrainedRobust`'s own strict-equality convention. */
+  readonly trainedRobust: boolean;
+}
+
+export type TrainedTaskResult = TrainedTaskDegenerateResult | TrainedTaskCategorizedResult;
+
+/**
+ * Empirical IQR of an arm's own (already `TrainedArmDistribution`-sorted)
+ * scores, using `null-stats.ts`'s low-tail-floor/high-tail-ceil-minus-one
+ * quantile convention (`quantileIndex`) — the same convention
+ * `nullSummary`'s own IQR uses, applied here to a 5-score control arm
+ * instead of a 500-graph null set.
+ */
+const armIqr = (arm: Readonly<TrainedArmDistribution>): number => {
+  const { scores, n } = arm;
+  return scores[quantileIndex(n, 0.75)] - scores[quantileIndex(n, 0.25)];
+};
+
+/**
+ * `.agents/plans/task-generality/01-task-plumbing.md`'s WP1: a thin wrapper
+ * around the existing `evaluateTrainedCategory`/`isTrainedRobust` (WP2/WP3
+ * apply this per task, reusing the task-independent P/C/M graphs unchanged —
+ * see `00-overview.md`'s key decisions). Applies the study's degenerate
+ * guard first (`00-overview.md`: "a task's trained result is degenerate if
+ * the 5-run trained C or M arm has IQR below `DEGENERATE_IQR_THRESHOLD` (or
+ * all its scores are equal)" — an all-equal arm's IQR is exactly 0, already
+ * below the threshold, so no separate equality check is needed): only a
+ * non-degenerate task is categorized at all, matching the published trained
+ * null's own convention of never deciding a category, only providing
+ * context.
+ */
+export const trainedTaskResult = (
+  pScores: Readonly<Record<PTrainerSeed, number>>,
+  cArm: Readonly<TrainedArmDistribution>,
+  mArm: Readonly<TrainedArmDistribution>
+): TrainedTaskResult => {
+  if (armIqr(cArm) < DEGENERATE_IQR_THRESHOLD || armIqr(mArm) < DEGENERATE_IQR_THRESHOLD) {
+    return { degenerate: true };
+  }
+  const perSeedEntries = P_TRAINER_SEEDS.map(
+    (seed): [PTrainerSeed, TrainedOutcomeCategory] => [seed, evaluateTrainedCategory(pScores[seed], cArm, mArm)]
+  );
+  const perSeed = Object.fromEntries(perSeedEntries) as Record<PTrainerSeed, TrainedOutcomeCategory>;
+  const categories = P_TRAINER_SEEDS.map((seed) => perSeed[seed]);
+  return { degenerate: false, perSeed, trainedRobust: categories.every((category) => category === categories[0]) };
 };

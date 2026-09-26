@@ -1,5 +1,6 @@
 import { decodeAction, OUTPUT_POPULATION } from '../../src/lib/arena/actions';
 import { observeAgent } from '../../src/lib/arena/sensors';
+import { resolveArenaTask } from '../../src/lib/arena/tasks';
 import { createWorld, stepWorld } from '../../src/lib/arena/world';
 import type {
   ActionsByAgent,
@@ -166,6 +167,16 @@ export interface EpisodeConfig {
   readonly substeps?: number;
   readonly left: AgentEpisodeConfig;
   readonly right: AgentEpisodeConfig;
+  /**
+   * `.agents/plans/task-generality/01-task-plumbing.md`'s WP1: the arena
+   * task id (`src/lib/arena/tasks.ts`'s `ARENA_TASKS`) whose config this
+   * episode's `createWorld` uses. `undefined` resolves to `'default'`
+   * (`ARENA_CONFIG`, unchanged) — every existing caller that never sets this
+   * field keeps producing byte-identical output. `resolveArenaTask` throws
+   * on an unrecognized id, so a stale/typo'd id fails loudly here rather
+   * than silently scoring the wrong task.
+   */
+  readonly arenaTask?: string;
   /**
    * Diagnostic-only hook, never used by a production caller (`evaluate.ts`
    * never passes it): invoked once per tick, immediately after `stepWorld`,
@@ -374,7 +385,7 @@ export const runEpisode = (config: Readonly<EpisodeConfig>): EpisodeResult => {
   const leftRunner = createAgentRunner('left', config.left, substeps);
   const rightRunner = createAgentRunner('right', config.right, substeps);
 
-  let world = createWorld(config.seed);
+  let world = createWorld(config.seed, resolveArenaTask(config.arenaTask).config);
   for (let tick = 0; tick < config.ticks; tick += 1) {
     const leftAction = leftRunner.step(world);
     const rightAction = rightRunner.step(world);

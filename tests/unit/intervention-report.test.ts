@@ -22,6 +22,7 @@ import {
   type PublishedNull
 } from '../../scripts/null/intervention-report';
 import type { NullGraphListEvaluationRaw } from '../../scripts/null/null-evaluate';
+import { resolveArenaTask } from '../../src/lib/arena/tasks';
 
 /**
  * Coverage for `scripts/null/intervention-report.ts`'s statistics layer
@@ -914,5 +915,51 @@ describe('runInterventionReport (CLI layer)', () => {
     // was never called in this test).
     const args = { ...argsFor(), out: DEFAULT_OUT };
     expect(() => runInterventionReport(args)).not.toThrow(/refusing to write a diagnosticOnly result/);
+  });
+
+  describe('--arena-task (task-generality WP1)', () => {
+    const patchAuthoredArenaTask = (id: string): void => {
+      const path = join(root, 'authored.json');
+      const authored = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+      authored.arenaTask = id;
+      authored.arenaTaskFingerprint = resolveArenaTask(id).fingerprint;
+      writeFileSync(path, JSON.stringify(authored));
+    };
+
+    it('labels the output when --arena-task matches authored.json\'s recorded task', () => {
+      writeFixtureFiles(0, 0);
+      patchAuthoredArenaTask('hazard-heavy');
+      const { statistics } = runInterventionReport(argsFor({ arenaTask: 'hazard-heavy' }));
+      expect(statistics.arenaTask).toEqual({ id: 'hazard-heavy', fingerprint: resolveArenaTask('hazard-heavy').fingerprint });
+    });
+
+    it('throws when --arena-task disagrees with authored.json\'s recorded task', () => {
+      writeFixtureFiles(0, 0);
+      patchAuthoredArenaTask('hazard-heavy');
+      expect(() => runInterventionReport(argsFor({ arenaTask: 'crowded' }))).toThrow(
+        /does not match authored\.json's recorded arena task fingerprint/
+      );
+    });
+
+    it('throws when --arena-task is passed but authored.json was scored under the default task', () => {
+      writeFixtureFiles(0, 0);
+      expect(() => runInterventionReport(argsFor({ arenaTask: 'hazard-heavy' }))).toThrow(
+        /does not match authored\.json's recorded arena task fingerprint/
+      );
+    });
+
+    it('does not add an arenaTask key when --arena-task is omitted and authored.json is the default task (byte-identity gate)', () => {
+      writeFixtureFiles(0, 0);
+      const { statistics } = runInterventionReport(argsFor());
+      expect(statistics.arenaTask).toBeUndefined();
+      expect(JSON.stringify(statistics)).not.toContain('arenaTask');
+    });
+
+    it('refuses to write a non-default arena-task result to the default --out', () => {
+      writeFixtureFiles(0, 0);
+      patchAuthoredArenaTask('hazard-heavy');
+      const args = { ...argsFor({ arenaTask: 'hazard-heavy' }), out: DEFAULT_OUT };
+      expect(() => runInterventionReport(args)).toThrow(/refusing to write a --arena-task "hazard-heavy" result/);
+    });
   });
 });

@@ -2,9 +2,11 @@ import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { resolveArenaTask } from '../../src/lib/arena/tasks';
 import { requireNonNegativeInt, requirePositiveInt, requireValue } from '../training/cli';
 import { atomicWriteFileSync, sha256Hex } from '../training/fsio';
 import { conditionRng, mean, pairedStats, type ConditionStats, type PairedStats } from '../training/stats';
+import { parseArenaTaskArg } from './arena-task-fields';
 import { assertConsistentInputs } from './intervention-report-validation';
 import { graphStats, quantileIndex, rankStatistics, type RankStatistics } from './null-stats';
 import type { NullDecoderKind } from './null-worker';
@@ -459,6 +461,16 @@ export interface InterventionStatistics {
    * that one nested boolean).
    */
   readonly diagnosticOnly?: true;
+  /**
+   * `.agents/plans/task-generality/01-task-plumbing.md`'s WP1: present only
+   * when `--arena-task` was explicitly passed (never for a default run — see
+   * `runInterventionReport`'s own construction of this field), so a default
+   * run's output bytes are unchanged. `fingerprint` is `resolveArenaTask(id)`'s
+   * own fingerprint (the requested task), cross-checked in
+   * `runInterventionReport` against `authored.json`'s own recorded
+   * `arenaTaskFingerprint` when present.
+   */
+  readonly arenaTask?: { readonly id: string; readonly fingerprint: string };
 }
 
 /** `id < id` string ordering — matches `null-evaluate.ts`'s `sortedGraphListEntries`, so this module's output key order is independent of `authored.json`'s own array order (itself already sorted the same way, but this does not assume that). */
@@ -609,6 +621,8 @@ export interface InterventionReportArgs {
   readonly bootstrapResamples: number;
   /** Escape hatch for diagnosis only: without it, `runInterventionReport` refuses to write `--out` when `biologicalReproduction.matches` is false (a dual-review finding — this acceptance gate was previously advisory only: the CLI printed `matches=false` and still wrote a category). */
   readonly allowReproductionMismatch: boolean;
+  /** `--arena-task <id>` — labels this run's output by task (see `InterventionStatistics.arenaTask`). Absent means the default task, and the default output is unchanged. */
+  readonly arenaTask?: string;
 }
 
 export const parseInterventionReportArgs = (argv: readonly string[]): InterventionReportArgs => {
@@ -619,6 +633,7 @@ export const parseInterventionReportArgs = (argv: readonly string[]): Interventi
   let bootstrapSeed = DEFAULT_BOOTSTRAP_SEED;
   let bootstrapResamples = DEFAULT_BOOTSTRAP_RESAMPLES;
   let allowReproductionMismatch = false;
+  let arenaTask: string | undefined;
 
   let i = 0;
   while (i < argv.length) {
@@ -644,6 +659,9 @@ export const parseInterventionReportArgs = (argv: readonly string[]): Interventi
     } else if (flag === '--allow-reproduction-mismatch') {
       allowReproductionMismatch = true;
       i += 1;
+    } else if (flag === '--arena-task') {
+      arenaTask = parseArenaTaskArg(requireValue(flag, argv[i + 1]));
+      i += 2;
     } else {
       throw new Error(`Unknown argument: ${flag}`);
     }
@@ -659,7 +677,7 @@ export const parseInterventionReportArgs = (argv: readonly string[]): Interventi
     }
   }
 
-  return { authored, index, publishedNull, out, bootstrapSeed, bootstrapResamples, allowReproductionMismatch };
+  return { authored, index, publishedNull, out, bootstrapSeed, bootstrapResamples, allowReproductionMismatch, arenaTask };
 };
 
 export const runInterventionReport = (
@@ -681,6 +699,23 @@ export const runInterventionReport = (
   const info = parseGraphListIndexInfo(indexBytes.toString('utf8'), args.index);
   const publishedNull = parsePublishedNull(publishedNullBytes.toString('utf8'), args.publishedNull);
 
+  // Task-generality WP1: `--arena-task` must agree with the task
+  // `authored.json` was actually scored under. `raw.arenaTaskFingerprint` is
+  // only ever present for a non-default `null-evaluate.ts` run
+  // (`arena-task-fields.ts`'s omit-when-absent convention), so a default
+  // `authored.json` (no recorded fingerprint) is treated as the default
+  // task's own fingerprint -- both sides of this comparison, and the label
+  // below, resolve through the same `resolveArenaTask`, so a default run
+  // (neither side set) is always a no-op match.
+  const resolvedArenaTask = resolveArenaTask(args.arenaTask);
+  const rawArenaTaskFingerprint = raw.arenaTaskFingerprint ?? resolveArenaTask().fingerprint;
+  if (resolvedArenaTask.fingerprint !== rawArenaTaskFingerprint) {
+    throw new Error(
+      `intervention-report: --arena-task ${JSON.stringify(args.arenaTask ?? 'default')} does not match ` +
+        "authored.json's recorded arena task fingerprint"
+    );
+  }
+
   const statistics = buildInterventionStatistics(raw, info, publishedNull, args.bootstrapSeed, args.bootstrapResamples, {
     authoredSha256: sha256Hex(authoredBytes),
     indexSha256: sha256Hex(indexBytes),
@@ -701,10 +736,13 @@ export const runInterventionReport = (
   // it, so a clean run's output is byte-identical whether or not the flag
   // was passed. `statistics` itself (from the pure `buildInterventionStatistics`)
   // never carries this field.
-  const output: InterventionStatistics =
-    args.allowReproductionMismatch && !statistics.biologicalReproduction.matches
-      ? { ...statistics, diagnosticOnly: true }
-      : statistics;
+  const output: InterventionStatistics = {
+    ...statistics,
+    ...(args.allowReproductionMismatch && !statistics.biologicalReproduction.matches ? { diagnosticOnly: true } : {}),
+    ...(args.arenaTask !== undefined
+      ? { arenaTask: { id: resolvedArenaTask.id, fingerprint: resolvedArenaTask.fingerprint } }
+      : {})
+  };
 
   // A diagnostic (`--allow-reproduction-mismatch`) run must never silently
   // clobber the canonical `statistics.json` at the default --out -- mirrors
@@ -719,6 +757,15 @@ export const runInterventionReport = (
     throw new Error(
       `intervention-report: refusing to write a diagnosticOnly result to the default --out (${DEFAULT_OUT}) -- ` +
         'pass an explicit --out for this diagnostic run.'
+    );
+  }
+  // Same reasoning, for a non-default `--arena-task` run: it must never
+  // silently overwrite the canonical default statistics.json every other
+  // script reads by default.
+  if (output.arenaTask && resolve(args.out) === resolve(DEFAULT_OUT)) {
+    throw new Error(
+      `intervention-report: refusing to write a --arena-task "${output.arenaTask.id}" result to the default --out ` +
+        `(${DEFAULT_OUT}) -- pass an explicit --out for this task's run.`
     );
   }
 

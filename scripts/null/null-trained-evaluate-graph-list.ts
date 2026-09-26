@@ -2,10 +2,12 @@ import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { resolveArenaTask } from '../../src/lib/arena/tasks';
 import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import { requireNonNegativeInt, requirePositiveInt, requireValue } from '../training/cli';
 import { atomicWriteFileSync, gitRev, sha256Hex } from '../training/fsio';
 import { MANIFEST_TRACKED_FIELDS, readRunDir } from '../training/run-dir';
+import { arenaTaskOutputFields, parseArenaTaskArg, type ArenaTaskOutputFields } from './arena-task-fields';
 import { readGraphListIndex, verifyGraphListFiles } from './graph-list-index';
 import { runCliMain, runMetaPathFor, runShardedEvaluation, toGraphRaw } from './null-evaluate';
 import {
@@ -114,6 +116,7 @@ export interface NullTrainedInterventionEvaluateArgs {
   readonly out: string;
   /** See `assertConfigsMatchManifest`'s doc comment. */
   readonly manifestPath: string;
+  readonly arenaTask?: string;
 }
 
 const DEFAULT_INTERVENTION_TRAINED_DIR = resolve(repoRoot, 'training/runs/interventions/trained');
@@ -133,6 +136,7 @@ export const parseNullTrainedInterventionEvaluateArgs = (argv: readonly string[]
   let shards = DEFAULT_SHARDS;
   let out = DEFAULT_INTERVENTION_OUT;
   let manifestPath = DEFAULT_INTERVENTION_MANIFEST_PATH;
+  let arenaTask: string | undefined;
 
   let index = 0;
   while (index < argv.length) {
@@ -170,6 +174,9 @@ export const parseNullTrainedInterventionEvaluateArgs = (argv: readonly string[]
     } else if (flag === '--manifest') {
       manifestPath = resolve(process.cwd(), requireValue(flag, argv[index + 1]));
       index += 2;
+    } else if (flag === '--arena-task') {
+      arenaTask = parseArenaTaskArg(requireValue(flag, argv[index + 1]));
+      index += 2;
     } else {
       throw new Error(`Unknown argument: ${flag}`);
     }
@@ -179,7 +186,20 @@ export const parseNullTrainedInterventionEvaluateArgs = (argv: readonly string[]
   if (!runs) throw new Error('--runs is required');
   if (!out.endsWith('.json')) throw new Error(`--out must end with ".json" (got "${out}")`);
 
-  return { graphList, runs, trainedDir, armsDir, heldOutStart, heldOutCount, ticks, hiddenSize, shards, out, manifestPath };
+  return {
+    graphList,
+    runs,
+    trainedDir,
+    armsDir,
+    heldOutStart,
+    heldOutCount,
+    ticks,
+    hiddenSize,
+    shards,
+    out,
+    manifestPath,
+    arenaTask
+  };
 };
 
 /**
@@ -289,6 +309,7 @@ export const buildInterventionTasks = (
 
   const heldOutSeeds = Array.from({ length: args.heldOutCount }, (_, i) => args.heldOutStart + i);
   const bundlePathsByGraphId = new Map<string, string>();
+  const expectedArenaTaskFingerprint = resolveArenaTask(args.arenaTask).fingerprint;
 
   const tasks = args.runs.map((run) => {
     const entry = entryById.get(run.id);
@@ -314,7 +335,9 @@ export const buildInterventionTasks = (
       expectedArm: 'rewired',
       expectedTrainerSeed: run.trainerSeed,
       expectedSubsteps: NEURAL_SUBSTEPS_PER_TICK,
-      expectedHiddenSize: args.hiddenSize
+      expectedHiddenSize: args.hiddenSize,
+      arenaTask: args.arenaTask,
+      expectedArenaTaskFingerprint
     };
     return task;
   });
@@ -339,7 +362,7 @@ export interface NullTrainedInterventionGraphRaw extends NullTrainedGraphRaw {
  * `--shards`/completion timing, matching `null-evaluate.ts`'s "canonical
  * task order" convention.
  */
-export interface NullTrainedInterventionEvaluationRaw {
+export interface NullTrainedInterventionEvaluationRaw extends ArenaTaskOutputFields {
   readonly version: 1;
   readonly seeds: { readonly start: number; readonly count: number };
   readonly ticks: number;
@@ -419,7 +442,8 @@ export const assembleInterventionRaw = (
     d: readBundleD(tasks[0].armBundlePath),
     evaluatorGitRev: gitRev(repoRoot),
     cemConfig,
-    cemConfigWarnings
+    cemConfigWarnings,
+    ...arenaTaskOutputFields(args.arenaTask)
   };
 };
 

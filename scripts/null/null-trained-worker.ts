@@ -53,6 +53,23 @@ export interface NullTrainedWorkerTask {
   readonly expectedTrainerSeed: number;
   readonly expectedSubsteps: number;
   readonly expectedHiddenSize: number;
+  /**
+   * `.agents/plans/task-generality/01-task-plumbing.md`'s WP1: the arena
+   * task id this run's `runEpisode` call resolves and scores against.
+   * Absent means `'default'` (`ARENA_CONFIG`, unchanged).
+   */
+  readonly arenaTask?: string;
+  /**
+   * The arena task fingerprint (`resolveArenaTask(arenaTask).fingerprint`)
+   * this run was *requested* to be — checked against the run directory's own
+   * recorded `config.json` `arenaTaskFingerprint` in
+   * `assertRunMatchesExpectedIdentity`'s fifth hard check, below. Unlike
+   * `expectedArm`/`expectedTrainerSeed`/etc., a run directory trained before
+   * this field existed has no recorded fingerprint at all, so that check
+   * fails closed (treats "missing" as a mismatch) rather than silently
+   * accepting an untagged run as if it matched every possible task.
+   */
+  readonly expectedArenaTaskFingerprint: string;
 }
 
 /**
@@ -104,6 +121,16 @@ const assertRunMatchesExpectedIdentity = (run: Readonly<LoadedRun>, task: Readon
       `null-trained-worker: ${task.runDir}/config.json has H=${run.config.H}, expected ${task.expectedHiddenSize}`
     );
   }
+  // Fifth hard check (task-generality WP1): the run's recorded arena-task
+  // fingerprint must equal the requested one -- `undefined` (a run
+  // directory trained before this field existed) never matches, since there
+  // is no way to know which task it was actually trained under.
+  if (run.config.arenaTaskFingerprint !== task.expectedArenaTaskFingerprint) {
+    throw new Error(
+      `null-trained-worker: ${task.runDir}/config.json has arenaTaskFingerprint ` +
+        `${JSON.stringify(run.config.arenaTaskFingerprint)}, expected ${JSON.stringify(task.expectedArenaTaskFingerprint)}`
+    );
+  }
 };
 
 /** Exported so tests can exercise the run-directory/bundle validation and scoring logic directly, without going through `node:child_process.fork`'s IPC wire protocol. */
@@ -143,6 +170,7 @@ export const runTask = (task: NullTrainedWorkerTask): readonly NullSeedResult[] 
       // caught -- passing it explicitly means a future change to the
       // default can never silently change what this scores at.
       substeps: task.expectedSubsteps,
+      arenaTask: task.arenaTask,
       left: { decoder: 'trained', graph, weights: run.weights },
       right: { decoder: 'parked' }
     });

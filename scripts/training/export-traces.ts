@@ -4,7 +4,9 @@ import { basename, dirname, extname, resolve } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 
 import { decodeAction } from '../../src/lib/arena/actions';
+import type { ArenaConfig } from '../../src/lib/arena/config';
 import { observeAgent } from '../../src/lib/arena/sensors';
+import { ARENA_TASK_IDS, resolveArenaTask, type ArenaTaskId } from '../../src/lib/arena/tasks';
 import { createWorld, stepWorld } from '../../src/lib/arena/world';
 import type { AgentId, WorldState } from '../../src/lib/arena/types';
 import {
@@ -135,6 +137,32 @@ const DEFAULT_OUT_DIR = 'tests/fixtures/golden';
 /** `graphId` used for the committed fixtures; exported so tests reuse it instead of a copied literal. */
 export const DEFAULT_GRAPH_ID = 'trace-graph';
 
+/**
+ * `.agents/plans/task-generality/01-task-plumbing.md`'s WP1: `--arena-task`'s
+ * own committed output directory, one per non-`default` task id, alongside
+ * (not inside) the default fixtures — never `DEFAULT_OUT_DIR` itself, so an
+ * arena-task export can never collide with or overwrite the default traces.
+ */
+const TASK_TRACE_OUT_DIR = (id: string): string => `${DEFAULT_OUT_DIR}/tasks/${id}`;
+/**
+ * Fewer ticks and a single seed than the default export's `TRACE_TICKS`/
+ * `TRACE_SEEDS` — `training/tests/test_tasks.py`'s per-task parity check
+ * needs only one seed's worth of rate/output/action parity per task, not the
+ * default's four-seed coverage.
+ *
+ * Deviation from `.agents/plans/task-generality/01-task-plumbing.md`'s
+ * stated 300 ticks, for the same reason `TRACE_TICKS` itself already
+ * deviates from its own plan's stated default (see that constant's doc
+ * comment): measured at 300 ticks, one seed's trace plus the shared
+ * `<graphId>.json` totalled ~214 KB, over the ≤ 200 KB per-task budget
+ * (`01-task-plumbing.md`'s own change-surface row). 200 ticks measures
+ * ~131–146 KB across all four task variants (comfortable margin), and this
+ * suite's parity checks (rate/output/action agreement per tick) don't
+ * depend on any particular tick count.
+ */
+export const TASK_TRACE_TICKS = 200;
+export const TASK_TRACE_SEED = 1;
+
 export interface CliArgs {
   graphPath?: string;
   substeps: number;
@@ -142,6 +170,8 @@ export interface CliArgs {
   /** True only when `--out` was actually passed, not merely defaulted. */
   outDirExplicit: boolean;
   includeWorld: boolean;
+  /** `--arena-task <id>`. `undefined` or `'default'` behaves exactly as if this flag were absent. */
+  arenaTask?: ArenaTaskId;
 }
 
 /**
@@ -168,6 +198,7 @@ export const parseArgs = (argv: readonly string[]): CliArgs => {
   let outDirExplicit = false;
   let substepsExplicit = false;
   let includeWorld = false;
+  let arenaTask: ArenaTaskId | undefined;
 
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
@@ -189,10 +220,29 @@ export const parseArgs = (argv: readonly string[]): CliArgs => {
       index += 1;
     } else if (flag === '--include-world') {
       includeWorld = true;
+    } else if (flag === '--arena-task') {
+      const value = requireValue(flag, argv[index + 1]);
+      if (!(ARENA_TASK_IDS as readonly string[]).includes(value)) {
+        throw new Error(`--arena-task must be one of ${ARENA_TASK_IDS.join(', ')} (got "${value}")`);
+      }
+      arenaTask = value as ArenaTaskId;
+      index += 1;
     } else {
       throw new Error(`Unknown argument: ${flag}`);
     }
   }
+
+  const isNonDefaultTask = arenaTask !== undefined && arenaTask !== 'default';
+  if (isNonDefaultTask && (graphPath !== undefined || substepsExplicit || includeWorld)) {
+    throw new Error('--arena-task cannot be combined with --graph/--substeps/--include-world');
+  }
+  // A non-default task's own canonical, committed output directory
+  // (`tests/fixtures/golden/tasks/<id>/`) -- unlike --graph/--substeps/
+  // --include-world below, an explicit --out is not required for this case,
+  // since this location is exactly as canonical (and as safe from
+  // overwriting the default fixtures) as DEFAULT_OUT_DIR is for the default
+  // task.
+  if (isNonDefaultTask && !outDirExplicit) outDir = TASK_TRACE_OUT_DIR(arenaTask!);
 
   // A non-default graph, substep count, or world-state column producing
   // output that lands in the committed fixture directory (by accident, with
@@ -216,7 +266,7 @@ export const parseArgs = (argv: readonly string[]): CliArgs => {
     }
   }
 
-  return { graphPath, substeps, outDir, outDirExplicit, includeWorld };
+  return { graphPath, substeps, outDir, outDirExplicit, includeWorld, arenaTask };
 };
 
 const GZIP_MAGIC = [0x1f, 0x8b];
@@ -417,6 +467,13 @@ interface SeedTraceFile {
 export interface BuildSeedTraceOptions {
   /** Record a per-tick `worldAfter` column. Default `false` (budget). */
   includeWorld?: boolean;
+  /**
+   * `.agents/plans/task-generality/01-task-plumbing.md`'s WP1: the arena
+   * config this trace's `createWorld` uses. Defaults to `ARENA_CONFIG`
+   * (`createWorld`'s own default) — omitting it is unchanged from before
+   * this field existed, so the committed default fixtures stay byte-identical.
+   */
+  arenaConfig?: Readonly<ArenaConfig>;
 }
 
 /**
@@ -433,7 +490,7 @@ export const buildSeedTrace = (
   options: BuildSeedTraceOptions = {}
 ): SeedTraceFile => {
   const includeWorld = options.includeWorld ?? false;
-  let world = createWorld(seed);
+  let world = createWorld(seed, options.arenaConfig);
   const configFingerprint = world.configFingerprint;
   const initialWorld = serializeWorld(world);
 
@@ -602,6 +659,28 @@ export const buildGoldenFiles = (
   ];
 };
 
+/**
+ * `--arena-task <id>` golden files (task-generality WP1): one seed
+ * (`TASK_TRACE_SEED`), `TASK_TRACE_TICKS` ticks, no readout case (the
+ * per-task parity suite checks world/rate/output/action parity only — see
+ * `TASK_TRACE_TICKS`'s own doc comment for the byte-budget reasoning).
+ * Exported so `tests/unit/export-traces.test.ts` can regression-check the
+ * committed per-task files the same way `golden-traces.test.ts` does for
+ * `buildGoldenFiles`.
+ */
+export const buildTaskGoldenFiles = (
+  graph: Readonly<ConnectomeGraph>,
+  graphId: string,
+  substeps: number,
+  arenaConfig: Readonly<ArenaConfig>
+): GoldenFile[] => {
+  const trace = buildSeedTrace(graph, graphId, TASK_TRACE_SEED, TASK_TRACE_TICKS, substeps, { arenaConfig });
+  return [
+    { fileName: `${graphId}.json`, value: serializeGraph(graph) },
+    { fileName: `${graphId}-seed-${trace.seed}.json`, value: trace }
+  ];
+};
+
 const writeJson = (path: string, value: unknown): number => {
   mkdirSync(dirname(path), { recursive: true });
   const contents = JSON.stringify(value);
@@ -617,7 +696,10 @@ const main = (): void => {
   const graphId = args.graphPath ? graphIdFromPath(args.graphPath) : DEFAULT_GRAPH_ID;
 
   const outDir = resolve(process.cwd(), args.outDir);
-  const files = buildGoldenFiles(graph, graphId, args.substeps, { includeWorld: args.includeWorld });
+  const isNonDefaultTask = args.arenaTask !== undefined && args.arenaTask !== 'default';
+  const files = isNonDefaultTask
+    ? buildTaskGoldenFiles(graph, graphId, args.substeps, resolveArenaTask(args.arenaTask).config)
+    : buildGoldenFiles(graph, graphId, args.substeps, { includeWorld: args.includeWorld });
 
   let totalBytes = 0;
   for (const { fileName, value } of files) {

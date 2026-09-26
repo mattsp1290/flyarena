@@ -129,7 +129,11 @@ describe('golden trace regeneration', () => {
     }
 
     // No orphaned committed file that buildGoldenFiles no longer produces.
-    const committedNames = readdirSync(GOLDEN_DIR).filter((name) => name.endsWith('.json'));
+    // `tasks.json` (task-generality WP1's cross-language fingerprint export)
+    // and the `tasks/` directory (per-task golden traces, each covered by
+    // its own `export-traces.test.ts` check) are committed here too but are
+    // not part of this default-graph fixture set, so both are excluded.
+    const committedNames = readdirSync(GOLDEN_DIR).filter((name) => name.endsWith('.json') && name !== 'tasks.json');
     expect(committedNames.sort()).toEqual(files.map((f) => f.fileName).sort());
   });
 

@@ -1,4 +1,5 @@
 import type { GraphMode } from '../../src/lib/connectome/format';
+import { resolveArenaTask } from '../../src/lib/arena/tasks';
 import { runEpisode } from '../training/episode';
 import { assertFiniteScores, graphFromTaskMode, loadVerifiedGraphBinary, runWorkerMain } from './null-worker-shared';
 
@@ -60,6 +61,8 @@ export interface NullWorkerTask {
    * protocol — see `runTask`'s own default below.
    */
   readonly decoder?: NullDecoderKind;
+  /** `.agents/plans/task-generality/01-task-plumbing.md`'s WP1: the arena task id every task's `runEpisode` call resolves and scores against. Absent means `'default'` (`ARENA_CONFIG`, unchanged) — see `validateTaskArenaTask` below for its IPC-boundary validation. */
+  readonly arenaTask?: string;
 }
 
 export interface NullSeedResult {
@@ -106,15 +109,34 @@ const validateTaskDecoder = (decoder: unknown): NullDecoderKind | undefined => {
   return decoder as NullDecoderKind;
 };
 
-const runTask = (task: NullWorkerTask): readonly NullSeedResult[] => {
+/**
+ * Mirrors `validateTaskDecoder`'s own doc comment: `task.arenaTask` crosses
+ * the `fork`/IPC boundary as plain JSON, so it must be re-validated here
+ * rather than trusted from `NullWorkerTask`'s compile-time type. Delegates
+ * to `resolveArenaTask` (the single source of truth for valid ids) instead
+ * of a second, hand-duplicated id list.
+ */
+const validateTaskArenaTask = (arenaTask: unknown): string | undefined => {
+  if (arenaTask === undefined) return undefined;
+  if (typeof arenaTask !== 'string') {
+    throw new Error(`null-worker: task.arenaTask is not a string: ${JSON.stringify(arenaTask)}`);
+  }
+  resolveArenaTask(arenaTask); // throws with a specific message on an unrecognized id
+  return arenaTask;
+};
+
+/** Exported so tests can exercise the config-resolution/scoring logic directly, without going through `node:child_process.fork`'s IPC wire protocol (mirrors `null-trained-worker.ts`'s own `runTask` export). */
+export const runTask = (task: NullWorkerTask): readonly NullSeedResult[] => {
   const graphBinary = loadVerifiedGraphBinary('null-worker', task.path, task.expectedSha256);
   const graph = graphFromTaskMode(task.mode, graphBinary);
   const decoder = validateTaskDecoder(task.decoder) ?? 'authored';
+  const arenaTask = validateTaskArenaTask(task.arenaTask);
 
   return task.heldOutSeeds.map((seed) => {
     const result = runEpisode({
       seed,
       ticks: task.ticks,
+      arenaTask,
       left: { decoder, graph },
       right: { decoder: 'parked' }
     });

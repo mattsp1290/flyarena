@@ -75,6 +75,18 @@ export interface RunConfig {
   readonly validationSeedRange?: readonly [number, number];
   readonly heldOutSeedRange?: readonly [number, number];
   readonly bestValidationFitness?: number;
+  /**
+   * `.agents/plans/task-generality/01-task-plumbing.md`'s WP1: the arena
+   * task id and fingerprint (`src/lib/arena/tasks.ts`) `flyarena-train`'s
+   * `--arena-task` flag resolved this run against, always recorded together
+   * by `cli.py`'s `_build_run_config`. Optional here only for older/tiny
+   * fixture run directories that predate arena tasks
+   * (`tests/fixtures/trained-readout-run.ts`); `null-trained-worker.ts`'s
+   * `assertRunMatchesExpectedIdentity` requires `arenaTaskFingerprint`
+   * present and matching for any run it scores.
+   */
+  readonly arenaTask?: string;
+  readonly arenaTaskFingerprint?: string;
 }
 
 export interface LoadedRun {

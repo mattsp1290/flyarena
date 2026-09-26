@@ -9,6 +9,7 @@ import {
   P_TRAINER_SEEDS,
   TRAINED_ARM_SIZE,
   trainedCategoryFlags,
+  trainedTaskResult,
   type PTrainerSeed,
   type TrainedArmDistribution,
   type TrainedSeedResult
@@ -251,5 +252,41 @@ describe('buildTrainedStatistics: end-to-end on synthetic data', () => {
     const raw = buildRaw({ 101: 1, 202: 1, 303: 1 }, [1, 2, 3, 4, 5], [1, 2, 3, 4, 5]);
     const staleGzip = { ...raw, runs: raw.runs.map((r) => (r.id === 'C000' ? { ...r, gzipSha256: 'stale'.padEnd(64, '0') } : r)) };
     expect(() => buildTrainedStatistics(staleGzip, infoAll, [1], 42, 200)).toThrow(/"C000" was scored from a different graph file than index\.json currently lists/);
+  });
+});
+
+describe('trainedTaskResult', () => {
+  const pScores: Readonly<Record<PTrainerSeed, number>> = { 101: 11, 202: 11, 303: 11 };
+
+  it('degenerate: the C arm has IQR below the threshold (an all-equal arm)', () => {
+    const cArm = armDist([5, 5, 5, 5, 5]);
+    const mArm = armDist([2, 4, 6, 8, 10]);
+    expect(trainedTaskResult(pScores, cArm, mArm)).toEqual({ degenerate: true });
+  });
+
+  it('degenerate: the M arm has IQR below the threshold', () => {
+    const cArm = armDist([1, 2, 3, 4, 5]);
+    const mArm = armDist([7, 7, 7, 7, 7]);
+    expect(trainedTaskResult(pScores, cArm, mArm)).toEqual({ degenerate: true });
+  });
+
+  it('non-degenerate and robust: every seed lands in the same category', () => {
+    const cArm = armDist([1, 2, 3, 4, 5]); // max 5
+    const mArm = armDist([2, 4, 6, 8, 10]); // max 10
+    const result = trainedTaskResult({ 101: 11, 202: 12, 303: 13 }, cArm, mArm);
+    expect(result.degenerate).toBe(false);
+    if (result.degenerate) throw new Error('unreachable');
+    expect(result.perSeed).toEqual({ 101: 'pathway-supported', 202: 'pathway-supported', 303: 'pathway-supported' });
+    expect(result.trainedRobust).toBe(true);
+  });
+
+  it('non-degenerate and not robust: seeds disagree on category (a tie at the C max counts as no-specific-effect)', () => {
+    const cArm = armDist([1, 2, 3, 4, 5]); // max 5
+    const mArm = armDist([2, 4, 6, 8, 10]); // max 10
+    const result = trainedTaskResult({ 101: 5, 202: 7, 303: 11 }, cArm, mArm);
+    expect(result.degenerate).toBe(false);
+    if (result.degenerate) throw new Error('unreachable');
+    expect(result.perSeed).toEqual({ 101: 'no-specific-effect', 202: 'edge-class-effect', 303: 'pathway-supported' });
+    expect(result.trainedRobust).toBe(false);
   });
 });

@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { resolveArenaTask } from '../../src/lib/arena/tasks';
 import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import { runExportArms } from '../../scripts/training/export-arms';
 import { runTask, type NullTrainedWorkerTask } from '../../scripts/null/null-trained-worker';
@@ -35,6 +36,7 @@ describe('runTask', () => {
     expectedTrainerSeed: 101,
     expectedSubsteps: NEURAL_SUBSTEPS_PER_TICK,
     expectedHiddenSize: 4,
+    expectedArenaTaskFingerprint: resolveArenaTask().fingerprint,
     ...overrides
   });
 
@@ -113,5 +115,20 @@ describe('runTask', () => {
     const bundle = JSON.parse(readFileSync(armBundlePath, 'utf8')) as Record<string, unknown>;
     writeFileSync(armBundlePath, JSON.stringify({ ...bundle, D: (bundle.D as number) + 1 }));
     expect(() => runTask(baseTask())).toThrow(/sha256 does not match its content/);
+  });
+
+  it('throws when the run was trained for a different arena task (fifth identity check)', () => {
+    expect(() => runTask(baseTask({ expectedArenaTaskFingerprint: resolveArenaTask('hazard-heavy').fingerprint }))).toThrow(
+      /has arenaTaskFingerprint/
+    );
+  });
+
+  it('throws when config.json predates arena tasks (no recorded arenaTaskFingerprint at all)', () => {
+    const configPath = join(runDir, 'config.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8')) as Record<string, unknown>;
+    delete config.arenaTask;
+    delete config.arenaTaskFingerprint;
+    writeFileSync(configPath, JSON.stringify(config));
+    expect(() => runTask(baseTask())).toThrow(/has arenaTaskFingerprint undefined/);
   });
 });
