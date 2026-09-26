@@ -241,3 +241,15 @@ or a failed live smoke check, `deploy.sh`:
    the bean; the operator running it copies the reported outcome (failure
    reason, rollback target, post-rollback check results) into a new dated
    entry here, per the format above, and leaves the bean open.
+
+## Behavior atlas release (backfilled marker)
+
+On 2026-09-24, main revision `fa6f5b7` was deployed as
+`20260924T205159Z-da5c2ca56a70`, the behavior atlas release. It is recorded in
+`docs/behavior-atlas-validation.md` ("Merge and deployed release"), which
+predates the marker guard, so it had no marker here. The guard's first run on
+2026-09-26 found this release live and aborted with no changes. This entry
+records it so the anchor matches the live `current` target.
+
+Release: 20260924T205159Z-da5c2ca56a70
+Commit: fa6f5b7
