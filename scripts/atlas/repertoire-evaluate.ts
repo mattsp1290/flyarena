@@ -1,6 +1,5 @@
 import { fork } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { requirePositiveInt, requireValue } from '../training/cli';
@@ -19,19 +18,37 @@ import type { RepertoireEvaluatedEntry, RepertoireWorkerMessage, RepertoireWorke
  * `shardCount` forked children never collide on one fixed debug port).
  *
  * Deliberately does **not** call that file's own exported
- * `runShardedEvaluation`: that scheduler's self-checking protocol assumes
- * one task produces *one result per held-out seed*
- * (`Result extends { readonly seed: number }`, checked against the task's
- * own `heldOutSeeds` array) -- here, one task (one search file) produces
- * exactly *one* whole-graph evaluation record, not a per-seed list, so
- * reusing it would mean forcing a one-element `heldOutSeeds`/`results` pair
- * through a check that means something different. `runWorkerScheduler`
- * below mirrors the same shape instead: a self-checking `key` match on
- * every reply, `abortAll` on the first error or unexpected exit (never left
- * to keep draining the queue), every child tracked and swept on every exit
- * path, and a result set that is independent of shard count or completion
- * order, because the caller re-orders by the plan's own canonical order
- * afterward, not by arrival order.
+ * `runShardedEvaluation`: a thermo-maintainability review correctly pointed
+ * out that this file's *earlier* doc comment misdiagnosed the reason --
+ * "one result per held-out seed" is not actually an obstacle (a one-element
+ * `heldOutSeeds: [task.searchSeed]` / matching `results` pair would satisfy
+ * that scheduler's own check exactly). The real, and only, blocker is that
+ * `runShardedEvaluation`'s generic constraints hardcode the wire-matching/
+ * reporting field name to `graphId`
+ * (`Task extends { readonly graphId: string; ... }`,
+ * `Message extends { readonly graphId: string; ... }`), and in this
+ * pipeline `graphId` is **not** unique per task: `biological` alone has 5
+ * tasks (one per search seed 1729-1733) that all share `graphId:
+ * 'biological'` (`repertoire-task.ts`'s own doc comment) -- which is exactly
+ * why `repertoire-plan.ts` needed a separate composite `key` field
+ * (`planEntryKey`, e.g. `"rewired-3@1730"`) in the first place. Generalizing
+ * `runShardedEvaluation`/`runWorkerMain` so the wire-matching field is
+ * parameterized (rather than hardcoded to `graphId`) -- the same move
+ * `null-worker-shared.ts`'s `runWorkerMain` already made once, from a
+ * `NullSeedResult`-only signature to `<Task, Result, Message>`, so
+ * `regime-worker.ts` could reuse it -- is a real option and is deliberately
+ * **deferred**, not rejected: `scripts/null/null-evaluate.ts` is being
+ * edited concurrently by another workstream (which also shifts that file's
+ * own producer-identity stamps), so this fix round only corrects this doc
+ * comment's stated reason and leaves the duplication as a tracked follow-up
+ * rather than touching that file here. `runWorkerScheduler` below mirrors
+ * the same fork/IPC shape instead, for now: a self-checking `key` match on
+ * every reply (`key`, not `graphId`, precisely because `graphId` can't
+ * serve that role here), `abortAll` on the first error or unexpected exit
+ * (never left to keep draining the queue), every child tracked and swept on
+ * every exit path, and a result set that is independent of shard count or
+ * completion order, because the caller re-orders by the plan's own
+ * canonical order afterward, not by arrival order.
  */
 const execArgvForChildren = (): string[] => process.execArgv.filter((flag) => !flag.startsWith('--inspect'));
 
@@ -220,8 +237,6 @@ const parseCliArgs = (argv: readonly string[]): CliArgs => {
   return { searches, graphsIndex, data, shards, out };
 };
 
-const WORKER_PATH = resolve(dirname(fileURLToPath(import.meta.url)), 'repertoire-worker.ts');
-
 export const runCliMain = async (args: Readonly<CliArgs>): Promise<void> => {
   const inputs = await loadPlanInputs(args.data, args.graphsIndex, DEFAULT_ARMS_DIR, args.searches);
   const plan = buildRepertoirePlan(inputs);
@@ -235,8 +250,28 @@ export const runCliMain = async (args: Readonly<CliArgs>): Promise<void> => {
   }
 
   const tasks = buildRepertoireTasks(plan);
+  // Computed lazily here (not as a module-top-level constant) so importing
+  // this module alone -- e.g. `tests/unit/repertoire.test.ts` pulling in
+  // `runWorkerScheduler`/`buildRepertoireTasks` -- never evaluates
+  // `import.meta.url` outside of an actual CLI run, matching
+  // `null-evaluate.ts`'s own `runEvaluationMode`, which computes its
+  // identically-built `workerPath` inside the function that uses it rather
+  // than at module scope.
+  //
+  // `new URL('./repertoire-worker.ts', import.meta.url)`, not
+  // `resolve(dirname(...), 'repertoire-worker.ts')`: `scripts/lib/import-graph.ts`'s
+  // `RELATIVE_IMPORT_RE` walker recognizes exactly three ways a producer
+  // names a relative dependency (`from '...'`, dynamic `import('...')`, and
+  // `new URL('...', import.meta.url)` -- the last one specifically for a
+  // forked-worker script, spawned by path/URL rather than a static `import`).
+  // A `resolve(dirname(...), 'literal.ts')` call matches none of the three,
+  // so a future producer-identity walk rooted here would silently miss
+  // `repertoire-worker.ts` even though its bytes genuinely execute as part of
+  // this driver's output -- matches `null-evaluate.ts`'s own
+  // `fileURLToPath(new URL('./null-worker.ts', import.meta.url))` idiom.
+  const workerPath = fileURLToPath(new URL('./repertoire-worker.ts', import.meta.url));
   const started = Date.now();
-  const results = await runWorkerScheduler(tasks, args.shards, WORKER_PATH);
+  const results = await runWorkerScheduler(tasks, args.shards, workerPath);
   const elapsedMs = Date.now() - started;
   const artifact = assembleEvaluatedArtifact(plan, results);
 

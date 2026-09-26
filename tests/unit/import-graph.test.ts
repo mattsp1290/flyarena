@@ -66,6 +66,20 @@ describe('collectRepoRelativeDependencies (real repository)', () => {
     expect(second).toEqual(first);
     expect(first.length).toBeGreaterThan(10);
   });
+
+  it("repertoire-evaluate.ts's closure includes repertoire-worker.ts (a thermo-maintainability review finding: WORKER_PATH used to be built with resolve(dirname(...), 'literal.ts'), a fourth specifier form RELATIVE_IMPORT_RE doesn't recognize, which would have made this forked worker invisible to a future producer-identity walk rooted here)", () => {
+    const entry = resolve(REPO_ROOT, 'scripts/atlas/repertoire-evaluate.ts');
+    const dependencies = collectRepoRelativeDependencies(entry, REPO_ROOT);
+
+    expect(dependencies).toContain('scripts/atlas/repertoire-evaluate.ts');
+    // The forked-child-process worker script -- located via `new URL('./repertoire-worker.ts', import.meta.url)`,
+    // the one specifier form this walker follows specifically for spawned workers.
+    expect(dependencies).toContain('scripts/atlas/repertoire-worker.ts');
+    // Statically imported, so these are already reachable via plain `from '...'`.
+    expect(dependencies).toContain('scripts/atlas/repertoire-plan.ts');
+    expect(dependencies).toContain('scripts/atlas/repertoire-task.ts');
+    expect(dependencies).toContain('scripts/atlas/verify-search-graph.ts');
+  });
 });
 
 describe('collectRepoRelativeDependencies (synthetic fixture trees)', () => {
