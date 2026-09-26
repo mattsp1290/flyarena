@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { resolveArenaTask } from '../../src/lib/arena/tasks';
 import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import { runExportArms } from '../../scripts/training/export-arms';
 import {
@@ -67,6 +68,15 @@ describe('parseNullTrainedEvaluateArgs', () => {
 
   it('rejects an unknown flag', () => {
     expect(() => parseNullTrainedEvaluateArgs(['--bogus'])).toThrow(/Unknown argument/);
+  });
+
+  it('--arena-task is absent by default and parses a valid id', () => {
+    expect(parseNullTrainedEvaluateArgs([]).arenaTask).toBeUndefined();
+    expect(parseNullTrainedEvaluateArgs(['--arena-task', 'hazard-heavy']).arenaTask).toBe('hazard-heavy');
+  });
+
+  it('rejects an unknown --arena-task id', () => {
+    expect(() => parseNullTrainedEvaluateArgs(['--arena-task', 'not-a-real-task'])).toThrow(/unknown arena task/);
   });
 });
 
@@ -173,6 +183,20 @@ describe('buildTasks / assembleRaw (fixture run directories)', () => {
     expect(biological101.expectedHiddenSize).toBe(4);
   });
 
+  it('every task carries the requested arena task and its resolved fingerprint (default when unset)', () => {
+    const defaultTasks = buildTasks(baseArgs());
+    for (const task of defaultTasks) {
+      expect(task.arenaTask).toBeUndefined();
+      expect(task.expectedArenaTaskFingerprint).toBe(resolveArenaTask().fingerprint);
+    }
+
+    const variantTasks = buildTasks(baseArgs({ arenaTask: 'hazard-heavy' }));
+    for (const task of variantTasks) {
+      expect(task.arenaTask).toBe('hazard-heavy');
+      expect(task.expectedArenaTaskFingerprint).toBe(resolveArenaTask('hazard-heavy').fingerprint);
+    }
+  });
+
   it('a biological task\'s expectedTrainerSeed is ITS OWN trainer seed, not args.replicaSeed (regression: an earlier bug could have wired args.replicaSeed into every task)', () => {
     // replicaSeed (101, the rewired-run trainer seed) is deliberately
     // DIFFERENT from the biological trainer seed under test (202) here, so
@@ -270,6 +294,33 @@ describe('buildTasks / assembleRaw (fixture run directories)', () => {
     expect(typeof raw.evaluatorGitRev === 'string' || raw.evaluatorGitRev === null).toBe(true);
     expect(raw.cemConfig).toBeNull(); // writeTinyRunDir wasn't given any cemConfig fields in this fixture
     expect(raw.cemConfigWarnings).toEqual([]);
+  });
+
+  it('assembleRaw: no arenaTask/arenaTaskFingerprint key when --arena-task is omitted (byte-identity gate)', () => {
+    const args = baseArgs();
+    const tasks = buildTasks(args);
+    const seeds = [30001, 30002, 30003];
+    const results = new Map<string, readonly NullSeedResult[]>(
+      tasks.map((t) => [t.graphId, seeds.map((seed) => ({ seed, movementScore: 1, foodPickups: 0, hazardContacts: 0 }))])
+    );
+
+    const raw = assembleRaw(args, tasks, results);
+    expect(raw.arenaTask).toBeUndefined();
+    expect(raw.arenaTaskFingerprint).toBeUndefined();
+    expect(JSON.stringify(raw)).not.toContain('arenaTask');
+  });
+
+  it('assembleRaw: records the requested arena task id/fingerprint when --arena-task is passed', () => {
+    const args = baseArgs({ arenaTask: 'crowded' });
+    const tasks = buildTasks(args);
+    const seeds = [30001, 30002, 30003];
+    const results = new Map<string, readonly NullSeedResult[]>(
+      tasks.map((t) => [t.graphId, seeds.map((seed) => ({ seed, movementScore: 1, foodPickups: 0, hazardContacts: 0 }))])
+    );
+
+    const raw = assembleRaw(args, tasks, results);
+    expect(raw.arenaTask).toBe('crowded');
+    expect(raw.arenaTaskFingerprint).toBe(resolveArenaTask('crowded').fingerprint);
   });
 
   /** Rebuilds all three fixture run dirs with an explicit CEM config, so `reconcileCemConfig`'s "all empty" tolerance case never triggers for these tests. */

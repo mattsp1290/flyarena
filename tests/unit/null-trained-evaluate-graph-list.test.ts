@@ -6,6 +6,7 @@ import { gunzipSync, gzipSync } from 'node:zlib';
 import { join, resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { resolveArenaTask } from '../../src/lib/arena/tasks';
 import { encodeGraphBinary } from '../../src/lib/connectome/format';
 import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import { createTraceGraph } from '../fixtures/trace-graph';
@@ -114,6 +115,20 @@ describe('parseNullTrainedInterventionEvaluateArgs', () => {
     expect(() =>
       parseNullTrainedInterventionEvaluateArgs(['--graph-list', 'i.json', '--runs', 'P:101', '--out', 'trained'])
     ).toThrow(/--out must end with "\.json"/);
+  });
+
+  it('--arena-task is absent by default and parses a valid id', () => {
+    expect(parseNullTrainedInterventionEvaluateArgs(['--graph-list', 'i.json', '--runs', 'P:101']).arenaTask).toBeUndefined();
+    expect(
+      parseNullTrainedInterventionEvaluateArgs(['--graph-list', 'i.json', '--runs', 'P:101', '--arena-task', 'crowded'])
+        .arenaTask
+    ).toBe('crowded');
+  });
+
+  it('rejects an unknown --arena-task id', () => {
+    expect(() =>
+      parseNullTrainedInterventionEvaluateArgs(['--graph-list', 'i.json', '--runs', 'P:101', '--arena-task', 'not-a-real-task'])
+    ).toThrow(/unknown arena task/);
   });
 });
 
@@ -306,6 +321,47 @@ describe('buildInterventionTasks / assembleInterventionRaw', () => {
     const args = baseArgs();
     const tasks = buildInterventionTasks(args);
     expect(() => assembleInterventionRaw(args, tasks, new Map())).toThrow(/missing results for/);
+  });
+
+  describe('--arena-task (task-generality WP1)', () => {
+    it('every task carries the requested arena task and its resolved fingerprint (default when unset)', () => {
+      const defaultTasks = buildInterventionTasks(baseArgs());
+      for (const task of defaultTasks) {
+        expect(task.arenaTask).toBeUndefined();
+        expect(task.expectedArenaTaskFingerprint).toBe(resolveArenaTask().fingerprint);
+      }
+
+      const variantTasks = buildInterventionTasks(baseArgs({ arenaTask: 'sparse-food' }));
+      for (const task of variantTasks) {
+        expect(task.arenaTask).toBe('sparse-food');
+        expect(task.expectedArenaTaskFingerprint).toBe(resolveArenaTask('sparse-food').fingerprint);
+      }
+    });
+
+    it('assembleInterventionRaw: no arenaTask/arenaTaskFingerprint key when --arena-task is omitted (byte-identity gate)', () => {
+      const args = baseArgs();
+      const tasks = buildInterventionTasks(args);
+      const seeds = [30001, 30002, 30003];
+      const results = new Map<string, readonly NullSeedResult[]>(
+        tasks.map((t) => [t.graphId, seeds.map((seed) => ({ seed, movementScore: 0.5, foodPickups: 1, hazardContacts: 0 }))])
+      );
+      const raw = assembleInterventionRaw(args, tasks, results);
+      expect(raw.arenaTask).toBeUndefined();
+      expect(raw.arenaTaskFingerprint).toBeUndefined();
+      expect(JSON.stringify(raw)).not.toContain('arenaTask');
+    });
+
+    it('assembleInterventionRaw: records the requested arena task id/fingerprint when --arena-task is passed', () => {
+      const args = baseArgs({ arenaTask: 'sparse-food' });
+      const tasks = buildInterventionTasks(args);
+      const seeds = [30001, 30002, 30003];
+      const results = new Map<string, readonly NullSeedResult[]>(
+        tasks.map((t) => [t.graphId, seeds.map((seed) => ({ seed, movementScore: 0.5, foodPickups: 1, hazardContacts: 0 }))])
+      );
+      const raw = assembleInterventionRaw(args, tasks, results);
+      expect(raw.arenaTask).toBe('sparse-food');
+      expect(raw.arenaTaskFingerprint).toBe(resolveArenaTask('sparse-food').fingerprint);
+    });
   });
 
   describe('assertConfigsMatchManifest', () => {

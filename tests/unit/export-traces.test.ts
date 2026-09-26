@@ -103,6 +103,53 @@ describe('parseArgs overwrite guard', () => {
   it('allows the default (no flags) invocation, which targets the committed directory on purpose', () => {
     expect(() => parseArgs([])).not.toThrow();
   });
+
+  describe('--arena-task', () => {
+    it('rejects an unknown arena task id', () => {
+      expect(() => parseArgs(['--arena-task', 'not-a-real-task'])).toThrow(/--arena-task must be one of/);
+    });
+
+    it('rejects --arena-task combined with --graph/--substeps/--include-world', () => {
+      expect(() => parseArgs(['--arena-task', 'hazard-heavy', '--substeps', '7'])).toThrow(
+        /--arena-task cannot be combined with/
+      );
+    });
+
+    it('defaults --out to tests/fixtures/golden/tasks/<id> for a non-default task', () => {
+      const args = parseArgs(['--arena-task', 'hazard-heavy']);
+      expect(args.outDir.endsWith('tests/fixtures/golden/tasks/hazard-heavy')).toBe(true);
+      expect(args.outDirExplicit).toBe(false);
+    });
+
+    it('--arena-task default resolves the same outDir/outDirExplicit as no --arena-task flag at all', () => {
+      // arenaTask itself legitimately differs ("default" vs. undefined —
+      // both are meaningful, recorded provenance elsewhere), but every
+      // output-affecting field must be identical.
+      const withDefault = parseArgs(['--arena-task', 'default']);
+      const withNone = parseArgs([]);
+      expect(withDefault.outDir).toBe(withNone.outDir);
+      expect(withDefault.outDirExplicit).toBe(withNone.outDirExplicit);
+      expect(withDefault.graphPath).toBe(withNone.graphPath);
+      expect(withDefault.substeps).toBe(withNone.substeps);
+      expect(withDefault.includeWorld).toBe(withNone.includeWorld);
+    });
+
+    // Regression (dual-review finding): an earlier version's overwrite guard
+    // (`nonDefaultExport`) only ever looked at --graph/--substeps/
+    // --include-world, so `--arena-task <id> --out tests/fixtures/golden`
+    // sailed through unchecked and would have silently overwritten the real
+    // committed default fixtures (same filenames: trace-graph.json,
+    // trace-graph-seed-1.json) with task-variant data.
+    it('refuses an explicit --out that resolves to the committed default fixtures directory', () => {
+      expect(() => parseArgs(['--arena-task', 'hazard-heavy', '--out', 'tests/fixtures/golden'])).toThrow(
+        /committed/
+      );
+    });
+
+    it('allows an explicit --out to a genuinely different directory', () => {
+      expect(() => parseArgs(['--arena-task', 'hazard-heavy', '--out', 'training/runs/tmp'])).not.toThrow();
+    });
+  });
 });
 
 describe('buildSeedTrace includeWorld', () => {

@@ -131,4 +131,12 @@ describe('runTask', () => {
     writeFileSync(configPath, JSON.stringify(config));
     expect(() => runTask(baseTask())).toThrow(/has arenaTaskFingerprint undefined/);
   });
+
+  it('throws (readRunDir type validation) when config.json has a non-string arenaTaskFingerprint', () => {
+    const configPath = join(runDir, 'config.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8')) as Record<string, unknown>;
+    config.arenaTaskFingerprint = 12345;
+    writeFileSync(configPath, JSON.stringify(config));
+    expect(() => runTask(baseTask())).toThrow(/"arenaTaskFingerprint" must be a string when present/);
+  });
 });

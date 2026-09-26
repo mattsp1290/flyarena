@@ -118,6 +118,11 @@ export const readRunDir = (dir: string): LoadedRun => {
   if (config.armBundleSha256 !== undefined && typeof config.armBundleSha256 !== 'string') {
     throw new Error(`evaluate: ${configPath}'s "armBundleSha256" must be a string when present`);
   }
+  for (const field of ['arenaTask', 'arenaTaskFingerprint'] as const) {
+    if (config[field] !== undefined && typeof config[field] !== 'string') {
+      throw new Error(`evaluate: ${configPath}'s "${field}" must be a string when present`);
+    }
+  }
   const runConfig = config as unknown as RunConfig;
   const { D, H, parameterCount } = runConfig;
   const expectedLength = readoutParameterCount(D, H);

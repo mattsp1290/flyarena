@@ -232,8 +232,7 @@ export const parseArgs = (argv: readonly string[]): CliArgs => {
     }
   }
 
-  const isNonDefaultTask = arenaTask !== undefined && arenaTask !== 'default';
-  if (isNonDefaultTask && (graphPath !== undefined || substepsExplicit || includeWorld)) {
+  if (arenaTask !== undefined && arenaTask !== 'default' && (graphPath !== undefined || substepsExplicit || includeWorld)) {
     throw new Error('--arena-task cannot be combined with --graph/--substeps/--include-world');
   }
   // A non-default task's own canonical, committed output directory
@@ -241,29 +240,39 @@ export const parseArgs = (argv: readonly string[]): CliArgs => {
   // --include-world below, an explicit --out is not required for this case,
   // since this location is exactly as canonical (and as safe from
   // overwriting the default fixtures) as DEFAULT_OUT_DIR is for the default
-  // task.
-  if (isNonDefaultTask && !outDirExplicit) outDir = TASK_TRACE_OUT_DIR(arenaTask!);
+  // task. `arenaTask` is narrowed directly here (not through a separately
+  // reused boolean) so this line never needs a non-null assertion.
+  if (arenaTask !== undefined && arenaTask !== 'default' && !outDirExplicit) {
+    outDir = TASK_TRACE_OUT_DIR(arenaTask);
+  }
 
-  // A non-default graph, substep count, or world-state column producing
-  // output that lands in the committed fixture directory (by accident, with
-  // no --out, or on purpose, with an --out that still resolves to it) would
-  // silently corrupt tests/fixtures/golden/ with non-canonical data.
-  const nonDefaultExport = graphPath !== undefined || substepsExplicit || includeWorld;
-  if (nonDefaultExport) {
-    if (!outDirExplicit) {
-      throw new Error(
-        '--graph/--substeps/--include-world change what gets exported; pass --out explicitly so ' +
-          `the result cannot land in the committed ${DEFAULT_OUT_DIR}/ directory by accident`
-      );
-    }
-    if (canonicalizePath(outDir) === canonicalizePath(DEFAULT_OUT_DIR)) {
-      throw new Error(
-        '--graph/--substeps/--include-world change what gets exported; --out ' +
-          `("${outDir}") resolves to the committed ${DEFAULT_OUT_DIR}/ directory, which would ` +
-          'overwrite the committed golden fixtures with non-canonical data. Pass a different ' +
-          '--out path (e.g. a gitignored directory such as training/runs/).'
-      );
-    }
+  // A non-default graph, substep count, world-state column, or arena task
+  // producing output that lands in the committed fixture directory (by
+  // accident, with no --out, or on purpose, with an --out that still
+  // resolves to it) would silently corrupt tests/fixtures/golden/ with
+  // non-canonical data. `--arena-task` alone never needs an explicit --out
+  // (it already redirects to its own safe directory above), so only the
+  // "must pass --out explicitly" branch is scoped to the other three flags —
+  // but the "does --out resolve to the default directory" branch below must
+  // cover every non-default export, --arena-task included, or an explicit
+  // `--out tests/fixtures/golden` would silently overwrite the real default
+  // fixtures with task-variant data (a dual-review finding).
+  const graphSubstepsWorldNonDefault = graphPath !== undefined || substepsExplicit || includeWorld;
+  const nonDefaultExport = graphSubstepsWorldNonDefault || (arenaTask !== undefined && arenaTask !== 'default');
+  if (graphSubstepsWorldNonDefault && !outDirExplicit) {
+    throw new Error(
+      '--graph/--substeps/--include-world change what gets exported; pass --out explicitly so ' +
+        `the result cannot land in the committed ${DEFAULT_OUT_DIR}/ directory by accident`
+    );
+  }
+  if (nonDefaultExport && outDirExplicit && canonicalizePath(outDir) === canonicalizePath(DEFAULT_OUT_DIR)) {
+    throw new Error(
+      '--graph/--substeps/--include-world/--arena-task change what gets exported; --out ' +
+        `("${outDir}") resolves to the committed ${DEFAULT_OUT_DIR}/ directory, which would ` +
+        'overwrite the committed golden fixtures with non-canonical data. Pass a different ' +
+        '--out path (e.g. a gitignored directory such as training/runs/, or omit --out to use ' +
+        "--arena-task's own tests/fixtures/golden/tasks/<id>/ directory)."
+    );
   }
 
   return { graphPath, substeps, outDir, outDirExplicit, includeWorld, arenaTask };
