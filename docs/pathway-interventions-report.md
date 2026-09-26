@@ -16,49 +16,34 @@ and CEM-retrained readouts.
 
 ## Method
 
-**Primary -- targeted degree-preserving swaps (P):** starting from the biological graph, repeatedly apply double-edge
-swaps `(a->b, c->d) -> (a->d, c->b)` where `a` is input-labeled, `d` is a thrust-population neuron, and both
-collateral endpoints `b` and `c` are bridge neurons (neither input nor output assigned). Choose greedily by the
-largest first-order increase of `T:rightClearance->thrust + T:forwardClearance->thrust`. Stop when both entries
-reach at least the null's 25th percentile, or at 200 swaps. This preserves in-degree, out-degree, the weight
-multiset, and the presynaptic signs (per-neuron, `presynapticSigns`). `k` is the number of accepted swaps.
+The interventions below are quoted byte-verbatim from `.agents/plans/pathway-interventions/00-overview.md`'s
+"Predeclared interventions and prediction" section (thermo-methodology review, Suggestion: an earlier version of
+this report substituted ASCII `->`/`--` for the plan's real `→`/`—` characters and dropped its mid-sentence
+bold emphasis; this section and "Predeclared outcome categories" below are now direct copies).
 
-**Control -- random degree-preserving swaps (C):** 100 graphs, each with exactly `k` uniformly random valid
-double-edge swaps anywhere in the graph (seeds 0-99). This tests "any perturbation of this size".
-
-**Control -- class-matched random swaps (M):** 100 graphs, each with exactly `k` valid swaps drawn uniformly (not
-greedily) from the same candidate class as P (`a` input-labeled, `d` thrust, `b`/`c` bridge), seeds 1000-1099.
-
-**Secondary -- magnitude-matched removal (R):** remove the attributed edges into thrust neurons from the input
-side that carry at least 50% of the first-order transfer. Because the biological graph has none, R is expected
-to be empty. If so, it is reported as not applicable.
-
-**Secondary -- clearance-only targeting (Q):** the same as P, but only `rightClearance` and `forwardClearance`
-input neurons may be the source `a`. This tests channel specificity rather than generic input->thrust wiring.
+- **Primary — targeted degree-preserving swaps (P):** starting from the biological graph, repeatedly apply double-edge swaps `(a→b, c→d) → (a→d, c→b)` where `a` is input-labeled, `d` is a thrust-population neuron, and both collateral endpoints `b` and `c` are **bridge** neurons (neither input nor output assigned). That keeps the collateral edges added and removed away from the output populations, and every control arm shares the same class restriction. Choose greedily by the largest first-order increase of `T:rightClearance→thrust + T:forwardClearance→thrust`. Stop when both entries reach at least the null's 25th percentile, or at 200 swaps. This preserves in-degree, out-degree, the weight multiset, and the presynaptic signs (per-neuron, `presynapticSigns`). Record the number of swaps `k`.
+- **Control — random degree-preserving swaps (C):** 100 graphs, each with exactly `k` uniformly random valid double-edge swaps anywhere in the graph (seeds `0…99`), under the same validity rules. This tests "any perturbation of this size".
+- **Control — class-matched random swaps (M):** 100 graphs, each with exactly `k` valid swaps drawn **uniformly** (not greedily) from the same candidate class as P (`a` input-labeled, `d` thrust, `b` and `c` bridge), seeds `1000…1099`. This separates "these specific, optimized edges" from "any edges of this class", and it matches P's collateral-edge class.
+- **Secondary — magnitude-matched removal (R):** remove the attributed edges into thrust neurons from the input side that carry at least 50% of the first-order transfer. Because the biological graph has none, R is expected to be empty. If so, it is reported as not applicable. It is kept only to check the premise.
+- **Secondary — clearance-only targeting (Q):** the same as P, but only `rightClearance` and `forwardClearance` input neurons may be the source `a`. This tests channel specificity rather than generic input→thrust wiring.
 
 ### Predeclared outcome categories (authored decoder)
 
-- **Pathway supported**: P's score is at or above the null's 25th percentile and above the 95th percentile of both the C and M distributions.
-- **Edge-class effect**: P is at or above the null's 25th percentile and above C's 95th percentile, but at or below M's 95th percentile. Any input->thrust edges of this class help about equally, and the specific optimized edges do not matter.
-- **Generic rewiring effect**: P is at or above the null's 25th percentile but at or below C's 95th percentile. Any k swaps help about equally.
-- **Not supported**: P stays below the null's 25th percentile.
-- **Channel-specific (modifier, authored decoder only)**: Q (clearance-channel sources only) is above the null's
-  25th percentile and above the 95th percentile of its own size-matched class control MQ: 100 graphs, each with
-  exactly `k_Q = |Q swaps|` uniform valid swaps from Q's candidate class, seeds 2000-2099. Q is never compared
-  against the P-sized C or M arms. Q is not evaluated with trained readouts, and this report states this.
+- **Pathway supported:** P's score is at or above the null's 25th percentile **and** above the 95th percentile of both the C and M distributions.
+- **Edge-class effect:** P is at or above the null's 25th percentile and above C's 95th percentile, **but** at or below M's 95th percentile. Any input→thrust edges of this class help about equally, and the specific optimized edges do not matter.
+- **Generic rewiring effect:** P is at or above the null's 25th percentile **but** at or below C's 95th percentile. Any `k` swaps help about equally.
+- **Not supported:** P stays below the null's 25th percentile.
+- **Channel-specific (modifier, authored decoder only):** Q (clearance-channel sources only) is above the null's 25th percentile and above the 95th percentile of **its own** size-matched class control MQ: 100 graphs, each with exactly `k_Q = |Q swaps|` uniform valid swaps from Q's candidate class, seeds `2000…2099`. Q is never compared against the P-sized C or M arms. Q is not evaluated with trained readouts, and the report states this.
 
-Claim language: a positive result means "the net effect of this accepted swap set", not an isolated single-edge
-causal effect.
+Claim language: a positive result means "the net effect of this accepted swap set", not an isolated single-edge causal effect. The report states this.
 
 ### Trained decoder
 
-The same C/M comparisons apply, but the **governing reference** is the freshly trained controls: 5 C graphs
-(C000-C004) and 5 M graphs (M1000-M1004), each at trainer seed 101 -- not the published 500-graph authored null,
-and the authored floor's null-percentile prong is not applied on this side (see the disclosure below for why).
-The published trained null (`rewiring-null-v1.json` `trained`, 20 full rewirings) is reported for context only
-and does not decide the category. With 5 graphs per arm, the trained cutoff is "above the maximum of that arm's
-5". The result is robust only if all three P trainer seeds (101/202/303) agree on the category, because the
-trained null was trainer-seed-sensitive.
+Trained decoder: the same categories. The **governing reference** is the freshly trained controls: 5 C graphs (C000–C004) and 5 M graphs (M1000–M1004), each at trainer seed 101. The published trained null (`rewiring-null-v1.json` `trained`, 20 full rewirings) is reported for context only and does not decide the category. With 5 graphs per arm, the trained cutoff is "above the maximum of that arm's 5". The report states that this resolution is coarse. The result is robust only if all three P trainer seeds (101/202/303) agree on the category, because the trained null was trainer-seed-sensitive.
+
+The C/M comparisons above are the same ones the authored side uses; the authored floor's own null-percentile
+prong is not applied on the trained side (the trained null is context-only, not a decisive threshold — see the
+disclosure immediately below, which is this report's own addition, not part of the quoted plan text above).
 
 The trained decoder's predeclared C/M-max comparison can rule pathway-supported and edge-class-effect in or out (P above/below the max of the freshly-trained 5-graph C/M arms at trainer seed 101), but 00-overview.md does not say how to report the finer generic-rewiring-effect vs not-supported split when P does not clear the C arm: that split needs a trained-null percentile floor, and this study's only trained null (rewiring-null-v1.json's published n=20 sample) is reported for context only, per 00-overview.md, not as a decisive threshold. 'no-specific-effect' is a reporting convention this study's coordinator adopted after the trained scores were known (methodology review, 2026-09-26), to avoid forcing an unlicensed generic/not-supported label -- it does not change which predeclared comparison P passed or failed, only how the undecidable case is named.
 
@@ -107,7 +92,7 @@ the 100 control graphs -- not "near the bottom" of the arm.
 | P | 3.6125 | 85.6% | 0.0099 | 0.0099 | -- |
 | Q | 3.4014 | 81.6% | -- | -- | 0.0099 |
 
-- P's category: **Pathway supported**: P's score is at or above the null's 25th percentile and above the 95th percentile of both the C and M distributions.
+- P's category: **Pathway supported:** P's score is at or above the null's 25th percentile **and** above the 95th percentile of both the C and M distributions.
 - Q's channel-specific modifier: **holds** (Q above the null's
   25th percentile and above its own MQ control's 95th percentile).
 - Control arms (mean `movementScore`, n=100 each): C p50=-0.2198 p95=-0.1833;
