@@ -443,7 +443,7 @@ const buildTrainedInterventionsStep = (inputs: BuildFindingStepsInputs): Finding
       ? 'this does not reproduce'
       : (trainedCategory as string) === (authored.category as string)
         ? 'this matches'
-        : "this is consistent with (the trained rules can't split generic-rewiring-effect from not-supported)";
+        : 'this is consistent with (the trained rules cannot split generic-rewiring-effect from not-supported)';
   const sentence =
     `With trained readouts, ${agreementPrefix} ${categoryText} — ${reproductionClause} the authored decoder's ` +
     `${authored.category} result, under this model.`;

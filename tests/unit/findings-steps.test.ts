@@ -163,6 +163,37 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     expect(step.sentence).toMatch(/under this model\.$/);
   });
 
+  it('step 3 appends a regime-invalid clause before "under this model.", for both the has-metrics and zero-metrics templates', () => {
+    const regimeInvalidWithMetrics: NullExplanationArtifact = {
+      ...realNullExplanation,
+      regime: { gatePassed: false },
+      finding: { ...realNullExplanation.finding, regimeInvalid: true }
+    };
+    const withMetrics = findStep(
+      buildFindingSteps({ ...baseInputs(), nullExplanation: nullExplanationOk(regimeInvalidWithMetrics) }),
+      'explanation'
+    );
+    expect(withMetrics.sentence).toContain('regime-invalid (inconclusive)');
+    expect(withMetrics.sentence).toMatch(/under this model\.$/);
+
+    const regimeInvalidNoMetrics: NullExplanationArtifact = {
+      ...realNullExplanation,
+      regime: { gatePassed: false },
+      finding: { ...realNullExplanation.finding, regimeInvalid: true, qualifyingMetrics: [] }
+    };
+    const noMetrics = findStep(
+      buildFindingSteps({ ...baseInputs(), nullExplanation: nullExplanationOk(regimeInvalidNoMetrics) }),
+      'explanation'
+    );
+    expect(noMetrics.sentence).toContain('regime-invalid (inconclusive)');
+    expect(noMetrics.sentence).toMatch(/under this model\.$/);
+
+    // The real shipped artifact's regime gate passed -- the clause must be absent.
+    const valid = findStep(buildFindingSteps(baseInputs()), 'explanation');
+    expect(valid.sentence).not.toContain('regime-invalid');
+    expect(valid.sentence).toMatch(/under this model\.$/);
+  });
+
   it('step 4 (intervention, authored) states the real authored category and channel-specific modifier', () => {
     const steps = buildFindingSteps(baseInputs());
     const step = findStep(steps, 'intervention');
@@ -227,6 +258,27 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     expect(step.sentence).toContain('seed 202: edge-class-effect');
     expect(step.sentence).toContain('seed 303: no-specific-effect');
     expect(step.sentence).toContain('does not reproduce');
+  });
+
+  it('step 6 says "is consistent with", never "this matches" or "does not reproduce", when a robust no-specific-effect merges the authored generic-rewiring-effect/not-supported split', () => {
+    for (const authoredCategory of ['generic-rewiring-effect', 'not-supported'] as const) {
+      const consistent: PathwayInterventionsArtifact = {
+        ...realPathwayInterventions,
+        authored: { ...realPathwayInterventions.authored, category: authoredCategory },
+        trained: {
+          trainedRobust: true,
+          perSeedCategory: { '101': 'no-specific-effect', '202': 'no-specific-effect', '303': 'no-specific-effect' }
+        }
+      };
+      const step = findStep(
+        buildFindingSteps({ ...baseInputs(), pathwayInterventions: pathwayInterventionsOk(consistent) }),
+        'trained-interventions'
+      );
+      expect(step.sentence, authoredCategory).toContain('is consistent with');
+      expect(step.sentence, authoredCategory).not.toContain('this matches');
+      expect(step.sentence, authoredCategory).not.toContain('does not reproduce');
+      expect(step.sentence, authoredCategory).toMatch(/under this model\.$/);
+    }
   });
 
   it('step 7 (behavior repertoire) is always "missing" with "Not yet published" in this WP (repertoire-null has not landed)', () => {
@@ -351,28 +403,53 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
    * template-lint unit test fails on a numeric literal appearing directly
    * in a template string") actually true.
    */
-  it('template-lint: steps.ts source contains no hard-coded numeric literal outside an artifact filename', () => {
-    const stepsSourcePath = resolve(here, '../../src/lib/findings/steps.ts');
-    const src = readFileSync(stepsSourcePath, 'utf-8')
-      .replace(/\/\*[\s\S]*?\*\//g, '') // strip block comments (doc prose like "WP1"/"00-overview.md")
-      .replace(/\/\/.*$/gm, ''); // strip line comments
-    // Backtick literals are matched first, and directly (an apostrophe
-    // inside one, e.g. "the rewired null's range", is not a string
-    // delimiter) -- backtick literals are then blanked out of `src` before
-    // the single-quote pass runs, so that same apostrophe can never be
-    // misread as the start of a single-quoted string spanning into
-    // surrounding real code.
-    const backtickLiterals = [...src.matchAll(/`((?:[^`\\]|\\.)*)`/g)].map((match) => match[1]);
-    const srcWithoutBackticks = src.replace(/`(?:[^`\\]|\\.)*`/g, '``');
-    const singleQuoteLiterals = [...srcWithoutBackticks.matchAll(/'((?:[^'\\]|\\.)*)'/g)].map((match) => match[1]);
-    const literals = [...backtickLiterals, ...singleQuoteLiterals];
-    const offenders = literals.filter((literal) => {
+  /**
+   * Extracts every backtick/single-/double-quoted string literal from
+   * `source` and returns the ones whose *static* text (interpolations
+   * stripped) contains a digit outside an artifact filename's own version
+   * number. A single alternation regex, not three independent passes over
+   * progressively-blanked text (round-2 dual review, Important — an
+   * earlier version ran a separate blank-then-rescan pass per quote style,
+   * which silently skipped double-quoted literals entirely and, worse, let
+   * an apostrophe inside one un-blanked double-quoted literal desync the
+   * single-quote pass for the rest of the file, hiding every literal after
+   * it). Matching all three quote styles in one linear scan means no quote
+   * style can ever desync another, and none is silently skipped.
+   */
+  const findNumericLiteralOffenders = (source: string): string[] => {
+    const withoutComments = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+    const literalPattern = /`((?:[^`\\]|\\.)*)`|'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"/g;
+    const literals = [...withoutComments.matchAll(literalPattern)].map((match) => match[1] ?? match[2] ?? match[3] ?? '');
+    return literals.filter((literal) => {
       const staticText = literal
         .replace(/\$\{[^}]*\}/g, '') // drop interpolations -- their computed values are asserted by the perturbation test below
         .replace(/[a-z][a-z0-9-]*-v\d+\.(json|md)/gi, ''); // allow a provenance label's own "<name>-v1.json"/".md" filename
       return /\d/.test(staticText);
     });
-    expect(offenders).toEqual([]);
+  };
+
+  /**
+   * Self-test for the lint helper itself (round-2 dual review, Important):
+   * proves it actually catches a hard-coded number in each of the three
+   * quote styles `steps.ts` uses, including past an unrelated apostrophe in
+   * an earlier double-quoted literal -- exactly the shape of bug the round-2
+   * review found in the prior version of this lint.
+   */
+  it('template-lint helper: catches a hard-coded number in backtick, single-, and double-quoted literals, including past an apostrophe', () => {
+    const synthetic = [
+      `const a = "the rewired null's range";`,
+      `const b = \`among 500 things\`;`,
+      `const c = 'also 42 things';`,
+      `const d = "and 7 more things";`
+    ].join('\n');
+    const offenders = findNumericLiteralOffenders(synthetic);
+    expect(offenders).toEqual(['among 500 things', 'also 42 things', 'and 7 more things']);
+  });
+
+  it('template-lint: steps.ts source contains no hard-coded numeric literal outside an artifact filename', () => {
+    const stepsSourcePath = resolve(here, '../../src/lib/findings/steps.ts');
+    const src = readFileSync(stepsSourcePath, 'utf-8');
+    expect(findNumericLiteralOffenders(src)).toEqual([]);
   });
 
   /**
