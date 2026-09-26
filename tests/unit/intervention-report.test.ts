@@ -87,6 +87,36 @@ describe('parseInterventionReportArgs', () => {
       ).toThrow(/--out must not overwrite an input file/);
     }
   );
+
+  describe('--stats-only (task-generality WP2)', () => {
+    it('defaults to false', () => {
+      expect(parseInterventionReportArgs([]).statsOnly).toBe(false);
+    });
+
+    it('requires --arena-task', () => {
+      expect(() => parseInterventionReportArgs(['--stats-only'])).toThrow(
+        /--stats-only requires --arena-task/
+      );
+    });
+
+    it('derives training/runs/tasks/<id>/intervention-stats.json when --out is left at its default', () => {
+      const args = parseInterventionReportArgs(['--stats-only', '--arena-task', 'hazard-heavy']);
+      expect(args.statsOnly).toBe(true);
+      expect(args.out.replaceAll('\\', '/')).toMatch(/training\/runs\/tasks\/hazard-heavy\/intervention-stats\.json$/);
+      expect(args.out).not.toBe(DEFAULT_OUT);
+    });
+
+    it('does not override an explicit --out', () => {
+      const args = parseInterventionReportArgs([
+        '--stats-only',
+        '--arena-task',
+        'hazard-heavy',
+        '--out',
+        'custom.json'
+      ]);
+      expect(args.out).toContain('custom.json');
+    });
+  });
 });
 
 describe('armDistribution', () => {
@@ -863,6 +893,7 @@ describe('runInterventionReport (CLI layer)', () => {
     bootstrapSeed: 42,
     bootstrapResamples: 200,
     allowReproductionMismatch: false,
+    statsOnly: false,
     ...overrides
   });
 
@@ -917,15 +948,15 @@ describe('runInterventionReport (CLI layer)', () => {
     expect(() => runInterventionReport(args)).not.toThrow(/refusing to write a diagnosticOnly result/);
   });
 
-  describe('--arena-task (task-generality WP1)', () => {
-    const patchAuthoredArenaTask = (id: string): void => {
-      const path = join(root, 'authored.json');
-      const authored = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
-      authored.arenaTask = id;
-      authored.arenaTaskFingerprint = resolveArenaTask(id).fingerprint;
-      writeFileSync(path, JSON.stringify(authored));
-    };
+  const patchAuthoredArenaTask = (id: string): void => {
+    const path = join(root, 'authored.json');
+    const authored = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+    authored.arenaTask = id;
+    authored.arenaTaskFingerprint = resolveArenaTask(id).fingerprint;
+    writeFileSync(path, JSON.stringify(authored));
+  };
 
+  describe('--arena-task (task-generality WP1)', () => {
     it('labels the output when --arena-task matches authored.json\'s recorded task', () => {
       writeFixtureFiles(0, 0);
       patchAuthoredArenaTask('hazard-heavy');
@@ -960,6 +991,22 @@ describe('runInterventionReport (CLI layer)', () => {
       patchAuthoredArenaTask('hazard-heavy');
       const args = { ...argsFor({ arenaTask: 'hazard-heavy' }), out: DEFAULT_OUT };
       expect(() => runInterventionReport(args)).toThrow(/refusing to write a --arena-task "hazard-heavy" result/);
+    });
+  });
+
+  describe('--stats-only (task-generality WP2)', () => {
+    it('marks the output statsOnly when the flag was passed', () => {
+      writeFixtureFiles(0, 0);
+      patchAuthoredArenaTask('hazard-heavy');
+      const { statistics } = runInterventionReport(argsFor({ arenaTask: 'hazard-heavy', statsOnly: true }));
+      expect(statistics.statsOnly).toBe(true);
+    });
+
+    it('does not add a statsOnly key when the flag is omitted (byte-identity gate)', () => {
+      writeFixtureFiles(0, 0);
+      const { statistics } = runInterventionReport(argsFor());
+      expect(statistics.statsOnly).toBeUndefined();
+      expect(JSON.stringify(statistics)).not.toContain('statsOnly');
     });
   });
 });

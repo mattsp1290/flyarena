@@ -471,6 +471,16 @@ export interface InterventionStatistics {
    * `arenaTaskFingerprint` when present.
    */
   readonly arenaTask?: { readonly id: string; readonly fingerprint: string };
+  /**
+   * `.agents/plans/task-generality/02-authored-runs.md`'s WP2: present (and
+   * `true`) only when `--stats-only` was passed — never set by
+   * `buildInterventionStatistics` itself (a pure function with no notion of
+   * that CLI flag), matching `diagnosticOnly`'s own provenance convention.
+   * Descriptive only: it does not change any computed statistic, only marks
+   * this run as the per-task descriptive pass rather than a WP4 publish
+   * input.
+   */
+  readonly statsOnly?: true;
 }
 
 /** `id < id` string ordering — matches `null-evaluate.ts`'s `sortedGraphListEntries`, so this module's output key order is independent of `authored.json`'s own array order (itself already sorted the same way, but this does not assume that). */
@@ -623,6 +633,19 @@ export interface InterventionReportArgs {
   readonly allowReproductionMismatch: boolean;
   /** `--arena-task <id>` — labels this run's output by task (see `InterventionStatistics.arenaTask`). Absent means the default task, and the default output is unchanged. */
   readonly arenaTask?: string;
+  /**
+   * `.agents/plans/task-generality/02-authored-runs.md`'s WP2: `--stats-only`
+   * marks this run as a per-task descriptive-statistics computation only
+   * (never a WP4 publish combining step). It requires `--arena-task <id>` --
+   * a stats-only run with no task makes no sense to derive a path for, and
+   * every real call site pairs the two flags (`--arena-task t --stats-only`)
+   * -- and, when `--out` was left at its default, derives
+   * `training/runs/tasks/<id>/intervention-stats.json` so the caller doesn't
+   * have to hand-build that path. An explicit `--out` is never overridden.
+   * This never touches `public/data` (this file has no other write path than
+   * `--out` to begin with).
+   */
+  readonly statsOnly: boolean;
 }
 
 export const parseInterventionReportArgs = (argv: readonly string[]): InterventionReportArgs => {
@@ -634,6 +657,7 @@ export const parseInterventionReportArgs = (argv: readonly string[]): Interventi
   let bootstrapResamples = DEFAULT_BOOTSTRAP_RESAMPLES;
   let allowReproductionMismatch = false;
   let arenaTask: string | undefined;
+  let statsOnly = false;
 
   let i = 0;
   while (i < argv.length) {
@@ -662,8 +686,27 @@ export const parseInterventionReportArgs = (argv: readonly string[]): Interventi
     } else if (flag === '--arena-task') {
       arenaTask = parseArenaTaskArg(requireValue(flag, argv[i + 1]));
       i += 2;
+    } else if (flag === '--stats-only') {
+      statsOnly = true;
+      i += 1;
     } else {
       throw new Error(`Unknown argument: ${flag}`);
+    }
+  }
+
+  if (statsOnly) {
+    if (arenaTask === undefined) {
+      throw new Error(
+        'intervention-report: --stats-only requires --arena-task <id> (it derives ' +
+          'training/runs/tasks/<id>/intervention-stats.json from the task id)'
+      );
+    }
+    // Only when `--out` was left at its default -- an explicit `--out` (any
+    // path, including one a caller happens to choose that equals the
+    // default) is never second-guessed here; see this field's own doc
+    // comment.
+    if (resolve(out) === resolve(DEFAULT_OUT)) {
+      out = resolve(repoRoot, 'training', 'runs', 'tasks', arenaTask, 'intervention-stats.json');
     }
   }
 
@@ -677,7 +720,17 @@ export const parseInterventionReportArgs = (argv: readonly string[]): Interventi
     }
   }
 
-  return { authored, index, publishedNull, out, bootstrapSeed, bootstrapResamples, allowReproductionMismatch, arenaTask };
+  return {
+    authored,
+    index,
+    publishedNull,
+    out,
+    bootstrapSeed,
+    bootstrapResamples,
+    allowReproductionMismatch,
+    arenaTask,
+    statsOnly
+  };
 };
 
 /**
@@ -772,7 +825,8 @@ export const runInterventionReport = (
     ...(args.allowReproductionMismatch && !statistics.biologicalReproduction.matches ? { diagnosticOnly: true } : {}),
     ...(args.arenaTask !== undefined
       ? { arenaTask: { id: resolvedArenaTask.id, fingerprint: resolvedArenaTask.fingerprint } }
-      : {})
+      : {}),
+    ...(args.statsOnly ? { statsOnly: true } : {})
   };
 
   guardCanonicalOutDefault(args.out, output);
