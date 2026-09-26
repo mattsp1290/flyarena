@@ -22,7 +22,6 @@ import {
   type PublishedNull
 } from '../../scripts/null/intervention-report';
 import type { NullGraphListEvaluationRaw } from '../../scripts/null/null-evaluate';
-import { resolveArenaTask } from '../../src/lib/arena/tasks';
 
 /**
  * Coverage for `scripts/null/intervention-report.ts`'s statistics layer
@@ -966,98 +965,10 @@ describe('runInterventionReport (CLI layer)', () => {
     expect(() => runInterventionReport(args)).not.toThrow(/refusing to write a diagnosticOnly result/);
   });
 
-  const patchAuthoredArenaTask = (id: string): void => {
-    const path = join(root, 'authored.json');
-    const authored = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
-    authored.arenaTask = id;
-    authored.arenaTaskFingerprint = resolveArenaTask(id).fingerprint;
-    writeFileSync(path, JSON.stringify(authored));
-  };
-
-  const patchPublishedNullArenaTask = (id: string): void => {
-    const path = join(root, 'null.json');
-    const publishedNull = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
-    publishedNull.arenaTask = { id, fingerprint: resolveArenaTask(id).fingerprint };
-    writeFileSync(path, JSON.stringify(publishedNull));
-  };
-
-  describe('--arena-task (task-generality WP1)', () => {
-    it('labels the output when --arena-task matches authored.json\'s recorded task', () => {
-      writeFixtureFiles(0, 0);
-      patchAuthoredArenaTask('hazard-heavy');
-      const { statistics } = runInterventionReport(argsFor({ arenaTask: 'hazard-heavy' }));
-      expect(statistics.arenaTask).toEqual({ id: 'hazard-heavy', fingerprint: resolveArenaTask('hazard-heavy').fingerprint });
-    });
-
-    it('throws when --arena-task disagrees with authored.json\'s recorded task', () => {
-      writeFixtureFiles(0, 0);
-      patchAuthoredArenaTask('hazard-heavy');
-      expect(() => runInterventionReport(argsFor({ arenaTask: 'crowded' }))).toThrow(
-        /does not match authored\.json's recorded arena task fingerprint/
-      );
-    });
-
-    it('throws when --arena-task is passed but authored.json was scored under the default task', () => {
-      writeFixtureFiles(0, 0);
-      expect(() => runInterventionReport(argsFor({ arenaTask: 'hazard-heavy' }))).toThrow(
-        /does not match authored\.json's recorded arena task fingerprint/
-      );
-    });
-
-    it('does not add an arenaTask key when --arena-task is omitted and authored.json is the default task (byte-identity gate)', () => {
-      writeFixtureFiles(0, 0);
-      const { statistics } = runInterventionReport(argsFor());
-      expect(statistics.arenaTask).toBeUndefined();
-      expect(JSON.stringify(statistics)).not.toContain('arenaTask');
-    });
-
-    it('refuses to write a non-default arena-task result to the default --out', () => {
-      writeFixtureFiles(0, 0);
-      patchAuthoredArenaTask('hazard-heavy');
-      const args = { ...argsFor({ arenaTask: 'hazard-heavy' }), out: DEFAULT_OUT };
-      expect(() => runInterventionReport(args)).toThrow(/refusing to write a --arena-task "hazard-heavy" result/);
-    });
-  });
-
-  describe('--stats-only (task-generality WP2)', () => {
-    it('marks the output statsOnly when the flag was passed and --null is scored under the same task', () => {
-      writeFixtureFiles(0, 0);
-      patchAuthoredArenaTask('hazard-heavy');
-      patchPublishedNullArenaTask('hazard-heavy');
-      const { statistics } = runInterventionReport(argsFor({ arenaTask: 'hazard-heavy', statsOnly: true }));
-      expect(statistics.statsOnly).toBe(true);
-    });
-
-    it('does not add a statsOnly key when the flag is omitted (byte-identity gate)', () => {
-      writeFixtureFiles(0, 0);
-      const { statistics } = runInterventionReport(argsFor());
-      expect(statistics.statsOnly).toBeUndefined();
-      expect(JSON.stringify(statistics)).not.toContain('statsOnly');
-    });
-
-    it('refuses --stats-only when --null has no recorded arena task (the task-independent default null)', () => {
-      writeFixtureFiles(0, 0);
-      patchAuthoredArenaTask('hazard-heavy');
-      expect(() => runInterventionReport(argsFor({ arenaTask: 'hazard-heavy', statsOnly: true }))).toThrow(
-        /requires --null to be a per-task null.*no recorded arena task/
-      );
-    });
-
-    it("refuses --stats-only when --null was scored under a different task than requested", () => {
-      writeFixtureFiles(0, 0);
-      patchAuthoredArenaTask('hazard-heavy');
-      patchPublishedNullArenaTask('crowded');
-      expect(() => runInterventionReport(argsFor({ arenaTask: 'hazard-heavy', statsOnly: true }))).toThrow(
-        /requires --null to be a per-task null.*is recorded under arena task "crowded"/
-      );
-    });
-
-    it('does NOT require a task-matched --null for a plain --arena-task run without --stats-only (WP1 behavior unchanged)', () => {
-      writeFixtureFiles(0, 0);
-      patchAuthoredArenaTask('hazard-heavy');
-      // --null has no arenaTask recorded at all here, yet this must still succeed.
-      const { statistics } = runInterventionReport(argsFor({ arenaTask: 'hazard-heavy' }));
-      expect(statistics.arenaTask).toEqual({ id: 'hazard-heavy', fingerprint: resolveArenaTask('hazard-heavy').fingerprint });
-    });
-  });
+  // `--arena-task` (task-generality WP1) and `--stats-only` (WP2) coverage
+  // lives in `intervention-report-arena-task.test.ts` -- this file was
+  // already at the repo's 1000-line review-blocker threshold, and that
+  // coverage needs its own `writeFixtureFiles`/`argsFor`/patch-helper setup
+  // anyway (the same split `null-worker-arena-task.test.ts` already did for
+  // `null-evaluate.test.ts`).
 });
