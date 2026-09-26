@@ -152,3 +152,20 @@ export const decoderRadio = (page: Page, decoder: 'authored' | 'trained'): Retur
 /** `ActivityPanel`'s color-mode radio group (WP3, "Live rate" / "Lesion effect (offline)") — same locator-helper precedent as `decoderRadio` above. */
 export const activityColorModeRadio = (page: Page, mode: 'live' | 'lesion'): ReturnType<Page['getByRole']> =>
   page.getByRole('radio', { name: mode === 'lesion' ? /lesion effect \(offline\)/i : /^live rate$/i });
+
+/**
+ * WP1 of `.agents/plans/findings-tour`: `FindingsPanel.svelte`'s own
+ * collapse/expand toggle — the button's accessible name switches between
+ * "Expand"/"Collapse" with the panel's open state (same convention as
+ * `activityToggle` above), and it is always the first `<button>` inside
+ * `section.findings` (the Previous/Next stepper controls only exist once
+ * expanded, and are declared after it in the template).
+ */
+export const findingsToggle = (page: Page) => page.locator('section.findings button').first();
+
+/** Expands the Findings panel and waits for it to actually be open. */
+export const expandFindingsPanel = async (page: Page): Promise<void> => {
+  await expect(findingsToggle(page)).toBeEnabled({ timeout: 20_000 });
+  await findingsToggle(page).click();
+  await expect(findingsToggle(page)).toHaveText(/collapse/i);
+};

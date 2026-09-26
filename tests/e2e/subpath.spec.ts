@@ -22,6 +22,19 @@ test('all views work beneath /fly/ with root asset routes deliberately unavailab
   // deliberately-unavailable root /data/ path.
   await expect(page.locator('.pathway-interventions-detail')).toContainText(/tested under this model.*the pathway-supported category holds/is);
   await expect(page.getByRole('link',{name:/intervention report/i})).toHaveAttribute('href','https://github.com/mattsp1290/flyarena/blob/main/docs/pathway-interventions-report.md');
+  // WP1 of `.agents/plans/findings-tour`: `FindingsPanel.svelte` builds its
+  // own provenance links from this same /fly/-prefixed `dataBaseUrl` — a
+  // base-path bug here would point step 1's "Pinned JSON" link at the
+  // deliberately-404ing root /data/ path instead.
+  await page.locator('section.findings button').first().click();
+  await expect(page.locator('section.findings ol.steps li.step').first()).toContainText(/under this model\./i,{timeout:20000});
+  const findingsJsonLink=page.locator('section.findings ol.steps li.step').first().getByRole('link',{name:'Pinned JSON'});
+  await expect(findingsJsonLink).toHaveAttribute('href','/fly/data/rewiring-null-v1.json');
+  expect((await request.get(await findingsJsonLink.getAttribute('href')as string)).status()).toBe(200);
+  // Collapsed again so the rest of this test's unscoped `getByRole('button',
+  // {name:/^collapse$/i})` (the activity panel's own toggle, below) keeps
+  // resolving to exactly one match.
+  await page.locator('section.findings button').first().click();
   // WP3: `loadPositions` fetches the positions sidecar under this same
   // /fly/ base path — if it fell back to the (deliberately 404ing) root
   // /data/ path instead, the toggle would stay disabled forever and
