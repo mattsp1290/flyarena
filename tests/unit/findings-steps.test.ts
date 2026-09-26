@@ -110,7 +110,7 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     expect(step.provenance[0].artifactPath).toBe(`/data/${manifest.rewiringNull?.artifact}`);
   });
 
-  it('step 2 (mirrored decoder) states the mirrored-decoder result relative to the un-mirrored baseline', () => {
+  it('step 2 (mirrored decoder) states the mirrored-decoder result relative to the un-mirrored baseline, with one provenance entry per source artifact', () => {
     const steps = buildFindingSteps(baseInputs());
     const step = findStep(steps, 'mirrored-decoder');
     expect(step.status).toBe('ok');
@@ -118,6 +118,38 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     // Real data: both baseline and mirrored bioPercentile are 0 -- "still leaves ... at the bottom".
     expect(step.sentence).toContain('still leaves biological at the bottom');
     expect(step.sentence).toMatch(/under this model\.$/);
+    // The sentence draws on two artifacts (the rewiring-null baseline and
+    // the null-explanation mirrored variant) -- both must be citable.
+    expect(step.provenance).toHaveLength(2);
+    expect(step.provenance.some((entry) => entry.sha256Prefix === manifest.rewiringNull?.sha256.slice(0, 12))).toBe(true);
+    expect(step.provenance.some((entry) => entry.sha256Prefix === manifest.nullExplanation?.sha256.slice(0, 12))).toBe(true);
+  });
+
+  it('step 2 shows whichever of its two source artifacts is worse, not always the rewiring-null one', () => {
+    // rewiringNull merely "absent" (nothing shipped) vs. nullExplanation
+    // actually "invalid" (a real verification failure) -- the failure must
+    // not be hidden behind the more benign "absent" status.
+    const absentPlusInvalid = buildFindingSteps({
+      ...baseInputs(),
+      rewiringNull: { status: 'absent', reason: 'The manifest has no rewiringNull artifact entry.' },
+      nullExplanation: { status: 'invalid', reason: 'sha256 mismatch' }
+    });
+    const step1 = findStep(absentPlusInvalid, 'mirrored-decoder');
+    expect(step1.status).toBe('invalid');
+    expect(step1.reason).toBe('sha256 mismatch');
+
+    // rewiringNull actually "invalid" vs. nullExplanation "ok" -- reachable
+    // because loadNullExplanation cross-checks against the manifest's own
+    // pinned rewiringNull.sha256, not against the live rewiring-null load's
+    // own success.
+    const invalidPlusOk = buildFindingSteps({
+      ...baseInputs(),
+      rewiringNull: { status: 'invalid', reason: 'bins do not sum to null.n' }
+    });
+    const step2 = findStep(invalidPlusOk, 'mirrored-decoder');
+    expect(step2.status).toBe('invalid');
+    expect(step2.reason).toBe('bins do not sum to null.n');
+    expect(step2.provenance).toHaveLength(2);
   });
 
   it('step 3 (explanation) lists every qualifying metric with its own formatted rho', () => {
@@ -156,7 +188,7 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     const step = findStep(steps, 'trained-interventions');
     expect(step.status).toBe('ok');
     expect(step.condition).toBe('both');
-    expect(step.sentence).toContain('all three seeds agree:');
+    expect(step.sentence).toContain('all 3 seeds agree:');
     expect(step.sentence).toContain('no-specific-effect');
     expect(step.sentence).toContain('does not reproduce');
     expect(step.sentence).not.toContain('this matches');
@@ -294,14 +326,6 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
 
   it('template-lint: no step sentence contains a bare numeric literal not produced by a shared formatter', () => {
     const steps = buildFindingSteps(baseInputs());
-    // Every number in these sentences is either produced by `formatPercentile`
-    // ("...th percentile") or `formatRho` ("ρ = 0.xxx"), or is an integer
-    // count read directly from a field name mentioned right next to it
-    // (`null.n`, `rewiredCount`, metric/seed counts) -- this asserts the
-    // *formatted* forms are present and used consistently, rather than
-    // trying to enumerate every legal digit (a step also legitimately cites
-    // e.g. "3 metrics" or "500 degree-preserving rewirings", counts read
-    // straight from the verified artifact's own array lengths).
     for (const step of steps) {
       if (step.status !== 'ok' || !step.sentence) continue;
       const percentileMentions = step.sentence.match(/\d+(\.\d+)?%/g) ?? [];
@@ -312,5 +336,84 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
       // own caption, not a Findings step template).
       expect(percentileMentions).toEqual([]);
     }
+  });
+
+  /**
+   * (dual review, Important) The output-scanning test above only rejects a
+   * bare "NN%" — it would pass a template that hard-coded, say, "among 500
+   * degree-preserving rewirings" or "rho = 0.412" directly, since neither
+   * contains a "%". This lints the *source* of `steps.ts` itself: every
+   * string/template literal, with `${...}` interpolations and comments
+   * stripped, must contain no digit at all, except the version number
+   * inside a provenance label's own artifact filename (e.g.
+   * "rewiring-null-v1.json") -- the one place a literal digit is legitimate
+   * and unavoidable. This makes `format.ts`'s own doc-comment claim ("a
+   * template-lint unit test fails on a numeric literal appearing directly
+   * in a template string") actually true.
+   */
+  it('template-lint: steps.ts source contains no hard-coded numeric literal outside an artifact filename', () => {
+    const stepsSourcePath = resolve(here, '../../src/lib/findings/steps.ts');
+    const src = readFileSync(stepsSourcePath, 'utf-8')
+      .replace(/\/\*[\s\S]*?\*\//g, '') // strip block comments (doc prose like "WP1"/"00-overview.md")
+      .replace(/\/\/.*$/gm, ''); // strip line comments
+    // Backtick literals are matched first, and directly (an apostrophe
+    // inside one, e.g. "the rewired null's range", is not a string
+    // delimiter) -- backtick literals are then blanked out of `src` before
+    // the single-quote pass runs, so that same apostrophe can never be
+    // misread as the start of a single-quoted string spanning into
+    // surrounding real code.
+    const backtickLiterals = [...src.matchAll(/`((?:[^`\\]|\\.)*)`/g)].map((match) => match[1]);
+    const srcWithoutBackticks = src.replace(/`(?:[^`\\]|\\.)*`/g, '``');
+    const singleQuoteLiterals = [...srcWithoutBackticks.matchAll(/'((?:[^'\\]|\\.)*)'/g)].map((match) => match[1]);
+    const literals = [...backtickLiterals, ...singleQuoteLiterals];
+    const offenders = literals.filter((literal) => {
+      const staticText = literal
+        .replace(/\$\{[^}]*\}/g, '') // drop interpolations -- their computed values are asserted by the perturbation test below
+        .replace(/[a-z][a-z0-9-]*-v\d+\.(json|md)/gi, ''); // allow a provenance label's own "<name>-v1.json"/".md" filename
+      return /\d/.test(staticText);
+    });
+    expect(offenders).toEqual([]);
+  });
+
+  /**
+   * (dual review, Important) Closes the gap the source lint above cannot:
+   * confirms every number actually *tracks* the artifact it is read from,
+   * rather than merely being absent as a literal. Perturbs the real
+   * fixtures' numeric fields and asserts the new formatted values (not the
+   * old ones) appear in the rebuilt sentences.
+   */
+  it('perturbation: step sentences track perturbed artifact values, not the original shipped numbers', () => {
+    const perturbedRewiringNull: RewiringNullArtifact = {
+      ...realRewiringNull,
+      bioPercentile: 0.256,
+      null: { ...realRewiringNull.null, n: 777 }
+    };
+    const step1 = findStep(
+      buildFindingSteps({ ...baseInputs(), rewiringNull: rewiringNullOk(perturbedRewiringNull) }),
+      'rewiring-null'
+    );
+    expect(step1.sentence).toContain('25.6th percentile');
+    expect(step1.sentence).toContain('777 degree-preserving rewirings');
+    expect(step1.sentence).not.toContain('0.0th percentile');
+    expect(step1.sentence).not.toContain('500 degree-preserving rewirings');
+
+    const perturbedTrained = {
+      ...(realRewiringNull.trained as Record<string, unknown>),
+      bioPercentile: 0.1,
+      bioReplicaPercentiles: [
+        { trainerSeed: 101, percentile: 0.1 },
+        { trainerSeed: 202, percentile: 0.9 },
+        { trainerSeed: 303, percentile: 0.1 }
+      ]
+    };
+    const step5 = findStep(
+      buildFindingSteps({
+        ...baseInputs(),
+        rewiringNull: rewiringNullOk({ ...realRewiringNull, trained: perturbedTrained })
+      }),
+      'trained-null'
+    );
+    expect(step5.sentence).toContain('10.0th percentile to 90.0th percentile');
+    expect(step5.sentence).not.toContain('0.0th percentile to 40.0th percentile');
   });
 });

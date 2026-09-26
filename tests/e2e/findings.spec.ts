@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { expect, test } from '@playwright/test';
 import {
@@ -67,7 +67,7 @@ test.describe('Findings panel', () => {
     // =no-specific-effect, so this must say "does not reproduce", never
     // "matches" (the bean's own "fix the step-6 polarity sentence" ask).
     const step6 = panel.locator('li.step').nth(5);
-    await expect(step6).toContainText(/all three seeds agree: no-specific-effect/);
+    await expect(step6).toContainText(/all 3 seeds agree: no-specific-effect/);
     await expect(step6).toContainText(/does not reproduce/);
     await expect(step6).not.toContainText(/this matches/);
 
@@ -85,13 +85,21 @@ test.describe('Findings panel', () => {
       const response = await request.get(href);
       expect(response.status(), href).toBe(200);
     }
+    // (dual review, Important) Report links point at github.com/mattsp1290/flyarena
+    // (`links.ts#githubDocUrl`) -- a real `request.get` there would make CI
+    // network-dependent and flaky (offline runs, GitHub rate limits, or a
+    // report doc that exists on this branch but not yet on remote `main`).
+    // Assert the href's shape and that the cited doc actually exists in
+    // this checkout instead -- same "resolvable" guarantee, no live fetch.
     const reportLinks = await panel.getByRole('link', { name: 'Report' }).evaluateAll((links) =>
       links.map((link) => (link as HTMLAnchorElement).href)
     );
     expect(reportLinks.length).toBeGreaterThan(0);
     for (const href of new Set(reportLinks)) {
-      const response = await request.get(href);
-      expect(response.status(), href).toBe(200);
+      expect(href, href).toMatch(/^https:\/\/github\.com\/mattsp1290\/flyarena\/blob\/main\/docs\/[\w-]+\.md$/);
+      const slug = href.split('/docs/')[1];
+      // `publicDataDir` is `<repoRoot>/public/data`.
+      expect(existsSync(resolve(publicDataDir, '../../docs', slug)), slug).toBe(true);
     }
   });
 

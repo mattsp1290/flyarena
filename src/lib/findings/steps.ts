@@ -31,7 +31,11 @@ import {
   type RewiringNullTrainedSection
 } from '../experiment/rewiringNull';
 import type { NullExplanationLoadResult } from '../experiment/nullExplanation';
-import { P_TRAINER_SEEDS, type PathwayInterventionsLoadResult } from '../experiment/pathwayInterventions';
+import {
+  P_TRAINER_SEEDS,
+  type PathwayInterventionsLoadResult,
+  type PathwayInterventionsTrainedCategory
+} from '../experiment/pathwayInterventions';
 import { githubDocUrl } from '../ui/links';
 import { formatPercentile, formatRho } from './format';
 
@@ -129,6 +133,24 @@ const reasonFor = (
   result: { readonly status: string; readonly reason?: string } | undefined
 ): string | undefined => (status === 'unavailable' || status === 'invalid' ? result?.reason : undefined);
 
+/**
+ * (dual review, Important) For a step whose sentence draws on *two* source
+ * artifacts (currently only step 2, the mirrored decoder), the displayed
+ * status must be whichever input's status is worse, not always the same
+ * one — otherwise a genuine verification failure on the "wrong" input could
+ * be hidden behind the other input's more benign status (e.g. the rewiring
+ * null merely `'missing'` while the null-explanation artifact is actually
+ * `'invalid'`). `'invalid'` (a real verification failure) always outranks
+ * `'unavailable'` (a retryable fetch failure), which outranks `'missing'`
+ * (nothing was ever shipped), which outranks `'loading'` (not yet
+ * resolved) — `'ok'` is the least severe and never wins over a degraded
+ * status from the other input.
+ */
+const STATUS_SEVERITY: Record<FindingStepStatus, number> = { invalid: 4, unavailable: 3, missing: 2, loading: 1, ok: 0 };
+
+const worseStatus = (a: FindingStepStatus, b: FindingStepStatus): FindingStepStatus =>
+  STATUS_SEVERITY[b] > STATUS_SEVERITY[a] ? b : a;
+
 // ---------------------------------------------------------------------------
 // Step 1: Rewiring null
 // ---------------------------------------------------------------------------
@@ -163,10 +185,22 @@ const buildRewiringNullStep = (inputs: BuildFindingStepsInputs): FindingStep => 
 // ---------------------------------------------------------------------------
 
 const buildMirroredDecoderStep = (inputs: BuildFindingStepsInputs): FindingStep => {
-  const provenance = provenanceFor(
+  // (dual review, Important) This step's sentence draws on *two* source
+  // artifacts (the rewiring-null baseline and the null-explanation mirrored
+  // variant) — both get their own provenance entry, per `FindingStep.provenance`'s
+  // own "one entry per source artifact" contract, so a reader can always
+  // find the artifact behind either number the sentence cites.
+  const rewiringProvenance = provenanceFor(
+    inputs.manifest,
+    inputs.manifest?.rewiringNull,
+    'Rewiring-null result, un-mirrored baseline (rewiring-null-v1.json)',
+    'rewiring-null-report.md',
+    inputs.dataBaseUrl
+  );
+  const explanationProvenance = provenanceFor(
     inputs.manifest,
     inputs.manifest?.nullExplanation,
-    'Null-explanation result (null-explanation-v1.json)',
+    'Null-explanation result, mirrored-decoder variant (null-explanation-v1.json)',
     'null-explanation-report.md',
     inputs.dataBaseUrl
   );
@@ -174,21 +208,26 @@ const buildMirroredDecoderStep = (inputs: BuildFindingStepsInputs): FindingStep 
     id: 'mirrored-decoder',
     title: 'Mirrored decoder',
     condition: 'authored' as const,
-    provenance: provenance ? [provenance] : []
+    provenance: [rewiringProvenance, explanationProvenance].filter((entry): entry is FindingStepProvenance => entry !== undefined)
   };
 
   // The mirrored-decoder check compares the null-explanation artifact's
   // `variants.flipBoth.bioPercentile` against the *un-mirrored* baseline
   // from the rewiring-null artifact (`NullExplanationNote.svelte`'s own
   // `baselinePercentile` prop) — both must have actually resolved to `'ok'`
-  // before this step has anything true to say.
+  // before this step has anything true to say. When either has not, the
+  // *worse* of the two statuses is shown (`worseStatus`'s own doc comment),
+  // not always the rewiring-null one — a genuine `'invalid'` on either
+  // input must never be hidden behind the other's more benign status.
   const rewiringStatus = rewiringNullStepStatus(inputs.rewiringNull);
-  if (rewiringStatus !== 'ok' || inputs.rewiringNull?.status !== 'ok') {
-    return { ...base, status: rewiringStatus, reason: reasonFor(rewiringStatus, inputs.rewiringNull) };
-  }
   const explanationStatus = sidecarStepStatus(inputs.nullExplanation);
-  if (explanationStatus !== 'ok' || inputs.nullExplanation?.status !== 'ok') {
-    return { ...base, status: explanationStatus, reason: reasonFor(explanationStatus, inputs.nullExplanation) };
+  const combinedStatus = worseStatus(rewiringStatus, explanationStatus);
+  if (combinedStatus !== 'ok' || inputs.rewiringNull?.status !== 'ok' || inputs.nullExplanation?.status !== 'ok') {
+    const reason =
+      STATUS_SEVERITY[explanationStatus] >= STATUS_SEVERITY[rewiringStatus]
+        ? reasonFor(explanationStatus, inputs.nullExplanation)
+        : reasonFor(rewiringStatus, inputs.rewiringNull);
+    return { ...base, status: combinedStatus, reason };
   }
 
   const baseline = inputs.rewiringNull.data.bioPercentile;
@@ -229,18 +268,41 @@ const buildExplanationStep = (inputs: BuildFindingStepsInputs): FindingStep => {
   if (status !== 'ok' || inputs.nullExplanation?.status !== 'ok') {
     return { ...base, status, reason: reasonFor(status, inputs.nullExplanation) };
   }
-  const metrics = inputs.nullExplanation.data.finding.qualifyingMetrics;
+  const { qualifyingMetrics: metrics, regimeInvalid } = inputs.nullExplanation.data.finding;
+
+  // (dual review, Important) `finding.regimeInvalid` is the loader's own
+  // cross-checked field (`nullExplanation.ts` rejects an artifact whose
+  // `finding.regimeInvalid` disagrees with `regime.gatePassed`) — a step
+  // that stated qualifying metrics "pass both predeclared gates" with no
+  // qualifier, on a re-run where the regime gate failed, would silently
+  // turn an inconclusive result into a positive one. Stated regardless of
+  // `metrics.length`, matching `NullExplanationNote.svelte`'s own
+  // regime-clause wording. Inserted before the fixed "under this model."
+  // ending (every step's own non-negotiable), never after it.
+  const regimeClause = regimeInvalid
+    ? '; the linear-regime check failed, so this result is reported as regime-invalid (inconclusive)'
+    : '';
+
   if (metrics.length === 0) {
     const sentence =
-      'Under the authored (hand-written) decoder, no clearance→thrust metric independently passes both ' +
-      'predeclared gates, under this model.';
+      'Under the authored (hand-written) decoder, no metric independently passes both predeclared gates ' +
+      `(outside the rewired null's range, and rank-correlated with score across rewirings)${regimeClause}, under this model.`;
     return { ...base, status: 'ok', sentence };
   }
-  const metricList = metrics.map((metric) => `${metric.name} (ρ = ${formatRho(metric.spearman)})`).join('; ');
+  // (dual review, Important) The two predeclared gates are "outside the
+  // null's 2.5-97.5% range" and "|rho| at or above the threshold"
+  // (nullExplanation.ts's own doc comment, and the artifact's own
+  // qualifyingMetricsNote) — not literally "clearance->thrust gates": a
+  // qualifying metric can be a linear transfer entry (T:channel->population)
+  // or a structural feature (e.g. weightedInDegree:*), and the real shipped
+  // data qualifies one of each. This states the gates accurately instead of
+  // misnaming a structural-feature metric as a clearance->thrust one.
+  const metricList = metrics.map((metric) => `${metric.name} (rank correlation with score, ρ = ${formatRho(metric.spearman)})`).join('; ');
   const sentence =
     `Under the authored (hand-written) decoder, ${metrics.length} metric${metrics.length === 1 ? '' : 's'} ` +
-    `independently pass${metrics.length === 1 ? 'es' : ''} both predeclared clearance→thrust gates: ${metricList}, ` +
-    `under this model.`;
+    `independently pass${metrics.length === 1 ? 'es' : ''} both predeclared gates (outside the rewired null's ` +
+    `range, and rank-correlated with score across rewirings): ${metricList} — a descriptive association, not a ` +
+    `causal claim${regimeClause}, under this model.`;
   return { ...base, status: 'ok', sentence };
 };
 
@@ -345,19 +407,43 @@ const buildTrainedInterventionsStep = (inputs: BuildFindingStepsInputs): Finding
   const { authored, trained } = inputs.pathwayInterventions.data;
 
   // Fixed sentence pattern (`01-findings-panel.md`): "With trained readouts,
-  // {all three seeds agree: | seeds disagree:} {trained category} — {this
-  // does not reproduce | this matches} the authored decoder's {authored
-  // category} result, under this model." The category *values* are always
-  // shown (never only `trainedRobust`), so a robust *absence* of effect
-  // (e.g. `no-specific-effect`) can never read as confirmation — and when
-  // the seeds disagree, there is no single robustly-reproduced category, so
-  // "matches" is never claimed in that branch either.
-  const agreementPrefix = trained.trainedRobust ? 'all three seeds agree:' : 'seeds disagree:';
+  // {all N seeds agree: | seeds disagree:} {trained category} — {this does
+  // not reproduce | this matches | this is consistent with} the authored
+  // decoder's {authored category} result, under this model." The category
+  // *values* are always shown (never only `trainedRobust`), so a robust
+  // *absence* of effect (e.g. `no-specific-effect`) can never read as
+  // confirmation — and when the seeds disagree, there is no single
+  // robustly-reproduced category, so neither "matches" nor "is consistent
+  // with" is ever claimed in that branch.
+  const agreementPrefix = trained.trainedRobust ? `all ${P_TRAINER_SEEDS.length} seeds agree:` : 'seeds disagree:';
   const categoryText = trained.trainedRobust
     ? trained.perSeedCategory[P_TRAINER_SEEDS[0]]
     : P_TRAINER_SEEDS.map((seed) => `seed ${seed}: ${trained.perSeedCategory[seed]}`).join(', ');
-  const matches = trained.trainedRobust && trained.perSeedCategory[P_TRAINER_SEEDS[0]] === authored.category;
-  const reproductionClause = matches ? 'this matches' : 'this does not reproduce';
+
+  // (dual review, Important) The authored and trained categories are two
+  // *different* vocabularies, not the same one — `no-specific-effect` is
+  // `pathwayInterventions.ts`'s own documented merge of the authored
+  // `generic-rewiring-effect`/`not-supported` split (the trained side's
+  // predeclared rules cannot decide that finer split). Comparing the raw
+  // strings would wrongly read an authored `not-supported` result next to a
+  // robust trained `no-specific-effect` as "does not reproduce", when the
+  // trained side is actually consistent with it — it just cannot confirm
+  // which of the two merged authored categories held. Map the authored
+  // category into the trained vocabulary before comparing, and only claim
+  // "matches" when both sides literally agree (never merely map-equal).
+  const authoredAsTrainedCategory: PathwayInterventionsTrainedCategory =
+    authored.category === 'generic-rewiring-effect' || authored.category === 'not-supported'
+      ? 'no-specific-effect'
+      : (authored.category as PathwayInterventionsTrainedCategory);
+  const trainedCategory: PathwayInterventionsTrainedCategory | undefined = trained.trainedRobust
+    ? trained.perSeedCategory[P_TRAINER_SEEDS[0]]
+    : undefined;
+  const reproductionClause =
+    trainedCategory === undefined || trainedCategory !== authoredAsTrainedCategory
+      ? 'this does not reproduce'
+      : (trainedCategory as string) === (authored.category as string)
+        ? 'this matches'
+        : "this is consistent with (the trained rules can't split generic-rewiring-effect from not-supported)";
   const sentence =
     `With trained readouts, ${agreementPrefix} ${categoryText} — ${reproductionClause} the authored decoder's ` +
     `${authored.category} result, under this model.`;

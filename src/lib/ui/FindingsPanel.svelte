@@ -109,11 +109,6 @@
 
     <div aria-live="polite" class="sr-only">Step {currentIndex + 1} of {steps.length}</div>
 
-    <div class="stepper-controls">
-      <button type="button" onclick={goPrevious} disabled={currentIndex === 0}>Previous</button>
-      <button type="button" onclick={goNext} disabled={currentIndex === steps.length - 1}>Next</button>
-    </div>
-
     <ol class="steps">
       {#each steps as step, index (step.id)}
         <li aria-current={index === currentIndex ? 'step' : undefined} class="step" class:current={index === currentIndex}>
@@ -151,6 +146,19 @@
               {/each}
             </ul>
           {/if}
+
+          {#if index === currentIndex}
+            <!-- (dual review, Important) Rendered inside the current step,
+                 immediately after its own content — not above the `<ol>` —
+                 so the next Tab from the just-focused heading reaches Next
+                 directly. Controls placed before the list would force a
+                 keyboard/screen-reader user to Shift+Tab backward through
+                 every earlier step's own links to reach Next again. -->
+            <div class="stepper-controls">
+              <button type="button" onclick={goPrevious} disabled={currentIndex === 0}>Previous</button>
+              <button type="button" onclick={goNext} disabled={currentIndex === steps.length - 1}>Next</button>
+            </div>
+          {/if}
         </li>
       {/each}
     </ol>
@@ -175,7 +183,7 @@
   .stepper-controls {
     display: flex;
     gap: 0.5rem;
-    margin-bottom: 0.75rem;
+    margin-top: 0.6rem;
   }
 
   .steps {
