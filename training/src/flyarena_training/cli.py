@@ -38,10 +38,13 @@ import torch
 
 from . import PRECISION_APPLIED  # noqa: F401  (import applies TF32/determinism settings)
 from .cem import CemConfig, CemResult, run_cem
+from .config import ARENA_TASKS, resolve_arena_task, resolve_arena_task_fingerprint
 from .graph import ConnectomeGraph, load_graph_json, output_neuron_indices
 from .readout import readout_parameter_count
 from .rollout import build_rollout_env, evaluate_fitness
 from .seeds import HELD_OUT_SEED_COUNT, HELD_OUT_SEED_START
+
+DEFAULT_ARENA_TASK = "default"
 
 ARM_NAMES: tuple[str, ...] = ("biological", "rewired", "disconnected")
 
@@ -121,6 +124,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--init-std", type=float, default=0.5, dest="init_std")
     parser.add_argument(
         "--device", default=None, help="torch device string (e.g. cpu, cuda). Defaults to cuda if available, else cpu."
+    )
+    parser.add_argument(
+        "--arena-task",
+        default=DEFAULT_ARENA_TASK,
+        dest="arena_task",
+        choices=sorted(ARENA_TASKS),
+        help="Arena task id (src/lib/arena/tasks.ts's ARENA_TASKS). Defaults to 'default' (ARENA_CONFIG, unchanged).",
     )
     return parser.parse_args(argv)
 
@@ -248,6 +258,12 @@ def _build_run_config(
         "H": args.hidden_size,
         "parameterCount": parameter_count,
         "substeps": substeps,
+        # task-generality WP1 (.agents/plans/task-generality/01-task-plumbing.md):
+        # always recorded together, never omitted — null-trained-worker.ts's
+        # fifth identity check requires arenaTaskFingerprint present for any
+        # run it scores.
+        "arenaTask": args.arena_task,
+        "arenaTaskFingerprint": resolve_arena_task_fingerprint(args.arena_task),
         # `armBundleSha256` is required present now that REQUIRED_BUNDLE_FIELDS
         # gates every bundle load: evaluate.ts's loadArmGraphs cross-checks it
         # against the loaded bundle's own sha256 (its "trained against the
@@ -332,7 +348,7 @@ def run_training(args: argparse.Namespace) -> TrainingResult:
     graph, d = _resolve_graph(raw_bundle, graph_path, device)
     parameter_count = readout_parameter_count(d, args.hidden_size)
 
-    env = build_rollout_env(graph, device=device)
+    env = build_rollout_env(graph, device=device, config=resolve_arena_task(args.arena_task))
 
     def evaluate(theta_batch: torch.Tensor, seeds) -> torch.Tensor:
         return evaluate_fitness(env, theta_batch, seeds, args.hidden_size, args.ticks, substeps)

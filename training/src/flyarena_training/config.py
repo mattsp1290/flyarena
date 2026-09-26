@@ -19,6 +19,7 @@ rationale.
 """
 from __future__ import annotations
 
+import dataclasses
 import math
 from dataclasses import dataclass
 
@@ -129,3 +130,86 @@ def assert_matches_fingerprint(fingerprint: str, tolerance: float = 1e-12) -> No
                 f"{expected} (diff {abs(actual - expected):.3e}). Regenerate the mirror in "
                 "training/src/flyarena_training/config.py from src/lib/arena/config.ts."
             )
+
+
+# `.agents/plans/task-generality/01-task-plumbing.md`'s WP1: mirror of
+# `src/lib/arena/tasks.ts`'s `ARENA_TASKS`. Field values are copied by hand
+# from the TS source the same way `ARENA_CONFIG` itself is (see this
+# module's own doc comment) -- `training/tests/test_tasks.py` cross-checks
+# every entry against `tests/fixtures/golden/tasks.json` (TS's own exported
+# fingerprints) via `parse_fingerprint`/`TS_FIELD_ORDER`, the same drift
+# check `assert_matches_fingerprint` already runs for the default task.
+ARENA_TASKS: dict[str, ArenaConfig] = {
+    "default": ARENA_CONFIG,
+    "hazard-heavy": dataclasses.replace(ARENA_CONFIG, hazard_count=4, hazard_penalty=6.0),
+    "sparse-food": dataclasses.replace(ARENA_CONFIG, food_count=1, half_width=18.0, half_depth=12.0),
+    "no-movement": dataclasses.replace(ARENA_CONFIG, movement_score_per_unit=0.0),
+    "crowded": dataclasses.replace(ARENA_CONFIG, half_width=8.0, half_depth=5.5),
+}
+
+# `resolveArenaTask`'s fingerprint, per task id (`createArenaConfigFingerprint`
+# in `src/lib/arena/config.ts`, computed over each `ARENA_TASKS` entry in
+# `src/lib/arena/tasks.ts`) -- hand-copied verbatim from the committed
+# `tests/fixtures/golden/tasks.json` rather than reformatted from Python
+# floats: JS's `Number#toString` and Python's `float.__str__` do not always
+# agree byte-for-byte (e.g. a whole-valued float prints as `"12"` in JS but
+# `"12.0"` in Python), so this module never re-derives a fingerprint
+# *string* -- only ever parses one TS already computed (see this module's
+# own top doc comment for the same reasoning applied to `ARENA_CONFIG`
+# itself). `cli.py` writes this string verbatim into `config.json`'s
+# `arenaTaskFingerprint`, so `null-trained-worker.ts`'s fifth identity check
+# compares two TS-native fingerprint strings, never a Python-formatted one.
+ARENA_TASK_FINGERPRINTS: dict[str, str] = {
+    "default": (
+        "arena-config-v1|fixedDeltaSeconds=0.03333333333333333|halfWidth=12|halfDepth=8|agentRadius=0.35|"
+        "foodRadius=0.25|hazardRadius=0.6|foodCount=4|hazardCount=2|spawnInset=1|maxSpeed=6|acceleration=9|"
+        "turnRate=3.141592653589793|rollingDrag=0.7|brakeDrag=8|movementScorePerUnit=0.1|foodScore=10|"
+        "hazardPenalty=2|sensorRange=24"
+    ),
+    "hazard-heavy": (
+        "arena-config-v1|fixedDeltaSeconds=0.03333333333333333|halfWidth=12|halfDepth=8|agentRadius=0.35|"
+        "foodRadius=0.25|hazardRadius=0.6|foodCount=4|hazardCount=4|spawnInset=1|maxSpeed=6|acceleration=9|"
+        "turnRate=3.141592653589793|rollingDrag=0.7|brakeDrag=8|movementScorePerUnit=0.1|foodScore=10|"
+        "hazardPenalty=6|sensorRange=24"
+    ),
+    "sparse-food": (
+        "arena-config-v1|fixedDeltaSeconds=0.03333333333333333|halfWidth=18|halfDepth=12|agentRadius=0.35|"
+        "foodRadius=0.25|hazardRadius=0.6|foodCount=1|hazardCount=2|spawnInset=1|maxSpeed=6|acceleration=9|"
+        "turnRate=3.141592653589793|rollingDrag=0.7|brakeDrag=8|movementScorePerUnit=0.1|foodScore=10|"
+        "hazardPenalty=2|sensorRange=24"
+    ),
+    "no-movement": (
+        "arena-config-v1|fixedDeltaSeconds=0.03333333333333333|halfWidth=12|halfDepth=8|agentRadius=0.35|"
+        "foodRadius=0.25|hazardRadius=0.6|foodCount=4|hazardCount=2|spawnInset=1|maxSpeed=6|acceleration=9|"
+        "turnRate=3.141592653589793|rollingDrag=0.7|brakeDrag=8|movementScorePerUnit=0|foodScore=10|"
+        "hazardPenalty=2|sensorRange=24"
+    ),
+    "crowded": (
+        "arena-config-v1|fixedDeltaSeconds=0.03333333333333333|halfWidth=8|halfDepth=5.5|agentRadius=0.35|"
+        "foodRadius=0.25|hazardRadius=0.6|foodCount=4|hazardCount=2|spawnInset=1|maxSpeed=6|acceleration=9|"
+        "turnRate=3.141592653589793|rollingDrag=0.7|brakeDrag=8|movementScorePerUnit=0.1|foodScore=10|"
+        "hazardPenalty=2|sensorRange=24"
+    ),
+}
+
+
+def resolve_arena_task(task_id: str) -> ArenaConfig:
+    """Mirror of `resolveArenaTask` (`src/lib/arena/tasks.ts`): the arena
+    config for `task_id`, or a `ValueError` on an unrecognized one (there is
+    no "fall back to default" here -- an unrecognized id must fail loudly,
+    the same way the TS side does)."""
+    try:
+        return ARENA_TASKS[task_id]
+    except KeyError:
+        raise ValueError(f"unknown arena task {task_id!r} (expected one of {sorted(ARENA_TASKS)})") from None
+
+
+def resolve_arena_task_fingerprint(task_id: str) -> str:
+    """The TS-computed fingerprint string for `task_id` (see
+    `ARENA_TASK_FINGERPRINTS`'s own doc comment for why this is a hand-copied
+    literal, not a Python-formatted string). Raises the same way
+    `resolve_arena_task` does on an unrecognized id."""
+    try:
+        return ARENA_TASK_FINGERPRINTS[task_id]
+    except KeyError:
+        raise ValueError(f"unknown arena task {task_id!r} (expected one of {sorted(ARENA_TASKS)})") from None
