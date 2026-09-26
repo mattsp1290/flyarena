@@ -20,6 +20,7 @@ import {
   type NullReportArgs
 } from '../../scripts/null/null-report';
 import { CONDITION_LABELS } from '../../scripts/null/null-report-variant';
+import { resolveArenaTask } from '../../src/lib/arena/tasks';
 
 /**
  * Coverage for `scripts/null/null-report.ts` — a dual-review pass on the
@@ -673,6 +674,37 @@ describe('runNullReport', () => {
       expect(result.artifact.trained).toBeUndefined();
       const written = JSON.parse(readFileSync(variantOut, 'utf8')) as { trained?: unknown };
       expect(written.trained).toBeUndefined();
+    });
+  });
+
+  describe('arenaTask passthrough (task-generality WP2)', () => {
+    it('carries raw.arenaTask/arenaTaskFingerprint through to the artifact when present', () => {
+      writeFileSync(
+        authoredPath,
+        JSON.stringify(buildRaw({ arenaTask: 'hazard-heavy', arenaTaskFingerprint: resolveArenaTask('hazard-heavy').fingerprint }))
+      );
+      const variantOut = join(root, 'variant-hazard-heavy-summary.json');
+      const result = runNullReport({ ...args, variantOut });
+      expect(result.artifact.arenaTask).toEqual({
+        id: 'hazard-heavy',
+        fingerprint: resolveArenaTask('hazard-heavy').fingerprint
+      });
+      const written = JSON.parse(readFileSync(variantOut, 'utf8')) as { arenaTask?: unknown };
+      expect(written.arenaTask).toEqual({ id: 'hazard-heavy', fingerprint: resolveArenaTask('hazard-heavy').fingerprint });
+    });
+
+    it('omits arenaTask when raw has none (default-task byte-identity gate)', () => {
+      const result = runNullReport(args);
+      expect(result.artifact.arenaTask).toBeUndefined();
+      expect(JSON.stringify(result.artifact)).not.toContain('arenaTask');
+    });
+
+    it('throws if raw has arenaTask but no arenaTaskFingerprint (a hand-edited/corrupted authored.json)', () => {
+      // `buildRaw`'s overrides are spread with no default arenaTaskFingerprint,
+      // so passing only `arenaTask` here reproduces exactly that corrupted shape.
+      writeFileSync(authoredPath, JSON.stringify(buildRaw({ arenaTask: 'hazard-heavy' })));
+      const variantOut = join(root, 'variant-broken-summary.json');
+      expect(() => runNullReport({ ...args, variantOut })).toThrow(/has arenaTask "hazard-heavy" but no arenaTaskFingerprint/);
     });
   });
 

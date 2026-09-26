@@ -269,6 +269,20 @@ export interface RewiringNullArtifact {
   readonly timing?: { readonly elapsedMs: number; readonly perEpisodeMs: number };
   /** Present only when `--trained`'s file exists (WP3's `null-trained-evaluate.ts` output) -- see `buildTrainedSection`. */
   readonly trained?: TrainedSection;
+  /**
+   * `.agents/plans/task-generality/02-authored-runs.md`'s WP2: passed
+   * through unchanged from `raw.arenaTask`/`raw.arenaTaskFingerprint`
+   * (`arena-task-fields.ts`'s omit-when-absent convention) -- present only
+   * when `--authored` was a `null-evaluate.ts --arena-task <id>` run, never
+   * for the shipped default-task artifact, so the published
+   * `rewiring-null-v1.json`'s bytes are unchanged. Lets
+   * `intervention-report.ts --stats-only` (via a `--variant-out` summary
+   * built from this field) verify a per-task `--null` was actually scored
+   * under the requested task, rather than trusting the caller passed the
+   * right file -- the biological connectome graph alone can't distinguish
+   * tasks, since only `ArenaConfig` differs between them.
+   */
+  readonly arenaTask?: { readonly id: string; readonly fingerprint: string };
 }
 
 const toScoredEntry = (stats: ConditionStats): ScoredEntry => ({
@@ -372,6 +386,27 @@ export interface RunNullReportResult {
   readonly artifactSha256: string;
   readonly artifact: RewiringNullArtifact;
 }
+
+/**
+ * `arena-task-fields.ts`'s `arenaTaskOutputFields` always sets `arenaTask`/
+ * `arenaTaskFingerprint` together (or neither) on a fresh `null-evaluate.ts`
+ * run, but `authored.json` is a plain file on disk that could be
+ * hand-edited or come from an older evaluator -- throws rather than
+ * silently building a `RewiringNullArtifact.arenaTask` entry with a
+ * `fingerprint` of `undefined` if the pair is inconsistent (the same class
+ * of defensive check this file already applies to `authored.json`'s other
+ * fields, e.g. `assertFiniteScores`).
+ */
+const resolveRawArenaTask = (
+  id: string,
+  fingerprint: string | undefined,
+  authoredPath: string
+): { readonly id: string; readonly fingerprint: string } => {
+  if (typeof fingerprint !== 'string') {
+    throw new Error(`null-report: ${authoredPath} has arenaTask "${id}" but no arenaTaskFingerprint`);
+  }
+  return { id, fingerprint };
+};
 
 export const buildArtifact = (
   raw: Readonly<NullEvaluationRaw>,
@@ -508,7 +543,8 @@ export const buildArtifact = (
     host: raw.host,
     ...(runMeta.elapsedMs !== undefined && runMeta.perEpisodeMs !== undefined
       ? { timing: { elapsedMs: runMeta.elapsedMs, perEpisodeMs: runMeta.perEpisodeMs } }
-      : {})
+      : {}),
+    ...(raw.arenaTask !== undefined ? { arenaTask: resolveRawArenaTask(raw.arenaTask, raw.arenaTaskFingerprint, args.authored) } : {})
   };
 };
 

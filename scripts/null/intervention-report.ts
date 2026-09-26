@@ -151,6 +151,20 @@ export interface PublishedNull {
   readonly seeds: { readonly start: number; readonly count: number };
   readonly ticks: number;
   readonly substeps: number;
+  /**
+   * `.agents/plans/task-generality/02-authored-runs.md`'s WP2: present only
+   * when this null was built (via `null-report.ts --variant-out`) from a
+   * `--arena-task`-labelled `null-evaluate.ts` run — absent for the shipped
+   * default-task `rewiring-null-v1.json`. `runInterventionReport`'s
+   * `--stats-only` mode requires this to be present and to match the
+   * requested `--arena-task`'s fingerprint: the biological connectome graph
+   * (and so `sourceGraphSha256`) is identical across every arena task, so
+   * that check alone cannot catch a per-task run ranked against the *wrong*
+   * task's null (a dual-review finding — the graph doesn't change per task,
+   * only `ArenaConfig` does, so nothing else in this file's existing
+   * consistency checks would notice).
+   */
+  readonly arenaTask?: { readonly id: string; readonly fingerprint: string };
 }
 
 /** Parses already-read JSON text — see `parseGraphListIndexInfo`'s doc comment for why (the same TOCTOU reasoning applies to every input this module hashes into `InterventionStatistics.inputs`). */
@@ -162,6 +176,7 @@ export const parsePublishedNull = (text: string, label: string): PublishedNull =
     seeds?: { start?: unknown; count?: unknown };
     ticks?: unknown;
     substeps?: unknown;
+    arenaTask?: { id?: unknown; fingerprint?: unknown };
   };
   const biologicalScore = parsed.biological?.score;
   if (typeof biologicalScore !== 'number' || !Number.isFinite(biologicalScore)) {
@@ -188,13 +203,25 @@ export const parsePublishedNull = (text: string, label: string): PublishedNull =
   if (typeof parsed.substeps !== 'number') {
     throw new Error(`intervention-report: ${label} is missing substeps`);
   }
+  // Tolerant of absence (the shipped default-task null never carries this),
+  // but a *present* arenaTask must be well-formed -- a malformed one is
+  // exactly the kind of silent-corruption case this field exists to guard
+  // against elsewhere, so it must not itself pass through unchecked here.
+  let arenaTask: PublishedNull['arenaTask'];
+  if (parsed.arenaTask !== undefined) {
+    if (typeof parsed.arenaTask.id !== 'string' || typeof parsed.arenaTask.fingerprint !== 'string') {
+      throw new Error(`intervention-report: ${label} has a malformed arenaTask`);
+    }
+    arenaTask = { id: parsed.arenaTask.id, fingerprint: parsed.arenaTask.fingerprint };
+  }
   return {
     biologicalScore,
     scores,
     sourceGraphSha256: parsed.sourceGraphSha256,
     seeds: { start: parsed.seeds.start, count: parsed.seeds.count },
     ticks: parsed.ticks,
-    substeps: parsed.substeps
+    substeps: parsed.substeps,
+    ...(arenaTask !== undefined ? { arenaTask } : {})
   };
 };
 
@@ -641,9 +668,17 @@ export interface InterventionReportArgs {
    * every real call site pairs the two flags (`--arena-task t --stats-only`)
    * -- and, when `--out` was left at its default, derives
    * `training/runs/tasks/<id>/intervention-stats.json` so the caller doesn't
-   * have to hand-build that path. An explicit `--out` is never overridden.
-   * This never touches `public/data` (this file has no other write path than
-   * `--out` to begin with).
+   * have to hand-build that path. An explicit `--out` is never overridden
+   * (tracked via a real "was --out passed" flag, not by comparing against
+   * the default path -- an operator explicitly choosing the default path
+   * is still an explicit choice). This never touches `public/data` (this
+   * file has no other write path than `--out` to begin with). Because the
+   * derived path is never the default `--out`, `guardCanonicalOutDefault`'s
+   * `diagnosticOnly` check (scoped only to the default path) does not apply
+   * to a `--stats-only` run even if `--allow-reproduction-mismatch` was
+   * also passed -- a diagnostic per-task run still writes normally to its
+   * derived path, just carrying both `statsOnly: true` and
+   * `diagnosticOnly: true`.
    */
   readonly statsOnly: boolean;
 }
@@ -658,6 +693,8 @@ export const parseInterventionReportArgs = (argv: readonly string[]): Interventi
   let allowReproductionMismatch = false;
   let arenaTask: string | undefined;
   let statsOnly = false;
+  /** True only when `--out` was actually passed, not merely defaulted -- see `--stats-only`'s own path-derivation branch below (a dual-review finding: comparing `resolve(out) === resolve(DEFAULT_OUT)` would also redirect an operator's own explicit `--out` that happens to equal the default, contradicting this field's "an explicit --out is never overridden" doc comment). Matches `export-traces.ts`'s `outDirExplicit` convention. */
+  let outExplicit = false;
 
   let i = 0;
   while (i < argv.length) {
@@ -673,6 +710,7 @@ export const parseInterventionReportArgs = (argv: readonly string[]): Interventi
       i += 2;
     } else if (flag === '--out') {
       out = resolve(process.cwd(), requireValue(flag, argv[i + 1]));
+      outExplicit = true;
       i += 2;
     } else if (flag === '--bootstrap-seed') {
       bootstrapSeed = requireNonNegativeInt(flag, argv[i + 1]);
@@ -701,11 +739,14 @@ export const parseInterventionReportArgs = (argv: readonly string[]): Interventi
           'training/runs/tasks/<id>/intervention-stats.json from the task id)'
       );
     }
-    // Only when `--out` was left at its default -- an explicit `--out` (any
+    // Only when `--out` was never passed at all -- an explicit `--out` (any
     // path, including one a caller happens to choose that equals the
     // default) is never second-guessed here; see this field's own doc
-    // comment.
-    if (resolve(out) === resolve(DEFAULT_OUT)) {
+    // comment. Tracked via `outExplicit`, not `resolve(out) === resolve(DEFAULT_OUT)`
+    // (a dual-review finding: that comparison can't distinguish "never passed"
+    // from "explicitly passed the default path", so it silently redirected
+    // the latter too).
+    if (!outExplicit) {
       out = resolve(repoRoot, 'training', 'runs', 'tasks', arenaTask, 'intervention-stats.json');
     }
   }
@@ -798,6 +839,35 @@ export const runInterventionReport = (
       `intervention-report: --arena-task ${JSON.stringify(args.arenaTask ?? 'default')} does not match ` +
         "authored.json's recorded arena task fingerprint"
     );
+  }
+
+  // `.agents/plans/task-generality/02-authored-runs.md`'s WP2, `--stats-only`
+  // only: the biological connectome graph is identical across every arena
+  // task (only `ArenaConfig` differs), so `sourceGraphSha256` agreement
+  // above cannot tell a task-correct `--null` from one scored under a
+  // *different* task -- checked only in `--stats-only` mode (not for every
+  // `--arena-task` run) so WP1's own existing, already-shipped generic
+  // `--arena-task` behavior (ranking against any explicitly-chosen `--null`,
+  // including the task-independent published one, for ad hoc/diagnostic
+  // use) stays unchanged; `--stats-only` is specifically WP2's official
+  // per-task statistics pass, where ranking against the wrong task's null
+  // would silently produce a wrong "pathway generalizes"/"null holds"
+  // verdict (a dual-review finding).
+  if (args.statsOnly) {
+    if (
+      publishedNull.arenaTask === undefined ||
+      publishedNull.arenaTask.fingerprint !== resolvedArenaTask.fingerprint
+    ) {
+      throw new Error(
+        `intervention-report: --stats-only --arena-task ${JSON.stringify(resolvedArenaTask.id)} requires --null to ` +
+          'be a per-task null (e.g. from `null-report.ts --variant-out`) scored under that same task -- ' +
+          `${args.publishedNull} ${
+            publishedNull.arenaTask
+              ? `is recorded under arena task ${JSON.stringify(publishedNull.arenaTask.id)}`
+              : 'has no recorded arena task (it looks like the task-independent default null)'
+          }`
+      );
+    }
   }
 
   const statistics = buildInterventionStatistics(raw, info, publishedNull, args.bootstrapSeed, args.bootstrapResamples, {

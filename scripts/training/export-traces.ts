@@ -1,5 +1,6 @@
 import { readFileSync, realpathSync } from 'node:fs';
 import { basename, extname, resolve } from 'node:path';
+import type { NonSharedBuffer } from 'node:buffer';
 import { gunzipSync } from 'node:zlib';
 
 import { decodeAction } from '../../src/lib/arena/actions';
@@ -282,18 +283,36 @@ const isGzip = (buffer: Readonly<Buffer>): boolean =>
   buffer.length >= 2 && buffer[0] === GZIP_MAGIC[0] && buffer[1] === GZIP_MAGIC[1];
 
 /**
- * Read a binary graph artifact from disk, matching format.ts's expected
+ * Parse already-read graph artifact bytes, matching format.ts's expected
  * ArrayBuffer input. Detects a gzip-compressed artifact by its magic bytes
  * (not the filename) and decompresses it first: `public/data/*.bin.gz`
  * (produced by `scripts/data/compile.py`'s `binfmt.write_gzip_deterministic`)
- * is gzip, not a raw `.bin`.
+ * is gzip, not a raw `.bin`. `parseGraphBinary` already calls
+ * `validateGraph` internally before returning, so a caller need not call it
+ * again.
+ *
+ * Split out of `loadGraphArtifact` (a task-generality WP2 finding,
+ * `scripts/null/task-clearance.ts`): a caller that also needs the graph's
+ * own sha256 (to record provenance) must hash and parse the *same* read's
+ * bytes, not read the file twice — a second `readFileSync` between the two
+ * calls could observe different bytes than the first (the same TOCTOU
+ * reasoning `intervention-report.ts`'s own doc comments document for its
+ * input-hashing convention). This function lets such a caller do
+ * `const bytes = readFileSync(path); sha256Hex(bytes); parseGraphArtifactBytes(bytes)`
+ * — one read, hashed and parsed from the identical buffer.
  */
-export const loadGraphArtifact = (path: string): ConnectomeGraph => {
-  const raw = readFileSync(path);
+export const parseGraphArtifactBytes = (raw: NonSharedBuffer): ConnectomeGraph => {
   const buffer = isGzip(raw) ? gunzipSync(raw) : raw;
   const arrayBuffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
   return parseGraphBinary(arrayBuffer);
 };
+
+/**
+ * Read a binary graph artifact from disk, matching format.ts's expected
+ * ArrayBuffer input. See `parseGraphArtifactBytes` for the gzip-detection
+ * and parsing logic this delegates to.
+ */
+export const loadGraphArtifact = (path: string): ConnectomeGraph => parseGraphArtifactBytes(readFileSync(path));
 
 /**
  * Derive a `graphId` from a graph artifact path. `basename(path,

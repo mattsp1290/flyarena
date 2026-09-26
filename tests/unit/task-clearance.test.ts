@@ -14,10 +14,15 @@ import {
   runTaskClearance,
   type TaskClearanceArgs
 } from '../../scripts/null/task-clearance';
+import { dirname, resolve as resolvePath } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { sha256Hex } from '../../scripts/training/fsio';
 import { encodeGraphBinary } from '../../src/lib/connectome/format';
 import { createTraceGraph } from '../fixtures/trace-graph';
 import { resolveArenaTask } from '../../src/lib/arena/tasks';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const REAL_ARTIFACT = resolvePath(here, '../../public/data/malecns-arena-v1.bin.gz');
 
 /**
  * Coverage for `scripts/null/task-clearance.ts`
@@ -47,20 +52,33 @@ describe('computeChannelPercentiles', () => {
   it('throws on an empty array', () => {
     expect(() => computeChannelPercentiles([])).toThrow(/at least one value/);
   });
+
+  it('throws on a non-finite sample instead of silently corrupting the sort', () => {
+    expect(() => computeChannelPercentiles([0.1, Number.NaN, 0.5])).toThrow(/values\[1\] is not a finite number/);
+    expect(() => computeChannelPercentiles([0.1, Number.POSITIVE_INFINITY])).toThrow(/values\[1\] is not a finite number/);
+  });
+
+  it('computes fractionSaturated as the fraction of samples exactly at 1', () => {
+    expect(computeChannelPercentiles([1, 1, 1, 1]).fractionSaturated).toBe(1);
+    expect(computeChannelPercentiles([0, 0.5, 0.9]).fractionSaturated).toBe(0);
+    expect(computeChannelPercentiles([0, 1, 1, 1]).fractionSaturated).toBe(0.75);
+    // A value merely close to 1 (not clamped to it) must not count as saturated.
+    expect(computeChannelPercentiles([0.999999, 1]).fractionSaturated).toBe(0.5);
+  });
 });
 
 describe('collectClearanceSamples', () => {
   const graph = createTraceGraph();
 
   it('collects exactly seedCount * ticks samples per channel', () => {
-    const samples = collectClearanceSamples(graph, resolveArenaTask('default').config, 1, 3, 20, 4);
+    const samples = collectClearanceSamples(graph, resolveArenaTask('default'), 1, 3, 20, 4);
     for (const channel of CLEARANCE_CHANNELS) {
       expect(samples[channel]).toHaveLength(3 * 20);
     }
   });
 
   it('produces channel values within the documented 0..1 observation range', () => {
-    const samples = collectClearanceSamples(graph, resolveArenaTask('crowded').config, 1, 2, 30, 4);
+    const samples = collectClearanceSamples(graph, resolveArenaTask('crowded'), 1, 2, 30, 4);
     for (const channel of CLEARANCE_CHANNELS) {
       for (const value of samples[channel]) {
         expect(value).toBeGreaterThanOrEqual(0);
@@ -70,9 +88,24 @@ describe('collectClearanceSamples', () => {
   });
 
   it('is deterministic given the same seed range', () => {
-    const a = collectClearanceSamples(graph, resolveArenaTask('sparse-food').config, 1, 2, 15, 4);
-    const b = collectClearanceSamples(graph, resolveArenaTask('sparse-food').config, 1, 2, 15, 4);
+    const a = collectClearanceSamples(graph, resolveArenaTask('sparse-food'), 1, 2, 15, 4);
+    const b = collectClearanceSamples(graph, resolveArenaTask('sparse-food'), 1, 2, 15, 4);
     expect(a).toEqual(b);
+  });
+
+  it('actually measures the requested arena task, not the default (regression: a dropped {arenaConfig} would pass every other check here)', () => {
+    const defaultSamples = collectClearanceSamples(graph, resolveArenaTask('default'), 1, 3, 30, 4);
+    const crowdedSamples = collectClearanceSamples(graph, resolveArenaTask('crowded'), 1, 3, 30, 4);
+    // crowded shrinks halfWidth/halfDepth substantially (12x8 -> 8x5.5), so
+    // the pooled clearance samples must differ from the default arena's.
+    expect(crowdedSamples.forwardClearance).not.toEqual(defaultSamples.forwardClearance);
+  });
+
+  it('throws when a trace records a different config fingerprint than requested (defense in depth against a dropped arenaConfig)', () => {
+    const wrong = { config: resolveArenaTask('default').config, fingerprint: 'not-a-real-fingerprint' };
+    expect(() => collectClearanceSamples(graph, wrong, 1, 1, 5, 4)).toThrow(
+      /trace was recorded under a different arena config than requested/
+    );
   });
 });
 
@@ -88,6 +121,7 @@ describe('buildTaskClearanceReport', () => {
     expect(report.seeds).toEqual({ start: 1, count: 4 });
     expect(report.ticks).toBe(25);
     expect(report.substeps).toBe(4);
+    expect(report.sensorRange).toBe(resolveArenaTask('hazard-heavy').config.sensorRange);
     for (const channel of CLEARANCE_CHANNELS) {
       expect(report.channels[channel].n).toBe(4 * 25);
     }
@@ -179,6 +213,35 @@ describe('runTaskClearance (file I/O)', () => {
     const writtenBytes = readFileSync(out);
     expect(JSON.parse(writtenBytes.toString('utf8'))).toEqual(report);
     expect(report.graph.sha256).toBe(sha256Hex(readFileSync(graphPath)));
+  });
+
+  it('records the graph path relative to the repo root when the graph lives inside it (reproducible across checkouts)', () => {
+    const out = join(root, 'clearance.json');
+    const { report } = runTaskClearance({
+      graph: REAL_ARTIFACT,
+      arenaTask: 'crowded',
+      seedStart: 1,
+      seedCount: 1,
+      ticks: 3,
+      substeps: 4,
+      out
+    });
+    expect(report.graph.path).toBe('public/data/malecns-arena-v1.bin.gz');
+  });
+
+  it('keeps an out-of-repo graph path absolute', () => {
+    const graphPath = writeFixtureGraph(); // under the tmpdir root, outside the repo
+    const out = join(root, 'clearance.json');
+    const { report } = runTaskClearance({
+      graph: graphPath,
+      arenaTask: 'crowded',
+      seedStart: 1,
+      seedCount: 1,
+      ticks: 5,
+      substeps: 4,
+      out
+    });
+    expect(report.graph.path).toBe(graphPath);
   });
 
   it('creates the output directory if it does not exist (mkdir before write)', () => {

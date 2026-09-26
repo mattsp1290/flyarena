@@ -116,6 +116,24 @@ describe('parseInterventionReportArgs', () => {
       ]);
       expect(args.out).toContain('custom.json');
     });
+
+    it('does not override an explicit --out that happens to equal the default path (dual-review finding)', () => {
+      const args = parseInterventionReportArgs([
+        '--stats-only',
+        '--arena-task',
+        'hazard-heavy',
+        '--out',
+        DEFAULT_OUT
+      ]);
+      expect(args.out).toBe(DEFAULT_OUT);
+    });
+
+    it('still derives the per-task path when --out is passed before --stats-only/--arena-task (flag order independence)', () => {
+      // Regression for tracking outExplicit via a boolean rather than
+      // "--out appeared after --stats-only in argv".
+      const args = parseInterventionReportArgs(['--arena-task', 'hazard-heavy', '--stats-only']);
+      expect(args.out.replaceAll('\\', '/')).toMatch(/training\/runs\/tasks\/hazard-heavy\/intervention-stats\.json$/);
+    });
   });
 });
 
@@ -956,6 +974,13 @@ describe('runInterventionReport (CLI layer)', () => {
     writeFileSync(path, JSON.stringify(authored));
   };
 
+  const patchPublishedNullArenaTask = (id: string): void => {
+    const path = join(root, 'null.json');
+    const publishedNull = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+    publishedNull.arenaTask = { id, fingerprint: resolveArenaTask(id).fingerprint };
+    writeFileSync(path, JSON.stringify(publishedNull));
+  };
+
   describe('--arena-task (task-generality WP1)', () => {
     it('labels the output when --arena-task matches authored.json\'s recorded task', () => {
       writeFixtureFiles(0, 0);
@@ -995,9 +1020,10 @@ describe('runInterventionReport (CLI layer)', () => {
   });
 
   describe('--stats-only (task-generality WP2)', () => {
-    it('marks the output statsOnly when the flag was passed', () => {
+    it('marks the output statsOnly when the flag was passed and --null is scored under the same task', () => {
       writeFixtureFiles(0, 0);
       patchAuthoredArenaTask('hazard-heavy');
+      patchPublishedNullArenaTask('hazard-heavy');
       const { statistics } = runInterventionReport(argsFor({ arenaTask: 'hazard-heavy', statsOnly: true }));
       expect(statistics.statsOnly).toBe(true);
     });
@@ -1007,6 +1033,31 @@ describe('runInterventionReport (CLI layer)', () => {
       const { statistics } = runInterventionReport(argsFor());
       expect(statistics.statsOnly).toBeUndefined();
       expect(JSON.stringify(statistics)).not.toContain('statsOnly');
+    });
+
+    it('refuses --stats-only when --null has no recorded arena task (the task-independent default null)', () => {
+      writeFixtureFiles(0, 0);
+      patchAuthoredArenaTask('hazard-heavy');
+      expect(() => runInterventionReport(argsFor({ arenaTask: 'hazard-heavy', statsOnly: true }))).toThrow(
+        /requires --null to be a per-task null.*no recorded arena task/
+      );
+    });
+
+    it("refuses --stats-only when --null was scored under a different task than requested", () => {
+      writeFixtureFiles(0, 0);
+      patchAuthoredArenaTask('hazard-heavy');
+      patchPublishedNullArenaTask('crowded');
+      expect(() => runInterventionReport(argsFor({ arenaTask: 'hazard-heavy', statsOnly: true }))).toThrow(
+        /requires --null to be a per-task null.*is recorded under arena task "crowded"/
+      );
+    });
+
+    it('does NOT require a task-matched --null for a plain --arena-task run without --stats-only (WP1 behavior unchanged)', () => {
+      writeFixtureFiles(0, 0);
+      patchAuthoredArenaTask('hazard-heavy');
+      // --null has no arenaTask recorded at all here, yet this must still succeed.
+      const { statistics } = runInterventionReport(argsFor({ arenaTask: 'hazard-heavy' }));
+      expect(statistics.arenaTask).toEqual({ id: 'hazard-heavy', fingerprint: resolveArenaTask('hazard-heavy').fingerprint });
     });
   });
 });

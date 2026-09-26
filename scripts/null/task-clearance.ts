@@ -1,13 +1,14 @@
 import { mkdirSync, readFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { validateGraph, type ConnectomeGraph } from '../../src/lib/connectome/format';
+import type { ConnectomeGraph } from '../../src/lib/connectome/format';
 import { OBSERVATION_CHANNELS } from '../../src/lib/arena/sensors';
 import { resolveArenaTask } from '../../src/lib/arena/tasks';
+import type { ArenaConfig } from '../../src/lib/arena/config';
 import { requireNonNegativeInt, requirePositiveInt, requireValue } from '../training/cli';
 import { atomicWriteFileSync, sha256Hex } from '../training/fsio';
-import { buildSeedTrace, loadGraphArtifact, TRACE_SUBSTEPS } from '../training/export-traces';
+import { buildSeedTrace, parseGraphArtifactBytes, TRACE_SUBSTEPS } from '../training/export-traces';
 import { quantileIndex } from './null-stats';
 import { parseArenaTaskArg } from './arena-task-fields';
 
@@ -35,9 +36,11 @@ import { parseArenaTaskArg } from './arena-task-fields';
  * statistical sample. This script is the real biological-graph, N-seed,
  * arbitrary-ticks tool the measurement actually needs. It does not
  * duplicate `export-traces.ts`'s tracing logic: `buildSeedTrace`/
- * `loadGraphArtifact` are already-exported, pure, generic-over-config
+ * `parseGraphArtifactBytes` are already-exported, pure, generic-over-config
  * functions there, and this script imports and reuses them directly rather
- * than re-implementing the world/model step loop.
+ * than re-implementing the world/model step loop (`parseGraphArtifactBytes`
+ * was split out of that file's `loadGraphArtifact` for this script's own
+ * single-read-hash-and-parse need — see its doc comment there).
  */
 
 export const CLEARANCE_CHANNELS = ['foodDistance', 'forwardClearance', 'leftClearance', 'rightClearance'] as const;
@@ -57,39 +60,72 @@ export interface ChannelPercentiles {
   readonly p95: number;
   readonly max: number;
   readonly n: number;
+  /**
+   * Fraction of samples exactly at `1` (`sensors.ts`'s `clamp01` clamps every
+   * one of `CLEARANCE_CHANNELS` to `[0, 1]`, so `1` unambiguously means "at
+   * or beyond `sensorRange`", not merely "a large but finite distance").
+   * Maintainability-review finding (task-generality WP2 dual review): a
+   * capped p95/max of exactly `1` reads as a real measured distance unless
+   * the report also states how much of the mass is saturated -- most acute
+   * in `sparse-food` (an enlarged arena over the same `sensorRange`), where
+   * `00-overview.md` itself predicts `foodDistance` saturates "far more
+   * often". Reported so `docs/task-generality-report.md` can quote it
+   * directly next to a saturated percentile instead of only the capped
+   * value.
+   */
+  readonly fractionSaturated: number;
 }
 
 /**
  * 5th/50th/95th percentile plus maximum of `values`, using `null-stats.ts`'s
  * `quantileIndex` (the same low-tail-floor / high-tail-ceil-minus-one
  * convention every other predeclared-statistics module in this study uses)
- * rather than a separately-invented percentile rule.
+ * rather than a separately-invented percentile rule. Throws on a non-finite
+ * sample (`NaN`/`Infinity`) rather than letting it silently corrupt the sort
+ * order and every percentile downstream of it (the same class of guard
+ * `intervention-report-validation.ts`'s `assertFiniteScores` applies to its
+ * own inputs).
  */
 export const computeChannelPercentiles = (values: readonly number[]): ChannelPercentiles => {
   if (values.length === 0) throw new Error('task-clearance: computeChannelPercentiles requires at least one value');
+  const badIndex = values.findIndex((value) => !Number.isFinite(value));
+  if (badIndex !== -1) {
+    throw new Error(`task-clearance: computeChannelPercentiles: values[${badIndex}] is not a finite number`);
+  }
   const sorted = [...values].sort((a, b) => a - b);
   const n = sorted.length;
+  const saturatedCount = sorted.reduce((count, value) => (value === 1 ? count + 1 : count), 0);
   return {
     p5: sorted[quantileIndex(n, 0.05)],
     p50: sorted[quantileIndex(n, 0.5)],
     p95: sorted[quantileIndex(n, 0.95)],
     max: sorted[n - 1],
-    n
+    n,
+    fractionSaturated: saturatedCount / n
   };
 };
 
 /**
  * Runs `buildSeedTrace` once per seed in `[seedStart, seedStart + seedCount)`
- * against `graph` under `arenaConfig`, and returns every recorded tick's
+ * against `graph` under `resolved.config`, and returns every recorded tick's
  * value for each of `CLEARANCE_CHANNELS`, pooled across all seeds (seed
  * order, then tick order within a seed — deterministic, matching
  * `buildSeedTrace`'s own per-tick loop). Pure and side-effect free: no file
  * I/O, so a caller (or a test) can exercise this against any in-memory
  * graph without touching disk.
+ *
+ * Cross-checks every trace's own recorded `configFingerprint`
+ * (`createWorld`'s, threaded through unchanged by `buildSeedTrace`) against
+ * `resolved.fingerprint` — a maintainability-review finding (task-generality
+ * WP2 dual review): without this, a future edit that accidentally dropped
+ * `{ arenaConfig }` from the `buildSeedTrace` call below would silently
+ * measure the *default* task's arena for every task id, and no existing
+ * check would notice (`TaskClearanceReport.arenaTask` comes from `resolved`
+ * directly, not from anything the trace itself measured).
  */
 export const collectClearanceSamples = (
   graph: Readonly<ConnectomeGraph>,
-  arenaConfig: ReturnType<typeof resolveArenaTask>['config'],
+  resolved: { readonly config: Readonly<ArenaConfig>; readonly fingerprint: string },
   seedStart: number,
   seedCount: number,
   ticks: number,
@@ -102,7 +138,13 @@ export const collectClearanceSamples = (
     rightClearance: []
   };
   for (let seed = seedStart; seed < seedStart + seedCount; seed += 1) {
-    const trace = buildSeedTrace(graph, 'task-clearance', seed, ticks, substeps, { arenaConfig });
+    const trace = buildSeedTrace(graph, 'task-clearance', seed, ticks, substeps, { arenaConfig: resolved.config });
+    if (trace.configFingerprint !== resolved.fingerprint) {
+      throw new Error(
+        `task-clearance: seed ${seed}'s trace was recorded under a different arena config than requested ` +
+          `(trace ${trace.configFingerprint}, requested ${resolved.fingerprint})`
+      );
+    }
     for (const observation of trace.observations) {
       for (const channel of CLEARANCE_CHANNELS) {
         samples[channel].push(observation[CHANNEL_INDEX[channel]]);
@@ -115,6 +157,7 @@ export const collectClearanceSamples = (
 export interface TaskClearanceReport {
   readonly version: 1;
   readonly arenaTask: { readonly id: string; readonly fingerprint: string };
+  readonly sensorRange: number;
   readonly graph: { readonly path: string; readonly sha256: string };
   readonly seeds: { readonly start: number; readonly count: number };
   readonly ticks: number;
@@ -134,13 +177,14 @@ export const buildTaskClearanceReport = (
   substeps: number
 ): TaskClearanceReport => {
   const resolved = resolveArenaTask(arenaTaskId);
-  const samples = collectClearanceSamples(graph, resolved.config, seedStart, seedCount, ticks, substeps);
+  const samples = collectClearanceSamples(graph, resolved, seedStart, seedCount, ticks, substeps);
   const channels = Object.fromEntries(
     CLEARANCE_CHANNELS.map((channel) => [channel, computeChannelPercentiles(samples[channel])])
   ) as Record<ClearanceChannel, ChannelPercentiles>;
   return {
     version: 1,
     arenaTask: { id: resolved.id, fingerprint: resolved.fingerprint },
+    sensorRange: resolved.config.sensorRange,
     graph: { path: graphPath, sha256: graphSha256 },
     seeds: { start: seedStart, count: seedCount },
     ticks,
@@ -219,16 +263,32 @@ export const parseTaskClearanceArgs = (argv: readonly string[]): TaskClearanceAr
   return { graph, arenaTask, seedStart, seedCount, ticks, substeps, out: resolvedOut };
 };
 
+/**
+ * A path under `repoRoot` is recorded relative to it (e.g.
+ * `public/data/malecns-arena-v1.bin.gz`), so `clearance.json` stays
+ * reproducible across checkouts/machines rather than embedding one
+ * machine's absolute filesystem prefix (a maintainability-review finding).
+ * A `--graph` path outside `repoRoot` (a genuinely out-of-tree fixture) is
+ * left absolute, since there is no shorter reproducible form for it.
+ */
+const displayGraphPath = (graphPath: string): string => {
+  const rel = relative(repoRoot, graphPath);
+  return rel.startsWith('..') ? graphPath : rel;
+};
+
 export const runTaskClearance = (
   args: Readonly<TaskClearanceArgs>
 ): { readonly out: string; readonly report: TaskClearanceReport } => {
+  // Read once: both the sha256 and the parsed graph come from this exact
+  // buffer, so the recorded hash always describes the bytes actually
+  // traced (see `parseGraphArtifactBytes`'s own doc comment for the TOCTOU
+  // this closes — a dual-review finding).
   const graphBytes = readFileSync(args.graph);
-  const graph = loadGraphArtifact(args.graph);
-  validateGraph(graph);
+  const graph = parseGraphArtifactBytes(graphBytes);
 
   const report = buildTaskClearanceReport(
     graph,
-    args.graph,
+    displayGraphPath(args.graph),
     sha256Hex(graphBytes),
     args.arenaTask,
     args.seedStart,
