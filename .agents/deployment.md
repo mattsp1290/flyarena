@@ -253,3 +253,19 @@ records it so the anchor matches the live `current` target.
 
 Release: 20260924T205159Z-da5c2ca56a70
 Commit: fa6f5b7
+
+## Findings tour release
+
+On 2026-09-26, main revision `5708d47` was deployed as
+`20260926T171536Z-affff96d5f16`. The release adds the Findings panel and the
+pathway-interventions ledger sentence and report. It also includes the atlas
+generalization and the new deploy lock and marker guard. `deploy.sh` held the
+deploy lock for the whole run and passed the Release: marker check. It then ran
+`npm ci`, `check` and `build --base`, uploaded, and switched `current`
+atomically. It verified public HTML and every emitted asset byte for byte. The
+live Chromium smoke check (`scripts/verify/live-smoke.ts`) passed: the app
+reached ready, Findings step 1 rendered, and the ledger rendered. No rollback
+was needed. The deploy log contained no connection values.
+
+Release: 20260926T171536Z-affff96d5f16
+Commit: 5708d47
