@@ -28,6 +28,7 @@ fail() {
   failures=$((failures + 1))
 }
 
+# shellcheck disable=SC2329 # false positive: registered below via `trap cleanup EXIT`, which shellcheck's static analysis doesn't connect back to this definition.
 cleanup() {
   local dir
   for dir in "${scratch_dirs[@]:-}"; do
@@ -266,13 +267,22 @@ fi
 
 # ---------------------------------------------------------------------------
 # 5. the Release-marker mismatch aborts
+#
+# (thermo review, Critical C1) Fixture ids below are deliberately in
+# deploy.sh's real release-id shape (8 digits, "T", 6 digits, "Z", "-", 12
+# hex chars) now that deploy_last_release_marker's regex requires it --
+# an arbitrary label like the previous "release-live" fixture would no
+# longer match at all, silently turning this into the "no marker found"
+# case instead of the "mismatch" case it's meant to exercise.
 # ---------------------------------------------------------------------------
+live_release_id='20200101T000000Z-aaaaaaaaaaaa'
+other_release_id='20200202T000000Z-bbbbbbbbbbbb'
 root=$(new_scratch_root)
-mkdir -p -- "$root/releases/release-live"
-ln -s -- releases/release-live "$root/current"
+mkdir -p -- "$root/releases/$live_release_id"
+ln -s -- "releases/$live_release_id" "$root/current"
 doc=$(mktemp)
 scratch_dirs+=("$doc")
-printf 'Release: release-stale-marker\nCommit: 0000000\n' > "$doc"
+printf 'Release: %s\nCommit: 0000000\n' "$other_release_id" > "$doc"
 
 run_child "$root" 'deploy_check_release_marker; echo CHECKED' \
   "$(child_prelude)"$'\n'"export DEPLOY_DEPLOYMENT_DOC=$doc"
@@ -285,10 +295,10 @@ fi
 # Positive case: a marker that matches the live current succeeds and
 # echoes that release id (the same value deploy.sh records as
 # `previous_release` for rollback).
-printf 'Release: release-live\nCommit: 0000000\n' > "$doc"
+printf 'Release: %s\nCommit: 0000000\n' "$live_release_id" > "$doc"
 run_child "$root" 'result=$(deploy_check_release_marker); printf "MATCHED:%s\n" "$result"' \
   "$(child_prelude)"$'\n'"export DEPLOY_DEPLOYMENT_DOC=$doc"
-if [[ $child_status -eq 0 && "$child_out" == *'MATCHED:release-live'* ]]; then
+if [[ $child_status -eq 0 && "$child_out" == *"MATCHED:$live_release_id"* ]]; then
   pass 'a Release: marker that matches the live current succeeds and returns that release id'
 else
   fail 'a Release: marker that matches the live current succeeds and returns that release id' "status=$child_status out=$child_out"
@@ -303,6 +313,183 @@ if [[ $child_status -ne 0 && "$child_out" == *"No 'Release:' marker found"* ]]; 
 else
   fail 'a missing Release: marker aborts rather than deploying with no anchor' "status=$child_status out=$child_out"
 fi
+
+# ---------------------------------------------------------------------------
+# 5b. (thermo review, Critical C1, both reviewers) the parser against the
+# REAL, checked-in .agents/deployment.md returns the real anchor -- this is
+# exactly the gap that let the doc's own "marker format" example poison the
+# parser ship undetected: every prior marker test above only ever used a
+# synthetic, single-marker fixture, never the actual production input.
+# ---------------------------------------------------------------------------
+run_child "$root" 'result=$(deploy_last_release_marker); printf "REAL_MARKER:%s\n" "$result"' \
+  "$(child_prelude)"
+if [[ $child_status -eq 0 && "$child_out" == *'REAL_MARKER:20260924T141451Z-e994aaab005c'* ]]; then
+  pass 'the parser run against the real, checked-in .agents/deployment.md returns the real anchor release id'
+else
+  fail 'the parser run against the real, checked-in .agents/deployment.md returns the real anchor release id' "status=$child_status out=$child_out"
+fi
+
+# 5c. A decoy example line shaped like a real marker (mimicking the exact
+# bug this suite failed to catch before) must never be picked up as the
+# last marker when a real anchor line also exists earlier in the file.
+decoy_doc=$(mktemp)
+scratch_dirs+=("$decoy_doc")
+{
+  printf 'Release: %s\n' "$live_release_id"
+  printf 'Commit: 0000000\n'
+  printf '\n### marker format\n\n'
+  printf '```text\n'
+  printf 'Release: RELEASE_ID\n'
+  printf 'Commit: SHORT_SHA\n'
+  printf '```\n'
+} > "$decoy_doc"
+run_child "$root" 'result=$(deploy_last_release_marker); printf "DECOY_TEST:%s\n" "$result"' \
+  "$(child_prelude)"$'\n'"export DEPLOY_DEPLOYMENT_DOC=$decoy_doc"
+if [[ $child_status -eq 0 && "$child_out" == *"DECOY_TEST:$live_release_id"* ]]; then
+  pass 'a non-id-shaped decoy example line after the real marker is ignored, not picked up as the last marker'
+else
+  fail 'a non-id-shaped decoy example line after the real marker is ignored, not picked up as the last marker' "status=$child_status out=$child_out"
+fi
+
+# ---------------------------------------------------------------------------
+# 6. (thermo review, Critical C2/ops-safety) neither DEPLOY_SSH nor
+# DEPLOY_URL ever appears in stdout/stderr across the stale, held (fresh),
+# and error (not-contention) acquire outcomes.
+# ---------------------------------------------------------------------------
+fake_ssh='secret-deploy-user@secret-deploy-host.example.internal'
+fake_url='https://secret-deploy-host.example.internal/fly/'
+
+run_child_secret() {
+  local root=$1 body=$2 prelude=$3
+  local script
+  script="$(printf '%s\n%s\n' "$prelude" "$body")"
+  set +e
+  child_out=$(DEPLOY_LOCK_ROOT_OVERRIDE="$root" DEPLOY_ROOT="$root" \
+    DEPLOY_SSH="$fake_ssh" DEPLOY_URL="$fake_url" \
+    bash -c "$script" 2>&1)
+  child_status=$?
+  set -e
+}
+
+# 6a. held (fresh) path.
+root=$(new_scratch_root)
+run_child_secret "$root" 'deploy_lock_acquire "release-secret-one"' "$(child_prelude)"
+run_child_secret "$root" 'deploy_lock_acquire "release-secret-two"' "$(child_prelude)"
+if [[ $child_status -ne 0 && "$child_out" != *"$fake_ssh"* && "$child_out" != *"$fake_url"* ]]; then
+  pass 'the held (fresh-lock) abort message never prints DEPLOY_SSH or DEPLOY_URL'
+else
+  fail 'the held (fresh-lock) abort message never prints DEPLOY_SSH or DEPLOY_URL' "status=$child_status out=$child_out"
+fi
+
+# 6b. stale path.
+root=$(new_scratch_root)
+mkdir -- "$root/.deploy.lock"
+stale_ts=$(( $(date -u +%s) - 3600 ))
+{
+  printf 'timestamp=%s\n' "$stale_ts"
+  printf 'hostname=some-other-host\n'
+  printf 'pid=12345\n'
+  printf 'release=release-secret-stale\n'
+} > "$root/.deploy.lock.owner"
+run_child_secret "$root" 'deploy_lock_acquire "release-secret-three"' "$(child_prelude)"
+if [[ $child_status -ne 0 && "$child_out" == *STALE* && "$child_out" != *"$fake_ssh"* && "$child_out" != *"$fake_url"* ]]; then
+  pass 'the stale-lock abort message (with its manual-clear command) never prints DEPLOY_SSH or DEPLOY_URL'
+else
+  fail 'the stale-lock abort message (with its manual-clear command) never prints DEPLOY_SSH or DEPLOY_URL' "status=$child_status out=$child_out"
+fi
+
+# 6c. error (not lock contention) path.
+root=$(new_scratch_root)
+chmod 0500 -- "$root"
+run_child_secret "$root" 'deploy_lock_acquire "release-secret-four"' "$(child_prelude)"
+chmod 0700 -- "$root"
+if [[ $child_status -ne 0 && "$child_out" != *"$fake_ssh"* && "$child_out" != *"$fake_url"* ]]; then
+  pass 'the lock-host-failure abort message never prints DEPLOY_SSH or DEPLOY_URL'
+else
+  fail 'the lock-host-failure abort message never prints DEPLOY_SSH or DEPLOY_URL' "status=$child_status out=$child_out"
+fi
+
+# ---------------------------------------------------------------------------
+# 7. (thermo review, Critical, maintainability C2 / ops-safety item 3)
+# DEPLOY_LOCK_ROOT_OVERRIDE and DEPLOY_DEPLOYMENT_DOC (test-only hooks) are
+# loudly refused, before any action, if present in a real --deploy run --
+# exercises deploy_refuse_test_overrides directly (the literal function
+# deploy.sh calls as the first statement of its --deploy branch), not a
+# reimplementation.
+# ---------------------------------------------------------------------------
+override_prelude() {
+  cat <<PRELUDE
+set -euo pipefail
+die() { printf 'deploy: %s\n' "\$*" >&2; exit 1; }
+source "$trap_lib"
+PRELUDE
+}
+
+# (thermo review follow-up) A bare `child_out=$(cmd)` assignment where `cmd`
+# is *expected* to fail would itself trip this script's own `set -e` (the
+# same command-substitution-assignment gotcha `run_child`/`run_child_secret`
+# above already guard against with `set +e`/`set -e`) -- this helper applies
+# the same guard for the raw `bash -c` invocations below.
+run_override_check() {
+  local extra_env=$1 body=$2
+  set +e
+  # (shellcheck SC2086) `$extra_env` must stay unquoted-safe: it is either
+  # empty or exactly one NAME=VALUE token (never containing spaces/globs in
+  # practice), but quoting it unconditionally would break the empty case --
+  # `env ""` tries to exec a literal empty-named command instead of just
+  # running bash with the inherited environment. Branching avoids both.
+  if [[ -n "$extra_env" ]]; then
+    child_out=$(env "$extra_env" bash -c "$(override_prelude)"$'\n'"$body" 2>&1)
+  else
+    child_out=$(bash -c "$(override_prelude)"$'\n'"$body" 2>&1)
+  fi
+  child_status=$?
+  set -e
+}
+
+run_override_check 'DEPLOY_LOCK_ROOT_OVERRIDE=/tmp/should-never-be-used' 'deploy_refuse_test_overrides; echo SHOULD_NOT_REACH_HERE'
+if [[ $child_status -ne 0 && "$child_out" == *'DEPLOY_LOCK_ROOT_OVERRIDE is set'* && "$child_out" != *SHOULD_NOT_REACH_HERE* ]]; then
+  pass 'deploy_refuse_test_overrides refuses loudly when DEPLOY_LOCK_ROOT_OVERRIDE is set'
+else
+  fail 'deploy_refuse_test_overrides refuses loudly when DEPLOY_LOCK_ROOT_OVERRIDE is set' "status=$child_status out=$child_out"
+fi
+
+run_override_check 'DEPLOY_DEPLOYMENT_DOC=/tmp/should-never-be-used' 'deploy_refuse_test_overrides; echo SHOULD_NOT_REACH_HERE'
+if [[ $child_status -ne 0 && "$child_out" == *'DEPLOY_DEPLOYMENT_DOC is set'* && "$child_out" != *SHOULD_NOT_REACH_HERE* ]]; then
+  pass 'deploy_refuse_test_overrides refuses loudly when DEPLOY_DEPLOYMENT_DOC is set'
+else
+  fail 'deploy_refuse_test_overrides refuses loudly when DEPLOY_DEPLOYMENT_DOC is set' "status=$child_status out=$child_out"
+fi
+
+run_override_check '' 'deploy_refuse_test_overrides; echo NEITHER_SET_OK'
+if [[ $child_status -eq 0 && "$child_out" == *NEITHER_SET_OK* ]]; then
+  pass 'deploy_refuse_test_overrides is a no-op when neither test-only hook is set'
+else
+  fail 'deploy_refuse_test_overrides is a no-op when neither test-only hook is set' "status=$child_status out=$child_out"
+fi
+
+# ---------------------------------------------------------------------------
+# 8. (thermo review, Suggestion S3/ops-safety) scripts/deploy-trap.sh's
+# on_exit runs every registered $cleanup_paths entry, not only the lock
+# release half already covered by test group 3.
+# ---------------------------------------------------------------------------
+scratch_file=$(mktemp)
+set +e
+child_out=$(CLEANUP_TEST_PATH="$scratch_file" bash -c "
+set -euo pipefail
+die() { printf 'deploy: %s\n' \"\$*\" >&2; exit 1; }
+source \"$trap_lib\"
+cleanup_paths+=(\"\$CLEANUP_TEST_PATH\")
+echo BEFORE_EXIT
+" 2>&1)
+child_status=$?
+set -e
+if [[ $child_status -eq 0 && "$child_out" == *BEFORE_EXIT* && ! -e "$scratch_file" ]]; then
+  pass 'on_exit removes every registered cleanup_paths entry, not only the lock'
+else
+  fail 'on_exit removes every registered cleanup_paths entry, not only the lock' "status=$child_status out=$child_out exists=$([[ -e "$scratch_file" ]] && echo yes || echo no)"
+fi
+rm -f -- "$scratch_file" # in case the check above failed and left it behind
 
 echo
 if [[ $failures -eq 0 ]]; then
