@@ -34,6 +34,12 @@ test.describe('model ledger and provenance (pathway interventions)', () => {
     await expect(detail).toContainText(/the channel-specific modifier holds/i);
     await expect(detail).toContainText(/P shows no advantage over either freshly-trained control arm/i);
     await expect(detail).toContainText(/\(robust\)/i);
+    // Fix-verification review finding: this caveat was dropped when the
+    // sentence was tightened from three sentences to two -- must always
+    // accompany the authored-decoder result.
+    await expect(detail).toContainText(
+      /this authored-decoder result is bound to the hand-written decoder; it is not necessarily the overall finding/i
+    );
 
     const reportLink = detail.getByRole('link', { name: /intervention report/i });
     await expect(reportLink).toHaveAttribute(

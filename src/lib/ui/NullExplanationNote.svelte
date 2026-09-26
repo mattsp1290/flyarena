@@ -331,6 +331,15 @@
       Tested under this model, with the authored (hand-written) decoder: {PATHWAY_AUTHORED_CLAUSE[pathwayInterventions.data.authored.category]}, and {pathwayChannelSpecificClause}.
     </p>
     <p>{pathwayTrainedClause}.</p>
+    <!-- Restored (fix-verification review finding: dropped when the sentence
+         was tightened from three sentences to two, contradicting the commit
+         message that landed that change). The authored-decoder result above
+         is one decoder's result, not the study's overall finding -- the
+         trained-readout sentence right above this one can (and here does)
+         disagree with it. -->
+    <p class="disclaimer">
+      This authored-decoder result is bound to the hand-written decoder; it is not necessarily the overall finding.
+    </p>
     <ul class="links">
       <li><a href={PATHWAY_INTERVENTIONS_REPORT_URL} target="_blank" rel="noreferrer">Intervention report</a></li>
     </ul>

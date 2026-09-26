@@ -55,6 +55,12 @@ describe('NullExplanationNote: pathway-interventions tested-outcome sentence', (
     expect(screen.getByText(/the channel-specific modifier holds/i)).toBeInTheDocument();
     expect(screen.getByText(/P shows no advantage over either freshly-trained control arm/i)).toBeInTheDocument();
     expect(screen.getByText(/\(robust\)/i)).toBeInTheDocument();
+    // Fix-verification review finding: this caveat was dropped when the
+    // sentence was tightened from three sentences to two -- must always
+    // accompany the authored-decoder result.
+    expect(
+      screen.getByText(/this authored-decoder result is bound to the hand-written decoder; it is not necessarily the overall finding/i)
+    ).toBeInTheDocument();
     const link = screen.getByRole('link', { name: /intervention report/i });
     expect(link).toHaveAttribute(
       'href',
@@ -153,10 +159,13 @@ describe('NullExplanationNote: pathwayInterventions renders independently of nul
     }
   };
 
-  it('shows the sentence and report link when nullExplanation is undefined (still loading)', () => {
+  it('shows the sentence, caveat, and report link when nullExplanation is undefined (still loading)', () => {
     render(NullExplanationNote, { nullExplanation: undefined, baselinePercentile: 0, rewiringCount: 500, pathwayInterventions: pathwayOk });
     expect(screen.getByText(/tested under this model/i)).toBeInTheDocument();
     expect(screen.getByText(/the pathway-supported category holds/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(/this authored-decoder result is bound to the hand-written decoder; it is not necessarily the overall finding/i)
+    ).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /intervention report/i })).toBeInTheDocument();
   });
 
