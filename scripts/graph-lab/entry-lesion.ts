@@ -84,6 +84,20 @@ const main = async (): Promise<void> => {
   const argsPath = process.argv[2];
   if (!argsPath) throw new Error('entry-lesion: missing required args-file argument');
   const args: LesionArgs = JSON.parse(readFileSync(argsPath, 'utf8'));
+  // `LesionArgs.mode`'s TS type only claims `'biological' | 'disconnected'`
+  // at compile time -- this crosses a JSON file boundary (Python's
+  // `default_runner` writes it, this process just reads and trusts
+  // whatever's on disk) with no runtime guarantee behind that type. A
+  // stray third value would otherwise reach `graphFromTaskMode`
+  // (`null-worker-shared.ts`, unmodified), whose own `mode === 'rewired'`/
+  // `mode === 'biological'` checks fall through to the `disconnected`
+  // derivation for *anything else* -- silently mis-scoring a request
+  // instead of erroring. Defense in depth: `jobs.py`'s own
+  // `default_runner` only ever writes one of these two values today, but
+  // this check does not rely on that staying true.
+  if (args.mode !== 'biological' && args.mode !== 'disconnected') {
+    throw new Error(`entry-lesion: unrecognized mode ${JSON.stringify(args.mode)}`);
+  }
 
   const tasks = buildTasks(args);
   const workerPath = fileURLToPath(new URL('./worker-lesion.mjs', import.meta.url));
@@ -129,7 +143,6 @@ const main = async (): Promise<void> => {
   printResult({
     graph: args.mode,
     graphSha256: args.expectedSha256,
-    dataDir: args.dataDir,
     host: { arch: process.arch, node: process.version },
     label: 'Computed on DGX (private, not published)',
     baseline: {

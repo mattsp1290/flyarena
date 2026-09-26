@@ -3,11 +3,13 @@
 Reuses `flyarena_lab/service.py`'s security patterns directly (Bearer with
 `hmac.compare_digest`, a body-limit ASGI middleware, CORS from an explicit
 origin list with `*` rejected, one active job / four retained), plus two
-things the synthetic lab doesn't need: a `PrivateNetworkAccess` middleware
-(the real backend is reached from a public page's private-network fetch,
-`.agents/plans/graph-lab/00-overview.md`'s WP5) and a job store that
-supervises a real child **process** rather than an in-process engine call
-(`jobs.Jobs`).
+things the synthetic lab doesn't need: Private Network Access (PNA) --
+the real backend is reached from a public page's private-network fetch,
+`.agents/plans/graph-lab/00-overview.md`'s WP5 -- via `CORSMiddleware`'s
+own `allow_private_network` (see the security-review note on
+`CORSMiddleware` below for why this isn't a hand-rolled middleware) and a
+job store that supervises a real child **process** rather than an
+in-process engine call (`jobs.Jobs`).
 """
 from __future__ import annotations
 
@@ -61,48 +63,6 @@ class BodyLimit:
             return await receive()
 
         await self.app(scope, buffered, send)
-
-
-class PrivateNetworkAccess:
-    """Answers a CORS preflight's `Access-Control-Request-Private-Network:
-    true` (Chromium's Private Network Access check, sent by a public page
-    fetching a tailnet-private address) with `Access-Control-Allow-Private-Network:
-    true` -- but only alongside an already-CORS-allowed origin. Runs *after*
-    `CORSMiddleware` in the ASGI stack (added first, so it wraps innermost
-    and its response passes back out through this one), and only touches
-    `OPTIONS` preflights that already carry an `Access-Control-Allow-Origin`
-    header from `CORSMiddleware` -- a disallowed origin's preflight is
-    passed through unchanged, still with no CORS allowance, and never gets
-    the private-network header either.
-    """
-
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or scope["method"] != "OPTIONS":
-            return await self.app(scope, receive, send)
-
-        wants_private_network = any(
-            name.decode("latin-1").lower() == "access-control-request-private-network"
-            and value.decode("latin-1").lower() == "true"
-            for name, value in scope.get("headers", [])
-        )
-        if not wants_private_network:
-            return await self.app(scope, receive, send)
-
-        async def send_wrapper(message):
-            if message["type"] == "http.response.start":
-                headers = list(message.get("headers", []))
-                already_allowed = any(
-                    name.decode("latin-1").lower() == "access-control-allow-origin" for name, _ in headers
-                )
-                if already_allowed:
-                    headers.append((b"access-control-allow-private-network", b"true"))
-                message = {**message, "headers": headers}
-            await send(message)
-
-        await self.app(scope, receive, send_wrapper)
 
 
 def _parse_origins(raw: str) -> list[str]:
@@ -212,7 +172,20 @@ def create_app(
         yield
         jobs.close()
 
-    app = FastAPI(title="FlyArena private graph lab", lifespan=lifespan)
+    # `docs_url`/`redoc_url`/`openapi_url` all `None`: FastAPI's defaults
+    # serve the OpenAPI schema and interactive docs unauthenticated (they
+    # sit outside `authorize`'s `Depends`, same as `/health`) -- a real
+    # information leak for a private, unpublished API (endpoint names,
+    # field names, and every bound in models.py), and `/docs`/`/redoc` also
+    # pull their JS from a CDN. A security-review finding: verified these
+    # three paths returned 200 with no token before this was added.
+    app = FastAPI(
+        title="FlyArena private graph lab",
+        lifespan=lifespan,
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
     app.state.jobs = jobs
     app.add_middleware(BodyLimit)
 
@@ -222,12 +195,30 @@ def create_app(
         allow_origins=origins,
         allow_methods=["GET", "POST", "DELETE"],
         allow_headers=["Authorization", "Content-Type"],
+        # `allow_private_network=True`: Starlette's own `CORSMiddleware`
+        # already implements the Private Network Access (PNA) preflight
+        # check natively (both the locally-pinned Starlette this project's
+        # own tests run against, and the base image's own bundled Starlette
+        # -- the graph-lab container installs with `--no-deps`, so it runs
+        # whichever Starlette the base image already has). A hand-rolled
+        # ASGI middleware answering the PNA header on top of this was
+        # actively *wrong*, not merely redundant: when
+        # `Access-Control-Request-Private-Network: true` is present and
+        # `allow_private_network` is left at its default `False`,
+        # `CORSMiddleware` itself already treats that as a preflight
+        # *failure* and returns 400 -- a non-2xx preflight response the
+        # browser rejects regardless of any extra header a second
+        # middleware might append afterward. A hand-rolled middleware
+        # wrapping `CORSMiddleware` from the outside can decorate that 400
+        # response with the header, but can never turn it back into the
+        # 200 a real browser's PNA fetch needs. `allow_private_network=True`
+        # is the only thing that makes `CORSMiddleware` return 200. It is
+        # still gated on the origin allowlist exactly like every other CORS
+        # decision here: `is_allowed_origin` is checked independently, and
+        # a disallowed origin's preflight still fails (400) on "origin"
+        # regardless of this flag.
+        allow_private_network=True,
     )
-    # Added after CORSMiddleware so it sits *outside* CORSMiddleware in the
-    # middleware stack (FastAPI/Starlette wraps middlewares in the reverse
-    # of `add_middleware` call order) and can inspect the CORS response
-    # CORSMiddleware already produced.
-    app.add_middleware(PrivateNetworkAccess)
 
     def authorize(authorization: str = Header(default="")) -> None:
         # `hmac.compare_digest` (not `==`): a timing side channel on token

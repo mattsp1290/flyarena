@@ -77,6 +77,17 @@ class HealthTests(unittest.TestCase):
             self.assertNotIn("freeMemory", body["gpu"])
             self.assertNotIn("jobs", body)
 
+    def test_docs_and_openapi_are_disabled(self):
+        """FastAPI's default `/docs`/`/redoc`/`/openapi.json` sit outside
+        `authorize`'s `Depends` (same as `/health`) and would otherwise leak
+        the whole API schema -- endpoint names, field names, every bound in
+        models.py -- to anyone who can reach this private service, with no
+        token required."""
+        app = make_app()
+        with TestClient(app) as client:
+            for path in ("/docs", "/redoc", "/openapi.json"):
+                self.assertEqual(client.get(path).status_code, 404, path)
+
 
 class AuthTests(unittest.TestCase):
     def test_every_non_health_route_requires_auth(self):
@@ -142,6 +153,18 @@ class CorsAndPnaTests(unittest.TestCase):
             create_app(token=TOKEN, runner=instant_runner)
 
     def test_pna_preflight_answered_only_for_allowed_origins(self):
+        """The security-meaningful signal for a CORS/PNA preflight is the
+        *status code*, not merely which headers are present: a browser
+        only proceeds with the real request after a 2xx preflight response,
+        regardless of what headers a non-2xx response happens to carry.
+        `CORSMiddleware`'s own preflight handler (this is `allow_private_network=True`
+        on `CORSMiddleware` itself, not a hand-rolled middleware -- see
+        `service.py`'s own comment on why) can still attach
+        `Access-Control-Allow-Private-Network: true` to a 400 for a
+        disallowed origin (it doesn't gate that one header on
+        `is_allowed_origin`), but the request never gets access-control-allow-origin
+        and the overall response is 400 -- both of which independently
+        stop a real browser from ever sending the follow-up request."""
         app = make_app(origins=ALLOWED_ORIGIN)
         with TestClient(app) as client:
             allowed = client.options(
@@ -152,7 +175,9 @@ class CorsAndPnaTests(unittest.TestCase):
                     "Access-Control-Request-Private-Network": "true",
                 },
             )
+            self.assertEqual(allowed.status_code, 200)
             self.assertEqual(allowed.headers.get("access-control-allow-private-network"), "true")
+            self.assertEqual(allowed.headers.get("access-control-allow-origin"), ALLOWED_ORIGIN)
 
             disallowed = client.options(
                 "/api/graph/v1/jobs",
@@ -162,7 +187,7 @@ class CorsAndPnaTests(unittest.TestCase):
                     "Access-Control-Request-Private-Network": "true",
                 },
             )
-            self.assertNotIn("access-control-allow-private-network", disallowed.headers)
+            self.assertEqual(disallowed.status_code, 400)
             self.assertNotIn("access-control-allow-origin", disallowed.headers)
 
     def test_preflight_without_private_network_request_is_unaffected(self):
@@ -219,6 +244,19 @@ class GraphIdValidationTests(unittest.TestCase):
             response = client.post("/api/graph/v1/jobs", json=body, headers=HEADERS)
             self.assertEqual(response.status_code, 422)
 
+    def test_rejects_non_ascii_digits_and_leading_zeros(self):
+        """Python's `\\d` matches every Unicode decimal-digit character
+        without `re.ASCII`, not just 0-9 -- "rewired:٥" (Arabic-Indic
+        5) and "rewired:１２" (fullwidth 12) both matched before
+        `GRAPH_PATTERN` added `re.ASCII`. A leading zero ("rewired:007")
+        matched a bare `\\d{1,3}` too."""
+        app = make_app()
+        with TestClient(app) as client:
+            for graph in ("rewired:٥", "rewired:１２", "rewired:007"):
+                body = dict(LESION_BODY, graph=graph)
+                response = client.post("/api/graph/v1/jobs", json=body, headers=HEADERS)
+                self.assertEqual(response.status_code, 422, graph)
+
     def test_rejects_a_trailing_newline(self):
         """Python's bare `$` matches immediately before a trailing "\\n",
         so a naive `^...$` pattern would accept "biological\\n" -- which
@@ -268,6 +306,30 @@ class GraphIdValidationTests(unittest.TestCase):
                             if status not in ("queued", "running", "cancelling"):
                                 break
                             time.sleep(0.05)
+
+
+class SeedRangeTests(unittest.TestCase):
+    def test_rejects_a_seed_range_that_overflows_uint32(self):
+        """`src/lib/arena/world.ts`'s `normalizeSeed` does `seed >>> 0`
+        (an unsigned 32-bit wrap): a `heldOutSeeds` entry built as
+        `seedStart + i` past `2**32 - 1` would silently wrap to some other,
+        smaller seed instead of erroring -- which can collide with an
+        earlier entry in the same request and make two "different" seeds
+        simulate the identical episode. `seedStart` alone being in range
+        does not bound `seedStart + seedCount - 1`, the actual highest
+        seed produced."""
+        app = make_app()
+        with TestClient(app) as client:
+            body = dict(LESION_BODY, seedStart=2**32 - 1, seedCount=4)
+            response = client.post("/api/graph/v1/jobs", json=body, headers=HEADERS)
+            self.assertEqual(response.status_code, 422)
+
+    def test_accepts_a_seed_range_that_exactly_fits(self):
+        app = make_app()
+        with TestClient(app) as client:
+            body = dict(LESION_BODY, seedStart=2**32 - 4, seedCount=4)
+            response = client.post("/api/graph/v1/jobs", json=body, headers=HEADERS)
+            self.assertEqual(response.status_code, 202)
 
 
 class SubprocessSafetyTests(unittest.TestCase):
@@ -362,6 +424,42 @@ class CancellationAndTimeoutTests(unittest.TestCase):
             time.sleep(0.05)
         raise AssertionError(f"process {pid} is still alive" + (f" ({last_error})" if last_error else ""))
 
+    def test_a_grandchild_outliving_its_leader_is_still_killed(self):
+        """`process.wait()` only waits for the leader, not the rest of its
+        process group -- if the leader (the Node entry, in production)
+        exits, cleanly or via a crash, while its own forked shard workers
+        are still alive, nothing else in the original code killed them.
+        This fake leader spawns a real grandchild `sleep`, reports its pid
+        via a progress line, and exits immediately while the grandchild is
+        still very much running -- proving `_final_sweep` catches it."""
+
+        def spawns_a_grandchild_then_exits(_request, _job_dir):
+            script = (
+                "import json, subprocess, sys; "
+                "child = subprocess.Popen(['sleep', '30']); "
+                "print(json.dumps({'type': 'progress', 'progress': {'grandchildPid': child.pid}})); "
+                "sys.stdout.flush()"
+            )
+            return ["python3", "-c", script]
+
+        app = make_app(runner=spawns_a_grandchild_then_exits)
+        with TestClient(app) as client:
+            submitted = client.post("/api/graph/v1/jobs", json=LESION_BODY, headers=HEADERS)
+            identifier = submitted.json()["id"]
+
+            deadline = time.monotonic() + 5
+            grandchild_pid = None
+            while time.monotonic() < deadline:
+                progress = client.get(f"/api/graph/v1/jobs/{identifier}", headers=HEADERS).json()["progress"]
+                if "grandchildPid" in progress:
+                    grandchild_pid = progress["grandchildPid"]
+                    break
+                time.sleep(0.02)
+            self.assertIsNotNone(grandchild_pid, "leader never reported its grandchild's pid")
+
+            self._wait_for_terminal(client, identifier)
+            self._assert_process_gone(grandchild_pid, timeout=5)
+
 
 class JobStoreBoundsTests(unittest.TestCase):
     def test_one_active_job_gives_409(self):
@@ -399,13 +497,22 @@ class JobStoreBoundsTests(unittest.TestCase):
 
 class NoSecretLeakTests(unittest.TestCase):
     def test_child_process_never_receives_the_token(self):
-        app = make_app(runner=env_probing_runner)
-        with TestClient(app) as client:
-            submitted = client.post("/api/graph/v1/jobs", json=LESION_BODY, headers=HEADERS)
-            identifier = submitted.json()["id"]
-            final = self._wait_for_terminal(client, identifier)
-            self.assertEqual(final["status"], "completed")
-            self.assertEqual(final["result"]["token_seen"], "MISSING")
+        """Regression-tests the actual leak path: `_child_env` must build
+        an explicit allow-list rather than `os.environ.copy()` even when
+        `GRAPH_LAB_TOKEN` really is present in the *process's own*
+        environment (not just passed as a `create_app(token=...)`
+        parameter, which alone would make this test pass vacuously no
+        matter what `_child_env` does, since nothing would be in
+        `os.environ` to leak in the first place)."""
+        with patch.dict(os.environ, {"GRAPH_LAB_TOKEN": TOKEN}):
+            os.environ["GRAPH_LAB_ORIGINS"] = ALLOWED_ORIGIN
+            app = create_app(token=None, runner=env_probing_runner)
+            with TestClient(app) as client:
+                submitted = client.post("/api/graph/v1/jobs", json=LESION_BODY, headers=HEADERS)
+                identifier = submitted.json()["id"]
+                final = self._wait_for_terminal(client, identifier)
+                self.assertEqual(final["status"], "completed")
+                self.assertEqual(final["result"]["token_seen"], "MISSING")
 
     def test_failed_job_error_never_includes_raw_stderr(self):
         def failing_runner(_request, _job_dir):

@@ -180,11 +180,26 @@ class Jobs:
         environment. `NODE_OPTIONS` is explicitly cleared rather than
         omitted, so a host-level `--require` injection (a tracing agent,
         for example) already set in the parent's environment is not
-        silently inherited by every job's Node child either."""
+        silently inherited by every job's Node child either.
+
+        `DD_IAST_ENABLED`/`DD_TRACE_ENABLED`/`PYTHONUNBUFFERED` are
+        included in the base allow-list (not only in a per-invocation
+        `extra`) even though WP1's only wired kind (`lesion`) launches a
+        Node child that doesn't read them: a Datadog host-level injection
+        (confirmed active in dev/CI sandboxes akin to this one, via
+        `/etc/ld.so.preload`, independent of this process's own
+        `DD_TRACE_ENABLED=false`) breaks `flyarena_training`'s tensor ops
+        under IAST (reproduced running the GPU atlas smoke test -- see the
+        Dockerfile's own note), so a future WP2 python child using this
+        same `_child_env` should not have to remember to add these itself.
+        None of these are secrets."""
         env = {
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "HOME": "/tmp",
             "NODE_OPTIONS": "",
+            "PYTHONUNBUFFERED": "1",
+            "DD_IAST_ENABLED": "false",
+            "DD_TRACE_ENABLED": "false",
         }
         env.update(extra)
         return env
@@ -238,21 +253,49 @@ class Jobs:
             reader = threading.Thread(target=self._drain, args=(process, job, outcome, stderr_tail), daemon=True)
             reader.start()
 
+            # `killing`/`give_up_deadline`: once either a cancel or a
+            # timeout has fired `_kill_group` (SIGTERM, then SIGKILL after
+            # `KILL_GRACE_SECONDS`), this loop still only learns the
+            # process is actually gone via `process.wait()` succeeding --
+            # with no bound on that wait, a process group SIGKILL somehow
+            # can't reap (e.g. stuck in uninterruptible I/O) would loop
+            # here forever, keeping `self.thread` alive and therefore
+            # `submit()`'s "one active job" check permanently 409ing every
+            # future request (an Important finding from review: "a job
+            # that can't be killed blocks the service"). Giving up after a
+            # bounded extra wait accepts a documented residual risk (a
+            # truly unkillable process's resources leak until the
+            # container itself restarts) in exchange for the service
+            # itself staying usable for new jobs.
+            killing = False
+            give_up_deadline = 0.0
             while True:
                 try:
                     process.wait(timeout=POLL_INTERVAL_SECONDS)
                     break
                 except subprocess.TimeoutExpired:
+                    if killing:
+                        if time.monotonic() > give_up_deadline:
+                            logging.error(
+                                "graph-lab job %s (%s): process group %s did not exit after SIGKILL; "
+                                "giving up waiting (it may still be running)",
+                                job.id,
+                                job.kind,
+                                job.pgid,
+                            )
+                            break
+                        continue
                     with self.lock:
                         cancelling = job.status == "cancelling"
                     if cancelling:
-                        continue
-                    if time.monotonic() > deadline:
+                        killing = True
+                    elif time.monotonic() > deadline:
                         with self.lock:
                             job.status = "timed-out"
                         self._kill_group(job)
-                        process.wait(timeout=KILL_GRACE_SECONDS + 2)
-                        break
+                        killing = True
+                    if killing:
+                        give_up_deadline = time.monotonic() + KILL_GRACE_SECONDS + 10
             reader.join(timeout=2)
 
             with self.lock:
@@ -282,7 +325,31 @@ class Jobs:
                 job.status = "failed"
                 job.error = "Job failed; check backend logs"
         finally:
+            # Unconditional final sweep, on every exit path (normal
+            # completion, cancel, timeout, or the generic exception handler
+            # above): `process.wait()` only waits for the *leader* --
+            # if it exits (cleanly or via a crash) while its own forked
+            # shard workers (`child_process.fork()` in the Node entries)
+            # are still alive, those workers are never otherwise killed
+            # and would keep computing, unbounded, after this job is
+            # already marked done and a new submission has been accepted.
+            # Confirmed reproducible in review before this was added.
+            self._final_sweep(job)
             shutil.rmtree(job_dir, ignore_errors=True)
+
+    def _final_sweep(self, job: Job) -> None:
+        """SIGKILL `job.pgid` one more time, unconditionally. Idempotent
+        and safe to call whether or not anything in the group is still
+        alive: `killpg` on an already-empty or already-reaped group just
+        raises `ProcessLookupError`, ignored here."""
+        with self.lock:
+            pgid = job.pgid
+        if pgid is None:
+            return
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
     @staticmethod
     def _drain(process: subprocess.Popen, job: "Job", outcome: dict, stderr_tail: list[str]) -> None:

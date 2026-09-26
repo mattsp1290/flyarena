@@ -25,7 +25,7 @@ from __future__ import annotations
 import re
 from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # `public/data/malecns-arena-v1.manifest.json`'s `neuronCount`. Duplicated
 # here (not imported from a JS module) as a lightweight API-layer bound;
@@ -38,6 +38,19 @@ NEURON_COUNT = 1008
 
 MAX_REWIRED_SEED = 499
 
+# `src/lib/arena/world.ts`'s `normalizeSeed` does `seed >>> 0` (an unsigned
+# 32-bit wrap) before ever using a seed -- so a `heldOutSeeds` entry built
+# as `seedStart + i` (`entry-lesion.ts`'s/`entry-swapset.ts`'s `buildTasks`)
+# that exceeds this range doesn't error, it silently wraps to some other,
+# smaller seed, which can collide with an earlier entry in the very same
+# request and make two "different" seeds simulate the identical episode --
+# a data-correctness bug (broken statistical independence), not a crash, so
+# nothing else here would have caught it. `seed_start` alone is bounded to
+# `[0, MAX_SEED]` by each field's own `Field(le=...)`, but that alone does
+# not bound `seed_start + seed_count - 1` -- the actual highest seed a
+# request produces -- which is checked by `_check_seed_range` below.
+MAX_SEED = 2**32 - 1
+
 # `\Z` (absolute end of string), never a bare `$`: Python's `$` also
 # matches immediately before a single trailing "\n", so `$` alone would let
 # "biological\n" (or "rewired:5\n") through this check while `mode` still
@@ -47,7 +60,16 @@ MAX_REWIRED_SEED = 499
 # silently falling through to the `disconnected` branch instead of erroring.
 # Verified empirically before this fix: `GRAPH_PATTERN.match("biological\n")`
 # matched with a bare `$`.
-GRAPH_PATTERN = re.compile(r"\A(biological|disconnected|rewired:(\d{1,3}))\Z")
+#
+# `re.ASCII`, and `(?:0|[1-9]\d{0,2})` instead of a bare `\d{1,3}`: without
+# `re.ASCII`, Python's `\d` matches every Unicode decimal-digit character,
+# not just 0-9 (e.g. "rewired:٥" (Arabic-Indic) and "rewired:１２"
+# (fullwidth) both matched, and `int()` happily parses them too) -- outside
+# this module's own documented "closed set" contract even though it never
+# reached an unvalidated path or subprocess argument. The non-capturing
+# `(?:0|[1-9]\d{0,2})` also rejects a leading zero ("rewired:007"), which
+# `\d{1,3}` alone allowed.
+GRAPH_PATTERN = re.compile(r"\A(biological|disconnected|rewired:(0|[1-9]\d{0,2}))\Z", re.ASCII)
 
 
 def validate_graph_id(value: str) -> str:
@@ -61,6 +83,17 @@ def validate_graph_id(value: str) -> str:
     if seed_text is not None and int(seed_text) > MAX_REWIRED_SEED:
         raise ValueError(f"rewired seed must be <= {MAX_REWIRED_SEED}")
     return value
+
+
+def _check_seed_range(seed_start: int, seed_count: int) -> None:
+    """Shared by `LesionJobRequest`/`SwapsetJobRequest`'s `model_validator`s:
+    the highest seed a request will actually produce
+    (`seed_start + seed_count - 1`) must itself stay within `MAX_SEED`, not
+    just `seed_start` alone."""
+    if seed_start + seed_count - 1 > MAX_SEED:
+        raise ValueError(
+            f"seedStart + seedCount - 1 ({seed_start + seed_count - 1}) exceeds the maximum seed {MAX_SEED}"
+        )
 
 
 def _validate_unique_indices(indices: list[int], *, min_len: int, max_len: int, label: str) -> list[int]:
@@ -82,7 +115,7 @@ class LesionJobRequest(BaseModel):
     kind: Literal["lesion"]
     graph: str
     sets: list[list[int]] = Field(min_length=1, max_length=32)
-    seed_start: int = Field(alias="seedStart", ge=0, le=2**32 - 1)
+    seed_start: int = Field(alias="seedStart", ge=0, le=MAX_SEED)
     seed_count: int = Field(alias="seedCount", ge=4, le=100)
     ticks: int = Field(ge=300, le=1800)
     decoder: Literal["authored"] = "authored"
@@ -98,6 +131,11 @@ class LesionJobRequest(BaseModel):
         for one_set in value:
             _validate_unique_indices(one_set, min_len=1, max_len=64, label="each lesion set")
         return value
+
+    @model_validator(mode="after")
+    def _check_seed_range(self) -> "LesionJobRequest":
+        _check_seed_range(self.seed_start, self.seed_count)
+        return self
 
 
 class AtlasJobRequest(BaseModel):
@@ -139,9 +177,14 @@ class SwapsetJobRequest(BaseModel):
     graph: Literal["biological"] = "biological"
     swaps: list[Swap] = Field(min_length=1, max_length=50)
     controls: int = Field(ge=0, le=100)
-    seed_start: int = Field(alias="seedStart", ge=0, le=2**32 - 1)
+    seed_start: int = Field(alias="seedStart", ge=0, le=MAX_SEED)
     seed_count: int = Field(alias="seedCount", ge=4, le=100)
     ticks: int = Field(ge=300, le=1800)
+
+    @model_validator(mode="after")
+    def _check_seed_range(self) -> "SwapsetJobRequest":
+        _check_seed_range(self.seed_start, self.seed_count)
+        return self
 
 
 JobRequest = Annotated[

@@ -33,14 +33,39 @@ const outdir = resolve(repoRoot, 'backend/graph_lab/js');
 // anyway or editing the guarded files (out of this WP's change surface).
 const ENTRY_NAMES = ['entry-lesion', 'entry-swapset', 'worker-lesion', 'worker-score'];
 
+/** @param {Uint8Array | string} bytes */
 const sha256Hex = (bytes) => createHash('sha256').update(bytes).digest('hex');
 
-const main = async () => {
-  mkdirSync(outdir, { recursive: true });
+/**
+ * Exported (not just used by this file's own CLI `main`) so
+ * `tests/unit/graph-lab-entries.test.ts` can build into its own temp
+ * directory in a `beforeAll` rather than depending on
+ * `backend/graph_lab/js/` already existing -- that directory is
+ * gitignored and produced only by `npm run graph-lab:bundle`, which CI's
+ * `npm run test:unit` never runs on its own; a test that silently skipped
+ * itself (or worse, silently passed against a stale local bundle left
+ * over from a developer's own machine) when it was missing would be
+ * worse than a build step embedded in the test itself.
+ * @param {string} targetOutdir
+ */
+export const runBundle = async (targetOutdir) => {
+  mkdirSync(targetOutdir, { recursive: true });
 
   await build({
     entryPoints: ENTRY_NAMES.map((name) => resolve(here, `${name}.ts`)),
-    outdir,
+    outdir: targetOutdir,
+    // Pinned to the repo root, not left to default to `process.cwd()`:
+    // esbuild embeds `absWorkingDir`-relative path *comments* for each
+    // bundled module's source origin even with `sourcemap: false`, so two
+    // invocations of this exact same script from different working
+    // directories (`npm run graph-lab:bundle` from the repo root vs.
+    // `node bundle.mjs` from inside `scripts/graph-lab/`) produced
+    // byte-different output and therefore a different `bundleSha256` for
+    // identical source -- verified by diffing both outputs before this
+    // was added. `bundleSha256` is the one value `/health` and every job
+    // result report as covering "all graph-lab code"; it must depend only
+    // on that code, never on how the build happened to be invoked.
+    absWorkingDir: repoRoot,
     outExtension: { '.js': '.mjs' },
     bundle: true,
     platform: 'node',
@@ -50,9 +75,10 @@ const main = async () => {
     logLevel: 'info'
   });
 
+  /** @type {Record<string, string>} */
   const files = {};
   for (const name of ENTRY_NAMES) {
-    const outPath = resolve(outdir, `${name}.mjs`);
+    const outPath = resolve(targetOutdir, `${name}.mjs`);
     files[`${name}.mjs`] = sha256Hex(readFileSync(outPath));
   }
   // Sorted keys: deterministic across Node/esbuild's own directory-listing
@@ -63,12 +89,28 @@ const main = async () => {
   const bundleSha256 = sha256Hex(JSON.stringify(sortedFiles));
   const bundleJson = { files: sortedFiles, bundleSha256 };
 
-  writeFileSync(resolve(outdir, 'bundle.json'), `${JSON.stringify(bundleJson, null, 2)}\n`);
-  // eslint-disable-next-line no-console -- CLI tool: user-facing summary.
-  console.log(`graph-lab bundle.mjs: wrote ${ENTRY_NAMES.length} bundles to ${outdir} (bundleSha256=${bundleSha256})`);
+  writeFileSync(resolve(targetOutdir, 'bundle.json'), `${JSON.stringify(bundleJson, null, 2)}\n`);
+  return { outdir: targetOutdir, bundleSha256, files: sortedFiles };
 };
 
-main().catch((error) => {
-  console.error('graph-lab bundle.mjs failed:', error);
-  process.exit(1);
-});
+const main = async () => {
+  const result = await runBundle(outdir);
+  // eslint-disable-next-line no-console -- CLI tool: user-facing summary.
+  console.log(
+    `graph-lab bundle.mjs: wrote ${ENTRY_NAMES.length} bundles to ${result.outdir} (bundleSha256=${result.bundleSha256})`
+  );
+};
+
+// Guarded (unlike a bundled entry, this file is only ever imported by
+// Vite/vitest's own per-module transform, which keeps each module's
+// `import.meta.url` accurate -- there is no esbuild `--bundle` collapse
+// hazard here, so this guard is safe): running this file directly (the
+// npm script, or the Dockerfile's build step) hits `main()`; importing
+// `runBundle` from the test file does not also trigger the CLI's own
+// default-outdir build as an import side effect.
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    console.error('graph-lab bundle.mjs failed:', error);
+    process.exit(1);
+  });
+}

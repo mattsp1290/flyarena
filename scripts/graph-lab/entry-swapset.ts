@@ -106,7 +106,6 @@ const main = async (): Promise<void> => {
     : [];
 
   printResult({
-    dataDir: args.dataDir,
     host: { arch: process.arch, node: process.version },
     label: 'Computed on DGX (private, not published)',
     scores: scores.map(({ graphId, n, mean }) => ({ graphId, n, mean })),

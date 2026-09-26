@@ -1,13 +1,14 @@
+// @vitest-environment node
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join, resolve } from 'node:path';
 import { gzipSync } from 'node:zlib';
 
-import { describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it } from 'vitest';
 
 import { encodeGraphBinary } from '../../src/lib/connectome/format';
+import { runBundle } from '../../scripts/graph-lab/bundle.mjs';
 import { sha256Hex } from '../../scripts/training/fsio';
 import { createTinyGraph } from '../fixtures/tiny-graph';
 
@@ -15,9 +16,16 @@ import { createTinyGraph } from '../fixtures/tiny-graph';
  * `.agents/plans/graph-lab/01-service-and-container.md`'s `bundle.mjs` row:
  * "A test runs the built .mjs bundles from an unrelated cwd, with the data
  * in a temp directory, and checks that they produce the fixture results."
- * Requires `npm run graph-lab:bundle` to have already produced
- * `backend/graph_lab/js/*.mjs` (gitignored, not committed) -- run it first
- * if this suite reports the bundle missing.
+ *
+ * Builds its own bundle into a temp directory in `beforeAll` (via
+ * `bundle.mjs`'s own exported `runBundle`) rather than depending on
+ * `backend/graph_lab/js/*.mjs` (gitignored, produced only by
+ * `npm run graph-lab:bundle`) already existing: CI's `npm run test:unit`
+ * never runs that build step on its own, so a test reading the repo's
+ * real bundle dir would either fail outright in CI or, worse, silently
+ * pass against a stale bundle left over on a developer's own machine.
+ * Building fresh here also means these tests are the *first* thing to
+ * notice a source change that breaks bundling, not a separate manual step.
  *
  * Runs each entry as a real, separate `node` child process (not an
  * in-process `import()`), from a cwd unrelated to both the repo and the
@@ -27,11 +35,13 @@ import { createTinyGraph } from '../fixtures/tiny-graph';
  * comes from the args file this test writes into its own temp directory.
  */
 
-const here = dirname(fileURLToPath(import.meta.url));
-const repoRoot = resolve(here, '../..');
-const bundleDir = resolve(repoRoot, 'backend/graph_lab/js');
-
 const unrelatedCwd = mkdtempSync(join(tmpdir(), 'graph-lab-cwd-'));
+let bundleDir: string;
+
+beforeAll(async () => {
+  bundleDir = mkdtempSync(join(tmpdir(), 'graph-lab-bundle-'));
+  await runBundle(bundleDir);
+}, 60_000);
 
 const parseLines = (output: string): { type: string; result?: unknown; message?: string }[] =>
   output
@@ -142,6 +152,41 @@ describe('graph-lab entry-lesion.mjs (built bundle, unrelated cwd, temp-director
     expect(second).toEqual(first);
   });
 
+  it('multi-shard (shards: 3, concurrent workers) matches single-shard output exactly', () => {
+    /** Every other test in this file pins `shards: 1` -- production runs
+     * up to 4 workers concurrently (`entry-lesion.ts`'s own
+     * `Math.min(4, tasks.length)` default), so without this test
+     * `shard.ts`'s actual concurrent-dispatch path (multiple `fork()`ed
+     * children in flight at once, `dispatchNext`'s queue draining) never
+     * ran in this suite at all. Three sets + a baseline = 4 tasks over 3
+     * shards forces at least one worker to run two tasks sequentially
+     * while the others run concurrently -- matching
+     * `scripts/null/null-evaluate.ts`'s own "shard count must not affect
+     * output" convention. */
+    const dataDir = mkdtempSync(join(tmpdir(), 'graph-lab-data-'));
+    const { path, sha256 } = writeFixtureGraph(dataDir);
+    const baseArgs = {
+      dataDir,
+      mode: 'biological',
+      graphPath: path,
+      expectedSha256: sha256,
+      sets: [[2], [3], [2, 3]],
+      seedStart: 1,
+      seedCount: 4,
+      ticks: 20,
+      bootstrapResamples: 200
+    };
+
+    const singleShardPath = join(dataDir, 'args-shards1.json');
+    writeFileSync(singleShardPath, JSON.stringify({ ...baseArgs, shards: 1 }));
+    const multiShardPath = join(dataDir, 'args-shards3.json');
+    writeFileSync(multiShardPath, JSON.stringify({ ...baseArgs, shards: 3 }));
+
+    const singleShardResult = runEntry('entry-lesion.mjs', singleShardPath);
+    const multiShardResult = runEntry('entry-lesion.mjs', multiShardPath);
+    expect(multiShardResult).toEqual(singleShardResult);
+  });
+
   it('rejects a graph binary whose sha256 does not match (tamper/corruption guard)', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'graph-lab-data-'));
     const { path } = writeFixtureGraph(dataDir);
@@ -159,7 +204,12 @@ describe('graph-lab entry-lesion.mjs (built bundle, unrelated cwd, temp-director
     const argsPath = join(dataDir, 'args.json');
     writeFileSync(argsPath, JSON.stringify(args));
 
-    expect(() => runEntry('entry-lesion.mjs', argsPath)).toThrow(/does not match expected|reported an error/);
+    // Specifically the sha256-mismatch message (`null-worker-shared.ts`'s
+    // `loadVerifiedGraphBinary`), not merely "some error happened" -- a
+    // regex broad enough to match any failure would still pass if the
+    // entry crashed for an unrelated reason, proving nothing about the
+    // tamper guard specifically.
+    expect(() => runEntry('entry-lesion.mjs', argsPath)).toThrow(/decompressed sha256 .* does not match expected/);
   });
 });
 
