@@ -4,6 +4,19 @@ set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 
 die() { printf 'deploy: %s\n' "$*" >&2; exit 1; }
+
+# Cleanup registered in $cleanup_paths runs once, on any exit (success,
+# `die`, or an unexpected failure) -- WP2 of `.agents/plans/findings-tour`
+# (`02-verified-redeploy.md`): "release the lock with a trap on EXIT,
+# including on failure." A single trap function (rather than the narrower
+# per-block traps this script used before) is required so the lock release
+# survives every exit path, including ones that happen before or after the
+# temp-file cleanup blocks further down. See scripts/deploy-trap.sh (also
+# sourced directly by scripts/verify/deploy-lock.test.sh, so that test
+# exercises this exact trap rather than a hand-maintained duplicate).
+# shellcheck source=scripts/deploy-trap.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/deploy-trap.sh"
+
 mode=${1:---deploy}
 [[ $# -le 1 ]] || die 'Expected at most one option.'
 case "$mode" in
@@ -60,6 +73,27 @@ fi
 mkdir -p "$root/releases"
 test -w "$root/releases"
 REMOTE
+
+  # The release id is decided now (before the build), not after it, so the
+  # lock's owner file can record which deploy this run is, and so the same
+  # id is later reused, unchanged, for the remote release directory and for
+  # matching `current` on rollback.
+  release="$(date -u +%Y%m%dT%H%M%SZ)-$(node -e 'console.log(require("node:crypto").randomBytes(6).toString("hex"))')"
+
+  # In-script, stale-aware concurrency guard (`02-verified-redeploy.md` step
+  # 2): no caller can bypass this because it lives inside deploy.sh itself,
+  # after the SSH preflight above. See scripts/deploy-lock.sh for the lock,
+  # marker-check, and rollback implementation (sourced, not executed, so it
+  # shares this shell's `set -euo pipefail`, `die`, `ssh_options`, and the
+  # `release` id just generated).
+  # shellcheck source=scripts/deploy-lock.sh
+  source "$(dirname -- "${BASH_SOURCE[0]}")/deploy-lock.sh"
+  deploy_lock_acquire "$release"
+  # Record the pre-deploy active release for rollback (step 3): the live
+  # `current` target, which this same call also confirms equals the last
+  # `Release:` marker in .agents/deployment.md -- otherwise an unrecorded
+  # deploy could silently become this run's rollback target.
+  previous_release=$(deploy_check_release_marker)
 fi
 
 # Never export deployment settings to Vite; only the public base path is needed.
@@ -70,14 +104,14 @@ npm run build -- --base "$base"
 # Create outside dist: adding the archive there while tar reads '.' changes its
 # directory metadata and can make GNU tar fail before upload.
 archive=$(mktemp)
-trap 'rm -f -- "$archive"' EXIT
+cleanup_paths+=("$archive")
 tar -czf "$archive" --exclude=flyarena.tar.gz -C dist .
 mv -- "$archive" dist/flyarena.tar.gz
-trap - EXIT
 printf 'Built dist/ and dist/flyarena.tar.gz for %s\n' "$base"
 [[ "$mode" == --deploy ]] || exit 0
 
-release="$(date -u +%Y%m%dT%H%M%SZ)-$(node -e 'console.log(require("node:crypto").randomBytes(6).toString("hex"))')"
+# $release was already decided above (before the build), so the lock's
+# owner file could record it.
 remote_release="$DEPLOY_ROOT/releases/$release"
 ssh "${ssh_options[@]}" "$DEPLOY_SSH" "mkdir '$remote_release'"
 scp "${ssh_options[@]}" dist/flyarena.tar.gz "$DEPLOY_SSH:$remote_release/package.tar.gz"
@@ -94,16 +128,84 @@ mv -Tf "$root/.current-$release" "$root/current"
 REMOTE
 
 # Compare public HTML and every emitted asset with the exact local build.
+# Unlike the earlier `die`-on-mismatch version, a failure here does not exit
+# immediately: it returns nonzero so the caller can roll back while still
+# holding the lock (`02-verified-redeploy.md` step 7).
 verify_dir=$(mktemp -d)
-trap 'rm -rf -- "$verify_dir"' EXIT
-curl --fail --silent --show-error --location --connect-timeout 10 --max-time 60 \
-  -H 'Cache-Control: no-cache' "${DEPLOY_URL%/}" -o "$verify_dir/response"
-cmp -s dist/index.html "$verify_dir/response" || die 'Public entry URL does not serve this release. Inspect the web-server route; previous releases are retained.'
-while IFS= read -r -d '' file; do
-  relative=${file#dist/}
-  url="${DEPLOY_URL%/}/$relative"
+cleanup_paths+=("$verify_dir")
+verify_assets() {
   curl --fail --silent --show-error --location --connect-timeout 10 --max-time 60 \
-    -H 'Cache-Control: no-cache' "$url" -o "$verify_dir/response"
-  cmp -s "$file" "$verify_dir/response" || die "Public content mismatch: $relative. Release is active; inspect the web-server mapping/cache. Previous releases are retained."
-done < <(find dist -type f ! -name flyarena.tar.gz -print0)
+    -H 'Cache-Control: no-cache' "${DEPLOY_URL%/}" -o "$verify_dir/response" || {
+    printf 'deploy: public entry URL request failed.\n' >&2
+    return 1
+  }
+  cmp -s dist/index.html "$verify_dir/response" || {
+    printf 'deploy: public entry URL does not serve this release.\n' >&2
+    return 1
+  }
+  while IFS= read -r -d '' file; do
+    relative=${file#dist/}
+    url="${DEPLOY_URL%/}/$relative"
+    curl --fail --silent --show-error --location --connect-timeout 10 --max-time 60 \
+      -H 'Cache-Control: no-cache' "$url" -o "$verify_dir/response" || {
+      printf 'deploy: public content request failed: %s\n' "$relative" >&2
+      return 1
+    }
+    cmp -s "$file" "$verify_dir/response" || {
+      printf 'deploy: public content mismatch: %s\n' "$relative" >&2
+      return 1
+    }
+  done < <(find dist -type f ! -name flyarena.tar.gz -print0)
+  return 0
+}
+
+# Live smoke check (`02-verified-redeploy.md` step 5): a small
+# Playwright/Chromium script that opens $DEPLOY_URL, waits for ready,
+# expands Findings, and checks step 1's sentence and the ledger render.
+# Requires devDependencies already installed by `npm ci` above (tsx,
+# @playwright/test) plus a Chromium browser (`npx playwright install
+# chromium`) on the machine running deploy.sh -- not installed here, since
+# that is a one-time, potentially large download better left to the
+# operator/CI image setup than to every deploy run.
+run_live_smoke() {
+  local bin="$PWD/node_modules/.bin/tsx"
+  if [[ ! -x "$bin" ]]; then
+    printf 'deploy: node_modules/.bin/tsx not found (expected after npm ci); cannot run the live smoke check.\n' >&2
+    return 1
+  fi
+  DEPLOY_URL="$DEPLOY_URL" "$bin" scripts/verify/live-smoke.ts
+}
+
+# On verification or smoke failure: roll back only if `current` still
+# equals this run's release (still holding the lock), then re-verify with
+# an HTTP 200 on the entry URL plus the smoke check, best-effort.
+report_failure_and_roll_back() {
+  local reason=$1
+  printf 'deploy: verification failed (%s). Attempting rollback to previous release %s.\n' "$reason" "$previous_release" >&2
+  if ! deploy_rollback "$release" "$previous_release"; then
+    printf 'deploy: rollback did not complete. Investigate manually; do not assume current is healthy.\n' >&2
+    return
+  fi
+  printf 'deploy: rolled back current -> %s.\n' "$previous_release" >&2
+  if curl --fail --silent --show-error --location --connect-timeout 10 --max-time 60 \
+    -H 'Cache-Control: no-cache' "${DEPLOY_URL%/}" -o /dev/null; then
+    printf 'deploy: post-rollback check: entry URL returns HTTP 200.\n' >&2
+  else
+    printf 'deploy: post-rollback check FAILED: entry URL did not return HTTP 200 after rollback. Investigate immediately.\n' >&2
+  fi
+  if run_live_smoke; then
+    printf 'deploy: post-rollback smoke check passed.\n' >&2
+  else
+    printf 'deploy: post-rollback smoke check did not pass (or could not run); the HTTP 200 check above is authoritative for rollback health, this is best-effort.\n' >&2
+  fi
+}
+
+if ! verify_assets; then
+  report_failure_and_roll_back 'byte-for-byte asset verification failed'
+  die 'Deployment failed verification; the previous release was restored where possible. See rollback output above. Leave this bean open and report.'
+fi
+if ! run_live_smoke; then
+  report_failure_and_roll_back 'live smoke check failed'
+  die 'Deployment failed the live smoke check; the previous release was restored where possible. See rollback output above. Leave this bean open and report.'
+fi
 printf 'Deployment verified. Release: %s\nThe static arena/workbench require no backend. Optional DGX sandbox placement is BACKEND_SSH in .env.\n' "$release"
