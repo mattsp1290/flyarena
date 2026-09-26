@@ -24,6 +24,7 @@
     "null:lookup-rewired-artifact": "tsx scripts/null/lookup-rewired-artifact.ts",
     "null:regime-check": "tsx scripts/null/regime-check.ts",
     "intervention:report": "tsx scripts/null/intervention-report.ts",
+    "intervention:artifact": "tsx scripts/null/intervention-artifact.ts",
     "analysis:fixture": "tsx scripts/analysis/export-trace-graph-fixture.ts",
     "lesion:evaluate": "tsx scripts/lesion/atlas-evaluate.ts",
     "lesion:report": "tsx scripts/lesion/atlas-report.ts",

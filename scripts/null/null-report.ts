@@ -282,8 +282,17 @@ const toScoredEntry = (stats: ConditionStats): ScoredEntry => ({
 // Manifest
 // ---------------------------------------------------------------------------
 
-/** Recursively sort object keys, matching `scripts/data/compile.py`'s `json.dumps(..., sort_keys=True)` convention this manifest is otherwise written with. */
-const sortKeysDeep = (value: unknown): unknown => {
+/**
+ * Recursively sort object keys, matching `scripts/data/compile.py`'s
+ * `json.dumps(..., sort_keys=True)` convention this manifest is otherwise
+ * written with. Exported (WP4 of `.agents/plans/pathway-interventions`,
+ * `scripts/null/intervention-artifact.ts`): that module needs the exact
+ * same manifest re-serialization scheme for its own `pathwayInterventions`
+ * key, and duplicating this small function would risk the two silently
+ * drifting apart on the one property (`verifyManifestRoundTrips`'s own
+ * round-trip guard) that makes either safe to use at all.
+ */
+export const sortKeysDeep = (value: unknown): unknown => {
   if (Array.isArray(value)) return value.map(sortKeysDeep);
   if (value !== null && typeof value === 'object') {
     const sorted: Record<string, unknown> = {};
