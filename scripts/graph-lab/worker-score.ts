@@ -1,4 +1,5 @@
 import { parseGraphBinary } from '../../src/lib/connectome/format';
+import { resolveArenaTask } from '../../src/lib/arena/tasks';
 import { runEpisode } from '../training/episode';
 import { assertFiniteScores, loadVerifiedGraphBinary, runWorkerMain } from '../null/null-worker-shared';
 
@@ -27,6 +28,8 @@ export interface ScoreWorkerTask {
   readonly expectedSha256: string;
   readonly heldOutSeeds: readonly number[];
   readonly ticks: number;
+  /** `.agents/plans/task-generality/01-task-plumbing.md`'s WP1: the arena task id this task's `runEpisode` call resolves and scores against. Absent means `'default'` (`ARENA_CONFIG`, unchanged). */
+  readonly arenaTask?: string;
 }
 
 export interface ScoreSeedResult {
@@ -50,14 +53,26 @@ export interface ScoreWorkerErrorMessage {
 
 export type ScoreWorkerMessage = ScoreWorkerResultMessage | ScoreWorkerErrorMessage;
 
+/** Mirrors `worker-lesion.ts`'s own `validateTaskArenaTask` (see there for the full rationale). */
+const validateTaskArenaTask = (arenaTask: unknown): string | undefined => {
+  if (arenaTask === undefined) return undefined;
+  if (typeof arenaTask !== 'string') {
+    throw new Error(`worker-score: task.arenaTask is not a string: ${JSON.stringify(arenaTask)}`);
+  }
+  resolveArenaTask(arenaTask); // throws with a specific message on an unrecognized id
+  return arenaTask;
+};
+
 const runTask = (task: ScoreWorkerTask): readonly ScoreSeedResult[] => {
   const graphBinary = loadVerifiedGraphBinary('worker-score', task.path, task.expectedSha256);
   const graph = parseGraphBinary(graphBinary.slice(0));
+  const arenaTask = validateTaskArenaTask(task.arenaTask);
 
   return task.heldOutSeeds.map((seed) => {
     const result = runEpisode({
       seed,
       ticks: task.ticks,
+      arenaTask,
       left: { decoder: 'authored', graph },
       right: { decoder: 'parked' }
     });

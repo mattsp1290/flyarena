@@ -35,13 +35,6 @@ COPY backend/graph_lab/__init__.py backend/graph_lab/service.py backend/graph_la
 RUN python -m pip install --no-cache-dir --no-deps ./graph_lab_src \
     && rm -rf ./graph_lab_src
 
-# --- esbuild-bundled JS entries/workers, produced locally by
-# `npm run graph-lab:bundle` (gitignored, not built inside this
-# Dockerfile -- no Node build toolchain, npm registry access, or repo
-# checkout is needed at image-build time beyond these already-built
-# outputs; run the bundle step before `docker build`).
-COPY backend/graph_lab/js /opt/graph-lab/js
-
 # --- Real-graph engine sources for WP2 (Python side). Not yet wired to any
 # job kind in WP1 (`service.py`'s `default_runner` 501s `atlas`/`swapset`
 # and `rewired:<seed>`) -- copied now so WP2 does not need to touch this
@@ -64,6 +57,19 @@ COPY scripts/analysis/env_guard.py scripts/analysis/swap_ops.py scripts/analysis
 # in this WP's report) and, in WP2, by the job engines.
 COPY public/data/malecns-arena-v1.bin.gz public/data/malecns-arena-v1.manifest.json public/data/rewiring-null-v1.json public/data/pathway-interventions-v1.json /opt/graph-lab/data/
 
+# --- esbuild-bundled JS entries/workers, produced locally by
+# `npm run graph-lab:bundle` (gitignored, not built inside this
+# Dockerfile -- no Node build toolchain, npm registry access, or repo
+# checkout is needed at image-build time beyond these already-built
+# outputs; run the bundle step before `docker build`). Placed last (a
+# thermo-review suggestion), after the training-source/data copies above:
+# those change rarely, while this bundle changes on every graph-lab TS
+# edit, and Docker invalidates every layer from the first changed one
+# downward -- copying the most-volatile artifact last means a routine
+# JS-only rebuild no longer forces a redundant re-COPY of the more-static
+# Python engine sources and graph data beneath it.
+COPY backend/graph_lab/js /opt/graph-lab/js
+
 # `DD_IAST_ENABLED=false` is load-bearing, not copied boilerplate: the
 # host's Datadog auto-instrumentation is force-injected into every process
 # on this box (`/etc/ld.so.preload`) regardless of this image's own
@@ -72,6 +78,18 @@ COPY public/data/malecns-arena-v1.bin.gz public/data/malecns-arena-v1.manifest.j
 # `_nearest_egocentric_batch` with `RuntimeError: Boolean value of Tensor
 # with more than one value is ambiguous` -- reproduced running the GPU
 # atlas smoke test in this container before this line was added.
+# Note (a thermo-review action item): that `/etc/ld.so.preload`/
+# `/opt/datadog-packages` injection is this sandbox's container *runtime*
+# (`docker info`'s `Default Runtime: dd-shim`), not this image -- confirmed
+# by reproducing the identical injected paths against the raw, unmodified
+# upstream base image with zero Dockerfile changes applied, and by
+# `docker history` showing no layer here writing either path. These `ENV`
+# lines are still worth keeping as defense-in-depth (they neutralize the
+# behavioral bug regardless of which host runs the image), but a future
+# reader should not treat their presence as evidence the image itself
+# carries a Datadog dependency, and should not expect them to matter on
+# the actual production DGX Spark host (a plain `runc` Docker host, per
+# `04-launch-and-runbook.md`, with no `dd-shim`).
 ENV CUBLAS_WORKSPACE_CONFIG=:4096:8 \
     PYTHONUNBUFFERED=1 \
     TORCHINDUCTOR_CACHE_DIR=/tmp/torch-cache \

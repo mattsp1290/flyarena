@@ -2,8 +2,8 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 import { graphFromTaskMode, loadVerifiedGraphBinary } from '../null/null-worker-shared';
+import { runShardedEvaluation } from '../null/sharded-evaluation';
 import { conditionRng, pairedStats } from '../training/stats';
-import { runOnWorkers } from './shard';
 import type { LesionSeedResult, LesionWorkerMessage, LesionWorkerTask } from './worker-lesion';
 
 /**
@@ -21,6 +21,35 @@ import type { LesionSeedResult, LesionWorkerMessage, LesionWorkerTask } from './
  * unrelated cwd against a temp-directory fixture graph). It intentionally
  * does not implement every WP2 bound (e.g. the GPU-busy check has no
  * analog here) -- those live with the job kinds WP2 actually wires.
+ *
+ * Sharding: uses `scripts/null/sharded-evaluation.ts`'s `runShardedEvaluation`
+ * directly (not a graph-lab-local reimplementation). That module was
+ * extracted from `null-evaluate.ts` on `origin/main` specifically to be
+ * self-contained (its only import is `node:child_process`) and free of
+ * the top-level `if (process.argv[1] === fileURLToPath(import.meta.url))
+ * main();` CLI-invocation guard that made `null-evaluate.ts` itself unsafe
+ * to bundle (see this WP's earlier commits/report for the empirical
+ * reproduction of that hazard). `LesionWorkerTask`/`LesionSeedResult`/
+ * `LesionWorkerMessage` already satisfy its generic constraints
+ * (`graphId` + `heldOutSeeds`; `seed`; the `result`/`error` message
+ * shape), so no task-shape changes were needed. This also closes two
+ * safety gaps a graph-lab-local `shard.ts` had dropped versus the
+ * canonical version (a review finding): a `child.on('error', ...)`
+ * handler (a spawn-level failure, e.g. `EMFILE`/`ENOMEM` under GPU/CPU
+ * contention, now fails fast instead of hanging until the job's
+ * wall-clock ceiling) and the "clean exit while a task is still in
+ * flight" check. It also adds a self-checking protocol (a worker's reply
+ * must match the task actually in flight, by `graphId` and per-seed
+ * `seed`) and a completeness check (every task must have a result) that
+ * this file's own error handling didn't have before either.
+ *
+ * Trade-off accepted: `runShardedEvaluation` has no per-task-completion
+ * progress hook (unlike the graph-lab-local scheduler it replaces), so
+ * only one `progress` line is emitted (before sharding starts) rather
+ * than one per completed task. Correctness/safety over progress
+ * granularity -- neither reviewer asked for finer-grained progress, and
+ * `jobs.py`'s job store never required it (the job's terminal status
+ * always comes from the final `result`/`error` line, not from progress).
  */
 
 interface LesionArgs {
@@ -34,6 +63,17 @@ interface LesionArgs {
   readonly ticks: number;
   readonly shards?: number;
   readonly bootstrapResamples?: number;
+  /**
+   * `.agents/plans/task-generality/01-task-plumbing.md`'s WP1: forwarded
+   * verbatim to each task's `arenaTask` field (see `worker-lesion.ts`),
+   * which `runEpisode` resolves the same way `null-worker.ts` does.
+   * Absent means `'default'` (`ARENA_CONFIG`, unchanged) -- `jobs.py`'s
+   * `default_runner` does not set this yet (WP1's own job models have no
+   * arena-task field), so every request today runs the default task; this
+   * field exists so a future job-model addition needs no further entry
+   * changes.
+   */
+  readonly arenaTask?: string;
 }
 
 interface SetResult {
@@ -64,7 +104,8 @@ const buildTasks = (args: LesionArgs): LesionWorkerTask[] => {
     expectedSha256: args.expectedSha256,
     heldOutSeeds,
     ticks: args.ticks,
-    lesion: []
+    lesion: [],
+    arenaTask: args.arenaTask
   };
   const setTasks = args.sets.map(
     (indices, setIndex): LesionWorkerTask => ({
@@ -74,7 +115,8 @@ const buildTasks = (args: LesionArgs): LesionWorkerTask[] => {
       expectedSha256: args.expectedSha256,
       heldOutSeeds,
       ticks: args.ticks,
-      lesion: [...indices].sort((a, b) => a - b)
+      lesion: [...indices].sort((a, b) => a - b),
+      arenaTask: args.arenaTask
     })
   );
   return [baseline, ...setTasks];
@@ -105,11 +147,10 @@ const main = async (): Promise<void> => {
   const resamples = args.bootstrapResamples ?? 2000;
 
   printProgress({ completed: 0, total: tasks.length });
-  const results = await runOnWorkers<LesionWorkerTask, LesionSeedResult, LesionWorkerMessage>(
+  const results = await runShardedEvaluation<LesionWorkerTask, LesionSeedResult, LesionWorkerMessage>(
     tasks,
     shardCount,
-    workerPath,
-    (completed, total) => printProgress({ completed, total })
+    workerPath
   );
 
   const baselineScores = results.get('baseline');

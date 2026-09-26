@@ -308,6 +308,64 @@ class GraphIdValidationTests(unittest.TestCase):
                             time.sleep(0.05)
 
 
+ATLAS_BODY = {
+    "kind": "atlas",
+    "graph": "biological",
+    "searchSeed": 1729,
+    "population": 8,
+    "generations": 2,
+    "ticks": 300,
+}
+
+SWAPSET_BODY = {
+    "kind": "swapset",
+    "graph": "biological",
+    "swaps": [{"a": 0, "b": 1, "c": 2, "d": 3}],
+    "controls": 0,
+    "seedStart": 30001,
+    "seedCount": 4,
+    "ticks": 300,
+}
+
+
+class UnwiredJobKindDispatchTests(unittest.TestCase):
+    """A thermo-review finding: the one `isinstance` branch this WP adds
+    specifically to reject `atlas`/`swapset` (`service.py`'s `default_runner`:
+    `if isinstance(request, (AtlasJobRequest, SwapsetJobRequest)): raise
+    HTTPException(501, ...)`) had zero direct test coverage -- only the
+    `rewired:*` 501 path (a different branch, for `LesionJobRequest`) was
+    exercised. A future reordering of that `isinstance` chain, or a typo in
+    the discriminator match, could silently start 500ing (or worse,
+    mis-dispatching) an `atlas`/`swapset` request with nothing failing here."""
+
+    @staticmethod
+    def _real_default_runner_app():
+        # `make_app()`'s default `runner=instant_runner` is a test fake that
+        # bypasses `default_runner` entirely (it would return 202 for
+        # *any* kind) -- these tests specifically exercise the real
+        # dispatch `isinstance` chain, so `runner` must be left unset here,
+        # matching `test_every_closed_set_member_passes_validation_through_the_real_default_runner`'s
+        # own pattern. `data_dir`/`bundle_dir` are never read on this path
+        # (the 501 fires before either kind touches the filesystem), but a
+        # temp dir is still supplied for consistency/safety.
+        data_dir = tempfile.mkdtemp()
+        bundle_dir = tempfile.mkdtemp()
+        os.environ["GRAPH_LAB_ORIGINS"] = ALLOWED_ORIGIN
+        return create_app(token=TOKEN, data_dir=data_dir, bundle_dir=bundle_dir)
+
+    def test_atlas_returns_501(self):
+        app = self._real_default_runner_app()
+        with TestClient(app) as client:
+            response = client.post("/api/graph/v1/jobs", json=ATLAS_BODY, headers=HEADERS)
+            self.assertEqual(response.status_code, 501)
+
+    def test_swapset_returns_501(self):
+        app = self._real_default_runner_app()
+        with TestClient(app) as client:
+            response = client.post("/api/graph/v1/jobs", json=SWAPSET_BODY, headers=HEADERS)
+            self.assertEqual(response.status_code, 501)
+
+
 class SeedRangeTests(unittest.TestCase):
     def test_rejects_a_seed_range_that_overflows_uint32(self):
         """`src/lib/arena/world.ts`'s `normalizeSeed` does `seed >>> 0`

@@ -112,6 +112,48 @@ jobs:
         # with pyproject.toml.
         run: uv run --locked pytest tests_python
 
+  graph-lab:
+    name: graph-lab security test suite (uv, no GPU/container)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10.2.0
+        with:
+          enable-cache: true
+
+      - name: Run backend/graph_lab's test suite
+        # backend/graph_lab/tests/test_security.py (auth, CORS/PNA, body
+        # limits, subprocess-argv safety, process-group cancellation/
+        # timeout, secret-leak checks) is the plan's own stop/go gate
+        # (".agents/plans/graph-lab/00-overview.md": "WP1: the security
+        # test suite passes before any job engine is wired") -- previously
+        # runnable only via a manual `cd backend/graph_lab && uv run
+        # pytest`, with nothing wired into CI. `graph_lab`'s own
+        # pyproject.toml has no torch/GPU dependency (unlike `training/`,
+        # deliberately out of this workflow's scope per this file's own
+        # header comment -- `graph_lab`'s Dockerfile installs with
+        # `--no-deps` and relies on the pinned NVIDIA base image for
+        # torch/numpy/fastapi/uvicorn/pydantic, so this uv-managed venv
+        # only ever needs its own small, CPU-only pinned deps), and every
+        # test in this suite fakes its own subprocess `runner` rather than
+        # spawning the real esbuild-bundled Node entries or the container
+        # -- so this job needs neither a GPU nor a Docker build.
+        # `python -I` (isolated mode: ignores `PYTHONPATH`/user site) is
+        # not required on a clean GitHub Actions runner, but matches this
+        # repo's own documented local-dev workaround for a sandbox-only
+        # quirk (some dev/review sandboxes force-inject a Datadog
+        # `PYTHONPATH` via `/etc/ld.so.preload` regardless of the shell's
+        # own environment, shadowing `typing_extensions` and breaking
+        # `fastapi`/`anyio` imports -- see `backend/graph_lab/Dockerfile`'s
+        # own note on the same sandbox-runtime injection). Harmless and
+        # a no-op here, kept for parity so this exact command also works
+        # unchanged in that sandbox.
+        run: uv run --locked python -I -m pytest -q
+        working-directory: backend/graph_lab
+
   dependency-report:
     name: Dependency audit and license report
     runs-on: ubuntu-latest

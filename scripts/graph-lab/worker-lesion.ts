@@ -1,4 +1,5 @@
 import type { GraphMode } from '../../src/lib/connectome/format';
+import { resolveArenaTask } from '../../src/lib/arena/tasks';
 import { runEpisode } from '../training/episode';
 import {
   assertFiniteScores,
@@ -8,17 +9,18 @@ import {
 } from '../null/null-worker-shared';
 
 /**
- * `entry-lesion.ts`'s child process (forked by `shard.ts`'s `runOnWorkers`,
- * one task per lesion set plus one baseline task with an empty `lesion`).
- * Structurally a thin variant of `scripts/null/null-worker.ts`'s own
- * `runTask` -- reusing the exact same graph-loading and finite-score
- * helpers from `null-worker-shared.ts` (never modified; see this WP's
- * scope note in `entry-lesion.ts`) -- with one addition: each task carries
- * its own `lesion` set, passed straight through to `runEpisode`'s
- * `left.lesion` (`scripts/training/episode.ts`), which already validates
- * it (range, sorted-unique) before running. An empty `lesion` array is
- * numerically identical to no lesion at all (`episode.ts`'s own
- * documented convention), which is exactly what the baseline task uses.
+ * `entry-lesion.ts`'s child process (forked by `scripts/null/sharded-evaluation.ts`'s
+ * `runShardedEvaluation`, one task per lesion set plus one baseline task
+ * with an empty `lesion`). Structurally a thin variant of
+ * `scripts/null/null-worker.ts`'s own `runTask` -- reusing the exact same
+ * graph-loading and finite-score helpers from `null-worker-shared.ts`
+ * (never modified; see this WP's scope note in `entry-lesion.ts`) -- with
+ * one addition: each task carries its own `lesion` set, passed straight
+ * through to `runEpisode`'s `left.lesion` (`scripts/training/episode.ts`),
+ * which already validates it (range, sorted-unique) before running. An
+ * empty `lesion` array is numerically identical to no lesion at all
+ * (`episode.ts`'s own documented convention), which is exactly what the
+ * baseline task uses.
  */
 export interface LesionWorkerTask {
   readonly graphId: string;
@@ -30,6 +32,8 @@ export interface LesionWorkerTask {
   readonly ticks: number;
   /** Sorted, unique neuron indices to lesion for this task; empty means the unlesioned baseline. */
   readonly lesion: readonly number[];
+  /** `.agents/plans/task-generality/01-task-plumbing.md`'s WP1: the arena task id this task's `runEpisode` call resolves and scores against. Absent means `'default'` (`ARENA_CONFIG`, unchanged) -- see `validateTaskArenaTask` below for its IPC-boundary validation, mirroring `null-worker.ts`'s own. */
+  readonly arenaTask?: string;
 }
 
 export interface LesionSeedResult {
@@ -53,15 +57,33 @@ export interface LesionWorkerErrorMessage {
 
 export type LesionWorkerMessage = LesionWorkerResultMessage | LesionWorkerErrorMessage;
 
+/**
+ * Mirrors `null-worker.ts`'s own `validateTaskArenaTask`: `task.arenaTask`
+ * crosses the `fork`/IPC boundary as plain JSON, so it must be re-validated
+ * here rather than trusted from `LesionWorkerTask`'s compile-time type.
+ * Delegates to `resolveArenaTask` (the single source of truth for valid
+ * ids) instead of re-declaring the valid-id set.
+ */
+const validateTaskArenaTask = (arenaTask: unknown): string | undefined => {
+  if (arenaTask === undefined) return undefined;
+  if (typeof arenaTask !== 'string') {
+    throw new Error(`worker-lesion: task.arenaTask is not a string: ${JSON.stringify(arenaTask)}`);
+  }
+  resolveArenaTask(arenaTask); // throws with a specific message on an unrecognized id
+  return arenaTask;
+};
+
 const runTask = (task: LesionWorkerTask): readonly LesionSeedResult[] => {
   const graphBinary = loadVerifiedGraphBinary('worker-lesion', task.path, task.expectedSha256);
   const graph = graphFromTaskMode(task.mode, graphBinary);
   const lesion = task.lesion.length > 0 ? Int32Array.from(task.lesion) : undefined;
+  const arenaTask = validateTaskArenaTask(task.arenaTask);
 
   return task.heldOutSeeds.map((seed) => {
     const result = runEpisode({
       seed,
       ticks: task.ticks,
+      arenaTask,
       left: { decoder: 'authored', graph, lesion },
       right: { decoder: 'parked' }
     });

@@ -1,8 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
+import { runShardedEvaluation } from '../null/sharded-evaluation';
 import { conditionRng, pairedStats } from '../training/stats';
-import { runOnWorkers } from './shard';
 import type { ScoreSeedResult, ScoreWorkerMessage, ScoreWorkerTask } from './worker-score';
 
 /**
@@ -22,6 +22,11 @@ import type { ScoreSeedResult, ScoreWorkerMessage, ScoreWorkerTask } from './wor
  * that args file. If `baselineGraphId` names one of `graphs`, every other
  * graph's paired difference against it is also computed, matching the
  * lesion entry's own baseline-diff shape.
+ *
+ * Sharding: `scripts/null/sharded-evaluation.ts`'s `runShardedEvaluation`
+ * directly -- see `entry-lesion.ts`'s doc comment for the full rationale
+ * (self-contained, no CLI-invocation guard, and it closes two safety gaps
+ * a graph-lab-local scheduler had dropped).
  */
 interface SwapsetGraphSpec {
   readonly graphId: string;
@@ -38,6 +43,8 @@ interface SwapsetArgs {
   readonly ticks: number;
   readonly shards?: number;
   readonly bootstrapResamples?: number;
+  /** `.agents/plans/task-generality/01-task-plumbing.md`'s WP1: forwarded verbatim to each task's `arenaTask` field -- see `entry-lesion.ts`'s identical field for the full rationale. */
+  readonly arenaTask?: string;
 }
 
 const printProgress = (progress: Record<string, unknown>): void => {
@@ -64,7 +71,8 @@ const main = async (): Promise<void> => {
     path: graph.path,
     expectedSha256: graph.expectedSha256,
     heldOutSeeds,
-    ticks: args.ticks
+    ticks: args.ticks,
+    arenaTask: args.arenaTask
   }));
 
   const workerPath = fileURLToPath(new URL('./worker-score.mjs', import.meta.url));
@@ -72,11 +80,10 @@ const main = async (): Promise<void> => {
   const resamples = args.bootstrapResamples ?? 2000;
 
   printProgress({ completed: 0, total: tasks.length });
-  const results = await runOnWorkers<ScoreWorkerTask, ScoreSeedResult, ScoreWorkerMessage>(
+  const results = await runShardedEvaluation<ScoreWorkerTask, ScoreSeedResult, ScoreWorkerMessage>(
     tasks,
     shardCount,
-    workerPath,
-    (completed, total) => printProgress({ completed, total })
+    workerPath
   );
 
   const scores = args.graphs.map((graph) => {

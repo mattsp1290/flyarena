@@ -31,7 +31,19 @@ const outdir = resolve(repoRoot, 'backend/graph_lab/js');
 // `entry-atlas-reeval.ts`'s own doc comment for the full analysis and the
 // reproduced error). Reported as a plan deviation rather than bundling it
 // anyway or editing the guarded files (out of this WP's change surface).
-const ENTRY_NAMES = ['entry-lesion', 'entry-swapset', 'worker-lesion', 'worker-score'];
+//
+// Each entry is paired explicitly with the worker(s) it `fork()`s at
+// runtime (a thermo-review suggestion: a flat list of entry/worker names
+// in a row makes it easy to add one without the other, with no error
+// until a job silently fails trying to `fork()` a `.mjs` that was never
+// built). An entry with no worker of its own -- none exist yet -- would
+// list an empty `workers` array, still visible here rather than omitted.
+const ENTRY_WORKER_PAIRS = [
+  { entry: 'entry-lesion', workers: ['worker-lesion'] },
+  { entry: 'entry-swapset', workers: ['worker-score'] }
+];
+
+const ENTRY_NAMES = ENTRY_WORKER_PAIRS.flatMap(({ entry, workers }) => [entry, ...workers]);
 
 /** @param {Uint8Array | string} bytes */
 const sha256Hex = (bytes) => createHash('sha256').update(bytes).digest('hex');
