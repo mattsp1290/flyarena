@@ -96,6 +96,11 @@ dry_run_fixture=0
 seed_start=0
 seed_count=20
 replica_seed=101
+# task-generality WP1 (.agents/plans/task-generality/01-task-plumbing.md):
+# src/lib/arena/tasks.ts's ARENA_TASKS id, passed to flyarena-train's own
+# --arena-task at both invocation sites below. "default" (ARENA_CONFIG,
+# unchanged) unless overridden.
+arena_task="default"
 # population/elites/generations/train_seeds_per_generation/alpha/std_floor/
 # init_std/hidden_size are intentionally left UNSET here -- read_manifest_cem_config
 # (below) fills each one that is still unset after CLI parsing from
@@ -153,7 +158,7 @@ DEFAULT_GRAPH_LIST_TRAINED_OUT="training/runs/interventions/trained"
 # --rewired-trained-dir, etc.
 
 usage() {
-  echo "Usage: $0 [--dry-run-fixture] [--seed-start N] [--seed-count N] [--replica-seed N]" >&2
+  echo "Usage: $0 [--dry-run-fixture] [--seed-start N] [--seed-count N] [--replica-seed N] [--arena-task ID]" >&2
   echo "          [--population N] [--elites N] [--generations N] [--train-seeds-per-generation N]" >&2
   echo "          [--alpha F] [--std-floor F] [--init-std F] [--hidden-size N] [--ticks N]" >&2
   echo "          [--graph PATH] [--graphs-dir DIR] [--arms-out DIR] [--trained-out DIR]" >&2
@@ -167,6 +172,7 @@ while [[ $# -gt 0 ]]; do
     --seed-start) seed_start="${2:?}"; shift 2 ;;
     --seed-count) seed_count="${2:?}"; shift 2 ;;
     --replica-seed) replica_seed="${2:?}"; shift 2 ;;
+    --arena-task) arena_task="${2:?}"; shift 2 ;;
     --population) population="${2:?}"; shift 2 ;;
     --elites) elites="${2:?}"; shift 2 ;;
     --generations) generations="${2:?}"; shift 2 ;;
@@ -430,7 +436,7 @@ verified_intervention_graph_for_id() {
 verify_resumed_config_matches_request() {
   local config_path="$1"
   python3 - "$config_path" "$replica_seed" "$population" "$elites" "$generations" \
-    "$train_seeds_per_generation" "$alpha" "$std_floor" "$init_std" "$hidden_size" "$ticks" <<'PY'
+    "$train_seeds_per_generation" "$alpha" "$std_floor" "$init_std" "$hidden_size" "$ticks" "$arena_task" <<'PY'
 import json
 import sys
 
@@ -450,6 +456,7 @@ want = {
     "initStd": float(sys.argv[9]),
     "H": int(sys.argv[10]),
     "ticks": int(sys.argv[11]),
+    "arenaTask": sys.argv[12],
 }
 mismatches = {k: (c.get(k), v) for k, v in want.items() if c.get(k) != v}
 if mismatches:
@@ -635,6 +642,7 @@ if [[ "$graph_list_mode" -eq 1 ]]; then
       --alpha "$alpha" \
       --std-floor "$std_floor" \
       --init-std "$init_std" \
+      --arena-task "$arena_task" \
       --out "$(to_abs_path "$id_out")"
 
     echo "train-sample.sh: id ${id}: done"
@@ -704,6 +712,7 @@ for (( seed = seed_start; seed < seed_start + seed_count; seed += 1 )); do
     --alpha "$alpha" \
     --std-floor "$std_floor" \
     --init-std "$init_std" \
+    --arena-task "$arena_task" \
     --out "$(to_abs_path "$seed_out")"
 
   echo "train-sample.sh: seed ${seed}: done"
