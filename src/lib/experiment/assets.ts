@@ -202,6 +202,18 @@ export interface ArenaManifest {
    * it exists.
    */
   nullExplanation?: SidecarManifestEntry;
+  /**
+   * WP4 of `.agents/plans/pathway-interventions`: the clearance->thrust
+   * pathway intervention study's artifact. `scripts/null/intervention-artifact.ts`
+   * writes this once `pathway-interventions-v1.json` exists — see
+   * `./pathwayInterventions.ts#loadPathwayInterventions`. Optional: a
+   * manifest produced before that WP (or a hand-built test fixture) simply
+   * has no intervention study to show — `loadPathwayInterventions` reports
+   * that as `status: 'missing'` rather than throwing, and
+   * `NullExplanationNote.svelte` simply omits the tested-outcome sentence
+   * rather than pretending it exists.
+   */
+  pathwayInterventions?: SidecarManifestEntry;
   sourceDataset: string;
   rewiredArms: Record<
     string,

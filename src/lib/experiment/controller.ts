@@ -12,6 +12,7 @@ import {
 } from './assets';
 import { loadRewiringNull, type RewiringNullLoadResult } from './rewiringNull';
 import { loadNullExplanation, type NullExplanationLoadResult } from './nullExplanation';
+import { loadPathwayInterventions, type PathwayInterventionsLoadResult } from './pathwayInterventions';
 import { buildGraphBufferForMode, createWorkerAgentBinding } from './bindings';
 import { ExperimentRunner, isNotInitializedRejection, type ExperimentTelemetry } from './runner';
 import { transition, type ExperimentStatus } from './state';
@@ -100,6 +101,19 @@ export interface ExperimentControllerCallbacks {
    */
   onNullExplanation: (result: NullExplanationLoadResult) => void;
   /**
+   * Fired once `loadPathwayInterventions` resolves (WP4 of
+   * `.agents/plans/pathway-interventions`) — sequenced after the
+   * null-explanation load settles, for the same reason `onNullExplanation`
+   * is sequenced after `onRewiringNull`'s own load (never races ahead of
+   * the note this sentence is appended to; this artifact's own cross-check
+   * needs `manifest`, not the resolved `NullExplanationLoadResult`), but
+   * fired independently of `onNullExplanation` itself (a throwing
+   * `onNullExplanation` host callback must never also skip this one). Never
+   * blocks reaching `ready`. The host's hook for the ledger panel's
+   * tested-outcome sentence, rendered under the null-explanation note.
+   */
+  onPathwayInterventions: (result: PathwayInterventionsLoadResult) => void;
+  /**
    * Fired once per agent right after `setDecoder()` has successfully applied
    * a decoder switch to both arms' Workers and reset the run to tick 0 —
    * mirrors `onTopologyApplied`'s "never speculatively before a switch is
@@ -133,6 +147,12 @@ export interface ExperimentControllerOptions {
    * Same seam-for-testability reasoning as `loadRewiringNull` above.
    */
   loadNullExplanation?: typeof loadNullExplanation;
+  /**
+   * Injectable for tests; defaults to
+   * `./pathwayInterventions.ts#loadPathwayInterventions`. Same
+   * seam-for-testability reasoning as `loadNullExplanation` above.
+   */
+  loadPathwayInterventions?: typeof loadPathwayInterventions;
   /** Passed straight through to the constructed `ExperimentRunner` (see `ExperimentRunnerOptions.targetTickIntervalMs`); `0` disables real-time pacing entirely, which unit tests use to run a many-tick determinism check without waiting out real seconds. Omitted in production, matching the runner's own real-time default. */
   targetTickIntervalMs?: number;
 }
@@ -377,6 +397,7 @@ export class ExperimentController {
     const loadReadout = this.options.loadTrainedReadout ?? loadTrainedReadoutArtifact;
     const loadNull = this.options.loadRewiringNull ?? loadRewiringNull;
     const loadExplanation = this.options.loadNullExplanation ?? loadNullExplanation;
+    const loadInterventions = this.options.loadPathwayInterventions ?? loadPathwayInterventions;
     const dataBaseUrl = `${import.meta.env.BASE_URL}data`;
     let artifacts: LoadedArenaArtifacts;
     try {
@@ -452,7 +473,7 @@ export class ExperimentController {
     // untested and beyond what was asked; using the same shared helper as
     // `nullLoad` above keeps both forks' `destroyed` handling identical by
     // construction instead of two call sites that can silently disagree.
-    void runSidecarLoad<NullExplanationLoadResult>(
+    const explanationLoad = runSidecarLoad<NullExplanationLoadResult>(
       () => nullLoad.then(() => loadExplanation(artifacts.manifest, dataBaseUrl)),
       // `'unavailable'`, not `'invalid'` (mirrors `nullLoad`'s own mapping
       // above, and `NullExplanationLoadResult`'s doc comment): a genuine
@@ -462,6 +483,25 @@ export class ExperimentController {
       (reason) => ({ status: 'unavailable', reason: `unexpected error while loading the null explanation: ${reason}` }),
       () => this.destroyed,
       (result) => this.options.callbacks.onNullExplanation(result),
+      (message) => this.options.callbacks.onError(message)
+    );
+
+    // WP4 of `.agents/plans/pathway-interventions`: "Call it next to
+    // loadNullExplanation" — sequenced after `explanationLoad` *settles*
+    // (mirrors `explanationLoad`'s own reasoning for chaining after
+    // `nullLoad`: never races ahead of the note this sentence is appended
+    // to, and forked off the settled promise rather than the
+    // `onNullExplanation` dispatch, so a throwing `onNullExplanation` host
+    // callback can never silently skip this load too). `loadInterventions`
+    // only needs `manifest`/`dataBaseUrl` (its own cross-check re-reads
+    // `manifest.rewiringNull.sha256`/`manifest.nullExplanation.sha256`
+    // directly), so it is attempted unconditionally, independent of
+    // whichever status the explanation load itself resolved to.
+    void runSidecarLoad<PathwayInterventionsLoadResult>(
+      () => explanationLoad.then(() => loadInterventions(artifacts.manifest, dataBaseUrl)),
+      (reason) => ({ status: 'unavailable', reason: `unexpected error while loading the pathway-interventions study: ${reason}` }),
+      () => this.destroyed,
+      (result) => this.options.callbacks.onPathwayInterventions(result),
       (message) => this.options.callbacks.onError(message)
     );
 

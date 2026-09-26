@@ -1,5 +1,10 @@
 <script lang="ts">
   import type { NullExplanationLoadResult, NullExplanationQualifyingMetric } from '../experiment/nullExplanation';
+  import type {
+    PathwayInterventionsAuthoredCategory,
+    PathwayInterventionsLoadResult,
+    PathwayInterventionsTrainedCategory
+  } from '../experiment/pathwayInterventions';
   import { githubDocUrl } from './links';
 
   /**
@@ -28,9 +33,11 @@
     baselinePercentile: number;
     /** `rewiringNull.data.null.n` — the null set size (the report's `500` rewired versions), read from the verified artifact rather than hard-coded so a future re-run with a different count can never leave this note silently describing the wrong run. */
     rewiringCount: number;
+    /** `undefined` while `ExperimentController#initialize()`'s pathway-interventions load (WP4 of `.agents/plans/pathway-interventions`) has not yet resolved. */
+    pathwayInterventions: PathwayInterventionsLoadResult | undefined;
   }
 
-  let { nullExplanation, baselinePercentile, rewiringCount }: Props = $props();
+  let { nullExplanation, baselinePercentile, rewiringCount, pathwayInterventions }: Props = $props();
 
   /** WP4's report link, built the same way `NullHistogram.svelte`'s own `GITHUB_REPORT_URL` is (`./links.ts#githubDocUrl`) — `docs/` is not part of the deployed static site, so a relative link would 404 under any base path. */
   const NULL_EXPLANATION_REPORT_URL = githubDocUrl('null-explanation-report.md');
@@ -193,6 +200,59 @@
         : "The linear-regime check passed, so the linear-transfer analysis above is treated as applicable to this model's dynamics."
       : ''
   );
+
+  /**
+   * WP4 of `.agents/plans/pathway-interventions`: the tested-outcome
+   * sentence, templated from the verified artifact's own predeclared
+   * category (`00-overview.md`'s vocabulary, stated mechanically — this
+   * never reads as a stronger or weaker claim than the category itself
+   * licenses). One template per authored category, each carrying the
+   * "net effect of the accepted swap set, not a single-edge effect"
+   * framing in its own wording so a reader never mistakes this for a
+   * single-edge causal claim.
+   */
+  const PATHWAY_AUTHORED_CLAUSE: Record<PathwayInterventionsAuthoredCategory, string> = {
+    'pathway-supported':
+      "the pathway-supported category holds: the accepted swap set's net effect outperforms both the unrestricted (C) and class-matched (M) random controls",
+    'edge-class-effect':
+      'the edge-class-effect category holds: the accepted swap set outperforms the unrestricted (C) control but not the class-matched (M) control — any edge of this class helps about equally',
+    'generic-rewiring-effect':
+      "the generic-rewiring-effect category holds: the accepted swap set's net effect does not clearly outperform either control — any perturbation of this size helps about equally",
+    'not-supported': "the not-supported category holds: the accepted swap set's net effect does not clear the null's 25th percentile"
+  };
+
+  /**
+   * One template per trained category — see
+   * `scripts/null/intervention-report-trained.ts`'s own doc comment for why
+   * `'no-specific-effect'` is not a renamed authored category (it is the
+   * deliberate merge of `'generic-rewiring-effect'`/`'not-supported'` for
+   * the trained side, where this study's predeclared rules cannot decide
+   * that finer split). Used only when `trainedRobust` is true — see
+   * `pathwayTrainedClause` below for the non-robust wording.
+   */
+  const PATHWAY_TRAINED_CLAUSE: Record<PathwayInterventionsTrainedCategory, string> = {
+    'pathway-supported': 'P also outperforms both freshly-trained control arms across all three trainer seeds tested',
+    'edge-class-effect': 'P outperforms the freshly-trained unrestricted (C) arm but not the class-matched (M) arm, across all three trainer seeds tested',
+    'no-specific-effect': 'P shows no advantage over either freshly-trained control arm, across all three trainer seeds tested'
+  };
+
+  const pathwayChannelSpecificClause = $derived(
+    pathwayInterventions?.status === 'ok'
+      ? pathwayInterventions.data.authored.channelSpecific
+        ? 'the channel-specific modifier holds (Q, using only clearance-channel sources, clears its own class-matched control)'
+        : 'the channel-specific modifier does not hold'
+      : ''
+  );
+
+  const pathwayTrainedClause = $derived(
+    pathwayInterventions?.status === 'ok'
+      ? pathwayInterventions.data.trained.trainedRobust
+        ? `under trained readouts, ${PATHWAY_TRAINED_CLAUSE[pathwayInterventions.data.trained.perSeedCategory['101']]} (robust)`
+        : 'under trained readouts, the three trainer seeds do not agree on a category (not robust)'
+      : ''
+  );
+
+  const PATHWAY_INTERVENTIONS_REPORT_URL = githubDocUrl('pathway-interventions-report.md');
 </script>
 
 {#if nullExplanation?.status === 'ok'}
@@ -219,6 +279,31 @@
     <ul class="links">
       <li><a href={NULL_EXPLANATION_REPORT_URL} target="_blank" rel="noreferrer">Full explanation report</a></li>
     </ul>
+
+    <!-- WP4 of `.agents/plans/pathway-interventions`: the tested-outcome
+         sentence, under this same explanation paragraph. `pathwayInterventions`
+         is a wholly separate load from `nullExplanation` above (its own
+         artifact, its own manifest entry) — `'missing'` hides this sentence
+         entirely (nothing was ever shipped); `'unavailable'` and `'invalid'`
+         each show their own honestly-worded message, mirroring every other
+         sidecar artifact in this panel. -->
+    {#if pathwayInterventions?.status === 'ok'}
+      <p class="pathway-interventions-sentence">
+        Tested under this model: {PATHWAY_AUTHORED_CLAUSE[pathwayInterventions.data.authored.category]}, and {pathwayChannelSpecificClause}.
+        {pathwayTrainedClause}.
+      </p>
+      <ul class="links">
+        <li><a href={PATHWAY_INTERVENTIONS_REPORT_URL} target="_blank" rel="noreferrer">Intervention report</a></li>
+      </ul>
+    {:else if pathwayInterventions?.status === 'unavailable'}
+      <p class="error-message">
+        Intervention test could not be loaded: {pathwayInterventions.reason}
+      </p>
+    {:else if pathwayInterventions?.status === 'invalid'}
+      <p class="error-message">
+        Intervention test failed verification: {pathwayInterventions.reason}
+      </p>
+    {/if}
   </div>
 {:else if nullExplanation?.status === 'unavailable'}
   <!-- A fetch/network failure or an unexpected runtime error — not a

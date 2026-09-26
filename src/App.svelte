@@ -11,6 +11,7 @@
   } from './lib/experiment/assets';
   import type { RewiringNullLoadResult } from './lib/experiment/rewiringNull';
   import type { NullExplanationLoadResult } from './lib/experiment/nullExplanation';
+  import type { PathwayInterventionsLoadResult } from './lib/experiment/pathwayInterventions';
   import { ExperimentController } from './lib/experiment/controller';
   import type { ExperimentRunner, ExperimentTelemetry } from './lib/experiment/runner';
   import type { ExperimentStatus } from './lib/experiment/state';
@@ -85,6 +86,8 @@
   let rewiringNullStatus = $state<RewiringNullLoadResult | undefined>(undefined);
   /** `undefined` until `initialize()`'s null-explanation load resolves (WP4 of `.agents/plans/null-explanation`); feeds the ledger's finding note next to the "Topology null distribution" histogram. Loading it never blocks Start, and never blocks reaching a settled `rewiringNullStatus` either — see `ExperimentController#initialize`'s doc comment. */
   let nullExplanationStatus = $state<NullExplanationLoadResult | undefined>(undefined);
+  /** `undefined` until `initialize()`'s pathway-interventions load resolves (WP4 of `.agents/plans/pathway-interventions`); feeds the ledger's tested-outcome sentence under the null-explanation note. Loading it never blocks Start, and never blocks reaching a settled `nullExplanationStatus` either — see `ExperimentController#initialize`'s doc comment. */
+  let pathwayInterventionsStatus = $state<PathwayInterventionsLoadResult | undefined>(undefined);
   /** True for the duration of an in-flight `controller.setDecoder()` call — set/cleared locally around that call (there is only ever one decoder shared by both arms, unlike per-arm topology switches, so a single flag suffices). */
   let decoderSwitchPending = $state(false);
 
@@ -332,6 +335,9 @@
         onNullExplanation: (result) => {
           if (!destroyed) nullExplanationStatus = result;
         },
+        onPathwayInterventions: (result) => {
+          if (!destroyed) pathwayInterventionsStatus = result;
+        },
         onDecoderApplied: (next) => {
           if (!destroyed) decoder = next;
         }
@@ -498,6 +504,7 @@
       trainedReadout={trainedReadoutStatus}
       rewiringNull={rewiringNullStatus}
       nullExplanation={nullExplanationStatus}
+      pathwayInterventions={pathwayInterventionsStatus}
     />
   </aside>
 </main>

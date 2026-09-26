@@ -5,6 +5,7 @@ import type { GraphMode } from '../../src/lib/connectome/format';
 import type { ArenaManifest, TrainedReadoutLoadResult } from '../../src/lib/experiment/assets';
 import type { RewiringNullLoadResult } from '../../src/lib/experiment/rewiringNull';
 import type { NullExplanationLoadResult } from '../../src/lib/experiment/nullExplanation';
+import type { PathwayInterventionsLoadResult } from '../../src/lib/experiment/pathwayInterventions';
 import type { ExperimentStatus } from '../../src/lib/experiment/state';
 import type { DecoderKind } from '../../src/lib/worker/protocol';
 import { createPublicDataFetch, FakeNeuralWorker } from '../helpers/fake-worker';
@@ -30,6 +31,7 @@ export type TestControllerCallbacks = ExperimentControllerCallbacks & {
   trainedReadoutStatuses: TrainedReadoutLoadResult[];
   rewiringNullResults: RewiringNullLoadResult[];
   nullExplanationResults: NullExplanationLoadResult[];
+  pathwayInterventionsResults: PathwayInterventionsLoadResult[];
   decodersApplied: DecoderKind[];
 };
 
@@ -41,6 +43,7 @@ export const createCallbacks = (): TestControllerCallbacks => {
   const trainedReadoutStatuses: TrainedReadoutLoadResult[] = [];
   const rewiringNullResults: RewiringNullLoadResult[] = [];
   const nullExplanationResults: NullExplanationLoadResult[] = [];
+  const pathwayInterventionsResults: PathwayInterventionsLoadResult[] = [];
   const decodersApplied: DecoderKind[] = [];
   return {
     statuses,
@@ -50,6 +53,7 @@ export const createCallbacks = (): TestControllerCallbacks => {
     trainedReadoutStatuses,
     rewiringNullResults,
     nullExplanationResults,
+    pathwayInterventionsResults,
     decodersApplied,
     onStatusChange: (status) => statuses.push(status),
     onTelemetry: vi.fn(),
@@ -60,6 +64,7 @@ export const createCallbacks = (): TestControllerCallbacks => {
     onTrainedReadoutStatus: (status) => trainedReadoutStatuses.push(status),
     onRewiringNull: (result) => rewiringNullResults.push(result),
     onNullExplanation: (result) => nullExplanationResults.push(result),
+    onPathwayInterventions: (result) => pathwayInterventionsResults.push(result),
     onDecoderApplied: (decoder) => decodersApplied.push(decoder)
   };
 };

@@ -2,6 +2,7 @@
   import type { ArenaManifest, TrainedReadoutLoadResult } from '../experiment/assets';
   import type { RewiringNullLoadResult } from '../experiment/rewiringNull';
   import type { NullExplanationLoadResult } from '../experiment/nullExplanation';
+  import type { PathwayInterventionsLoadResult } from '../experiment/pathwayInterventions';
   import type { DecoderKind } from '../worker/protocol';
   import NullHistogram from './NullHistogram.svelte';
   import NullExplanationNote from './NullExplanationNote.svelte';
@@ -29,9 +30,11 @@
     rewiringNull: RewiringNullLoadResult | undefined;
     /** `undefined` while `ExperimentController#initialize()`'s null-explanation load (WP4 of `.agents/plans/null-explanation`) has not yet resolved. */
     nullExplanation: NullExplanationLoadResult | undefined;
+    /** `undefined` while `ExperimentController#initialize()`'s pathway-interventions load (WP4 of `.agents/plans/pathway-interventions`) has not yet resolved. */
+    pathwayInterventions: PathwayInterventionsLoadResult | undefined;
   }
 
-  let { manifest, decoder, trainedReadout, rewiringNull, nullExplanation }: Props = $props();
+  let { manifest, decoder, trainedReadout, rewiringNull, nullExplanation, pathwayInterventions }: Props = $props();
 
   const LEDGER_ROWS = $derived<readonly { term: string; label: string }[]>([
     { term: 'Graph topology', label: 'Measured' },
@@ -108,7 +111,14 @@
     // instead disclosed in place, next to the histogram itself (see the
     // section below), the same "row stays static, per-session status shown
     // in place" split "Lesion effect map"'s own doc comment explains.
-    { term: 'Null-result explanation', label: 'Computed (offline)' }
+    { term: 'Null-result explanation', label: 'Computed (offline)' },
+    // WP4 of `.agents/plans/pathway-interventions`: same static-row/
+    // in-place-status split as "Null-result explanation" above — this row
+    // documents what the study *is*; a missing/failed-verification
+    // tested-outcome sentence is disclosed in place, inside
+    // `NullExplanationNote.svelte` (mirroring that component's own
+    // `nullExplanation` handling).
+    { term: 'Pathway intervention test', label: 'Computed (offline)' }
   ]);
 
   const reportUrl = $derived(`${import.meta.env.BASE_URL}data/trained-readout-v1.report.json`);
@@ -236,7 +246,7 @@
            internally (`'missing'` hides the whole block; the other two show
            their own honestly-worded message), mirroring
            `rewiringNull.status`'s own three-way split just below. -->
-      <NullExplanationNote {nullExplanation} baselinePercentile={rewiringNull.data.bioPercentile} rewiringCount={rewiringNull.data.null.n} />
+      <NullExplanationNote {nullExplanation} {pathwayInterventions} baselinePercentile={rewiringNull.data.bioPercentile} rewiringCount={rewiringNull.data.null.n} />
     {:else if rewiringNull.status === 'unavailable'}
       <!-- A fetch/network failure or an unexpected runtime error
            (`controller.ts`'s leading `.catch`) — not a claim about the

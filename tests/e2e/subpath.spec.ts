@@ -15,6 +15,13 @@ test('all views work beneath /fly/ with root asset routes deliberately unavailab
   // up in the `failed` 4xx/5xx log asserted at the end of this test.
   await expect(page.getByRole('heading',{name:/what biological's low score is associated with/i})).toBeVisible({timeout:20000});
   await expect(page.locator('.null-explanation-detail')).toContainText(/linear signal gain from right clearance input to thrust output/i);
+  // WP4 of `.agents/plans/pathway-interventions`: `loadPathwayInterventions`
+  // (chained after `loadNullExplanation`, both fired from `initialize()`
+  // under this same /fly/-prefixed `dataBaseUrl`) must resolve to its real
+  // "ok" tested-outcome sentence here too, not silently 404 against the
+  // deliberately-unavailable root /data/ path.
+  await expect(page.locator('.null-explanation-detail')).toContainText(/tested under this model.*the pathway-supported category holds/is);
+  await expect(page.getByRole('link',{name:/intervention report/i})).toHaveAttribute('href','https://github.com/mattsp1290/flyarena/blob/main/docs/pathway-interventions-report.md');
   // WP3: `loadPositions` fetches the positions sidecar under this same
   // /fly/ base path — if it fell back to the (deliberately 404ing) root
   // /data/ path instead, the toggle would stay disabled forever and
@@ -76,4 +83,17 @@ test('real HTTP origin verifies graph hashes in both the arena and experiment Wo
   await page.reload();
   await expect(page.getByRole('alert')).toContainText('sha256');
   await expect(page.getByRole('button',{name:'Fork & compare →'})).toBeDisabled();
+});
+
+test('a tampered pathway-interventions-v1.json under /fly/ shows an honest verification-failure message, while the rest of the app (Start included) keeps working', async ({page}) => {
+  await page.route('**/data/pathway-interventions-v1.json', async route => {
+    const bytes = await readFile('public/data/pathway-interventions-v1.json');
+    bytes[10] ^= 0xff;
+    await route.fulfill({status:200, contentType:'application/json', body:bytes});
+  });
+  await page.goto('/fly/');
+  await expect(page.getByRole('status')).toHaveText('ready');
+  await expect(page.locator('.ledger')).toContainText(/intervention test failed verification/i);
+  await expect(page.locator('body')).not.toContainText(/tested under this model/i);
+  await expect(page.getByRole('heading',{name:/what biological's low score is associated with/i})).toBeVisible();
 });

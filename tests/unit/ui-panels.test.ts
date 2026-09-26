@@ -349,7 +349,7 @@ describe('LedgerPanel', () => {
   };
 
   it('renders the ledger vocabulary, never says brain emulation, and links to the manifest/ledger/license', () => {
-    const { container } = render(LedgerPanel, { manifest, decoder: 'authored', trainedReadout: undefined, rewiringNull: undefined, nullExplanation: undefined });
+    const { container } = render(LedgerPanel, { manifest, decoder: 'authored', trainedReadout: undefined, rewiringNull: undefined, nullExplanation: undefined, pathwayInterventions: undefined });
 
     expect(ledgerRow(container, 'Graph topology')).toHaveTextContent('Measured');
     expect(ledgerRow(container, 'Biological annotations')).toHaveTextContent('Annotated');
@@ -378,7 +378,7 @@ describe('LedgerPanel', () => {
   });
 
   it('renders the static ledger vocabulary even without a loaded manifest', () => {
-    const { container } = render(LedgerPanel, { manifest: undefined, decoder: 'authored', trainedReadout: undefined, rewiringNull: undefined, nullExplanation: undefined });
+    const { container } = render(LedgerPanel, { manifest: undefined, decoder: 'authored', trainedReadout: undefined, rewiringNull: undefined, nullExplanation: undefined, pathwayInterventions: undefined });
     expect(ledgerRow(container, 'Graph topology')).toHaveTextContent('Measured');
   });
 
@@ -392,7 +392,7 @@ describe('LedgerPanel', () => {
   } as unknown as TrainedReadoutLoadResult;
 
   it('shows the "Readout (trained mode)" row and provenance detail (hash prefix, param count, D -> H -> 3, report links) when the artifact is ok, visible even in Authored mode', () => {
-    const { container } = render(LedgerPanel, { manifest, decoder: 'authored', trainedReadout: trainedReadoutOk, rewiringNull: undefined, nullExplanation: undefined });
+    const { container } = render(LedgerPanel, { manifest, decoder: 'authored', trainedReadout: trainedReadoutOk, rewiringNull: undefined, nullExplanation: undefined, pathwayInterventions: undefined });
 
     expect(ledgerRow(container, 'Readout (trained mode)')).toHaveTextContent('Trained (offline)');
     expect(screen.getByText('835')).toBeInTheDocument();
@@ -410,7 +410,7 @@ describe('LedgerPanel', () => {
   });
 
   it('scopes the "Sensory encoder and action decoder" row label to Trained mode', () => {
-    const { container } = render(LedgerPanel, { manifest, decoder: 'trained', trainedReadout: trainedReadoutOk, rewiringNull: undefined, nullExplanation: undefined });
+    const { container } = render(LedgerPanel, { manifest, decoder: 'trained', trainedReadout: trainedReadoutOk, rewiringNull: undefined, nullExplanation: undefined, pathwayInterventions: undefined });
     const row = ledgerRow(container, 'Sensory encoder and action decoder');
     expect(row).toHaveTextContent(/authored/i);
     expect(row).toHaveTextContent(/trained/i);
@@ -422,7 +422,8 @@ describe('LedgerPanel', () => {
       decoder: 'authored',
       trainedReadout: { status: 'unavailable', reason: 'trained-readout-v1.json sha256 mismatch' },
       rewiringNull: undefined,
-      nullExplanation: undefined
+      nullExplanation: undefined,
+      pathwayInterventions: undefined
     });
     const message = screen.getByText(/artifact failed verification/i);
     expect(message).toHaveTextContent(/sha256 mismatch/i);
@@ -481,7 +482,8 @@ describe('LedgerPanel', () => {
       decoder: 'authored',
       trainedReadout: undefined,
       rewiringNull: rewiringNullOk,
-      nullExplanation: undefined
+      nullExplanation: undefined,
+      pathwayInterventions: undefined
     });
 
     expect(ledgerRow(container, 'Topology null distribution')).toHaveTextContent('Computed (offline)');
@@ -513,7 +515,8 @@ describe('LedgerPanel', () => {
       decoder: 'authored',
       trainedReadout: undefined,
       rewiringNull: { status: 'absent', reason: 'no entry' },
-      nullExplanation: undefined
+      nullExplanation: undefined,
+      pathwayInterventions: undefined
     });
     expect(ledgerRow(container, 'Topology null distribution')).toHaveTextContent('Computed (offline) — not shipped');
     expect(screen.queryByRole('heading', { name: /topology null distribution/i })).not.toBeInTheDocument();
@@ -526,7 +529,8 @@ describe('LedgerPanel', () => {
       decoder: 'authored',
       trainedReadout: undefined,
       rewiringNull: { status: 'invalid', reason: 'rewiring-null artifact sha256 mismatch' },
-      nullExplanation: undefined
+      nullExplanation: undefined,
+      pathwayInterventions: undefined
     });
     const message = screen.getByText(/null-distribution result failed verification/i);
     expect(message).toHaveTextContent(/sha256 mismatch/i);
@@ -542,7 +546,8 @@ describe('LedgerPanel', () => {
       decoder: 'authored',
       trainedReadout: undefined,
       rewiringNull: { status: 'unavailable', reason: 'network error (test)' },
-      nullExplanation: undefined
+      nullExplanation: undefined,
+      pathwayInterventions: undefined
     });
     const message = screen.getByText(/null-distribution result could not be loaded/i);
     expect(message).toHaveTextContent(/network error \(test\)/i);
@@ -557,7 +562,8 @@ describe('LedgerPanel', () => {
       decoder: 'authored',
       trainedReadout: undefined,
       rewiringNull: undefined,
-      nullExplanation: undefined
+      nullExplanation: undefined,
+      pathwayInterventions: undefined
     });
     expect(ledgerRow(container, 'Topology null distribution')).toHaveTextContent('Loading…');
     expect(screen.queryByRole('heading', { name: /topology null distribution/i })).not.toBeInTheDocument();
@@ -572,7 +578,8 @@ describe('LedgerPanel', () => {
       decoder: 'authored',
       trainedReadout: undefined,
       rewiringNull: undefined,
-      nullExplanation: undefined
+      nullExplanation: undefined,
+      pathwayInterventions: undefined
     });
     expect(ledgerRow(container, 'Null-result explanation')).toHaveTextContent('Computed (offline)');
   });
@@ -583,7 +590,8 @@ describe('LedgerPanel', () => {
       decoder: 'authored',
       trainedReadout: undefined,
       rewiringNull: rewiringNullOk,
-      nullExplanation: nullExplanationOk
+      nullExplanation: nullExplanationOk,
+      pathwayInterventions: undefined
     });
 
     expect(screen.getByRole('heading', { name: /what biological's low score is associated with/i })).toBeInTheDocument();
@@ -663,7 +671,8 @@ describe('LedgerPanel', () => {
       decoder: 'authored',
       trainedReadout: undefined,
       rewiringNull: rewiringNullOk,
-      nullExplanation: movedUp
+      nullExplanation: movedUp,
+      pathwayInterventions: undefined
     });
     // rewiringNullOk.data.bioPercentile is 0 — the baseline is read from the
     // real un-mirrored result, not assumed to be 0 (round-2 dual review,
@@ -684,7 +693,8 @@ describe('LedgerPanel', () => {
       decoder: 'authored',
       trainedReadout: undefined,
       rewiringNull: nonzeroBaseline,
-      nullExplanation: nullExplanationOk
+      nullExplanation: nullExplanationOk,
+      pathwayInterventions: undefined
     });
     expect(screen.getByText(/moves biological from the 20\.0th percentile to the 0\.0th percentile/i)).toBeInTheDocument();
     expect(screen.queryByText(/still leaves biological at the bottom/i)).not.toBeInTheDocument();
@@ -719,7 +729,8 @@ describe('LedgerPanel', () => {
       decoder: 'authored',
       trainedReadout: undefined,
       rewiringNull: rewiringNullOk,
-      nullExplanation: twoFeatureMetrics
+      nullExplanation: twoFeatureMetrics,
+      pathwayInterventions: undefined
     });
     const sensitiveLinks = screen.getAllByRole('link', { name: /definition-sensitive/i });
     expect(sensitiveLinks).toHaveLength(1);
@@ -737,7 +748,8 @@ describe('LedgerPanel', () => {
       decoder: 'authored',
       trainedReadout: undefined,
       rewiringNull: rewiringNullOk,
-      nullExplanation: { status: 'invalid', reason: 'null-explanation artifact sha256 mismatch' }
+      nullExplanation: { status: 'invalid', reason: 'null-explanation artifact sha256 mismatch' },
+      pathwayInterventions: undefined
     });
     const message = screen.getByText(/explanation failed verification/i);
     expect(message).toHaveTextContent(/sha256 mismatch/i);
@@ -750,7 +762,8 @@ describe('LedgerPanel', () => {
       decoder: 'authored',
       trainedReadout: undefined,
       rewiringNull: rewiringNullOk,
-      nullExplanation: { status: 'unavailable', reason: 'network error (test)' }
+      nullExplanation: { status: 'unavailable', reason: 'network error (test)' },
+      pathwayInterventions: undefined
     });
     const message = screen.getByText(/explanation could not be loaded/i);
     expect(message).toHaveTextContent(/network error \(test\)/i);
@@ -764,7 +777,8 @@ describe('LedgerPanel', () => {
       decoder: 'authored',
       trainedReadout: undefined,
       rewiringNull: rewiringNullOk,
-      nullExplanation: { status: 'missing', reason: 'The manifest has no nullExplanation artifact entry.' }
+      nullExplanation: { status: 'missing', reason: 'The manifest has no nullExplanation artifact entry.' },
+      pathwayInterventions: undefined
     });
     expect(screen.queryByRole('heading', { name: /what biological's low score is associated with/i })).not.toBeInTheDocument();
     expect(screen.queryByText(/explanation failed verification/i)).not.toBeInTheDocument();
