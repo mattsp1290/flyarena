@@ -1,6 +1,6 @@
 import { fork } from 'node:child_process';
 import { mkdirSync, readFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gunzipSync } from 'node:zlib';
 
@@ -280,8 +280,21 @@ export const readGraphListIndex = (path: string): GraphListIndex => {
     // mis-generated index silently read a file outside the run's own graph
     // set. Content integrity is still independently enforced by both sha
     // layers either way, so this is a fail-fast/contract check, not the
-    // primary integrity guard.
-    if (entry.path.startsWith('/') || entry.path.split('/').includes('..')) {
+    // primary integrity guard. Resolution-based (not a raw string check on
+    // `entry.path` for a leading `/` or a `..` path segment): a string check
+    // both under- and over-rejects -- it would miss a Windows-style
+    // drive-absolute path, and it would reject an in-bounds path like
+    // `"graphs/../graphs/P.bin.gz"` that a resolution-based check correctly
+    // allows (a dual-review finding).
+    const indexDir = dirname(path);
+    const relativeToIndexDir = relative(indexDir, resolve(indexDir, entry.path));
+    if (
+      isAbsolute(entry.path) ||
+      relativeToIndexDir === '' ||
+      relativeToIndexDir === '..' ||
+      relativeToIndexDir.startsWith(`..${sep}`) ||
+      isAbsolute(relativeToIndexDir)
+    ) {
       throw new Error(
         `null-evaluate: ${path} entry "${entry.id}" has a path outside index.json's own directory: "${entry.path}"`
       );

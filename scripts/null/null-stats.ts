@@ -52,8 +52,7 @@ export interface NullSummary {
  * sorted null set itself rather than to bootstrap resamples, since "null
  * mean, median, std, 2.5/97.5 percentiles" (the plan's own wording) are
  * empirical statistics of the null set, not a bootstrap of it.
- */
-/**
+ *
  * Exported (a dual-review finding on `scripts/null/intervention-report.ts`,
  * WP2 of the pathway-interventions study): that module needs the exact same
  * low-tail-floor / high-tail-ceil-minus-one quantile convention for its own

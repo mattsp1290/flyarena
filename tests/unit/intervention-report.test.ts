@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
@@ -16,7 +16,7 @@ import {
   readPublishedNull,
   runInterventionReport,
   type GraphKind,
-  type GraphListIndexEntryInfo,
+  type GraphListIndexInfo,
   type InterventionReportArgs,
   type PublishedNull
 } from '../../scripts/null/intervention-report';
@@ -104,7 +104,8 @@ describe('publishedNullFloorValue', () => {
       scores,
       sourceGraphSha256: 'x'.repeat(64),
       seeds: { start: 30001, count: 100 },
-      ticks: 1800
+      ticks: 1800,
+      substeps: 4
     };
     expect(publishedNullFloorValue(publishedNull)).toBe(3);
   });
@@ -165,7 +166,8 @@ describe('checkBiologicalReproduction', () => {
     scores: [0, 1, 2, 3],
     sourceGraphSha256: 'x'.repeat(64),
     seeds: { start: 30001, count: 100 },
-    ticks: 1800
+    ticks: 1800,
+    substeps: 4
   });
 
   it('matches when the computed mean equals the published score exactly', () => {
@@ -186,11 +188,12 @@ describe('readGraphListIndexInfo', () => {
     root = mkdtempSync(join(tmpdir(), 'intervention-report-info-'));
   });
 
-  it('parses id -> {kind, gzipSha256} from index.json entries', () => {
+  it('parses id -> {kind, gzipSha256} plus controlCount from index.json entries', () => {
     const path = join(root, 'index.json');
     writeFileSync(
       path,
       JSON.stringify({
+        controlCount: 100,
         entries: [
           { id: 'P', kind: 'P', gzipSha256: 'a'.repeat(64) },
           { id: 'C000', kind: 'C', gzipSha256: 'b'.repeat(64) },
@@ -199,34 +202,51 @@ describe('readGraphListIndexInfo', () => {
       })
     );
     const info = readGraphListIndexInfo(path);
-    expect(info.get('P')).toEqual({ kind: 'P', gzipSha256: 'a'.repeat(64) });
-    expect(info.get('C000')).toEqual({ kind: 'C', gzipSha256: 'b'.repeat(64) });
-    expect(info.get('MQ2000')).toEqual({ kind: 'MQ', gzipSha256: 'c'.repeat(64) });
+    expect(info.controlCount).toBe(100);
+    expect(info.entries.get('P')).toEqual({ kind: 'P', gzipSha256: 'a'.repeat(64) });
+    expect(info.entries.get('C000')).toEqual({ kind: 'C', gzipSha256: 'b'.repeat(64) });
+    expect(info.entries.get('MQ2000')).toEqual({ kind: 'MQ', gzipSha256: 'c'.repeat(64) });
   });
 
   it('rejects an entry with an unrecognized kind', () => {
     const path = join(root, 'index.json');
-    writeFileSync(path, JSON.stringify({ entries: [{ id: 'X', kind: 'bogus', gzipSha256: 'a'.repeat(64) }] }));
+    writeFileSync(
+      path,
+      JSON.stringify({ controlCount: 1, entries: [{ id: 'X', kind: 'bogus', gzipSha256: 'a'.repeat(64) }] })
+    );
     expect(() => readGraphListIndexInfo(path)).toThrow(/malformed entry/);
   });
 
   it('rejects an entry missing gzipSha256', () => {
     const path = join(root, 'index.json');
-    writeFileSync(path, JSON.stringify({ entries: [{ id: 'X', kind: 'C' }] }));
+    writeFileSync(path, JSON.stringify({ controlCount: 1, entries: [{ id: 'X', kind: 'C' }] }));
     expect(() => readGraphListIndexInfo(path)).toThrow(/malformed entry/);
   });
 
   it('rejects a duplicate id (even with the same kind/sha)', () => {
     const path = join(root, 'index.json');
     const entry = { id: 'X', kind: 'C', gzipSha256: 'a'.repeat(64) };
-    writeFileSync(path, JSON.stringify({ entries: [entry, { ...entry }] }));
+    writeFileSync(path, JSON.stringify({ controlCount: 1, entries: [entry, { ...entry }] }));
     expect(() => readGraphListIndexInfo(path)).toThrow(/more than once/);
   });
 
   it('rejects an empty entries array', () => {
     const path = join(root, 'index.json');
-    writeFileSync(path, JSON.stringify({ entries: [] }));
+    writeFileSync(path, JSON.stringify({ controlCount: 1, entries: [] }));
     expect(() => readGraphListIndexInfo(path)).toThrow(/has no entries/);
+  });
+
+  it('rejects a missing/non-positive-integer controlCount', () => {
+    const path = join(root, 'index.json');
+    const entry = { id: 'X', kind: 'C', gzipSha256: 'a'.repeat(64) };
+    writeFileSync(path, JSON.stringify({ entries: [entry] })); // no controlCount
+    expect(() => readGraphListIndexInfo(path)).toThrow(/missing a positive integer controlCount/);
+
+    writeFileSync(path, JSON.stringify({ controlCount: 0, entries: [entry] }));
+    expect(() => readGraphListIndexInfo(path)).toThrow(/missing a positive integer controlCount/);
+
+    writeFileSync(path, JSON.stringify({ controlCount: 1.5, entries: [entry] }));
+    expect(() => readGraphListIndexInfo(path)).toThrow(/missing a positive integer controlCount/);
   });
 });
 
@@ -236,7 +256,8 @@ describe('readPublishedNull', () => {
     rewired: [{ score: 1 }, { score: 2 }, { score: 3 }],
     sourceGraphSha256: 'x'.repeat(64),
     seeds: { start: 30001, count: 100 },
-    ticks: 1800
+    ticks: 1800,
+    substeps: 4
   };
 
   let root: string;
@@ -244,7 +265,7 @@ describe('readPublishedNull', () => {
     root = mkdtempSync(join(tmpdir(), 'intervention-report-null-'));
   });
 
-  it('parses biological.score, rewired[].score, sourceGraphSha256, seeds, ticks', () => {
+  it('parses biological.score, rewired[].score, sourceGraphSha256, seeds, ticks, substeps', () => {
     const path = join(root, 'null.json');
     writeFileSync(path, JSON.stringify(validBody));
     const parsed = readPublishedNull(path);
@@ -253,6 +274,7 @@ describe('readPublishedNull', () => {
     expect(parsed.sourceGraphSha256).toBe('x'.repeat(64));
     expect(parsed.seeds).toEqual({ start: 30001, count: 100 });
     expect(parsed.ticks).toBe(1800);
+    expect(parsed.substeps).toBe(4);
   });
 
   it('throws when biological.score is missing', () => {
@@ -300,6 +322,13 @@ describe('readPublishedNull', () => {
     writeFileSync(path, JSON.stringify(rest));
     expect(() => readPublishedNull(path)).toThrow(/missing ticks/);
   });
+
+  it('throws when substeps is missing', () => {
+    const path = join(root, 'null.json');
+    const { substeps: _s, ...rest } = validBody;
+    writeFileSync(path, JSON.stringify(rest));
+    expect(() => readPublishedNull(path)).toThrow(/missing substeps/);
+  });
 });
 
 describe('buildInterventionStatistics: end-to-end on synthetic data', () => {
@@ -338,15 +367,21 @@ describe('buildInterventionStatistics: end-to-end on synthetic data', () => {
     host: { arch: 'arm64', node: 'v22.0.0' }
   });
 
-  const infoFor = (idsAndKinds: readonly (readonly [string, GraphKind])[]): ReadonlyMap<string, GraphListIndexEntryInfo> =>
-    new Map(idsAndKinds.map(([id, kind]) => [id, { kind, gzipSha256: `gz-${id}`.padEnd(64, '0') }]));
+  const infoFor = (
+    idsAndKinds: readonly (readonly [string, GraphKind])[],
+    controlCount: number
+  ): GraphListIndexInfo => ({
+    entries: new Map(idsAndKinds.map(([id, kind]) => [id, { kind, gzipSha256: `gz-${id}`.padEnd(64, '0') }])),
+    controlCount
+  });
 
   const nullFor = (scores: readonly number[]): PublishedNull => ({
     biologicalScore: 0,
     scores,
     sourceGraphSha256: SOURCE_SHA,
     seeds: { start: 30001, count: seeds.length },
-    ticks: 20
+    ticks: 20,
+    substeps: 4
   });
 
   const buildFixture = () => {
@@ -361,13 +396,16 @@ describe('buildInterventionStatistics: end-to-end on synthetic data', () => {
       ...mqIds.map((id) => [id, 1] as const)
     ];
     const raw = graphList(idsAndScores);
-    const info = infoFor([
-      ['P', 'P'],
-      ['Q', 'Q'],
-      ...cIds.map((id) => [id, 'C'] as const),
-      ...mIds.map((id) => [id, 'M'] as const),
-      ...mqIds.map((id) => [id, 'MQ'] as const)
-    ]);
+    const info = infoFor(
+      [
+        ['P', 'P'],
+        ['Q', 'Q'],
+        ...cIds.map((id) => [id, 'C'] as const),
+        ...mIds.map((id) => [id, 'M'] as const),
+        ...mqIds.map((id) => [id, 'MQ'] as const)
+      ],
+      4
+    );
     // A published null of 20 values, all well below P/Q's scores, so both
     // land above the 25th-percentile floor value comfortably.
     const publishedNull = nullFor(Array.from({ length: 20 }, (_, i) => -5 + i * 0.1));
@@ -430,13 +468,16 @@ describe('buildInterventionStatistics: end-to-end on synthetic data', () => {
       ...mqIds.map((id) => [id, 5] as const)
     ];
     const raw = graphList(idsAndScores);
-    const info = infoFor([
-      ['P', 'P'],
-      ['Q', 'Q'],
-      ...cIds.map((id) => [id, 'C'] as const),
-      ...mIds.map((id) => [id, 'M'] as const),
-      ...mqIds.map((id) => [id, 'MQ'] as const)
-    ]);
+    const info = infoFor(
+      [
+        ['P', 'P'],
+        ['Q', 'Q'],
+        ...cIds.map((id) => [id, 'C'] as const),
+        ...mIds.map((id) => [id, 'M'] as const),
+        ...mqIds.map((id) => [id, 'MQ'] as const)
+      ],
+      2
+    );
     const publishedNull = nullFor(Array.from({ length: 20 }, (_, i) => -5 + i * 0.1));
     const stats = buildInterventionStatistics(raw, info, publishedNull, 42, 200, SCRATCH_INPUTS);
     expect(stats.p.category).toBe('generic-rewiring-effect');
@@ -454,13 +495,16 @@ describe('buildInterventionStatistics: end-to-end on synthetic data', () => {
       ...mqIds.map((id) => [id, 1] as const)
     ];
     const raw = graphList(idsAndScores);
-    const info = infoFor([
-      ['P', 'P'],
-      ['Q', 'Q'],
-      ...cIds.map((id) => [id, 'C'] as const),
-      ...mIds.map((id) => [id, 'M'] as const),
-      ...mqIds.map((id) => [id, 'MQ'] as const)
-    ]);
+    const info = infoFor(
+      [
+        ['P', 'P'],
+        ['Q', 'Q'],
+        ...cIds.map((id) => [id, 'C'] as const),
+        ...mIds.map((id) => [id, 'M'] as const),
+        ...mqIds.map((id) => [id, 'MQ'] as const)
+      ],
+      2
+    );
     const publishedNull = nullFor(Array.from({ length: 20 }, (_, i) => -5 + i * 0.1));
     const stats = buildInterventionStatistics(raw, info, publishedNull, 42, 200, SCRATCH_INPUTS);
     expect(stats.p.category).toBe('not-supported');
@@ -486,33 +530,36 @@ describe('buildInterventionStatistics: end-to-end on synthetic data', () => {
     const { raw, publishedNull } = buildFixture();
     // Every real id from buildFixture, plus one the index expects but
     // authored.json never scored.
-    const info = infoFor([
-      ['P', 'P'],
-      ['Q', 'Q'],
-      ['C000', 'C'],
-      ['C001', 'C'],
-      ['C002', 'C'],
-      ['C003', 'C'],
-      ['M1000', 'M'],
-      ['M1001', 'M'],
-      ['M1002', 'M'],
-      ['M1003', 'M'],
-      ['MQ2000', 'MQ'],
-      ['MQ2001', 'MQ'],
-      ['MQ2002', 'MQ'],
-      ['MQ2003', 'MQ'],
-      ['MQ2004', 'MQ'] // authored.json has no entry for this one
-    ]);
+    const info = infoFor(
+      [
+        ['P', 'P'],
+        ['Q', 'Q'],
+        ['C000', 'C'],
+        ['C001', 'C'],
+        ['C002', 'C'],
+        ['C003', 'C'],
+        ['M1000', 'M'],
+        ['M1001', 'M'],
+        ['M1002', 'M'],
+        ['M1003', 'M'],
+        ['MQ2000', 'MQ'],
+        ['MQ2001', 'MQ'],
+        ['MQ2002', 'MQ'],
+        ['MQ2003', 'MQ'],
+        ['MQ2004', 'MQ'] // authored.json has no entry for this one
+      ],
+      4
+    );
     expect(() => buildInterventionStatistics(raw, info, publishedNull, 42, 200, SCRATCH_INPUTS)).toThrow(
-      /missing 1 index id\(s\): MQ2004/
+      /coverage mismatch.*missing 1 index id\(s\): MQ2004/
     );
   });
 
-  it('throws when a graph id in authored.json has no matching index entry', () => {
+  it('throws when authored.json has an id the index has no entry for (the reverse-coverage direction)', () => {
     const { raw, publishedNull } = buildFixture();
-    const info = infoFor([['P', 'P']]); // authored.json's other 13 ids are absent from the index
+    const info = infoFor([['P', 'P']], 1); // authored.json's other 13 ids are absent from the index
     expect(() => buildInterventionStatistics(raw, info, publishedNull, 42, 200, SCRATCH_INPUTS)).toThrow(
-      /no kind found for graph id/
+      /coverage mismatch.*id\(s\) not in index\.json/
     );
   });
 
@@ -536,7 +583,7 @@ describe('buildInterventionStatistics: end-to-end on synthetic data', () => {
     const { raw, info, publishedNull } = buildFixture();
     const mismatched = { ...publishedNull, seeds: { start: 1, count: seeds.length } };
     expect(() => buildInterventionStatistics(raw, info, mismatched, 42, 200, SCRATCH_INPUTS)).toThrow(
-      /seeds\/ticks differ/
+      /seeds\/ticks\/substeps differ/
     );
   });
 
@@ -544,7 +591,7 @@ describe('buildInterventionStatistics: end-to-end on synthetic data', () => {
     const { raw, info, publishedNull } = buildFixture();
     const mismatched = { ...publishedNull, ticks: 9999 };
     expect(() => buildInterventionStatistics(raw, info, mismatched, 42, 200, SCRATCH_INPUTS)).toThrow(
-      /seeds\/ticks differ/
+      /seeds\/ticks\/substeps differ/
     );
   });
 
@@ -583,21 +630,111 @@ describe('buildInterventionStatistics: end-to-end on synthetic data', () => {
     );
   });
 
-  it('throws when there is not exactly one graph of kind P', () => {
+  it('throws when there is not exactly one graph of kind P (zero found)', () => {
     const { raw, publishedNull } = buildFixture();
     const cIds = ['C000', 'C001', 'C002', 'C003'];
     const mIds = ['M1000', 'M1001', 'M1002', 'M1003'];
     const mqIds = ['MQ2000', 'MQ2001', 'MQ2002', 'MQ2003'];
-    // Mislabel P's kind as C in the index -- zero graphs now have kind 'P'.
-    const info = infoFor([
-      ['P', 'C'],
-      ['Q', 'Q'],
-      ...cIds.map((id) => [id, 'C'] as const),
-      ...mIds.map((id) => [id, 'M'] as const),
-      ...mqIds.map((id) => [id, 'MQ'] as const)
-    ]);
+    // Mislabel P's kind as Q (not C/M/MQ, so the controlCount arm-size check
+    // above is untouched and this test isolates exactlyOneOfKind itself):
+    // zero graphs now have kind 'P'.
+    const info = infoFor(
+      [
+        ['P', 'Q'],
+        ['Q', 'Q'],
+        ...cIds.map((id) => [id, 'C'] as const),
+        ...mIds.map((id) => [id, 'M'] as const),
+        ...mqIds.map((id) => [id, 'MQ'] as const)
+      ],
+      4
+    );
     expect(() => buildInterventionStatistics(raw, info, publishedNull, 42, 200, SCRATCH_INPUTS)).toThrow(
-      /expected exactly one graph of kind "P"/
+      /expected exactly one graph of kind "P", found 0/
+    );
+  });
+
+  it('throws when there is not exactly one graph of kind Q (two found, P still correct)', () => {
+    const { publishedNull } = buildFixture();
+    const cIds = ['C000', 'C001', 'C002', 'C003'];
+    const mIds = ['M1000', 'M1001', 'M1002', 'M1003'];
+    const mqIds = ['MQ2000', 'MQ2001', 'MQ2002', 'MQ2003'];
+    // An extra "Q2" id, also kind 'Q' -- P and the C/M/MQ arms are all
+    // correctly sized (controlCount still holds), isolating exactlyOneOfKind's
+    // "found 2" branch for Q specifically.
+    const idsAndScores: (readonly [string, number])[] = [
+      ['P', 10],
+      ['Q', 8],
+      ['Q2', 8],
+      ...cIds.map((id) => [id, 1] as const),
+      ...mIds.map((id) => [id, 2] as const),
+      ...mqIds.map((id) => [id, 1] as const)
+    ];
+    const raw = graphList(idsAndScores);
+    const info = infoFor(
+      [
+        ['P', 'P'],
+        ['Q', 'Q'],
+        ['Q2', 'Q'],
+        ...cIds.map((id) => [id, 'C'] as const),
+        ...mIds.map((id) => [id, 'M'] as const),
+        ...mqIds.map((id) => [id, 'MQ'] as const)
+      ],
+      4
+    );
+    expect(() => buildInterventionStatistics(raw, info, publishedNull, 42, 200, SCRATCH_INPUTS)).toThrow(
+      /expected exactly one graph of kind "Q", found 2/
+    );
+  });
+
+  it('throws when the kind-"P" graph\'s id is not literally "P" (a mislabeled index passes the "exactly one" check but not this one)', () => {
+    const { raw, publishedNull } = buildFixture();
+    const cIds = ['C000', 'C001', 'C002', 'C003'];
+    const mIds = ['M1000', 'M1001', 'M1002', 'M1003'];
+    const mqIds = ['MQ2000', 'MQ2001', 'MQ2002', 'MQ2003'];
+    // Swap P's and C000's kinds: exactly one graph has kind 'P' (id "C000")
+    // and the arms are still the right size, so exactlyOneOfKind alone would
+    // not catch this -- only the id === 'P' assertion does.
+    const info = infoFor(
+      [
+        ['P', 'C'],
+        ['C000', 'P'],
+        ['Q', 'Q'],
+        ...cIds.slice(1).map((id) => [id, 'C'] as const),
+        ...mIds.map((id) => [id, 'M'] as const),
+        ...mqIds.map((id) => [id, 'MQ'] as const)
+      ],
+      4
+    );
+    expect(() => buildInterventionStatistics(raw, info, publishedNull, 42, 200, SCRATCH_INPUTS)).toThrow(
+      /kind "P"\/"Q" have id\(s\) "C000"\/"Q"/
+    );
+  });
+
+  it('throws when an arm has fewer graphs than the index\'s own declared controlCount', () => {
+    const { publishedNull } = buildFixture();
+    const cIds = ['C000', 'C001', 'C002', 'C003'];
+    const mIds = ['M1000', 'M1001', 'M1002']; // one short of controlCount
+    const mqIds = ['MQ2000', 'MQ2001', 'MQ2002', 'MQ2003'];
+    const idsAndScores: (readonly [string, number])[] = [
+      ['P', 10],
+      ['Q', 8],
+      ...cIds.map((id) => [id, 1] as const),
+      ...mIds.map((id) => [id, 2] as const),
+      ...mqIds.map((id) => [id, 1] as const)
+    ];
+    const raw = graphList(idsAndScores);
+    const info = infoFor(
+      [
+        ['P', 'P'],
+        ['Q', 'Q'],
+        ...cIds.map((id) => [id, 'C'] as const),
+        ...mIds.map((id) => [id, 'M'] as const),
+        ...mqIds.map((id) => [id, 'MQ'] as const)
+      ],
+      4 // declared controlCount, but M only has 3 entries above
+    );
+    expect(() => buildInterventionStatistics(raw, info, publishedNull, 42, 200, SCRATCH_INPUTS)).toThrow(
+      /arm M has 3 graph\(s\), but index\.json declares controlCount=4/
     );
   });
 });
@@ -643,6 +780,7 @@ describe('runInterventionReport (CLI layer)', () => {
     const index = {
       sourceArtifact: 'src.bin.gz',
       sourceSha256: SOURCE_SHA,
+      controlCount: 1,
       entries: graphs.map((g) => ({ id: g.id, kind: g.kind, gzipSha256: `gz-${g.id}`.padEnd(64, '0') }))
     };
     writeFileSync(join(root, 'index.json'), JSON.stringify(index));
@@ -652,7 +790,8 @@ describe('runInterventionReport (CLI layer)', () => {
       rewired: Array.from({ length: 20 }, (_, i) => ({ score: -5 + i * 0.1 })),
       sourceGraphSha256: SOURCE_SHA,
       seeds: { start: 30001, count: seeds.length },
-      ticks: 20
+      ticks: 20,
+      substeps: 4
     };
     writeFileSync(join(root, 'null.json'), JSON.stringify(publishedNull));
   };
@@ -689,15 +828,27 @@ describe('runInterventionReport (CLI layer)', () => {
   it('refuses to write when the biological reproduction check fails (fail-closed by default)', () => {
     const root = mkdtempSync(join(tmpdir(), 'intervention-report-cli-repro-fail-'));
     writeFixtureFiles(root, 0, 999); // computed 0 != published 999
-    expect(() => runInterventionReport(argsFor(root))).toThrow(/biological reproduction check failed/);
+    const args = argsFor(root);
+    expect(() => runInterventionReport(args)).toThrow(/biological reproduction check failed/);
+    expect(existsSync(args.out)).toBe(false);
     rmSync(root, { recursive: true, force: true });
   });
 
-  it('writes anyway when --allow-reproduction-mismatch is set, for diagnosis', () => {
+  it('writes anyway when --allow-reproduction-mismatch is set, for diagnosis, and marks the output diagnosticOnly', () => {
     const root = mkdtempSync(join(tmpdir(), 'intervention-report-cli-repro-allow-'));
     writeFixtureFiles(root, 0, 999);
     const { statistics } = runInterventionReport(argsFor(root, { allowReproductionMismatch: true }));
     expect(statistics.biologicalReproduction.matches).toBe(false);
+    expect(statistics.diagnosticOnly).toBe(true);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('does not mark diagnosticOnly when --allow-reproduction-mismatch is passed but the check actually passes', () => {
+    const root = mkdtempSync(join(tmpdir(), 'intervention-report-cli-repro-clean-'));
+    writeFixtureFiles(root, 0, 0); // matches
+    const { statistics } = runInterventionReport(argsFor(root, { allowReproductionMismatch: true }));
+    expect(statistics.biologicalReproduction.matches).toBe(true);
+    expect(statistics.diagnosticOnly).toBeUndefined();
     rmSync(root, { recursive: true, force: true });
   });
 });

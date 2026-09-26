@@ -69,27 +69,52 @@ export interface GraphListIndexEntryInfo {
 }
 
 /**
- * `id -> {kind, gzipSha256}` for every entry in `scripts/analysis/
- * interventions.py`'s `index.json`. Read independently of
- * `null-evaluate.ts`'s own `GraphListIndex`/`GraphListEntry` types (which
- * only carry what `null-evaluate.ts` itself needs —
- * `id`/`path`/`gzipSha256`/`binarySha256`, not `kind`) rather than threading
- * `kind` through the evaluator's wire protocol and raw output, which has no
- * use for it. Throws on an entry with a missing/unrecognized `kind`, or a
- * duplicate `id` — matching `null-evaluate.ts`'s `readGraphListIndex`'s own
- * strict rejection of a repeated id (an earlier version of this function
- * tolerated an exact repeat as long as the `kind` agreed; the two readers of
- * the same file disagreeing on what counts as valid was a maintainability
- * review finding).
+ * `readGraphListIndexInfo`'s full return value: the per-id map, plus the
+ * index's own top-level `controlCount` (`scripts/analysis/interventions.py`'s
+ * `--control-count`, 100 in this study's real run) — `assertConsistentInputs`
+ * uses it to check the C/M/MQ arms actually have `controlCount` graphs each,
+ * not merely "at least one" (`armDistribution`'s own floor). Without this, a
+ * dev/fixture/truncated index (or one built with a smaller `--control-count`)
+ * would silently compute a category at an unplanned, coarser percentile
+ * resolution — `quantileIndex(5, 0.95) = 4` (the arm maximum) is this study's
+ * own *trained*-decoder cutoff rule, not the authored one (a dual-review
+ * finding).
  */
-export const readGraphListIndexInfo = (indexPath: string): ReadonlyMap<string, GraphListIndexEntryInfo> => {
-  const parsed = JSON.parse(readFileSync(indexPath, 'utf8')) as {
+export interface GraphListIndexInfo {
+  readonly entries: ReadonlyMap<string, GraphListIndexEntryInfo>;
+  readonly controlCount: number;
+}
+
+/**
+ * Parses the raw JSON text of `scripts/analysis/interventions.py`'s
+ * `index.json` (already-read bytes, `utf8`-decoded) into `id ->
+ * {kind, gzipSha256}` plus `controlCount`. Split out from
+ * `readGraphListIndexInfo` (which reads the file itself) so
+ * `runInterventionReport` can parse the exact same bytes it hashed into
+ * `InterventionStatistics.inputs.indexSha256` — reading the file a second
+ * time here would let `inputs.indexSha256` describe different bytes than
+ * what was actually parsed if the file changed between the two reads (a
+ * dual-review finding: a TOCTOU gap that defeats the whole point of
+ * recording that hash for a downstream consumer to verify against).
+ * Throws on an entry with a missing/unrecognized `kind`, or a duplicate
+ * `id` — matching `null-evaluate.ts`'s `readGraphListIndex`'s own strict
+ * rejection of a repeated id (an earlier version of this function tolerated
+ * an exact repeat as long as the `kind` agreed; the two readers of the same
+ * file disagreeing on what counts as valid was a maintainability review
+ * finding).
+ */
+export const parseGraphListIndexInfo = (text: string, label: string): GraphListIndexInfo => {
+  const parsed = JSON.parse(text) as {
     entries?: readonly { id?: unknown; kind?: unknown; gzipSha256?: unknown }[];
+    controlCount?: unknown;
   };
   if (!Array.isArray(parsed.entries) || parsed.entries.length === 0) {
-    throw new Error(`intervention-report: ${indexPath} has no entries`);
+    throw new Error(`intervention-report: ${label} has no entries`);
   }
-  const info = new Map<string, GraphListIndexEntryInfo>();
+  if (typeof parsed.controlCount !== 'number' || !Number.isInteger(parsed.controlCount) || parsed.controlCount <= 0) {
+    throw new Error(`intervention-report: ${label} is missing a positive integer controlCount`);
+  }
+  const entries = new Map<string, GraphListIndexEntryInfo>();
   for (const entry of parsed.entries) {
     if (
       typeof entry.id !== 'string' ||
@@ -97,15 +122,19 @@ export const readGraphListIndexInfo = (indexPath: string): ReadonlyMap<string, G
       !isGraphKind(entry.kind) ||
       typeof entry.gzipSha256 !== 'string'
     ) {
-      throw new Error(`intervention-report: ${indexPath} has a malformed entry: ${JSON.stringify(entry)}`);
+      throw new Error(`intervention-report: ${label} has a malformed entry: ${JSON.stringify(entry)}`);
     }
-    if (info.has(entry.id)) {
-      throw new Error(`intervention-report: ${indexPath} lists id "${entry.id}" more than once`);
+    if (entries.has(entry.id)) {
+      throw new Error(`intervention-report: ${label} lists id "${entry.id}" more than once`);
     }
-    info.set(entry.id, { kind: entry.kind, gzipSha256: entry.gzipSha256 });
+    entries.set(entry.id, { kind: entry.kind, gzipSha256: entry.gzipSha256 });
   }
-  return info;
+  return { entries, controlCount: parsed.controlCount };
 };
+
+/** Reads and parses `indexPath` — see `parseGraphListIndexInfo`'s doc comment for why the two are split. */
+export const readGraphListIndexInfo = (indexPath: string): GraphListIndexInfo =>
+  parseGraphListIndexInfo(readFileSync(indexPath, 'utf8'), indexPath);
 
 // ---------------------------------------------------------------------------
 // Published 500-graph authored null
@@ -118,46 +147,56 @@ export interface PublishedNull {
   readonly sourceGraphSha256: string;
   readonly seeds: { readonly start: number; readonly count: number };
   readonly ticks: number;
+  readonly substeps: number;
 }
 
-export const readPublishedNull = (path: string): PublishedNull => {
-  const parsed = JSON.parse(readFileSync(path, 'utf8')) as {
+/** Parses already-read JSON text — see `parseGraphListIndexInfo`'s doc comment for why (the same TOCTOU reasoning applies to every input this module hashes into `InterventionStatistics.inputs`). */
+export const parsePublishedNull = (text: string, label: string): PublishedNull => {
+  const parsed = JSON.parse(text) as {
     biological?: { score?: unknown };
     rewired?: readonly { score?: unknown }[];
     sourceGraphSha256?: unknown;
     seeds?: { start?: unknown; count?: unknown };
     ticks?: unknown;
+    substeps?: unknown;
   };
   const biologicalScore = parsed.biological?.score;
   if (typeof biologicalScore !== 'number' || !Number.isFinite(biologicalScore)) {
-    throw new Error(`intervention-report: ${path} is missing a finite biological.score`);
+    throw new Error(`intervention-report: ${label} is missing a finite biological.score`);
   }
   if (!Array.isArray(parsed.rewired) || parsed.rewired.length === 0) {
-    throw new Error(`intervention-report: ${path} has no rewired entries`);
+    throw new Error(`intervention-report: ${label} has no rewired entries`);
   }
   const scores = parsed.rewired.map((entry, i) => {
     if (typeof entry.score !== 'number' || !Number.isFinite(entry.score)) {
-      throw new Error(`intervention-report: ${path} rewired[${i}].score is not a finite number`);
+      throw new Error(`intervention-report: ${label} rewired[${i}].score is not a finite number`);
     }
     return entry.score;
   });
   if (typeof parsed.sourceGraphSha256 !== 'string') {
-    throw new Error(`intervention-report: ${path} is missing sourceGraphSha256`);
+    throw new Error(`intervention-report: ${label} is missing sourceGraphSha256`);
   }
   if (typeof parsed.seeds?.start !== 'number' || typeof parsed.seeds?.count !== 'number') {
-    throw new Error(`intervention-report: ${path} is missing seeds.start/seeds.count`);
+    throw new Error(`intervention-report: ${label} is missing seeds.start/seeds.count`);
   }
   if (typeof parsed.ticks !== 'number') {
-    throw new Error(`intervention-report: ${path} is missing ticks`);
+    throw new Error(`intervention-report: ${label} is missing ticks`);
+  }
+  if (typeof parsed.substeps !== 'number') {
+    throw new Error(`intervention-report: ${label} is missing substeps`);
   }
   return {
     biologicalScore,
     scores,
     sourceGraphSha256: parsed.sourceGraphSha256,
     seeds: { start: parsed.seeds.start, count: parsed.seeds.count },
-    ticks: parsed.ticks
+    ticks: parsed.ticks,
+    substeps: parsed.substeps
   };
 };
+
+/** Reads and parses `path` — see `parsePublishedNull`'s doc comment for why the two are split. */
+export const readPublishedNull = (path: string): PublishedNull => parsePublishedNull(readFileSync(path, 'utf8'), path);
 
 /**
  * `.agents/plans/pathway-interventions/03-evaluation.md`'s "the biological
@@ -212,44 +251,73 @@ const assertFiniteScores = (label: string, movementScore: readonly number[]): vo
   if (badIndex !== -1) {
     throw new Error(`intervention-report: ${label}.movementScore[${badIndex}] is not a finite number`);
   }
-}
+};
 
 /**
  * `buildInterventionStatistics`'s preflight: everything that must hold for
  * `raw` (a `--graph-list` `authored.json`), `info` (`index.json`'s
- * id -> kind/gzipSha256 map), and `publishedNull`
- * (`rewiring-null-v1.json`'s scores + condition fields) to describe the same
- * comparable experiment. None of this was previously checked (a dual-review
- * finding on both `null-evaluate.ts --graph-list` and this file — a partial,
- * stale, or wrong-decoder `authored.json` would silently produce a category
- * ranked against an incompatible null):
+ * id -> kind/gzipSha256 map plus its declared `controlCount`), and
+ * `publishedNull` (`rewiring-null-v1.json`'s scores + condition fields) to
+ * describe the same comparable experiment. None of this was previously
+ * checked (a dual-review finding on both `null-evaluate.ts --graph-list` and
+ * this file — a partial, stale, or wrong-decoder `authored.json` would
+ * silently produce a category ranked against an incompatible null):
  *
+ * - **Shape.** `raw.graphs` must be an array — catches an operator pointing
+ *   `--authored` at a `--rewired-index`-mode `authored.json` (same file
+ *   name, different shape: `rewired`/no `graphs`) with an actionable message
+ *   instead of a bare `TypeError` several lines later.
  * - **Decoder.** The predeclared categories are authored-decoder only
  *   (`00-overview.md`), and the published null's own `condition` is
  *   `"authored, opponent parked"` — a non-`'authored'` `raw.decoder` is
  *   rejected outright, mirroring `null-report.ts`'s own decoder guard.
- * - **Seeds/ticks/source graph.** `raw.seeds`/`raw.ticks`/
- *   `raw.sourceGraphSha256` must match `publishedNull`'s own recorded
- *   values — otherwise every rank/percentile below compares scores from two
- *   different conditions.
- * - **Coverage.** Every id in `info` (the index) must appear in `raw.graphs`
- *   (the acceptance criterion in `03-evaluation.md`: "`authored.json` has
- *   entries for every index id"), and `raw.graphs` must not repeat an id —
- *   otherwise an arm silently shrinks or double-counts a graph.
+ *   (WP3's trained-decoder statistics reuse `armDistribution`/`evaluateCategory`
+ *   against a 5-graph-per-arm freshly-trained C/M reference instead of this
+ *   published 500-graph null — `03-evaluation.md`'s "the same statistics as
+ *   WP2" — so this hard `'authored'` guard and the published-null comparison
+ *   above are exactly the two pieces that will need to become parameters
+ *   rather than fixed to this module's own inputs; noted here so WP3 doesn't
+ *   have to rediscover it.)
+ * - **Seeds/ticks/substeps/source graph.** `raw.seeds`/`raw.ticks`/
+ *   `raw.substeps`/`raw.sourceGraphSha256` must match `publishedNull`'s own
+ *   recorded values — otherwise every rank/percentile below compares scores
+ *   from two different conditions.
+ * - **Coverage, both directions.** Every id in `info.entries` (the index)
+ *   must appear in `raw.graphs`, and every id in `raw.graphs` must appear in
+ *   `info.entries` (the acceptance criterion in `03-evaluation.md`:
+ *   "`authored.json` has entries for every index id") — checked together so
+ *   a coverage mismatch always reports which ids are on which side, rather
+ *   than the "extra id" direction failing one graph at a time inside the
+ *   per-graph loop below with a message that reads like a missing-`kind`
+ *   bug. `raw.graphs` must also not repeat an id — otherwise an arm silently
+ *   shrinks or double-counts a graph.
+ * - **Arm size vs the index's own declared `controlCount`.** Each of C/M/MQ
+ *   must have exactly `info.controlCount` graphs — `armDistribution` alone
+ *   only requires "at least one", so a truncated or dev-sized index (a
+ *   smaller `--control-count`) would otherwise silently compute the category
+ *   at a coarser percentile resolution with no signal in the output.
  * - **Graph identity.** Each `raw.graphs[i].gzipSha256` must match `info`'s
  *   own `gzipSha256` for that id — catching a stale `authored.json` scored
  *   against an older `interventions.py` run (a different `k`) than the
  *   `index.json` now being read.
- * - **Seed alignment.** Every graph (biological included) must share
- *   biological's own `heldOutSeeds`, in order — `pairedStats` below only
- *   checks array *length*, not which seeds they are.
+ * - **Seed alignment.** `raw.biological.heldOutSeeds` must equal the
+ *   `[seeds.start, ..., seeds.start + seeds.count - 1]` range `raw.seeds`
+ *   itself claims, and every other graph (biological included) must share
+ *   that same sequence, in order — `pairedStats` below only checks array
+ *   *length*, not which seeds they are.
  * - **Finite scores.** No `movementScore` entry may be non-finite.
  */
 const assertConsistentInputs = (
   raw: Readonly<NullGraphListEvaluationRaw>,
-  info: ReadonlyMap<string, GraphListIndexEntryInfo>,
+  info: Readonly<GraphListIndexInfo>,
   publishedNull: Readonly<PublishedNull>
 ): void => {
+  if (!Array.isArray(raw.graphs)) {
+    throw new Error(
+      'intervention-report: authored.json has no graphs[] -- is this a --rewired-index run? intervention-report ' +
+        'needs `null-evaluate.ts --graph-list` output'
+    );
+  }
   if (raw.decoder !== 'authored') {
     throw new Error(
       `intervention-report: authored.json was scored with decoder "${raw.decoder}"; the predeclared categories ` +
@@ -265,13 +333,15 @@ const assertConsistentInputs = (
   if (
     raw.seeds.start !== publishedNull.seeds.start ||
     raw.seeds.count !== publishedNull.seeds.count ||
-    raw.ticks !== publishedNull.ticks
+    raw.ticks !== publishedNull.ticks ||
+    raw.substeps !== publishedNull.substeps
   ) {
     throw new Error(
-      'intervention-report: authored.json seeds/ticks differ from the published null -- ranks would compare ' +
-        `different conditions (authored.json: seeds ${raw.seeds.start}..${raw.seeds.start + raw.seeds.count - 1} ` +
-        `ticks=${raw.ticks}; published null: seeds ${publishedNull.seeds.start}..` +
-        `${publishedNull.seeds.start + publishedNull.seeds.count - 1} ticks=${publishedNull.ticks})`
+      'intervention-report: authored.json seeds/ticks/substeps differ from the published null -- ranks would ' +
+        `compare different conditions (authored.json: seeds ${raw.seeds.start}..${raw.seeds.start + raw.seeds.count - 1} ` +
+        `ticks=${raw.ticks} substeps=${raw.substeps}; published null: seeds ${publishedNull.seeds.start}..` +
+        `${publishedNull.seeds.start + publishedNull.seeds.count - 1} ticks=${publishedNull.ticks} ` +
+        `substeps=${publishedNull.substeps})`
     );
   }
 
@@ -281,11 +351,20 @@ const assertConsistentInputs = (
     throw new Error(`intervention-report: authored.json has a duplicate graph id "${duplicate}"`);
   }
   const rawIdSet = new Set(rawIds);
-  const missing = [...info.keys()].filter((id) => !rawIdSet.has(id));
-  if (missing.length > 0) {
+  const missing = [...info.entries.keys()].filter((id) => !rawIdSet.has(id));
+  const extra = rawIds.filter((id) => !info.entries.has(id));
+  if (missing.length > 0 || extra.length > 0) {
+    const missingText =
+      missing.length > 0
+        ? `missing ${missing.length} index id(s): ${missing.slice(0, 10).join(', ')}${missing.length > 10 ? ', ...' : ''}`
+        : undefined;
+    const extraText =
+      extra.length > 0
+        ? `${extra.length} id(s) not in index.json (stale authored.json or a different index?): ` +
+          `${extra.slice(0, 10).join(', ')}${extra.length > 10 ? ', ...' : ''}`
+        : undefined;
     throw new Error(
-      `intervention-report: authored.json is missing ${missing.length} index id(s): ` +
-        `${missing.slice(0, 10).join(', ')}${missing.length > 10 ? ', ...' : ''}`
+      `intervention-report: authored.json/index.json coverage mismatch -- ${[missingText, extraText].filter(Boolean).join('; ')}`
     );
   }
 
@@ -296,9 +375,16 @@ const assertConsistentInputs = (
   }
   assertFiniteScores('biological', raw.biological.movementScore);
   const referenceSeeds = raw.biological.heldOutSeeds;
+  const expectedSeeds = Array.from({ length: raw.seeds.count }, (_, i) => raw.seeds.start + i);
+  if (!sameSeeds(referenceSeeds, expectedSeeds)) {
+    throw new Error(
+      'intervention-report: authored.json biological.heldOutSeeds does not match its own seeds.start/seeds.count'
+    );
+  }
 
+  const armCounts = new Map<GraphKind, number>();
   for (const graph of raw.graphs) {
-    const entryInfo = info.get(graph.id);
+    const entryInfo = info.entries.get(graph.id);
     if (!entryInfo) throw new Error(`intervention-report: no kind found for graph id "${graph.id}" in the index`);
     if (entryInfo.gzipSha256 !== graph.gzipSha256) {
       throw new Error(
@@ -310,6 +396,16 @@ const assertConsistentInputs = (
       throw new Error(`intervention-report: "${graph.id}" was scored on different held-out seeds than biological`);
     }
     assertFiniteScores(graph.id, graph.movementScore);
+    armCounts.set(entryInfo.kind, (armCounts.get(entryInfo.kind) ?? 0) + 1);
+  }
+
+  for (const kind of ['C', 'M', 'MQ'] as const) {
+    const n = armCounts.get(kind) ?? 0;
+    if (n !== info.controlCount) {
+      throw new Error(
+        `intervention-report: arm ${kind} has ${n} graph(s), but index.json declares controlCount=${info.controlCount}`
+      );
+    }
   }
 };
 
@@ -400,18 +496,28 @@ export const NULL_FLOOR_PERCENTILE = 0.25;
 /**
  * The published null's 25th-percentile **value** (not a percentile-rank
  * statistic of some other score): `sorted(publishedNull.scores)[quantileIndex(n, 0.25)]`.
- * This is the same convention `scripts/analysis/interventions.py`'s own
- * `_regenerate_null_targets` uses for its stopping-rule targets
- * (`explain_stats.quantile_index`, "the null's 25th percentile" == a sorted
- * quantile value) — WP1's P/Q construction is greedily optimized to stop
- * right around this exact threshold, so this module's category decision
- * must use the identical definition. An earlier version of this function
- * instead compared P's *empirical percentile-rank* within the null
- * (`rankStatistics(...).bioPercentile`, a `(kBelow + 0.5*kEqual)/n`
- * mid-rank statistic) against `0.25` — a different quantity that disagrees
- * with this one for any score strictly between `sorted[124]` and
- * `sorted[125]` (`n = 500`), which could flip the headline category right
- * at the boundary P was optimized toward (a dual-review finding).
+ * This is the same low-tail-floor quantile convention
+ * `explain_stats.quantile_index`/`null-stats.ts`'s `quantileIndex` use
+ * everywhere else in this study, including
+ * `scripts/analysis/interventions.py`'s own `_regenerate_null_targets`
+ * (which uses it for *its* stopping-rule targets — but those targets are
+ * the transfer-matrix entries `T[thrust, rightClearance]`/
+ * `T[thrust, forwardClearance]`, not `movementScore`; P's greedy swap
+ * search never sees or optimizes toward this movementScore null at all, so
+ * the only real link to WP1 is the shared quantile *convention*, not any
+ * claim that P was constructed to land near this specific threshold — a
+ * dual-review finding on an earlier version of this doc comment, which
+ * incorrectly implied the latter).
+ *
+ * This module deliberately does **not** compare P's *empirical
+ * percentile-rank* within the null (`rankStatistics(...).bioPercentile`, a
+ * `(kBelow + 0.5*kEqual)/n` mid-rank statistic) against `0.25` — an earlier
+ * version of `evaluateCategory` did exactly that, and it is a different
+ * quantity that disagrees with this quantile-value definition for any score
+ * strictly between `sorted[124]` and `sorted[125]` (`n = 500`), which could
+ * flip the headline category right at that boundary (a separate dual-review
+ * finding). The plan's "at or above the null's 25th percentile" is read as
+ * a comparison against a null *value*, per this convention.
  */
 export const publishedNullFloorValue = (publishedNull: Readonly<PublishedNull>): number => {
   const sorted = [...publishedNull.scores].sort((a, b) => a - b);
@@ -509,6 +615,18 @@ export interface InterventionStatistics {
   readonly p: PArmResult;
   readonly q: QArmResult;
   readonly host: { readonly arch: string; readonly node: string };
+  /**
+   * Present (and `true`) only when `runInterventionReport` wrote this file
+   * despite a failed `biologicalReproduction` check, via
+   * `--allow-reproduction-mismatch` — never set by `buildInterventionStatistics`
+   * itself (a pure function with no notion of that CLI flag). A downstream
+   * consumer (WP4) should refuse to publish any `statistics.json` carrying
+   * this field, rather than relying on remembering to also check
+   * `biologicalReproduction.matches` (a dual-review finding: a diagnostic
+   * override file was otherwise indistinguishable from a clean run except by
+   * that one nested boolean).
+   */
+  readonly diagnosticOnly?: true;
 }
 
 /** `id < id` string ordering — matches `null-evaluate.ts`'s `sortedGraphListEntries`, so this module's output key order is independent of `authored.json`'s own array order (itself already sorted the same way, but this does not assume that). */
@@ -532,7 +650,7 @@ const exactlyOneOfKind = (graphs: readonly GraphOutcomeEntry[], kind: GraphKind)
 
 export const buildInterventionStatistics = (
   raw: Readonly<NullGraphListEvaluationRaw>,
-  info: ReadonlyMap<string, GraphListIndexEntryInfo>,
+  info: Readonly<GraphListIndexInfo>,
   publishedNull: Readonly<PublishedNull>,
   bootstrapSeed: number,
   bootstrapResamples: number,
@@ -557,7 +675,7 @@ export const buildInterventionStatistics = (
   const graphs: GraphOutcomeEntry[] = [...raw.graphs]
     .sort(byIdAscending)
     .map((graph) => {
-      const entryInfo = info.get(graph.id);
+      const entryInfo = info.entries.get(graph.id);
       if (!entryInfo) throw new Error(`intervention-report: no kind found for graph id "${graph.id}" in the index`);
       return toGraphOutcomeEntry(
         graph.id,
@@ -579,6 +697,16 @@ export const buildInterventionStatistics = (
 
   const pGraph = exactlyOneOfKind(graphs, 'P');
   const qGraph = exactlyOneOfKind(graphs, 'Q');
+  // exactlyOneOfKind locates P/Q by `kind`, not by `id === 'P'`/`id === 'Q'`
+  // (see its own doc comment) -- this closes the remaining gap: an index
+  // where the *other* id was mislabeled `kind: 'P'` would otherwise pass
+  // "exactly one P graph found" while reporting a stranger's score under
+  // `p.id: 'P'` (a dual-review finding).
+  if (pGraph.id !== 'P' || qGraph.id !== 'Q') {
+    throw new Error(
+      `intervention-report: the graph(s) with kind "P"/"Q" have id(s) "${pGraph.id}"/"${qGraph.id}", expected "P"/"Q"`
+    );
+  }
 
   const pRankAmongC = rankStatistics(cArm.scores, pGraph.mean).pHigh;
   const pRankAmongM = rankStatistics(mArm.scores, pGraph.mean).pHigh;
@@ -591,7 +719,11 @@ export const buildInterventionStatistics = (
   return {
     version: 1,
     decoder: raw.decoder,
-    seeds: raw.seeds,
+    // Built explicitly (not `seeds: raw.seeds`/`host: raw.host` passthrough)
+    // so this output's schema is fixed by this module, not by whatever
+    // extra keys a future/hand-edited authored.json's `seeds`/`host` objects
+    // happen to carry (a dual-review finding).
+    seeds: { start: raw.seeds.start, count: raw.seeds.count },
     ticks: raw.ticks,
     bootstrap: { seed: bootstrapSeed, resamples: bootstrapResamples },
     inputs,
@@ -614,7 +746,7 @@ export const buildInterventionStatistics = (
       qRankAmongMQ,
       channelSpecific
     },
-    host: raw.host
+    host: { arch: raw.host.arch, node: raw.host.node }
   };
 };
 
@@ -689,13 +821,21 @@ export const parseInterventionReportArgs = (argv: readonly string[]): Interventi
 export const runInterventionReport = (
   args: Readonly<InterventionReportArgs>
 ): { readonly out: string; readonly statistics: InterventionStatistics } => {
+  // Each file is read exactly once: the same bytes are both hashed (into
+  // `inputs.*Sha256`) and parsed, via `parseGraphListIndexInfo`/
+  // `parsePublishedNull` taking already-read text rather than re-reading
+  // from disk -- a second `readFileSync` per file would let the recorded
+  // hash describe different bytes than what was actually parsed if the file
+  // changed in between (a dual-review finding: a TOCTOU gap that would
+  // defeat the whole point of `inputs`, which a downstream consumer uses to
+  // verify it isn't looking at a stale copy).
   const authoredBytes = readFileSync(args.authored);
   const indexBytes = readFileSync(args.index);
   const publishedNullBytes = readFileSync(args.publishedNull);
 
   const raw = JSON.parse(authoredBytes.toString('utf8')) as NullGraphListEvaluationRaw;
-  const info = readGraphListIndexInfo(args.index);
-  const publishedNull = readPublishedNull(args.publishedNull);
+  const info = parseGraphListIndexInfo(indexBytes.toString('utf8'), args.index);
+  const publishedNull = parsePublishedNull(publishedNullBytes.toString('utf8'), args.publishedNull);
 
   const statistics = buildInterventionStatistics(raw, info, publishedNull, args.bootstrapSeed, args.bootstrapResamples, {
     authoredSha256: sha256Hex(authoredBytes),
@@ -711,10 +851,20 @@ export const runInterventionReport = (
         'against an incompatible null. Pass --allow-reproduction-mismatch to write anyway for diagnosis.'
     );
   }
+  // `diagnosticOnly` is only ever added here, and only when the override was
+  // actually exercised (a failed check plus the flag) -- passing
+  // `--allow-reproduction-mismatch` on an otherwise-clean run must not mark
+  // it, so a clean run's output is byte-identical whether or not the flag
+  // was passed. `statistics` itself (from the pure `buildInterventionStatistics`)
+  // never carries this field.
+  const output: InterventionStatistics =
+    args.allowReproductionMismatch && !statistics.biologicalReproduction.matches
+      ? { ...statistics, diagnosticOnly: true }
+      : statistics;
 
   mkdirSync(dirname(args.out), { recursive: true });
-  atomicWriteFileSync(args.out, JSON.stringify(statistics));
-  return { out: args.out, statistics };
+  atomicWriteFileSync(args.out, JSON.stringify(output));
+  return { out: args.out, statistics: output };
 };
 
 const main = (): void => {
