@@ -1,10 +1,10 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { loadAtlas } from './assets';
-  import { loadRepertoireNull, type RepertoireNullLoadResult } from './repertoire';
+  import { loadRepertoireNull, type RepertoireNullLoadResult } from '../experiment/repertoireNull';
   import type { ArenaManifest } from '../experiment/assets';
   import { githubDocUrl } from '../ui/links';
-  import { COVERAGE_EDGES, TURN_EDGES, HELDOUT_SEEDS, CONTROL_NAMES, average, type Control, type LoadedAtlas } from './types';
+  import { COVERAGE_EDGES, TURN_EDGES, CELL_COUNT, HELDOUT_SEEDS, CONTROL_NAMES, average, type Control, type LoadedAtlas } from './types';
   import BehaviorReplay from './BehaviorReplay.svelte';
   import Workbench from '../counterfactual/Workbench.svelte';
   let loaded = $state<LoadedAtlas | null>(null), error = $state(''), selectedId = $state<number | null>(null);
@@ -49,28 +49,63 @@
   const controlLabels: Record<Control, string> = { biological: 'Intact circuit', disconnected: 'No recurrent edges', silenced: 'Zero readout inputs' };
   const mean = (name: Control) => selected ? average(selected.heldout[name].map(m => m.movementScore)) : 0;
   /**
+   * A maintainability review (Important) found the strip's own doc comment
+   * claimed to cross-check this study against the manifest's biological
+   * graph and rewiring-null distribution, but never against the shipped
+   * atlas itself — even though the study's whole premise
+   * (`docs/behavior-repertoire-null-report.md`'s Method section) is that it
+   * reuses the shipped atlas search exactly. `loadRepertoireNull` cannot
+   * make that check itself (the atlas is pinned by its own separate
+   * `behavior-atlas-v1.manifest.json`, not by the central manifest that
+   * loader cross-checks against — see that function's own doc comment for
+   * why the check belongs here instead). This component is the one place
+   * that already loads both: `loaded.sha256` (from `load()`, the shipped
+   * atlas's own verified sha256) and `repertoireNull.data.sources.atlasSha256`
+   * (the atlas this study was computed against). Neither load waits on the
+   * other; this is a display-time check only, once both have resolved.
+   */
+  const repertoireStale = $derived(
+    loaded !== null && repertoireNull?.status === 'ok' && repertoireNull.data.sources.atlasSha256 !== loaded.sha256
+  );
+  /**
    * `03-artifact-and-atlas-strip.md`'s one-line strip, templated only from
    * `repertoireNull.data`'s own verified fields — never a hard-coded number.
-   * `null` when there is nothing to show (still loading, or `missing`,
-   * which hides the line entirely per spec).
+   * `null` when there is nothing to show (still loading, `missing`, which
+   * hides the line entirely per spec, or `repertoireStale`, which instead
+   * renders the same "failed verification" line an `invalid` load would).
    */
   const repertoireStripText = $derived.by(() => {
     const result = repertoireNull;
-    if (result?.status !== 'ok') return null;
+    if (result?.status !== 'ok' || repertoireStale) return null;
     const { primary, search, robustness } = result.data;
     const dist = primary.rewiredDistribution.occupied;
+    // `dist.values` is guaranteed non-empty and ascending by
+    // `loadRepertoireNull`'s own shape validation, so `[0]`/`.at(-1)` are
+    // always the sample's real min/max (a maintainability review,
+    // Important, previously found this could read "undefined" for a
+    // malformed artifact — the loader now rejects that shape outright).
     const range = `${dist.values[0]}–${dist.values.at(-1)}`;
     const seeds = [search.primarySearchSeed, ...search.extraSearchSeeds];
     const seedCount = seeds.length;
     const robustClause = robustness.robust
       ? `robust across all ${seedCount} search seeds`
       : `not robust: seeds give ${seeds.map((seed) => `${seed}: ${robustness.perSeed[seed]}`).join(', ')}`;
-    const extraSeedRange =
-      search.extraSearchSeeds.length > 0 ? `${search.extraSearchSeeds[0]}–${search.extraSearchSeeds.at(-1)}` : '';
+    // A maintainability review (Suggestion) found this sentence read "Seeds
+    // <blank> compare against only N seed-matched rewirings" whenever there
+    // were no extra search seeds at all -- omit the clause entirely in that
+    // case instead.
+    const coarseClause =
+      search.extraSearchSeeds.length > 0
+        ? ` Seeds ${search.extraSearchSeeds[0]}–${search.extraSearchSeeds.at(-1)} compare against only ${search.rewiredSeedMatchedCount} seed-matched rewirings.`
+        : '';
+    // `primary.tie` (a maintainability review, Suggestion): validated by
+    // the loader but previously never shown here — see `steps.ts`'s
+    // identical disclosure for the reasoning.
+    const tieSuffix = primary.tie ? ' (tie)' : '';
     return (
-      `Repertoire vs ${search.rewiredCount} rewirings: biological occupies ${primary.bio.occupied} of 36 cells ` +
-      `(rewired median ${dist.p50}, range ${range}) — ${primary.category} at search seed ${search.primarySearchSeed}; ` +
-      `${robustClause}. Seeds ${extraSeedRange} compare against only ${search.rewiredSeedMatchedCount} seed-matched rewirings.`
+      `Repertoire vs ${search.rewiredCount} rewirings: biological occupies ${primary.bio.occupied} of ${CELL_COUNT} cells ` +
+      `(rewired median ${dist.p50}, range ${range}) — ${primary.category}${tieSuffix} at search seed ${search.primarySearchSeed}; ` +
+      `${robustClause}.${coarseClause}`
     );
   });
   const REPERTOIRE_REPORT_URL = githubDocUrl('behavior-repertoire-null-report.md');
@@ -119,7 +154,7 @@
           </p>
         {:else if repertoireNull?.status === 'unavailable'}
           <p class="repertoire-strip error-message">Repertoire comparison could not be loaded</p>
-        {:else if repertoireNull?.status === 'invalid'}
+        {:else if repertoireNull?.status === 'invalid' || repertoireStale}
           <p class="repertoire-strip error-message">Repertoire comparison failed verification</p>
         {/if}
         <details><summary>How this repertoire was discovered</summary>
