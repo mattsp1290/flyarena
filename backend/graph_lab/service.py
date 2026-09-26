@@ -17,7 +17,6 @@ import hmac
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Callable
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
