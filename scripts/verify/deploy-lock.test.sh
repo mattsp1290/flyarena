@@ -95,6 +95,24 @@ run_child() {
   set -e
 }
 
+# Same as run_child, but with distinctive, obviously-fake DEPLOY_SSH/
+# DEPLOY_URL values in place of the generic 'unused@unused' -- used by every
+# test below that asserts a message never leaks either one (thermo review,
+# Critical C2/ops-safety and its regression-fix follow-up).
+fake_ssh='secret-deploy-user@secret-deploy-host.example.internal'
+fake_url='https://secret-deploy-host.example.internal/fly/'
+run_child_secret() {
+  local root=$1 body=$2 prelude=$3
+  local script
+  script="$(printf '%s\n%s\n' "$prelude" "$body")"
+  set +e
+  child_out=$(DEPLOY_LOCK_ROOT_OVERRIDE="$root" DEPLOY_ROOT="$root" \
+    DEPLOY_SSH="$fake_ssh" DEPLOY_URL="$fake_url" \
+    bash -c "$script" 2>&1)
+  child_status=$?
+  set -e
+}
+
 # ---------------------------------------------------------------------------
 # 1. acquire, then a second acquire aborts (lock still fresh)
 # ---------------------------------------------------------------------------
@@ -166,6 +184,54 @@ if [[ $child_status -ne 0 && "$child_out" != *STALE* && "$child_out" != *'is hel
   pass 'a lock-host failure unrelated to contention aborts with its own message, never reported as stale or held'
 else
   fail 'a lock-host failure unrelated to contention aborts with its own message, never reported as stale or held' "status=$child_status out=$child_out"
+fi
+
+# ---------------------------------------------------------------------------
+# 2c/2d. (thermo review follow-up, regression fix) A missing owner file --
+# the lock directory exists but its `.deploy.lock.owner` never got written
+# (or was removed), e.g. the owning run crashed between `mkdir` and the
+# owner write (a dropped SSH connection, `kill -9`) -- must never become a
+# permanently orphaned lock with no recovery path. The lock directory's own
+# mtime stands in for the missing owner timestamp, giving this case the
+# same fresh/stale math and, once stale, the same manual-clear command as a
+# normal lock. Both cases also assert the fake DEPLOY_SSH/DEPLOY_URL never
+# leak, via run_child_secret.
+# ---------------------------------------------------------------------------
+
+# 2c. old lock-directory mtime (>= 30 minutes) -> reported through the
+# normal STALE path, noting the owner file is missing, with the manual-clear
+# command -- never left as an unrecoverable "indeterminate" forever.
+root=$(new_scratch_root)
+mkdir -- "$root/.deploy.lock"
+old_mtime_epoch=$(( $(date -u +%s) - 3600 ))
+touch -d "@$old_mtime_epoch" -- "$root/.deploy.lock"
+run_child_secret "$root" 'deploy_lock_acquire "release-owner-missing-stale"; echo ACQUIRED' "$(child_prelude)"
+if [[ $child_status -ne 0 && "$child_out" == *STALE* && "$child_out" == *'owner file is missing'* && "$child_out" == *rmdir* \
+  && "$child_out" != *"$fake_ssh"* && "$child_out" != *"$fake_url"* ]]; then
+  pass 'a missing owner file with an old lock-directory mtime is reported as stale, with the manual-clear command'
+else
+  fail 'a missing owner file with an old lock-directory mtime is reported as stale, with the manual-clear command' "status=$child_status out=$child_out"
+fi
+if [[ -d "$root/.deploy.lock" ]]; then
+  pass 'the owner-missing stale lock is left untouched, never broken automatically'
+else
+  fail 'the owner-missing stale lock is left untouched, never broken automatically'
+fi
+
+# 2d. fresh lock-directory mtime (< 30 minutes) -> reported as held/
+# indeterminate ("retry shortly"), but with the "if this persists beyond 30
+# minutes" guidance and the same manual-clear command as a fallback --
+# never a dead end with no recovery path at all.
+root=$(new_scratch_root)
+mkdir -- "$root/.deploy.lock"
+run_child_secret "$root" 'deploy_lock_acquire "release-owner-missing-fresh"; echo ACQUIRED' "$(child_prelude)"
+if [[ $child_status -ne 0 && "$child_out" != *ACQUIRED* && "$child_out" != *STALE* \
+  && "$child_out" == *'owner file is missing'* && "$child_out" == *'retry shortly'* \
+  && "$child_out" == *'If this persists beyond'* && "$child_out" == *rmdir* \
+  && "$child_out" != *"$fake_ssh"* && "$child_out" != *"$fake_url"* ]]; then
+  pass 'a missing owner file with a fresh lock-directory mtime is reported as held/indeterminate, with retry and orphan-recovery guidance'
+else
+  fail 'a missing owner file with a fresh lock-directory mtime is reported as held/indeterminate, with retry and orphan-recovery guidance' "status=$child_status out=$child_out"
 fi
 
 # ---------------------------------------------------------------------------
@@ -356,20 +422,6 @@ fi
 # DEPLOY_URL ever appears in stdout/stderr across the stale, held (fresh),
 # and error (not-contention) acquire outcomes.
 # ---------------------------------------------------------------------------
-fake_ssh='secret-deploy-user@secret-deploy-host.example.internal'
-fake_url='https://secret-deploy-host.example.internal/fly/'
-
-run_child_secret() {
-  local root=$1 body=$2 prelude=$3
-  local script
-  script="$(printf '%s\n%s\n' "$prelude" "$body")"
-  set +e
-  child_out=$(DEPLOY_LOCK_ROOT_OVERRIDE="$root" DEPLOY_ROOT="$root" \
-    DEPLOY_SSH="$fake_ssh" DEPLOY_URL="$fake_url" \
-    bash -c "$script" 2>&1)
-  child_status=$?
-  set -e
-}
 
 # 6a. held (fresh) path.
 root=$(new_scratch_root)

@@ -78,11 +78,20 @@ _DEPLOY_LOCK_SENTINEL_HELD='##DEPLOY-LOCK:HELD##'
 # so a concurrent HELD reader can never observe "the lock directory exists
 # but the owner file does not yet" (a `mkdir`-then-write TOCTOU window) and
 # default to treating a lock that is genuinely milliseconds old as though it
-# were fully absent. If the rename has not happened yet, the reader still
-# gets nothing and can't know the real timestamp -- see the
-# "timestamp=INDETERMINATE" fallback below, which `deploy_lock_acquire`
-# treats as "not confirmed stale," never as "instantly stale," precisely
-# because this window, while now much narrower, is not literally zero.
+# were fully absent. This narrows that window a great deal but a reader can
+# still land inside it (or the owning run can die -- an SSH drop, `kill -9`
+# -- between `mkdir` and the owner write, orphaning the lock with no owner
+# file at all, permanently, unless something can still age it out).
+#
+# (thermo review follow-up, regression fix) When the owner file is missing,
+# the fallback below is the lock *directory's own mtime* (`stat -c %Y`,
+# read on the same host as the timestamp -- see `deploy_lock_acquire`'s own
+# comment on why), not a fixed "indeterminate, retry" with no way out. This
+# gives an owner-file-missing lock the same staleness math and the same
+# manual-clear recovery path as a normal lock, via the `owner_missing=1`
+# marker `deploy_lock_acquire` checks below -- so a crash exactly in this
+# window still eventually reports STALE with the clear command, instead of
+# blocking every future deploy forever with no recovery path at all.
 _DEPLOY_LOCK_ACQUIRE_SCRIPT='
 set -euo pipefail
 root=$1; release=$2; ts=$3; host=$4; pid=$5
@@ -107,7 +116,9 @@ if grep -qi "file exists" -- "$mkdir_err"; then
   if [[ -f "$owner_file" ]]; then
     cat -- "$owner_file"
   else
-    printf "timestamp=INDETERMINATE\n"
+    dir_mtime=$(stat -c %Y -- "$lock" 2>/dev/null || printf "0")
+    printf "timestamp=%s\n" "$dir_mtime"
+    printf "owner_missing=1\n"
   fi
   exit 1
 fi
@@ -167,10 +178,14 @@ mv -Tf -- "$root/.rollback-current" "$root/current"
 #   - a fresh lock (owner timestamp < 30 minutes old): abort, no changes.
 #   - a stale lock: abort, reported as stale, with the manual-clear command.
 #     Never broken automatically.
-#   - the owner file is missing or unreadable despite the lock directory
-#     existing (the narrow TOCTOU window between `mkdir` and the owner
-#     file's rename-into-place elsewhere): treated as indeterminate, never
-#     as instantly stale -- see `_DEPLOY_LOCK_ACQUIRE_SCRIPT`'s own comment.
+#   - the owner file is missing (the narrow TOCTOU window between `mkdir`
+#     and the owner file's rename-into-place, or the owning run crashing
+#     inside that window -- an SSH drop, `kill -9`): the lock directory's
+#     own mtime stands in for the owner timestamp (see
+#     `_DEPLOY_LOCK_ACQUIRE_SCRIPT`'s own comment), so this still resolves
+#     to the normal fresh/stale math and, if stale, the same manual-clear
+#     recovery path -- a crash in this exact window must never orphan the
+#     lock forever with no way to recover it.
 #   - anything else -- SSH/connectivity failure, permission denied, a full
 #     or read-only filesystem on the lock host -- is its own distinct die
 #     message, never misreported as a stale lock. The only signal trusted
@@ -205,21 +220,37 @@ deploy_lock_acquire() {
   # that sentinel actually fell in the output (see the sentinel's comment).
   local owner
   owner=$(awk -v sentinel="$_DEPLOY_LOCK_SENTINEL_HELD" 'found{print} $0==sentinel{found=1}' <<<"$output")
-  local owner_ts now age
+  local owner_ts owner_missing now age manual_clear
   owner_ts=$(printf '%s\n' "$owner" | sed -n 's/^timestamp=//p' | head -n1)
+  owner_missing=$(printf '%s\n' "$owner" | sed -n 's/^owner_missing=//p' | head -n1)
   if [[ -z "$owner_ts" || ! "$owner_ts" =~ ^[0-9]+$ ]]; then
-    die "Deploy lock at $root/.deploy.lock exists, but its owner file is missing or unreadable (likely a concurrent acquire in progress, mid-write). Not confirmed stale -- retry shortly rather than clearing the lock manually. Owner:
+    die "Deploy lock at $root/.deploy.lock exists, but its state could not be read at all (no usable timestamp, not even the lock directory's own mtime). Not confirmed stale -- investigate manually before clearing. Owner:
 $owner"
   fi
   now=$(date -u +%s)
   age=$(( now - owner_ts ))
-  if (( age < DEPLOY_LOCK_STALE_SECONDS )); then
+  manual_clear="After confirming no deploy is actually running, clear it manually, either directly on the host or over SSH to the configured deploy destination: rm -f '$root/.deploy.lock.owner'; rmdir '$root/.deploy.lock'"
+  if [[ "$owner_missing" == "1" ]]; then
+    # (thermo review follow-up, regression fix) `$age` here comes from the
+    # lock directory's own mtime, not an owner file (there isn't one) --
+    # still enough to tell "probably still mid-acquire" from "orphaned, the
+    # owning run never got to write its owner file at all" apart, and,
+    # critically, still gives a recovery path once 30 minutes have passed
+    # either way, instead of blocking every future deploy forever.
+    if (( age >= DEPLOY_LOCK_STALE_SECONDS )); then
+      die "Deploy lock at $root/.deploy.lock is STALE (age ${age}s, based on the lock directory's own mtime -- its owner file is missing, most likely an interrupted acquire, e.g. a dropped SSH connection between mkdir and the owner write). Refusing to break it automatically.
+$manual_clear"
+    else
+      die "Deploy lock at $root/.deploy.lock exists, but its owner file is missing (age ${age}s, based on the lock directory's own mtime) -- likely a concurrent acquire in progress; retry shortly rather than clearing it now. If this persists beyond ${DEPLOY_LOCK_STALE_SECONDS}s, it is an orphaned lock.
+$manual_clear"
+    fi
+  elif (( age < DEPLOY_LOCK_STALE_SECONDS )); then
     die "Deploy lock is held (age ${age}s, under the 1800s staleness threshold). Another deploy is in progress; aborting with no changes. Owner:
 $owner"
   else
     die "Deploy lock at $root/.deploy.lock is STALE (age ${age}s). Refusing to break it automatically. Owner:
 $owner
-After confirming no deploy is actually running, clear it manually, either directly on the host or over SSH to the configured deploy destination: rm -f '$root/.deploy.lock.owner'; rmdir '$root/.deploy.lock'"
+$manual_clear"
   fi
 }
 
