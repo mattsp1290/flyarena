@@ -1,5 +1,5 @@
 import { quantileIndex } from '../null/null-stats';
-import { average } from '../../src/lib/atlas/types';
+import { average, COVERAGE_EDGES } from '../../src/lib/atlas/types';
 import type { RepertoireCellResult } from './repertoire-task';
 
 /**
@@ -14,8 +14,7 @@ import type { RepertoireCellResult } from './repertoire-task';
  * authored-null study.
  */
 
-export interface RepertoireCellMetricInput
-  extends Pick<RepertoireCellResult, 'cell' | 'quality' | 'heldoutOwn'> {}
+export type RepertoireCellMetricInput = Pick<RepertoireCellResult, 'cell' | 'quality' | 'heldoutOwn'>;
 
 /** Occupied cells among 36, after TS rebinning and collision resolution -- `cells` already *is* the occupied set (`evaluateSearchOnGraph`'s `ordered` array, one entry per distinct occupied cell), so this is just its length. */
 export const occupied = (cells: readonly RepertoireCellMetricInput[]): number => cells.length;
@@ -24,10 +23,13 @@ export const occupied = (cells: readonly RepertoireCellMetricInput[]): number =>
 export const qd = (cells: readonly RepertoireCellMetricInput[]): number =>
   cells.reduce((sum, cell) => sum + Math.max(0, cell.quality), 0);
 
-/** The number of distinct coverage bins plus the number of distinct turning bins occupied. `cell.cell = turningBin * 6 + coverageBin` (`src/lib/atlas/types.ts`'s `cellFor`), so `cell % 6` recovers the coverage bin and `Math.floor(cell / 6)` the turning bin -- never re-derived from raw `coverage`/`turning` values, which could land on a bin boundary differently than the GPU search's own rebinning. */
+/** The number of coverage bins `cellFor` (`src/lib/atlas/types.ts`) packs into one `cell` index: `cellFor = binIndex(turning, TURN_EDGES) * COVERAGE_BIN_COUNT + binIndex(coverage, COVERAGE_EDGES)`, so this is also the multiplier that separates the turning bin from the coverage bin below. */
+const COVERAGE_BIN_COUNT = COVERAGE_EDGES.length - 1;
+
+/** The number of distinct coverage bins plus the number of distinct turning bins occupied, among *this* re-evaluation's TS-rebinned cells (never the GPU search's own archive, which can rebin candidates into different cells than TS re-evaluation does -- `gpuArchiveSize` vs `occupied` audits that gap). `cell.cell = turningBin * COVERAGE_BIN_COUNT + coverageBin` (`cellFor`'s own packing, above), so `cell % COVERAGE_BIN_COUNT` recovers the coverage bin and `Math.floor(cell / COVERAGE_BIN_COUNT)` the turning bin -- never re-derived from raw `coverage`/`turning` values, which could land on a bin boundary differently than `cellFor`'s own rebinning already did. */
 export const span = (cells: readonly RepertoireCellMetricInput[]): number => {
-  const coverageBins = new Set(cells.map((cell) => cell.cell % 6));
-  const turningBins = new Set(cells.map((cell) => Math.floor(cell.cell / 6)));
+  const coverageBins = new Set(cells.map((cell) => cell.cell % COVERAGE_BIN_COUNT));
+  const turningBins = new Set(cells.map((cell) => Math.floor(cell.cell / COVERAGE_BIN_COUNT)));
   return coverageBins.size + turningBins.size;
 };
 
@@ -44,6 +46,7 @@ export const heldoutOwnMedian = (cells: readonly RepertoireCellMetricInput[]): n
 export interface RewiredDistribution {
   readonly n: number;
   readonly p25: number;
+  /** `null-stats.ts`'s `quantileIndex` convention, applied at `p = 0.5`: for an even `n` this is the upper-middle element (`sorted[n/2]`'s neighbor rule), not the mean of the two middle elements -- reported for descriptive display only, never used in `metricVerdict`/`categorize`'s category logic below. */
   readonly p50: number;
   readonly p75: number;
   readonly values: readonly number[];

@@ -19,13 +19,13 @@ import { runRepertoireTask, type RepertoireWorkerMessage, type RepertoireWorkerT
 process.on('message', (task: RepertoireWorkerTask) => {
   runRepertoireTask(task)
     .then((entry) => {
-      const message: RepertoireWorkerMessage = { type: 'result', graphId: task.graphId, results: [entry] };
+      const message: RepertoireWorkerMessage = { type: 'result', key: task.key, results: [entry] };
       process.send?.(message);
     })
     .catch((error: unknown) => {
       const message: RepertoireWorkerMessage = {
         type: 'error',
-        graphId: task.graphId,
+        key: task.key,
         message: error instanceof Error ? error.message : String(error)
       };
       process.send?.(message);

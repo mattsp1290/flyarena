@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -6,7 +7,9 @@ import { fileURLToPath } from 'node:url';
 
 import {
   buildRepertoirePlan,
+  planEntryKey,
   verifyBundleIdentity,
+  type RepertoirePlanEntry,
   type RepertoirePlanInputs
 } from '../../scripts/atlas/repertoire-plan';
 import { runRepertoireTask, type RepertoireCellResult, type RepertoireWorkerTask } from '../../scripts/atlas/repertoire-task';
@@ -60,6 +63,8 @@ const fakeRewireIndex = (seedCount: number): RewireIndex => ({
   }))
 });
 
+const FAKE_SEARCH_OPTIONS = { population: 64, generations: 24, ticks: 900 };
+
 describe('repertoire-plan: buildRepertoirePlan', () => {
   const inputsFor = (seedCount: number): RepertoirePlanInputs => ({
     rewireIndex: fakeRewireIndex(seedCount),
@@ -67,7 +72,8 @@ describe('repertoire-plan: buildRepertoirePlan', () => {
     biologicalGzipSha256: 'bio-gzip-sha',
     disconnectedBinarySha256: 'disc-binary-sha',
     armsDir: '/arms',
-    searchDir: '/search'
+    searchDir: '/search',
+    searchOptions: FAKE_SEARCH_OPTIONS
   });
 
   it('produces exactly the planned 46 (graph, seed) pairs', () => {
@@ -82,6 +88,11 @@ describe('repertoire-plan: buildRepertoirePlan', () => {
       expect(forSeed.length).toBe(seed < 5 ? 5 : 1);
       expect(forSeed.map((e) => e.searchSeed)).toContain(1729);
     }
+  });
+
+  it('every entry carries the shipped search budget, unmodified', () => {
+    const plan = buildRepertoirePlan(inputsFor(20));
+    for (const entry of plan) expect(entry.expectedSearchOptions).toEqual(FAKE_SEARCH_OPTIONS);
   });
 
   it('orders entries by (graph, seed), never lexically over graphId (rewired-10 after rewired-9, not before rewired-2)', () => {
@@ -115,6 +126,13 @@ describe('repertoire-plan: buildRepertoirePlan', () => {
     const plan = buildRepertoirePlan(inputsFor(20));
     const bundlePaths = new Set(plan.filter((e) => e.arm === 'rewired').map((e) => e.bundlePath));
     expect(bundlePaths.size).toBe(20);
+  });
+});
+
+describe('repertoire-plan: planEntryKey', () => {
+  it('builds the composite <graphId>@<searchSeed> key', () => {
+    expect(planEntryKey({ graphId: 'rewired-3', searchSeed: 1730 })).toBe('rewired-3@1730');
+    expect(planEntryKey({ graphId: 'biological', searchSeed: 1729 })).toBe('biological@1729');
   });
 });
 
@@ -344,7 +362,65 @@ describe('repertoire-metrics: pure functions', () => {
   });
 });
 
-describe('repertoire-task: runRepertoireTask rejects arm/bundle mix-ups', () => {
+// Shared by both the in-process `runRepertoireTask` tests and the real
+// forked-worker harness test below -- a minimal, `validateSearch`-passing
+// one-candidate search artifact for `bundle`, matching
+// `tests/unit/atlas.test.ts`'s own `buildSearchArtifact` fixture pattern.
+const FIXTURE_RUNTIME_CONFIG = Object.fromEntries(
+  Object.entries(ARENA_CONFIG).map(([key, value]) => [key.replace(/[A-Z]/g, (c) => '_' + c.toLowerCase()), value])
+);
+const FIXTURE_SEARCH_OPTIONS = { seed: 1, population: 4, generations: 1, ticks: 30 };
+
+const buildSearchArtifact = (bundle: SerializedArmBundle, candidateCount = 1): SearchArtifact => {
+  const d = bundle.D;
+  const hiddenSize = 8;
+  const parameterCount = readoutParameterCount(d, hiddenSize);
+  const candidates = Array.from({ length: candidateCount }, (_, id) => ({
+    id,
+    theta: Array.from({ length: parameterCount }, (_, i) => (((i * 37 + id * 11) % 101) / 101 - 0.5) * 0.2),
+    quality: 0,
+    coverage: 0,
+    turning: 0
+  }));
+  return {
+    schemaVersion: 1,
+    modelVersion: ATLAS_VERSION,
+    options: FIXTURE_SEARCH_OPTIONS,
+    inputSize: d,
+    hiddenSize,
+    substeps: 4,
+    discoverySeeds: DISCOVERY_SEEDS,
+    heldoutSeeds: HELDOUT_SEEDS,
+    coverageEdges: COVERAGE_EDGES,
+    turnEdges: TURN_EDGES,
+    graphArtifactSha256: bundle.graphArtifactSha256,
+    bundleSha256: bundle.sha256,
+    bundle: bundle as unknown as Record<string, unknown>,
+    candidates,
+    history: [{ generation: 1, occupied: candidateCount, bestQuality: 0 }],
+    searchPolicy: {
+      initialStd: 0.5,
+      mutationScales: [0.05, 0.15, 0.4],
+      freshFraction: 0.25,
+      weightBound: 8,
+      ties: 'earlier candidate',
+      rng: 'torch CPU Generator'
+    },
+    runtime: {
+      device: 'cpu',
+      deviceName: 'vitest',
+      torch: '0.0.0',
+      cuda: null,
+      seconds: 1,
+      peakTensorBytes: 0,
+      config: FIXTURE_RUNTIME_CONFIG
+    }
+  };
+};
+
+const binarySha = (bundle: SerializedArmBundle) => sha256Hex(new Uint8Array(encodeGraphBinary(deserializeArmBundle(bundle))));
+
+describe('repertoire-task: runRepertoireTask', () => {
   let root: string;
   let biological: SerializedArmBundle;
   let rewired: SerializedArmBundle;
@@ -362,64 +438,19 @@ describe('repertoire-task: runRepertoireTask rejects arm/bundle mix-ups', () => 
     if (root) rmSync(root, { recursive: true, force: true });
   });
 
-  const runtimeConfig = Object.fromEntries(
-    Object.entries(ARENA_CONFIG).map(([key, value]) => [key.replace(/[A-Z]/g, (c) => '_' + c.toLowerCase()), value])
-  );
-
-  const buildSearchArtifact = (bundle: SerializedArmBundle): SearchArtifact => {
-    const d = bundle.D;
-    const hiddenSize = 8;
-    const parameterCount = readoutParameterCount(d, hiddenSize);
-    const theta = Array.from({ length: parameterCount }, (_, i) => (((i * 37) % 101) / 101 - 0.5) * 0.2);
-    return {
-      schemaVersion: 1,
-      modelVersion: ATLAS_VERSION,
-      options: { seed: 1, population: 4, generations: 1, ticks: 30 },
-      inputSize: d,
-      hiddenSize,
-      substeps: 4,
-      discoverySeeds: DISCOVERY_SEEDS,
-      heldoutSeeds: HELDOUT_SEEDS,
-      coverageEdges: COVERAGE_EDGES,
-      turnEdges: TURN_EDGES,
-      graphArtifactSha256: bundle.graphArtifactSha256,
-      bundleSha256: bundle.sha256,
-      bundle: bundle as unknown as Record<string, unknown>,
-      candidates: [{ id: 0, theta, quality: 0, coverage: 0, turning: 0 }],
-      history: [{ generation: 1, occupied: 1, bestQuality: 0 }],
-      searchPolicy: {
-        initialStd: 0.5,
-        mutationScales: [0.05, 0.15, 0.4],
-        freshFraction: 0.25,
-        weightBound: 8,
-        ties: 'earlier candidate',
-        rng: 'torch CPU Generator'
-      },
-      runtime: {
-        device: 'cpu',
-        deviceName: 'vitest',
-        torch: '0.0.0',
-        cuda: null,
-        seconds: 1,
-        peakTensorBytes: 0,
-        config: runtimeConfig
-      }
-    };
-  };
-
-  const binarySha = (bundle: SerializedArmBundle) => sha256Hex(new Uint8Array(encodeGraphBinary(deserializeArmBundle(bundle))));
-
   it('rejects a search whose bundle is rewired when the plan expected biological', async () => {
     const searchPath = join(root, 'wrong-arm-biological.json');
     writeFileSync(searchPath, JSON.stringify(buildSearchArtifact(rewired)));
     await expect(
       runRepertoireTask({
-        graphId: 'biological@1729',
+        key: 'biological@1729',
+        graphId: 'biological',
         searchPath,
         expected: { arm: 'biological', binarySha256: binarySha(rewired), parentGzipSha256: rewired.graphArtifactSha256 },
+        expectedOptions: FIXTURE_SEARCH_OPTIONS,
         arm: 'biological',
         rewiringSeed: null,
-        searchSeed: 1729
+        searchSeed: 1
       })
     ).rejects.toThrow('arm mismatch');
   });
@@ -429,29 +460,75 @@ describe('repertoire-task: runRepertoireTask rejects arm/bundle mix-ups', () => 
     writeFileSync(searchPath, JSON.stringify(buildSearchArtifact(biological)));
     await expect(
       runRepertoireTask({
-        graphId: 'rewired-9@1729',
+        key: 'rewired-9@1729',
+        graphId: 'rewired-9',
         searchPath,
         expected: { arm: 'rewired', binarySha256: binarySha(biological), parentGzipSha256: biological.graphArtifactSha256 },
+        expectedOptions: FIXTURE_SEARCH_OPTIONS,
         arm: 'rewired',
         rewiringSeed: 9,
-        searchSeed: 1729
+        searchSeed: 1
       })
     ).rejects.toThrow('arm mismatch');
   });
 
-  it('returns a RepertoireEvaluatedEntry with heldoutOwn (never a "biological"-named field) for a rewired graph', async () => {
+  it('rejects a search whose recorded seed does not match the planned search seed, even with correct graph identity', async () => {
+    const searchPath = join(root, 'wrong-seed.json');
+    writeFileSync(searchPath, JSON.stringify(buildSearchArtifact(rewired)));
+    await expect(
+      runRepertoireTask({
+        key: 'rewired-9@1730',
+        graphId: 'rewired-9',
+        searchPath,
+        expected: { arm: 'rewired', binarySha256: binarySha(rewired), parentGzipSha256: rewired.graphArtifactSha256 },
+        // The fixture search file's own options.seed is 1, not 1730 -- this
+        // simulates a copied/renamed search file (a dual-review finding:
+        // graph identity alone is shared across every search seed of the
+        // same graph, so it cannot catch this on its own).
+        expectedOptions: { ...FIXTURE_SEARCH_OPTIONS, seed: 1730 },
+        arm: 'rewired',
+        rewiringSeed: 9,
+        searchSeed: 1730
+      })
+    ).rejects.toThrow('Search options mismatch');
+  });
+
+  it('rejects a search whose recorded budget is smaller than the shipped budget, even with correct graph identity and seed', async () => {
+    const searchPath = join(root, 'shrunk-budget.json');
+    writeFileSync(searchPath, JSON.stringify(buildSearchArtifact(rewired)));
+    await expect(
+      runRepertoireTask({
+        key: 'rewired-9@1',
+        graphId: 'rewired-9',
+        searchPath,
+        expected: { arm: 'rewired', binarySha256: binarySha(rewired), parentGzipSha256: rewired.graphArtifactSha256 },
+        // Shipped budget is population 64 -- the fixture search file was
+        // (legitimately, for test speed) generated at population 4.
+        expectedOptions: { ...FIXTURE_SEARCH_OPTIONS, population: 64 },
+        arm: 'rewired',
+        rewiringSeed: 9,
+        searchSeed: 1
+      })
+    ).rejects.toThrow('Search options mismatch');
+  });
+
+  it('returns a RepertoireEvaluatedEntry with the plain graphId, heldoutOwn (never a "biological"-named field), and the verified searchOptions', async () => {
     const searchPath = join(root, 'valid-rewired.json');
     writeFileSync(searchPath, JSON.stringify(buildSearchArtifact(rewired)));
     const entry = await runRepertoireTask({
-      graphId: 'rewired-9@1729',
+      key: 'rewired-9@1',
+      graphId: 'rewired-9',
       searchPath,
       expected: { arm: 'rewired', binarySha256: binarySha(rewired), parentGzipSha256: rewired.graphArtifactSha256 },
+      expectedOptions: FIXTURE_SEARCH_OPTIONS,
       arm: 'rewired',
       rewiringSeed: 9,
-      searchSeed: 1729
+      searchSeed: 1
     });
+    expect(entry.graphId).toBe('rewired-9');
     expect(entry.occupied).toBe(1);
     expect(entry.gpuArchiveSize).toBe(1);
+    expect(entry.searchOptions).toEqual(FIXTURE_SEARCH_OPTIONS);
     expect(entry.cells).toHaveLength(1);
     const cellResult: RepertoireCellResult = entry.cells[0];
     expect(cellResult.heldoutOwn).toHaveLength(12);
@@ -462,33 +539,33 @@ describe('repertoire-task: runRepertoireTask rejects arm/bundle mix-ups', () => 
 describe('repertoire-evaluate: runWorkerScheduler shard determinism / failure paths (stub worker)', () => {
   // `repertoire-worker.ts` itself is a real `.ts` file that needs a `tsx`
   // loader to resolve its own extensionless `./repertoire-task` import when
-  // forked -- `scripts/null/null-evaluate.ts`'s own shard-determinism test
-  // gets that loader by spawning its *CLI* as a subprocess with `--import
-  // tsx` (so the forked children inherit it via `execArgvForChildren`), but
-  // a plain `vitest run` invocation's own process has no such loader in its
-  // `execArgv` to inherit. `tests/fixtures/repertoire-stub-worker.mjs` (a
-  // plain `.mjs` file, no TS/loader involved) exercises the *scheduler*'s
-  // own mechanics directly instead -- shard-count/completion-order
-  // independence and fail-fast abort -- exactly mirroring
-  // `tests/unit/null-evaluate.test.ts`'s own "runShardedEvaluation:
-  // failure/abort paths (stub worker)" section. The real per-task pipeline
-  // (verify + evaluate + heldoutOwn renaming + arm-mismatch rejection) is
-  // covered separately above by calling `runRepertoireTask` directly,
-  // in-process, with no forking involved.
+  // forked. A plain `vitest run` invocation's own process has no such
+  // loader in its `execArgv` to inherit, so these tests exercise the
+  // *scheduler*'s own mechanics directly against a plain-`.mjs` stub worker
+  // instead -- shard-count/completion-order independence and fail-fast
+  // abort -- mirroring `tests/unit/null-evaluate.test.ts`'s own
+  // "runShardedEvaluation: failure/abort paths (stub worker)" section. The
+  // real forked worker (a genuine `.ts` fork, not a stub) is exercised
+  // separately below, via a `tsx`-launched subprocess harness, and the real
+  // per-task pipeline (verify + evaluate + heldoutOwn renaming + arm/seed/
+  // budget-mismatch rejection) is covered above by calling
+  // `runRepertoireTask` directly, in-process, with no forking involved.
   const stubWorkerPath = resolve(dirname(fileURLToPath(import.meta.url)), '../fixtures/repertoire-stub-worker.mjs');
 
-  /** `delayMs` is a stub-worker-only extension of the wire protocol, not part of the real `RepertoireWorkerTask`. */
-  const task = (graphId: string, delayMs = 0): RepertoireWorkerTask & { delayMs: number } => ({
-    graphId,
+  /** `delayMs` is a stub-worker-only extension of the wire protocol, not part of the real `RepertoireWorkerTask`. Here `key` and `graphId` are deliberately the same string -- these tests exercise the scheduler's own key-matching, not the plain-vs-composite distinction (covered by `planEntryKey`'s and `runRepertoireTask`'s own tests above). */
+  const task = (key: string, delayMs = 0): RepertoireWorkerTask & { delayMs: number } => ({
+    key,
+    graphId: key,
     searchPath: 'unused',
     expected: { arm: 'rewired', binarySha256: 'unused', parentGzipSha256: 'unused' },
+    expectedOptions: { seed: 1, population: 4, generations: 1, ticks: 30 },
     arm: 'rewired',
     rewiringSeed: null,
     searchSeed: 1,
     delayMs
   });
 
-  it('results are keyed by graphId and independent of which shard finishes which task first', async () => {
+  it('results are keyed by key and independent of which shard finishes which task first', async () => {
     // Reverse-order completion: task 0 is slowest, task 4 is fastest.
     const tasks = [0, 1, 2, 3, 4].map((i) => task(`t${i}`, (5 - i) * 15));
     const results = await runWorkerScheduler(tasks, 5, stubWorkerPath);
@@ -496,16 +573,17 @@ describe('repertoire-evaluate: runWorkerScheduler shard determinism / failure pa
   });
 
   it('--shards 1 and --shards 3 assemble byte-identical output for the same task list', async () => {
-    const plan = [0, 1, 2].map((i) => ({
+    const plan: RepertoirePlanEntry[] = [0, 1, 2].map((i) => ({
       graphId: `fixture-${i}`,
       arm: 'rewired' as const,
       rewiringSeed: null,
       searchSeed: 1,
       bundlePath: 'unused',
       searchOutputPath: 'unused',
-      expected: { arm: 'rewired' as const, binarySha256: 'unused', parentGzipSha256: 'unused' }
+      expected: { arm: 'rewired' as const, binarySha256: 'unused', parentGzipSha256: 'unused' },
+      expectedSearchOptions: { population: 4, generations: 1, ticks: 30 }
     }));
-    const tasks = plan.map((entry, i) => task(`${entry.graphId}@${entry.searchSeed}`, (3 - i) * 10));
+    const tasks = plan.map((entry, i) => task(planEntryKey(entry), (3 - i) * 10));
 
     const results1 = await runWorkerScheduler(tasks, 1, stubWorkerPath);
     const results3 = await runWorkerScheduler(tasks, 3, stubWorkerPath);
@@ -514,16 +592,140 @@ describe('repertoire-evaluate: runWorkerScheduler shard determinism / failure pa
     const artifact3 = assembleEvaluatedArtifact(plan, results3);
 
     expect(JSON.stringify(artifact1)).toBe(JSON.stringify(artifact3));
+    // The persisted `graphId` on each entry is the plain id (from the stub's
+    // own response), never the composite `key` -- pins the fix for the
+    // dual-review finding that an earlier version leaked the composite key
+    // into this field.
     expect(artifact1.graphs.map((g) => g.graphId)).toEqual(['fixture-0@1', 'fixture-1@1', 'fixture-2@1']);
   });
 
-  it('a task-level error aborts the whole run rather than draining the rest of the queue', async () => {
-    const tasks = [task('err'), ...Array.from({ length: 12 }, (_, i) => task(`t${i}`, 200))];
+  it('a task-level error aborts the whole run quickly, not after the full queue drains', async () => {
+    // Self-calibrating regression floor (mirrors
+    // `tests/unit/null-evaluate.test.ts`'s identically-reasoned stub-worker
+    // test): with 2 shards and 'err' dispatched first, a correct abort lets
+    // at most one delayed task per shard start before `abortAll` fires, so
+    // wall time is dominated by fork/IPC overhead alone, independent of
+    // `remainingTaskCount`. A regressed scheduler that keeps draining the
+    // queue after the first error would instead split all 12 remaining
+    // 200ms tasks across 2 shards and take about 1200ms -- asserting well
+    // under that floor catches the regression without a flaky tight bound.
+    const delayMs = 200;
+    const remainingTaskCount = 12;
+    const tasks = [task('err'), ...Array.from({ length: remainingTaskCount }, (_, i) => task(`t${i}`, delayMs))];
+    const regressionFloorMs = (remainingTaskCount / 2) * delayMs; // 1200ms
+    const started = Date.now();
     await expect(runWorkerScheduler(tasks, 2, stubWorkerPath)).rejects.toThrow(/stub-induced failure/);
+    const elapsedMs = Date.now() - started;
+    expect(elapsedMs).toBeLessThan(regressionFloorMs / 2); // generous 600ms bound, well below the 1200ms floor
   });
 
   it('a worker killed by a signal is reported as a failure, not treated as a clean exit', async () => {
     const tasks = [task('kill'), task('t1', 50), task('t2', 50)];
     await expect(runWorkerScheduler(tasks, 3, stubWorkerPath)).rejects.toThrow(/exited unexpectedly/);
   });
+});
+
+describe('repertoire-evaluate: real forked worker (tsx subprocess harness)', () => {
+  // Unlike the stub-worker section above, this spawns a small harness
+  // script (`tests/fixtures/repertoire-scheduler-harness.mjs`) as its OWN
+  // subprocess via `node --import tsx`, exactly the way
+  // `tests/unit/null-evaluate.test.ts` spawns `null-evaluate.ts`'s CLI to
+  // get a real `.ts`-loader-carrying `process.execArgv` for its forked
+  // children to inherit. This exercises the REAL `repertoire-worker.ts`
+  // (a genuine fork of a `.ts` file, not a stub) end to end, on real
+  // fixture search files -- confirmed working during dual review; a
+  // shard-determinism test using only the stub worker cannot exercise this
+  // path, since the stub's output is identical by construction regardless
+  // of what the real worker does.
+  let root: string;
+  let biological: SerializedArmBundle;
+  let disconnected: SerializedArmBundle;
+  let outDir: string;
+  const searchPaths = new Map<string, string>();
+
+  const harnessPath = resolve(dirname(fileURLToPath(import.meta.url)), '../fixtures/repertoire-scheduler-harness.mjs');
+  const evaluateModulePath = resolve(process.cwd(), 'scripts/atlas/repertoire-evaluate.ts');
+  const workerPath = resolve(process.cwd(), 'scripts/atlas/repertoire-worker.ts');
+
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), 'repertoire-real-worker-'));
+    const result = runExportArms({ outDir: root, fixtureRewire: true, fixtureRewireSeed: 2 });
+    outDir = result.outDir;
+    biological = JSON.parse(readFileSync(join(outDir, 'biological.json'), 'utf8'));
+    disconnected = JSON.parse(readFileSync(join(outDir, 'disconnected.json'), 'utf8'));
+
+    for (const [key, bundle, count] of [
+      ['fixture-a@1', biological, 1],
+      ['fixture-b@1', disconnected, 2],
+      ['fixture-c@1', biological, 1]
+    ] as const) {
+      const path = join(root, `${key.replace('@', '-')}.json`);
+      writeFileSync(path, JSON.stringify(buildSearchArtifact(bundle, count)));
+      searchPaths.set(key, path);
+    }
+  });
+
+  afterAll(() => {
+    if (root) rmSync(root, { recursive: true, force: true });
+  });
+
+  const buildTasks = (): (RepertoireWorkerTask & Record<string, unknown>)[] => [
+    {
+      key: 'fixture-a@1',
+      graphId: 'fixture-a',
+      searchPath: searchPaths.get('fixture-a@1')!,
+      expected: { arm: 'biological' as const, binarySha256: binarySha(biological), parentGzipSha256: biological.graphArtifactSha256 },
+      expectedOptions: FIXTURE_SEARCH_OPTIONS,
+      arm: 'biological' as const,
+      rewiringSeed: null,
+      searchSeed: 1
+    },
+    {
+      key: 'fixture-b@1',
+      graphId: 'fixture-b',
+      searchPath: searchPaths.get('fixture-b@1')!,
+      expected: { arm: 'disconnected' as const, binarySha256: binarySha(disconnected), parentGzipSha256: disconnected.graphArtifactSha256 },
+      expectedOptions: FIXTURE_SEARCH_OPTIONS,
+      arm: 'disconnected' as const,
+      rewiringSeed: null,
+      searchSeed: 1
+    },
+    {
+      key: 'fixture-c@1',
+      graphId: 'fixture-c',
+      searchPath: searchPaths.get('fixture-c@1')!,
+      expected: { arm: 'biological' as const, binarySha256: binarySha(biological), parentGzipSha256: biological.graphArtifactSha256 },
+      expectedOptions: FIXTURE_SEARCH_OPTIONS,
+      arm: 'biological' as const,
+      rewiringSeed: null,
+      searchSeed: 1
+    }
+  ];
+
+  const runHarness = (shards: number, tasksPath: string) =>
+    spawnSync(
+      process.execPath,
+      ['--import', 'tsx', harnessPath, evaluateModulePath, workerPath, String(shards), tasksPath],
+      { encoding: 'utf8', timeout: 60_000, cwd: process.cwd() }
+    );
+
+  it('forks the real repertoire-worker.ts and produces byte-identical results for --shards 1 and --shards 3', () => {
+    const tasksPath = join(root, 'tasks.json');
+    writeFileSync(tasksPath, JSON.stringify(buildTasks()));
+
+    const result1 = runHarness(1, tasksPath);
+    const result3 = runHarness(3, tasksPath);
+
+    expect(result1.status, result1.stderr).toBe(0);
+    expect(result3.status, result3.stderr).toBe(0);
+
+    const entries1 = JSON.parse(result1.stdout) as [string, unknown][];
+    const entries3 = JSON.parse(result3.stdout) as [string, unknown][];
+    expect(entries1.map(([key]) => key)).toEqual(['fixture-a@1', 'fixture-b@1', 'fixture-c@1']);
+    expect(JSON.stringify(entries1)).toBe(JSON.stringify(entries3));
+
+    const [, biologicalEntryA] = entries1[0] as [string, { readonly occupied: number; readonly graphId: string }];
+    expect(biologicalEntryA.graphId).toBe('fixture-a');
+    expect(biologicalEntryA.occupied).toBe(1);
+  }, 60_000);
 });

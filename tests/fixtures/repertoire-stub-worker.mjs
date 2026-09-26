@@ -9,13 +9,19 @@
 // `process.send({type: 'result'|'error', ...})`, with `results` always a
 // one-element array, matching `RepertoireWorkerMessage`'s shape) to drive
 // those paths directly, with no real search file or episode involved.
+//
+// Matches on `task.key` (the composite wire/scheduling key,
+// `repertoire-plan.ts`'s `planEntryKey`), not `task.graphId` (the plain
+// graph identity) -- the real worker's own protocol distinguishes these two
+// fields (`repertoire-task.ts`'s `RepertoireWorkerTask` doc comment), and
+// this stub's tests rely on `key` being the unique-per-task field.
 process.on('message', (task) => {
-  if (task.graphId === 'kill') {
+  if (task.key === 'kill') {
     process.kill(process.pid, 'SIGKILL');
     return;
   }
-  if (task.graphId === 'err') {
-    process.send({ type: 'error', graphId: task.graphId, message: 'stub-induced failure' });
+  if (task.key === 'err') {
+    process.send({ type: 'error', key: task.key, message: 'stub-induced failure' });
     return;
   }
   const end = Date.now() + (task.delayMs ?? 0);
@@ -23,20 +29,21 @@ process.on('message', (task) => {
     // Busy-wait: deterministic, no async timer needed for a short delay.
   }
   // A deterministic, content-derived stand-in `RepertoireEvaluatedEntry` --
-  // its `occupied` count echoes the task's own graphId length so the
+  // its `occupied`/`gpuArchiveSize` echo the task's own `key` length so the
   // determinism assertion can tell entries apart without depending on
   // completion order.
   process.send({
     type: 'result',
-    graphId: task.graphId,
+    key: task.key,
     results: [
       {
-        graphId: task.graphId,
+        graphId: task.graphId ?? task.key,
         arm: 'rewired',
         rewiringSeed: null,
         searchSeed: 1,
-        gpuArchiveSize: task.graphId.length,
-        occupied: task.graphId.length,
+        searchOptions: { seed: 1, population: 4, generations: 1, ticks: 30 },
+        gpuArchiveSize: task.key.length,
+        occupied: task.key.length,
         collisions: 0,
         cells: []
       }

@@ -3,6 +3,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { createDisconnectedGraph, encodeGraphBinary } from '../../src/lib/connectome/format';
+import { ATLAS_FILE, type SearchArtifact } from '../../src/lib/atlas/types';
 import { loadLocalAssets } from '../experiments/local-assets';
 import { readRewireIndex, type RewireIndex } from '../null/rewire-index';
 import { computeArmBundleSha256, deserializeArmBundle, type SerializedArmBundle } from '../training/export-arms';
@@ -36,7 +37,7 @@ import type { ExpectedGraphIdentity } from './verify-search-graph';
  *   `graphId` is `biological`, `disconnected`, or `rewired-<N>`.
  */
 export interface RepertoirePlanEntry {
-  /** `biological` | `disconnected` | `rewired-<N>`. */
+  /** `biological` | `disconnected` | `rewired-<N>`. Never includes the search seed -- see `planEntryKey` for the composite key that does. */
   readonly graphId: string;
   readonly arm: ArmName;
   /** The rewiring seed for a `rewired` entry, else `null`. */
@@ -45,7 +46,21 @@ export interface RepertoirePlanEntry {
   readonly bundlePath: string;
   readonly searchOutputPath: string;
   readonly expected: ExpectedGraphIdentity;
+  /** The shipped search budget every entry is searched with (`loadPlanInputs` reads it off the shipped atlas artifact -- never hardcoded, never shrunk). Combined with `searchSeed` above, this is what `repertoire-task.ts` checks a search file's own recorded `options` against, so a misnamed, duplicated, or under-budget search file cannot silently stand in for this entry (a dual-review finding: graph identity alone is shared across every one of a graph's search seeds, so it cannot tell them apart). */
+  readonly expectedSearchOptions: Readonly<Pick<SearchArtifact['options'], 'population' | 'generations' | 'ticks'>>;
 }
+
+/**
+ * The composite key that uniquely identifies one planned search (a
+ * `RepertoirePlanEntry` alone is not unique when the same rewiring is
+ * searched at multiple seeds) -- the single place this string is built, so
+ * `repertoire-evaluate.ts`'s task/message wire key and its final
+ * `evaluated.json` assembly can never disagree about what it looks like (a
+ * dual-review finding: the two previously built this string independently
+ * in two places).
+ */
+export const planEntryKey = (entry: Pick<RepertoirePlanEntry, 'graphId' | 'searchSeed'>): string =>
+  `${entry.graphId}@${entry.searchSeed}`;
 
 /** The shipped search's own seed (`docs/behavior-atlas-validation.md`, `SearchOptions.seed`'s default). Every graph is searched at least once at this seed. */
 export const PRIMARY_SEARCH_SEED = 1729;
@@ -63,6 +78,7 @@ export interface RepertoirePlanInputs {
   readonly disconnectedBinarySha256: string;
   readonly armsDir: string;
   readonly searchDir: string;
+  readonly searchOptions: Readonly<Pick<SearchArtifact['options'], 'population' | 'generations' | 'ticks'>>;
 }
 
 const bundlePathFor = (armsDir: string, graphArtifactSha256: string, arm: ArmName, rewiringSeed: number | null): string =>
@@ -80,8 +96,15 @@ const bundlePathFor = (armsDir: string, graphArtifactSha256: string, arm: ArmNam
  * `rewire_batch.py`'s own `index.json`).
  */
 export const buildRepertoirePlan = (inputs: Readonly<RepertoirePlanInputs>): readonly RepertoirePlanEntry[] => {
-  const { rewireIndex, biologicalBinarySha256, biologicalGzipSha256, disconnectedBinarySha256, armsDir, searchDir } =
-    inputs;
+  const {
+    rewireIndex,
+    biologicalBinarySha256,
+    biologicalGzipSha256,
+    disconnectedBinarySha256,
+    armsDir,
+    searchDir,
+    searchOptions
+  } = inputs;
   const seedEntry = new Map(rewireIndex.seeds.map((entry) => [entry.seed, entry]));
   const entries: RepertoirePlanEntry[] = [];
 
@@ -95,7 +118,8 @@ export const buildRepertoirePlan = (inputs: Readonly<RepertoirePlanInputs>): rea
       searchSeed,
       bundlePath: bundlePathFor(armsDir, biologicalGzipSha256, 'biological', null),
       searchOutputPath: outputPathFor('biological', searchSeed),
-      expected: { arm: 'biological', binarySha256: biologicalBinarySha256, parentGzipSha256: biologicalGzipSha256 }
+      expected: { arm: 'biological', binarySha256: biologicalBinarySha256, parentGzipSha256: biologicalGzipSha256 },
+      expectedSearchOptions: searchOptions
     });
   }
 
@@ -106,7 +130,8 @@ export const buildRepertoirePlan = (inputs: Readonly<RepertoirePlanInputs>): rea
     searchSeed: PRIMARY_SEARCH_SEED,
     bundlePath: bundlePathFor(armsDir, biologicalGzipSha256, 'disconnected', null),
     searchOutputPath: outputPathFor('disconnected', PRIMARY_SEARCH_SEED),
-    expected: { arm: 'disconnected', binarySha256: disconnectedBinarySha256, parentGzipSha256: biologicalGzipSha256 }
+    expected: { arm: 'disconnected', binarySha256: disconnectedBinarySha256, parentGzipSha256: biologicalGzipSha256 },
+    expectedSearchOptions: searchOptions
   });
 
   for (let rewiringSeed = 0; rewiringSeed < REWIRED_COUNT; rewiringSeed += 1) {
@@ -129,7 +154,8 @@ export const buildRepertoirePlan = (inputs: Readonly<RepertoirePlanInputs>): rea
         searchSeed,
         bundlePath,
         searchOutputPath: outputPathFor(graphId, searchSeed),
-        expected
+        expected,
+        expectedSearchOptions: searchOptions
       });
     }
   }
@@ -154,16 +180,24 @@ export const buildRepertoirePlan = (inputs: Readonly<RepertoirePlanInputs>): rea
  */
 export const verifyBundleIdentity = (bundlePath: string, expected: Readonly<ExpectedGraphIdentity>): void => {
   const bundle = JSON.parse(readFileSync(bundlePath, 'utf8')) as SerializedArmBundle;
-  if (bundle.formatVersion !== 1) throw new Error(`repertoire-plan: ${bundlePath} has unexpected formatVersion`);
+  if (bundle.formatVersion !== 1) {
+    throw new Error(`repertoire-plan: ${bundlePath} has unexpected formatVersion ${String(bundle.formatVersion)} (expected 1)`);
+  }
   if (bundle.arm !== expected.arm) {
     throw new Error(`repertoire-plan: ${bundlePath} arm mismatch: expected ${expected.arm}, bundle says ${bundle.arm}`);
   }
   const { sha256: declaredSha256, ...withoutHash } = bundle;
-  if (computeArmBundleSha256(withoutHash) !== declaredSha256) {
-    throw new Error(`repertoire-plan: ${bundlePath} is not self-consistent with its own declared sha256`);
+  const recomputedSha256 = computeArmBundleSha256(withoutHash);
+  if (recomputedSha256 !== declaredSha256) {
+    throw new Error(
+      `repertoire-plan: ${bundlePath} is not self-consistent with its own declared sha256 ` +
+        `(declared ${declaredSha256}, recomputed ${recomputedSha256})`
+    );
   }
   if (bundle.graphArtifactSha256 !== expected.parentGzipSha256) {
-    throw new Error(`repertoire-plan: ${bundlePath} parent identity mismatch`);
+    throw new Error(
+      `repertoire-plan: ${bundlePath} parent identity mismatch (expected ${expected.parentGzipSha256}, got ${bundle.graphArtifactSha256})`
+    );
   }
   if (bundle.arm === 'disconnected' && bundle.metadata.edgeCount !== 0) {
     throw new Error(`repertoire-plan: ${bundlePath} is arm disconnected but edgeCount is not 0`);
@@ -177,7 +211,91 @@ export const verifyBundleIdentity = (bundlePath: string, expected: Readonly<Expe
   }
 };
 
-/** Load `manifest.json` + the compiled biological graph, and derive the disconnected control's expected binary sha256 from it -- the one piece of `RepertoirePlanInputs` that isn't read straight off a file on disk. */
+const REWIRING_NULL_FILE = 'rewiring-null-v1.json';
+
+interface RewiringNullDoc {
+  readonly sourceGraphSha256: string;
+  readonly rewired: readonly { readonly seed: number; readonly gzipSha256: string }[];
+}
+
+/**
+ * WP2's stop/go gate 3 (`.agents/plans/repertoire-null/00-overview.md`'s
+ * "Stop/go gates" section): every rewiring `index.json` names for seeds
+ * `[0, REWIRED_COUNT)` must be the *same* regenerated batch
+ * `<data>/rewiring-null-v1.json` was computed against -- sha256-verified
+ * against the manifest's own `rewiringNull.sha256` first, so this isn't
+ * itself trusting an unverified file. Every later check (`verifyBundleIdentity`,
+ * `verifyAndEvaluateSearchGraph`) only re-verifies a bundle/search file
+ * against whatever `index.json` says; nothing else on this branch catches
+ * an `index.json` that is self-consistent but simply *wrong* -- rewired
+ * from a different source graph, generated with different parameters, or
+ * hand-edited (a dual-review finding). Also asserts the 20 `binarySha256`
+ * values used are pairwise distinct, per `02-runs-and-reevaluation.md`'s
+ * "assert that the 20 rewired bundles re-encode to 20 distinct binaries".
+ * Throws with every mismatch listed, not just the first, so a bad batch is
+ * fully diagnosable from one run.
+ */
+const verifyRewireIndexAgainstShippedNull = (
+  rewireIndex: Readonly<RewireIndex>,
+  biologicalBinarySha256: string,
+  data: string
+): void => {
+  if (rewireIndex.sourceSha256 !== biologicalBinarySha256) {
+    throw new Error(
+      `repertoire-plan: rewire index was regenerated from a different biological source ` +
+        `(index.sourceSha256=${rewireIndex.sourceSha256}, manifest.binarySha256=${biologicalBinarySha256})`
+    );
+  }
+
+  const rewiringNullPath = resolve(data, REWIRING_NULL_FILE);
+  const rewiringNullBytes = readFileSync(rewiringNullPath);
+  const rewiringNull = JSON.parse(rewiringNullBytes.toString('utf8')) as RewiringNullDoc;
+  if (rewiringNull.sourceGraphSha256 !== biologicalBinarySha256) {
+    throw new Error(
+      `repertoire-plan: ${rewiringNullPath} sourceGraphSha256 does not match the biological manifest ` +
+        `(expected ${biologicalBinarySha256}, got ${rewiringNull.sourceGraphSha256})`
+    );
+  }
+
+  const rewiringNullBySeed = new Map(rewiringNull.rewired.map((entry) => [entry.seed, entry]));
+  const indexBySeed = new Map(rewireIndex.seeds.map((entry) => [entry.seed, entry]));
+  const mismatches: string[] = [];
+  const binaryShas = new Set<string>();
+  for (let seed = 0; seed < REWIRED_COUNT; seed += 1) {
+    const indexEntry = indexBySeed.get(seed);
+    const nullEntry = rewiringNullBySeed.get(seed);
+    if (!indexEntry) {
+      mismatches.push(`seed ${seed}: missing from the rewire index`);
+      continue;
+    }
+    if (!nullEntry) {
+      mismatches.push(`seed ${seed}: missing from ${rewiringNullPath}`);
+      continue;
+    }
+    if (indexEntry.gzipSha256 !== nullEntry.gzipSha256) {
+      mismatches.push(
+        `seed ${seed}: gzipSha256 mismatch (index=${indexEntry.gzipSha256}, ${REWIRING_NULL_FILE}=${nullEntry.gzipSha256})`
+      );
+    }
+    binaryShas.add(indexEntry.binarySha256);
+  }
+  if (mismatches.length > 0) {
+    throw new Error(`repertoire-plan: gate 3 failed against ${rewiringNullPath}:\n${mismatches.join('\n')}`);
+  }
+  if (binaryShas.size !== REWIRED_COUNT) {
+    throw new Error(
+      `repertoire-plan: rewire index has only ${binaryShas.size} distinct binarySha256 value(s) across ${REWIRED_COUNT} rewiring seeds (expected ${REWIRED_COUNT} distinct)`
+    );
+  }
+};
+
+/**
+ * Load `manifest.json` + the compiled biological graph, derive the
+ * disconnected control's expected binary sha256 from it, read the shipped
+ * search budget off the shipped atlas artifact (`ATLAS_FILE`, never
+ * hardcoded or shrunk), and enforce gate 3 against `rewiring-null-v1.json`
+ * (see `verifyRewireIndexAgainstShippedNull`).
+ */
 export const loadPlanInputs = async (
   data: string,
   graphsIndexPath: string,
@@ -188,16 +306,24 @@ export const loadPlanInputs = async (
     loadLocalAssets(data),
     Promise.resolve(readRewireIndex(graphsIndexPath))
   ]);
+
+  verifyRewireIndexAgainstShippedNull(rewireIndex, assets.manifest.binarySha256, data);
+
   const disconnectedBinarySha256 = sha256Hex(
     new Uint8Array(encodeGraphBinary(createDisconnectedGraph(assets.parsedBiological)))
   );
+
+  const atlasArtifact = JSON.parse(readFileSync(resolve(data, ATLAS_FILE), 'utf8')) as { source: SearchArtifact };
+  const { population, generations, ticks } = atlasArtifact.source.options;
+
   return {
     rewireIndex,
     biologicalBinarySha256: assets.manifest.binarySha256,
     biologicalGzipSha256: assets.manifest.gzipSha256,
     disconnectedBinarySha256,
     armsDir,
-    searchDir
+    searchDir,
+    searchOptions: { population, generations, ticks }
   };
 };
 

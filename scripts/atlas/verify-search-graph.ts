@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { createDisconnectedGraph, encodeGraphBinary, type ConnectomeGraph } from '../../src/lib/connectome/format';
 import { outputNeuronIndices } from '../../src/lib/connectome/readout';
 import { validateSearch } from '../../src/lib/atlas/validation';
+import type { SearchArtifact } from '../../src/lib/atlas/types';
 import {
   deserializeArmBundle,
   type ArmName,
@@ -81,10 +82,26 @@ export interface ExpectedGraphIdentity {
  * Omitting *both* `expected.binarySha256` and `verifiedBiologicalGraph` for
  * a `disconnected` bundle is a hard error, not a silent pass.
  */
+/**
+ * `source.options`' seed/population/generations/ticks, checked against
+ * `expectedOptions` when supplied (optional -- WP1's own callers, and
+ * `publish.ts`'s single shipped-seed path, never pass it). Added for WP2's
+ * driver (`repertoire-task.ts`), whose per-graph identity check alone
+ * cannot tell "the right graph, searched at the wrong seed or a shrunk
+ * budget" apart from "the right graph, searched exactly as planned" --
+ * every one of the 5 biological search seeds (and every one of rewirings
+ * 0-4's 5 search seeds) shares the *same* bundle/binary identity, so a
+ * misnamed, duplicated, or hand-run-at-a-smaller-budget search file passes
+ * every identity check above and would otherwise be silently accepted (a
+ * dual-review finding).
+ */
+export type ExpectedSearchOptions = Readonly<SearchArtifact['options']>;
+
 export async function verifyAndEvaluateSearchGraph(
   searchPath: string,
   expected: ExpectedGraphIdentity,
-  verifiedBiologicalGraph?: Readonly<ConnectomeGraph>
+  verifiedBiologicalGraph?: Readonly<ConnectomeGraph>,
+  expectedOptions?: ExpectedSearchOptions
 ): Promise<GraphEvaluationResult> {
   const input: unknown = JSON.parse(await readFile(searchPath, 'utf8'));
   const source = validateSearch(input);
@@ -94,6 +111,18 @@ export async function verifyAndEvaluateSearchGraph(
     throw new Error(`Search graph arm mismatch: expected ${expected.arm}, bundle says ${bundle.arm}`);
   if (bundle.graphArtifactSha256 !== expected.parentGzipSha256)
     throw new Error('Search graph parent identity mismatch');
+  if (expectedOptions) {
+    const mismatches = (['seed', 'population', 'generations', 'ticks'] as const).filter(
+      (key) => source.options[key] !== expectedOptions[key]
+    );
+    if (mismatches.length > 0) {
+      throw new Error(
+        `Search options mismatch: ${mismatches
+          .map((key) => `${key} expected ${expectedOptions[key]}, got ${source.options[key]}`)
+          .join('; ')}`
+      );
+    }
+  }
   if (!isBundleSelfConsistent(source, bundle))
     throw new Error('Search artifact is not self-consistent with its bundle');
   // atlas_cli.py records `arm` at the search JSON's top level alongside

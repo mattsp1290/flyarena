@@ -46,10 +46,12 @@ if [ ! -f "$ATLAS_ARTIFACT" ]; then
   exit 1
 fi
 # Never hardcode/shrink the search budget: read it off the shipped atlas
-# artifact's own recorded search options every run.
-POPULATION=$(jq '.source.options.population' "$ATLAS_ARTIFACT")
-GENERATIONS=$(jq '.source.options.generations' "$ATLAS_ARTIFACT")
-TICKS=$(jq '.source.options.ticks' "$ATLAS_ARTIFACT")
+# artifact's own recorded search options every run. `-e` fails loudly (jq
+# exits non-zero) on a missing/null field instead of handing atlas_cli.py a
+# literal "null" population/generations/ticks argument.
+POPULATION=$(jq -er '.source.options.population' "$ATLAS_ARTIFACT")
+GENERATIONS=$(jq -er '.source.options.generations' "$ATLAS_ARTIFACT")
+TICKS=$(jq -er '.source.options.ticks' "$ATLAS_ARTIFACT")
 echo "repertoire-search: shipped budget population=$POPULATION generations=$GENERATIONS ticks=$TICKS (from $ATLAS_ARTIFACT)"
 
 PLAN_JSON=$(npx tsx scripts/atlas/repertoire-plan.ts --mode emit \
@@ -61,6 +63,7 @@ ONLY_KEY="${1:-}"
 
 RAN=0
 SKIPPED=0
+MATCHED=0
 while IFS= read -r ENTRY; do
   GRAPH_ID=$(echo "$ENTRY" | jq -r '.graphId')
   SEED=$(echo "$ENTRY" | jq -r '.searchSeed')
@@ -74,6 +77,7 @@ while IFS= read -r ENTRY; do
   if [ -n "$ONLY_KEY" ] && [ "$KEY" != "$ONLY_KEY" ]; then
     continue
   fi
+  MATCHED=$((MATCHED + 1))
 
   if [ -f "$OUTPUT" ]; then
     echo "repertoire-search: [skip] $KEY (output already exists at $OUTPUT)"
@@ -99,5 +103,14 @@ while IFS= read -r ENTRY; do
   echo "repertoire-search: [done] $KEY in ${SEARCH_ELAPSED}s"
   RAN=$((RAN + 1))
 done < <(echo "$PLAN_JSON" | jq -c '.[]')
+
+# A mistyped calibration key (e.g. a transposed digit) would otherwise match
+# nothing, run zero searches, and still exit 0 -- indistinguishable from a
+# genuinely already-complete run (a dual-review finding).
+if [ -n "$ONLY_KEY" ] && [ "$MATCHED" -eq 0 ]; then
+  echo "repertoire-search: no planned entry matches '$ONLY_KEY'" >&2
+  echo "$PLAN_JSON" | jq -r '.[] | .graphId + "@" + (.searchSeed | tostring)' >&2
+  exit 1
+fi
 
 echo "repertoire-search: ran $RAN search(es), skipped $SKIPPED already-present"

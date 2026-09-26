@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 
 import { requirePositiveInt, requireValue } from '../training/cli';
 import { atomicWriteFileSync } from '../training/fsio';
-import { buildRepertoirePlan, loadPlanInputs, type RepertoirePlanEntry } from './repertoire-plan';
+import { buildRepertoirePlan, loadPlanInputs, planEntryKey, type RepertoirePlanEntry } from './repertoire-plan';
 import type { RepertoireEvaluatedEntry, RepertoireWorkerMessage, RepertoireWorkerTask } from './repertoire-task';
 
 /**
@@ -26,7 +26,7 @@ import type { RepertoireEvaluatedEntry, RepertoireWorkerMessage, RepertoireWorke
  * exactly *one* whole-graph evaluation record, not a per-seed list, so
  * reusing it would mean forcing a one-element `heldOutSeeds`/`results` pair
  * through a check that means something different. `runWorkerScheduler`
- * below mirrors the same shape instead: a self-checking `graphId` match on
+ * below mirrors the same shape instead: a self-checking `key` match on
  * every reply, `abortAll` on the first error or unexpected exit (never left
  * to keep draining the queue), every child tracked and swept on every exit
  * path, and a result set that is independent of shard count or completion
@@ -79,24 +79,24 @@ export const runWorkerScheduler = async (
       child.on('message', (message: RepertoireWorkerMessage) => {
         const expectedTask = inFlight;
         inFlight = undefined;
-        if (!expectedTask || message.graphId !== expectedTask.graphId) {
+        if (!expectedTask || message.key !== expectedTask.key) {
           errors.push(
-            `repertoire-evaluate: received a message for "${message.graphId}" but no matching task was in flight ` +
-              `(expected "${expectedTask?.graphId ?? 'none'}")`
+            `repertoire-evaluate: received a message for "${message.key}" but no matching task was in flight ` +
+              `(expected "${expectedTask?.key ?? 'none'}")`
           );
           abortAll();
           return;
         }
         if (message.type === 'result') {
           if (message.results.length !== 1) {
-            errors.push(`${message.graphId}: expected exactly one result, got ${message.results.length}`);
+            errors.push(`${message.key}: expected exactly one result, got ${message.results.length}`);
             abortAll();
             return;
           }
-          if (!results.has(message.graphId)) results.set(message.graphId, message.results[0]);
+          if (!results.has(message.key)) results.set(message.key, message.results[0]);
           assignNext();
         } else {
-          errors.push(`${message.graphId}: ${message.message}`);
+          errors.push(`${message.key}: ${message.message}`);
           abortAll();
         }
       });
@@ -110,7 +110,7 @@ export const runWorkerScheduler = async (
         if (!cleanExit) {
           errors.push(
             `worker exited unexpectedly (code ${String(code)}, signal ${String(signal)})` +
-              (inFlight ? ` while running "${inFlight.graphId}"` : '')
+              (inFlight ? ` while running "${inFlight.key}"` : '')
           );
           abortAll();
         }
@@ -137,9 +137,11 @@ export const runWorkerScheduler = async (
 /** One task per planned search file -- `repertoire-worker.ts`'s wire-protocol input. */
 export const buildRepertoireTasks = (plan: readonly RepertoirePlanEntry[]): readonly RepertoireWorkerTask[] =>
   plan.map((entry) => ({
-    graphId: `${entry.graphId}@${entry.searchSeed}`,
+    key: planEntryKey(entry),
+    graphId: entry.graphId,
     searchPath: entry.searchOutputPath,
     expected: entry.expected,
+    expectedOptions: { seed: entry.searchSeed, ...entry.expectedSearchOptions },
     arm: entry.arm,
     rewiringSeed: entry.rewiringSeed,
     searchSeed: entry.searchSeed
@@ -154,8 +156,10 @@ export interface RepertoireEvaluatedArtifact {
  * Assemble the final artifact in the plan's own canonical `(graph, seed)`
  * order (`repertoire-plan.ts`'s `buildRepertoirePlan` doc comment) --
  * independent of shard count or completion order, since `results` is keyed
- * by `graphId` and looked up per plan entry, never iterated in arrival
- * order.
+ * by `planEntryKey(entry)` and looked up per plan entry, never iterated in
+ * arrival order. Uses the same `planEntryKey` helper `buildRepertoireTasks`
+ * does, rather than rebuilding the composite string a second, independently
+ * maintained way (a dual-review finding).
  */
 export const assembleEvaluatedArtifact = (
   plan: readonly RepertoirePlanEntry[],
@@ -163,7 +167,7 @@ export const assembleEvaluatedArtifact = (
 ): RepertoireEvaluatedArtifact => ({
   schemaVersion: 1,
   graphs: plan.map((entry) => {
-    const key = `${entry.graphId}@${entry.searchSeed}`;
+    const key = planEntryKey(entry);
     const entryResult = results.get(key);
     if (!entryResult) throw new Error(`repertoire-evaluate: missing result for ${key}`);
     return entryResult;
@@ -221,7 +225,7 @@ export const runCliMain = async (args: Readonly<CliArgs>): Promise<void> => {
   if (missing.length > 0) {
     throw new Error(
       `repertoire-evaluate: ${missing.length} planned search file(s) are missing:\n` +
-        missing.map((entry) => `  ${entry.graphId}@${entry.searchSeed}: ${entry.searchOutputPath}`).join('\n')
+        missing.map((entry) => `  ${planEntryKey(entry)}: ${entry.searchOutputPath}`).join('\n')
     );
   }
 
