@@ -19,8 +19,11 @@ degree-preserving rewirings (seeds `0..19`). Biological and rewirings
 1730, 1731, 1732, 1733 for search-seed robustness -- **rewired seeds
 5..19 were searched at a single search seed
 (1729) only**, never at the extra seeds. Every search was re-evaluated in TypeScript
-(authoritative), re-binned into the 36-cell coverage x turning grid, with the diversity gate disabled for null
-graphs (a narrow repertoire is a valid result, not an error).
+(authoritative), re-binned into the 36-cell coverage x turning grid, with the diversity gate disabled
+for null graphs (a narrow repertoire is a valid result, not an error). The discovery seeds and held-out seeds
+above are pinned globally, shared by every graph and every search seed; only population/generations/ticks are
+checked per entry against the shipped atlas budget (a maintainability review, Suggestion: this doc comment
+previously left that unstated, which could be misread as a per-entry seed check).
 
 ### Predeclared metrics
 
@@ -41,7 +44,7 @@ graphs (a narrow repertoire is a valid result, not an error).
 Search-seed robustness: the category is **robust** only if it is the same for all 5
 biological search seeds against the seed-matched rewired distribution. Rewirings
 `0..4` are the seed-matched sample for seeds
-1730, 1731, 1732, 1733 -- **that sample has only 5 points (a 5% percentile
+1730, 1731, 1732, 1733 -- **that sample has only 5 points (a 20% percentile
 resolution)**, far coarser than the 20-point primary comparison at seed 1729.
 
 ## Results
@@ -74,23 +77,27 @@ read as the study's headline without this disclosure: it is not robust across se
 
 ### Occupancy maps (search seed 1729, row = turning bin (bottom = most negative), column = coverage bin (left = least covered))
 
-### Biological (1 = occupied, 0 = empty)
+#### Biological (1 = occupied, 0 = empty)
 
-| 1 | 1 | 1 | 1 | 0 | 0 |
-| 1 | 1 | 1 | 1 | 1 | 0 |
-| 1 | 1 | 1 | 1 | 1 | 0 |
-| 1 | 1 | 1 | 1 | 1 | 0 |
-| 1 | 1 | 1 | 1 | 1 | 0 |
-| 1 | 1 | 1 | 1 | 0 | 0 |
+| turning \ coverage | 0%+ | 5%+ | 10%+ | 20%+ | 35%+ | 60%+ |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0.67..1.00 | 1 | 1 | 1 | 1 | 0 | 0 |
+| 0.33..0.67 | 1 | 1 | 1 | 1 | 1 | 0 |
+| 0.00..0.33 | 1 | 1 | 1 | 1 | 1 | 0 |
+| -0.33..0.00 | 1 | 1 | 1 | 1 | 1 | 0 |
+| -0.67..-0.33 | 1 | 1 | 1 | 1 | 1 | 0 |
+| -1.00..-0.67 | 1 | 1 | 1 | 1 | 0 | 0 |
 
-### Rewired occupancy frequency (of 20 rewirings)
+#### Rewired occupancy frequency (of 20 rewirings)
 
-| 20 | 20 | 20 | 14 | 0 | 0 |
-| 20 | 20 | 19 | 20 | 18 | 4 |
-| 20 | 20 | 20 | 20 | 20 | 10 |
-| 20 | 20 | 20 | 20 | 20 | 7 |
-| 20 | 20 | 20 | 20 | 19 | 3 |
-| 20 | 20 | 20 | 19 | 0 | 0 |
+| turning \ coverage | 0%+ | 5%+ | 10%+ | 20%+ | 35%+ | 60%+ |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0.67..1.00 | 20 | 20 | 20 | 14 | 0 | 0 |
+| 0.33..0.67 | 20 | 20 | 19 | 20 | 18 | 4 |
+| 0.00..0.33 | 20 | 20 | 20 | 20 | 20 | 10 |
+| -0.33..0.00 | 20 | 20 | 20 | 20 | 20 | 7 |
+| -0.67..-0.33 | 20 | 20 | 20 | 20 | 19 | 3 |
+| -1.00..-0.67 | 20 | 20 | 20 | 19 | 0 | 0 |
 
 ### Disconnected control (reference only, not part of the null)
 
@@ -179,5 +186,5 @@ against the predeclared categories above.
 - `sources.evaluatedSha256`: `a1f18138a26f64fe569a0ca8a0aad4b01ea4f2a32089e088db88079932682ba5`
 - `sources.atlasSha256`: `3cf39f80d017655a425d89416f989a093474a6628d2221eb91c839e36033b276`
 - `sources.graphsIndexSha256`: `c887b555c559be56ef3b7c733609a5b672bd4e7e7db5ad3f2c23d1591574f812`
-- Producer: `scripts/atlas/repertoire-report.ts`, sourceSha256 `b696218b708aa1a94808910bf5f0b66f0d99a0850e8a74b036ee03aff1cec615` (59 files)
+- Producer: `scripts/atlas/repertoire-report.ts`, sourceSha256 `57a8a76edf038e4843b8e6cb4d99ccee6d374e664de1dfe0f4a4c6575cd98971` (59 files)
 - Host: arm64 / node v22.22.3
