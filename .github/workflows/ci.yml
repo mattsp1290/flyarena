@@ -49,6 +49,18 @@ jobs:
       - name: Unit and integration tests (Vitest)
         run: npm run test:unit
 
+      - name: Deploy lock test suite (bash, no SSH)
+        # scripts/verify/deploy-lock.test.sh exercises scripts/deploy-lock.sh
+        # entirely against a local mktemp -d scratch directory via the
+        # DEPLOY_LOCK_ROOT_OVERRIDE test hook -- no SSH, no secrets, no real
+        # host, so it needs nothing beyond what this job already has
+        # (ubuntu-latest ships bash, mktemp, grep, sed, awk, ln, mv, date,
+        # chmod). A regression here (e.g. the concurrency guard silently
+        # deferring to a test-only override, or the Release: marker parser
+        # matching this repo's own documentation) would otherwise only
+        # surface during an actual deploy attempt.
+        run: npm run test:deploy-lock
+
       - name: Production build
         run: npm run build
 
