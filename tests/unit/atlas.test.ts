@@ -1,8 +1,11 @@
-import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { describe, it, expect, afterAll, beforeAll } from 'vitest';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { loadLocalAssets } from '../../scripts/experiments/local-assets';
 import { loadLocalAtlas } from '../../scripts/atlas/files';
-import { publishAtlas } from '../../scripts/atlas/publish';
+import { publishAtlas, evaluateSearchOnGraph } from '../../scripts/atlas/publish';
+import { evaluateSearchForGraph } from '../../scripts/atlas/verify-search-graph';
 import { evaluateBehavior } from '../../scripts/atlas/evaluate';
 import { prepareGraph } from '../../src/lib/counterfactual/targets';
 import {
@@ -16,8 +19,23 @@ import { createArenaConfigFingerprint, ARENA_CONFIG } from '../../src/lib/arena/
 import { resolveController } from '../../src/lib/atlas/controller';
 import { readAtlasManifest, verifyAtlasBytes } from '../../src/lib/atlas/assets';
 import { validateAtlas } from '../../src/lib/atlas/validation';
-import { COVERAGE_EDGES, binIndex } from '../../src/lib/atlas/types';
+import {
+  ATLAS_VERSION,
+  COVERAGE_EDGES,
+  TURN_EDGES,
+  DISCOVERY_SEEDS,
+  HELDOUT_SEEDS,
+  binIndex,
+  type SearchArtifact
+} from '../../src/lib/atlas/types';
 import { readoutFromFlat } from '../../src/lib/connectome/readout-serialization';
+import { readoutParameterCount } from '../../src/lib/connectome/readout';
+import { encodeGraphBinary } from '../../src/lib/connectome/format';
+import {
+  deserializeArmBundle,
+  runExportArms,
+  type SerializedArmBundle
+} from '../../scripts/training/export-arms';
 import { runEpisode } from '../../scripts/training/episode';
 import { sha256Hex } from '../../scripts/training/fsio';
 import { DEFAULT_REQUEST } from '../../src/lib/counterfactual/types';
@@ -139,5 +157,189 @@ describe('selected-controller causal engine', () => {
     await expect(resolveController(loaded, prepared, 99999)).rejects.toThrow();
     const wrong = { ...loaded, atlas: { ...loaded.atlas, graphBinarySha256: 'a'.repeat(64) } };
     await expect(resolveController(wrong, prepared, controller.id)).rejects.toThrow('identities');
+  });
+});
+
+describe('evaluateSearchOnGraph / evaluateSearchForGraph (generalized to any verified graph)', () => {
+  // Trace-graph fixture arms (biological/rewired/disconnected), exported the
+  // same way `training:export-arms --fixture-rewire` does, so these tests
+  // exercise real bundle JSON, never a hand-rolled shape
+  // (`.agents/plans/repertoire-null/01-generalize-atlas-pipeline.md` WP1).
+  let root: string;
+  let biological: SerializedArmBundle;
+  let rewired: SerializedArmBundle;
+  let disconnected: SerializedArmBundle;
+
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), 'atlas-verify-search-graph-'));
+    const exportResult = runExportArms({ outDir: root, fixtureRewire: true, fixtureRewireSeed: 3 });
+    biological = JSON.parse(
+      readFileSync(join(exportResult.outDir, 'biological.json'), 'utf8')
+    ) as SerializedArmBundle;
+    rewired = JSON.parse(
+      readFileSync(join(exportResult.outDir, 'rewired.json'), 'utf8')
+    ) as SerializedArmBundle;
+    disconnected = JSON.parse(
+      readFileSync(join(exportResult.outDir, 'disconnected.json'), 'utf8')
+    ) as SerializedArmBundle;
+  });
+
+  afterAll(() => {
+    if (root) rmSync(root, { recursive: true, force: true });
+  });
+
+  const runtimeConfig = Object.fromEntries(
+    Object.entries(ARENA_CONFIG).map(([key, value]) => [
+      key.replace(/[A-Z]/g, (c) => '_' + c.toLowerCase()),
+      value
+    ])
+  );
+
+  // A minimal, `validateSearch`-passing one-candidate search artifact for
+  // `bundle` (same D across every trace-graph arm, by `export-arms.ts`'s own
+  // "D equal across arms" gate). ticks/population/generations are kept tiny
+  // -- this exercises the rebinning/held-out plumbing, not a real search.
+  const buildSearchArtifact = (bundle: SerializedArmBundle): SearchArtifact => {
+    const d = bundle.D;
+    const hiddenSize = 8;
+    const parameterCount = readoutParameterCount(d, hiddenSize);
+    const theta = Array.from({ length: parameterCount }, (_, i) => (((i * 37) % 101) / 101 - 0.5) * 0.2);
+    return {
+      schemaVersion: 1,
+      modelVersion: ATLAS_VERSION,
+      options: { seed: 1, population: 4, generations: 1, ticks: 30 },
+      inputSize: d,
+      hiddenSize,
+      substeps: 4,
+      discoverySeeds: DISCOVERY_SEEDS,
+      heldoutSeeds: HELDOUT_SEEDS,
+      coverageEdges: COVERAGE_EDGES,
+      turnEdges: TURN_EDGES,
+      graphArtifactSha256: bundle.graphArtifactSha256,
+      bundleSha256: bundle.sha256,
+      bundle: bundle as unknown as Record<string, unknown>,
+      candidates: [{ id: 0, theta, quality: 0, coverage: 0, turning: 0 }],
+      history: [{ generation: 1, occupied: 1, bestQuality: 0 }],
+      searchPolicy: {
+        initialStd: 0.5,
+        mutationScales: [0.05, 0.15, 0.4],
+        freshFraction: 0.25,
+        weightBound: 8,
+        ties: 'earlier candidate',
+        rng: 'torch CPU Generator'
+      },
+      runtime: {
+        device: 'cpu',
+        deviceName: 'vitest',
+        torch: '0.0.0',
+        cuda: null,
+        seconds: 1,
+        peakTensorBytes: 0,
+        config: runtimeConfig
+      }
+    };
+  };
+
+  it('evaluateSearchOnGraph with the diversity gate off and heldout "own" returns one occupied cell for a single candidate', async () => {
+    const source = buildSearchArtifact(biological);
+    const graph = deserializeArmBundle(biological);
+    const result = await evaluateSearchOnGraph(source, graph, {
+      requireDiversity: false,
+      heldout: 'own'
+    });
+    expect(result.gpuArchiveSize).toBe(1);
+    expect(result.collisions).toBe(0);
+    expect(result.cells.length).toBe(1);
+    expect(result.cells[0].heldout.biological).toHaveLength(12);
+    expect(result.cells[0].heldout.disconnected).toBeUndefined();
+    expect(result.cells[0].heldout.silenced).toBeUndefined();
+  });
+
+  it('evaluateSearchOnGraph with heldout "all" populates every CONTROL_NAMES control', async () => {
+    const source = buildSearchArtifact(biological);
+    const graph = deserializeArmBundle(biological);
+    const result = await evaluateSearchOnGraph(source, graph, {
+      requireDiversity: false,
+      heldout: 'all'
+    });
+    expect(result.cells[0].heldout.biological).toHaveLength(12);
+    expect(result.cells[0].heldout.disconnected).toHaveLength(12);
+    expect(result.cells[0].heldout.silenced).toHaveLength(12);
+  });
+
+  it('accepts a rewired bundle whose re-encoded binary matches the expected seed sha', async () => {
+    const searchPath = join(root, 'rewired-search.json');
+    writeFileSync(searchPath, JSON.stringify(buildSearchArtifact(rewired)));
+    const binarySha256 = sha256Hex(new Uint8Array(encodeGraphBinary(deserializeArmBundle(rewired))));
+    const result = await evaluateSearchForGraph(searchPath, {
+      arm: 'rewired',
+      binarySha256,
+      parentGzipSha256: rewired.graphArtifactSha256
+    });
+    expect(result.cells.length).toBe(1);
+    expect(result.gpuArchiveSize).toBe(1);
+  });
+
+  it('rejects a rewired bundle whose re-encoded binary does not match the expected seed sha, even when its graphArtifactSha256 (parent) matches', async () => {
+    const searchPath = join(root, 'rewired-search-wrong-binary.json');
+    writeFileSync(searchPath, JSON.stringify(buildSearchArtifact(rewired)));
+    await expect(
+      evaluateSearchForGraph(searchPath, {
+        arm: 'rewired',
+        binarySha256: 'a'.repeat(64),
+        parentGzipSha256: rewired.graphArtifactSha256
+      })
+    ).rejects.toThrow('binary identity mismatch');
+  });
+
+  it('rejects a graph whose graphArtifactSha256 (parent) does not match, even with a correct binary sha', async () => {
+    const searchPath = join(root, 'rewired-search-wrong-parent.json');
+    writeFileSync(searchPath, JSON.stringify(buildSearchArtifact(rewired)));
+    const binarySha256 = sha256Hex(new Uint8Array(encodeGraphBinary(deserializeArmBundle(rewired))));
+    await expect(
+      evaluateSearchForGraph(searchPath, {
+        arm: 'rewired',
+        binarySha256,
+        parentGzipSha256: 'a'.repeat(64)
+      })
+    ).rejects.toThrow('parent identity mismatch');
+  });
+
+  it('rejects a disconnected bundle with edgeCount > 0', async () => {
+    // A well-formed, internally-consistent (non-disconnected) graph
+    // mislabeled as arm "disconnected" -- the tamper scenario this check
+    // exists for, not a bundle whose metadata disagrees with its own arrays
+    // (which `deserializeArmBundle`'s `validateGraph` would already reject).
+    const mislabeled: SerializedArmBundle = { ...biological, arm: 'disconnected' };
+    const searchPath = join(root, 'disconnected-search-nonzero-edges.json');
+    writeFileSync(searchPath, JSON.stringify(buildSearchArtifact(mislabeled)));
+    await expect(
+      evaluateSearchForGraph(searchPath, {
+        arm: 'disconnected',
+        parentGzipSha256: mislabeled.graphArtifactSha256
+      })
+    ).rejects.toThrow('edgeCount 0');
+  });
+
+  it('accepts a disconnected bundle with edgeCount 0 and requires no binarySha256', async () => {
+    const searchPath = join(root, 'disconnected-search.json');
+    writeFileSync(searchPath, JSON.stringify(buildSearchArtifact(disconnected)));
+    const result = await evaluateSearchForGraph(searchPath, {
+      arm: 'disconnected',
+      parentGzipSha256: disconnected.graphArtifactSha256
+    });
+    expect(result.cells.length).toBe(1);
+  });
+
+  it('rejects an arm mismatch between the bundle and what was expected', async () => {
+    const searchPath = join(root, 'arm-mismatch-search.json');
+    writeFileSync(searchPath, JSON.stringify(buildSearchArtifact(rewired)));
+    await expect(
+      evaluateSearchForGraph(searchPath, {
+        arm: 'biological',
+        binarySha256: sha256Hex(new Uint8Array(encodeGraphBinary(deserializeArmBundle(rewired)))),
+        parentGzipSha256: rewired.graphArtifactSha256
+      })
+    ).rejects.toThrow('arm mismatch');
   });
 });
