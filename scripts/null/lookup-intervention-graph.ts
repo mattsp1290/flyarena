@@ -1,114 +1,47 @@
-import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { sha256Hex } from '../training/fsio';
+import { readGraphListIndex, verifyGraphListFiles } from './graph-list-index';
 
 /**
  * `.agents/plans/pathway-interventions/03-evaluation.md`'s WP3
- * (`train-sample.sh --graph-list/--ids`, `null-trained-evaluate.ts
- * --graph-list/--trained-dir`): a small, self-contained reader/verifier for
- * `scripts/analysis/interventions.py`'s `index.json` (WP1's output --
- * `training/runs/interventions/run1/index.json` in this study), the
- * predeclared intervention/control graph list (`P`, `Q`, `C000..C099`,
- * `M1000..M1099`, `MQ2000..MQ2099`, and `R` only when non-empty).
+ * (`train-sample.sh --graph-list/--ids`): a thin CLI wrapper that resolves
+ * one id to its verified graph path, for `train-sample.sh`'s bash callers
+ * (which cannot import a TS module's functions directly and need a
+ * subprocess entrypoint the way `lookup-rewired-artifact.ts` already
+ * provides for the seed-keyed mode).
  *
- * Deliberately its OWN module, not an addition to `null-evaluate.ts`'s
- * `RewireIndex`/`readRewireIndex` (a *different* index format -- seed-keyed
- * numeric entries from `rewire_batch.py`, not id-keyed entries from
- * `interventions.py`) -- and not an edit to `null-evaluate.ts`/
- * `null-worker.ts` at all: a concurrent bean is adding `null-evaluate.ts`'s
- * own `--graph-list` mode (WP2) to those exact two files, so this module
- * only ever imports their already-published exports, never edits them,
- * avoiding a merge collision over the same lines.
- *
- * Tolerant of extra fields (`kind`, `swaps`, `targetReached`, `transfer`,
- * `binarySha256`, `kP`, `kQ`, `maxSwaps`, `producer`, `sourceArtifact`,
- * `sourceSha256`, `version`, `controlCount`) beyond the three this module
- * reads (`id`/`path`/`gzipSha256`) -- this module only depends on what it
- * actually uses, matching `null-evaluate.ts`'s `readRewireIndex` doc
- * comment's own stated convention.
- */
-
-export interface InterventionIndexEntry {
-  readonly id: string;
-  readonly path: string;
-  readonly gzipSha256: string;
-}
-
-export interface InterventionIndex {
-  readonly entries: readonly InterventionIndexEntry[];
-}
-
-/** Parse and lightly validate `interventions.py`'s `index.json`. */
-export const readInterventionIndex = (path: string): InterventionIndex => {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(readFileSync(path, 'utf8'));
-  } catch (error) {
-    throw new Error(
-      `lookup-intervention-graph: cannot read/parse ${path}: ${error instanceof Error ? error.message : String(error)}`
-    );
-  }
-  const record = parsed as { entries?: unknown };
-  if (!Array.isArray(record.entries) || record.entries.length === 0) {
-    throw new Error(`lookup-intervention-graph: ${path} has no "entries"`);
-  }
-  const seenIds = new Set<string>();
-  for (const entry of record.entries as readonly unknown[]) {
-    const candidate = entry as Partial<InterventionIndexEntry>;
-    if (
-      typeof candidate.id !== 'string' ||
-      candidate.id.length === 0 ||
-      typeof candidate.path !== 'string' ||
-      typeof candidate.gzipSha256 !== 'string'
-    ) {
-      throw new Error(`lookup-intervention-graph: ${path} has a malformed entry: ${JSON.stringify(entry)}`);
-    }
-    // A duplicate id would make `resolveVerifiedInterventionGraphPath`'s
-    // `find` silently pick whichever one happens to come first -- reject the
-    // index outright instead (`interventions.py` itself can't produce this,
-    // since every id it writes is unique by construction, but a hand-merged
-    // or hand-edited index.json can).
-    if (seenIds.has(candidate.id)) {
-      throw new Error(`lookup-intervention-graph: ${path} lists id "${candidate.id}" more than once`);
-    }
-    seenIds.add(candidate.id);
-  }
-  return parsed as InterventionIndex;
-};
-
-/**
- * Resolve `id`'s graph path (relative to `indexPath`'s own directory, the
- * same convention `interventions.py` itself uses for `entries[].path`) and
- * verify its raw gzip bytes' sha256 against the index's recorded
- * `gzipSha256` -- so a corrupted, stale, or mismatched-provenance graph
- * fails loudly here, before any `export-arms`/`flyarena-train` GPU time is
- * spent, rather than surfacing only as a much-later, much-less-specific
- * training or scoring failure.
+ * Reuses `graph-list-index.ts`'s `readGraphListIndex`/`verifyGraphListFiles`
+ * -- the exact same validated, path-traversal-safe, two-layer-gzip/binary-
+ * sha-aware reader `null-evaluate.ts`'s own `--graph-list` mode (WP2) uses
+ * for `scripts/analysis/interventions.py`'s id-keyed `index.json` (WP1's
+ * output: `P`, `Q`, `C000..C099`, `M1000..M1099`, `MQ2000..MQ2099`, and `R`
+ * only when non-empty) -- rather than a second, independently-drifting
+ * parser (a thermo-maintainability review finding: an earlier version of
+ * this file had its own parallel `index.json` reader/verifier with a
+ * strictly weaker contract -- no path-traversal containment, and only
+ * `gzipSha256`, not `graph-list-index.ts`'s two-layer gzip/binary sha
+ * contract). This module now only ever imports `graph-list-index.ts`'s
+ * already-published exports, never redeclares its own copy of that parsing
+ * logic, so `train-sample.sh`'s `--graph-list`/`--ids` mode and
+ * `null-evaluate.ts`'s `--graph-list` mode can never again silently diverge
+ * on what counts as a valid `index.json`. `readGraphListIndex`/
+ * `verifyGraphListFiles`'s own test coverage (`tests/unit/null-evaluate.test.ts`)
+ * is this module's coverage too; only the "resolve one id, CLI wrapper"
+ * behavior below is specific to this file.
  */
 export const resolveVerifiedInterventionGraphPath = (indexPath: string, id: string): string => {
-  const index = readInterventionIndex(indexPath);
+  const index = readGraphListIndex(indexPath);
   const entry = index.entries.find((candidate) => candidate.id === id);
   if (!entry) {
     throw new Error(`lookup-intervention-graph: id "${id}" not found in ${indexPath}`);
   }
-  const graphPath = resolve(dirname(indexPath), entry.path);
-  let bytes: Buffer;
-  try {
-    bytes = readFileSync(graphPath);
-  } catch (error) {
-    throw new Error(
-      `lookup-intervention-graph: id "${id}": cannot read ${graphPath}: ${error instanceof Error ? error.message : String(error)}`
-    );
-  }
-  const actual = sha256Hex(bytes);
-  if (actual !== entry.gzipSha256) {
-    throw new Error(
-      `lookup-intervention-graph: id "${id}": ${graphPath} gzip sha256 ${actual} does not match index.json (${entry.gzipSha256})`
-    );
-  }
-  return graphPath;
+  // Verifies every entry's gzip bytes (not just `id`'s) -- the same
+  // whole-index check `null-evaluate.ts`'s own `--graph-list` mode performs
+  // once up front, reused here rather than adding a single-entry variant
+  // `graph-list-index.ts` doesn't otherwise need.
+  verifyGraphListFiles(index, dirname(indexPath));
+  return resolve(dirname(indexPath), entry.path);
 };
 
 /**

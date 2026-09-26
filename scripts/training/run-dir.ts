@@ -160,6 +160,23 @@ export const CEM_CONFIG_FIELDS = [
   'heldOutSeedRange'
 ] as const;
 
+/**
+ * The subset of `CEM_CONFIG_FIELDS` that `public/data/trained-readout-v1.manifest.json`'s
+ * `training` block actually carries (it has no `trainingSeedRange`/
+ * `trainingSeedRng`/`validationSeedRange`/`heldOutSeedRange` -- those are
+ * per-run-directory provenance, not per-study manifest fields). Derived
+ * (not a second hand-typed literal array) so a future rename of any
+ * `CEM_CONFIG_FIELDS` entry can never silently leave this list stale (a
+ * thermo-maintainability review suggestion). Consumed by
+ * `scripts/null/train-sample.sh`'s own preflight (via its own Python
+ * reimplementation, which independently reads the same manifest keys) and
+ * `scripts/null/null-trained-evaluate-graph-list.ts`'s
+ * `assertConfigsMatchManifest`.
+ */
+export const MANIFEST_TRACKED_FIELDS = CEM_CONFIG_FIELDS.filter(
+  (field) => !field.endsWith('Range') && field !== 'trainingSeedRng'
+);
+
 /** A candidate whose every `CEM_CONFIG_FIELDS` value is `undefined` — an arm with no recorded CEM hyperparameters at all. */
 export const isEmptyCemConfig = (candidate: Readonly<Record<string, unknown>>): boolean =>
   Object.values(candidate).every((value) => value === undefined);

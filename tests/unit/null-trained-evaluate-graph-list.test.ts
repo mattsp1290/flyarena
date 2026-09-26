@@ -2,7 +2,7 @@
 import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { gzipSync } from 'node:zlib';
+import { gunzipSync, gzipSync } from 'node:zlib';
 import { join, resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
@@ -17,19 +17,22 @@ import {
   buildInterventionTasks,
   parseNullTrainedInterventionEvaluateArgs,
   type NullTrainedInterventionEvaluateArgs
-} from '../../scripts/null/null-trained-evaluate';
+} from '../../scripts/null/null-trained-evaluate-graph-list';
 import type { NullSeedResult } from '../../scripts/null/null-worker';
 import { writeTinyRunDir } from '../fixtures/trained-readout-run';
 
 /**
- * Coverage for `scripts/null/null-trained-evaluate.ts`'s WP3
+ * Coverage for `scripts/null/null-trained-evaluate-graph-list.ts`'s WP3
  * `--graph-list`/`--trained-dir` intervention mode
- * (`.agents/plans/pathway-interventions/03-evaluation.md`). Mirrors
+ * (`.agents/plans/pathway-interventions/03-evaluation.md`) -- extracted out
+ * of `null-trained-evaluate.ts` into its own module once that file crossed
+ * 1000 lines (a thermo-maintainability review finding). Mirrors
  * `null-trained-evaluate.test.ts`'s existing fixture style (real
  * `runExportArms` bundles, `writeTinyRunDir` run directories) but builds a
  * REAL biological + rewired `.bin.gz` pair on disk (the trace-graph fixture,
- * gzip-encoded) so `--graph-list`'s own gzip-sha256 verification
- * (`resolveVerifiedInterventionGraphPath`) and the
+ * gzip-encoded) so `graph-list-index.ts`'s gzip-sha256 verification
+ * (`verifyGraphListFiles`, reused by this module rather than a second
+ * parallel index reader -- another review finding) and the
  * `provenance.kind === 'rewired-artifact'` cross-check
  * (`assertBundleMatchesInterventionGraph`) are exercised against real
  * bytes, not the `--fixture-rewire` short-circuit the rewired-seed mode's
@@ -143,7 +146,7 @@ describe('buildInterventionTasks / assembleInterventionRaw', () => {
 
   /** Writes a real biological + rewired `.bin.gz` pair, exports a real `rewired-artifact` bundle for `id`, and adds `id` to the graph-list index this suite writes to `indexPath`. */
   const addInterventionGraph = (
-    entries: Array<{ id: string; path: string; gzipSha256: string }>,
+    entries: Array<{ id: string; path: string; gzipSha256: string; binarySha256: string }>,
     id: string,
     rewireSeed: number
   ): void => {
@@ -169,7 +172,12 @@ describe('buildInterventionTasks / assembleInterventionRaw', () => {
     };
     d = bundle.D;
 
-    entries.push({ id, path: `graphs/${id}.bin.gz`, gzipSha256: sha256Hex(rewiredBytes) });
+    entries.push({
+      id,
+      path: `graphs/${id}.bin.gz`,
+      gzipSha256: sha256Hex(rewiredBytes),
+      binarySha256: sha256Hex(gunzipSync(rewiredBytes))
+    });
 
     for (const trainerSeed of id === 'P' ? [101, 202] : [101]) {
       writeTinyRunDir({
@@ -193,10 +201,18 @@ describe('buildInterventionTasks / assembleInterventionRaw', () => {
     indexPath = join(graphListDir, 'index.json');
     mkdirSync(graphListDir, { recursive: true });
 
-    const entries: Array<{ id: string; path: string; gzipSha256: string }> = [];
+    const entries: Array<{ id: string; path: string; gzipSha256: string; binarySha256: string }> = [];
     addInterventionGraph(entries, 'P', 0);
     addInterventionGraph(entries, 'C000', 1);
-    writeFileSync(indexPath, JSON.stringify({ entries, version: 1 }));
+    // `graph-list-index.ts`'s `readGraphListIndex` requires these top-level
+    // fields too (the same contract `null-evaluate.ts`'s own `--graph-list`
+    // mode enforces) -- placeholder values are fine here since this suite
+    // never verifies the biological source itself, only the per-entry gzip
+    // bytes `verifyGraphListFiles` checks.
+    writeFileSync(
+      indexPath,
+      JSON.stringify({ sourceArtifact: 'malecns-arena-v1.bin.gz', sourceSha256: 'a'.repeat(64), entries, version: 1 })
+    );
     writeFileSync(
       join(root, 'manifest.json'),
       JSON.stringify({
