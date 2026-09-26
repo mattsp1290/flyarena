@@ -224,12 +224,25 @@ const graphBinarySha256ForMode = (manifest: ArenaManifest, mode: GraphMode): str
  * silently disagree, in favor of the simpler, already-tested shape (never
  * skip the fetch itself; only gate the dispatch/onError step).
  *
- * Returns the settled result promise (never rejects) so a caller can also
- * use it as a sequencing gate for a second, dependent sidecar load, the way
- * the explanation fork below needs to wait for `nullLoad` to settle without
- * chaining directly onto its `onRewiringNull` dispatch (round-2 dual
- * review, Important — see the call site's own comment for the isolation bug
- * that chaining onto the dispatch step caused).
+ * Returns the settled result promise (never rejects), which a caller
+ * *could* use as a sequencing gate for a second, dependent sidecar load —
+ * but as of the four `initialize()` forks below, none of them actually
+ * needs to (a thermo-maintainability review, Important: an earlier version
+ * chained all four onto one another in sequence purely as an authorial
+ * habit copied from the first fork onto every fork added since, even
+ * though every one of their own doc comments already said the opposite —
+ * each needs only `artifacts.manifest`/`dataBaseUrl`, available the instant
+ * `load(dataBaseUrl)` resolves at the top of `initialize()`, not the
+ * *result* of any other fork. Chaining them serially made the wall-clock
+ * cost of loading all four sidecar artifacts the *sum* of their fetch
+ * latencies rather than the *max* — a real, user-visible difference for the
+ * Findings panel and the ledger on a throttled connection, not a
+ * micro-optimization, and one that would only have grown worse with a
+ * fifth artifact). If a future sidecar load genuinely needs to wait on
+ * another one's *result* (not just its manifest), chain it the way the
+ * pre-parallelization version of this file did, and say so in that fork's
+ * own comment — chaining for no data dependency is the anti-pattern this
+ * comment now flags, not chaining itself.
  */
 function runSidecarLoad<T>(
   load: () => Promise<T>,
@@ -436,90 +449,57 @@ export class ExperimentController {
     this.rewiredGraphBuffer = artifacts.rewired;
     this.options.callbacks.onManifest(artifacts.manifest, artifacts.parsedBiological);
 
-    // WP4: fire-and-forget, deliberately not awaited here (unlike the
-    // trained-readout load just below) — "loading must not block Start"
-    // means this must not sit in this method's own `await` chain ahead of
-    // Worker construction. `runSidecarLoad` (module-level helper above)
-    // owns the leading-`.catch`/trailing-`.catch` wrapping both forks need:
-    // the leading one enforces `loadRewiringNull`'s own "never throws"
-    // contract at this call site too (dual review, Important — mirrors
-    // `App.svelte`'s own `onManifest` handler, which added the equivalent
-    // `.catch` around `loadPositions` for the same reason), so an unexpected
-    // throw anywhere in the loader's chain can never leave
-    // `rewiringNullStatus` `undefined` forever (the ledger row stuck on
-    // "Loading…") or become an unhandled rejection; the trailing one guards
-    // the *callback* instead — `onRewiringNull` is host code (`App.svelte`),
-    // and a throw there is routed to `onError` rather than becoming an
-    // unhandled rejection.
-    //
-    // `runSidecarLoad` returns the settled result promise (never rejects —
-    // `loadNull` failures are converted to a resolved `'unavailable'` status
-    // right here) so the explanation fork below can fork off *this same
-    // settled promise* independently, rather than chaining onto this fork's
-    // own dispatch step. That independence matters (round-2 dual review,
-    // Important): an earlier version chained the null-explanation load
-    // directly after the `onRewiringNull(result)` callback call, so a
-    // throwing `onRewiringNull` host callback (host code, e.g. `App.svelte`)
-    // silently skipped the null-explanation load too, contradicting this
-    // method's own "attempted unconditionally" comment below. Forking both
-    // chains off the same settled `nullLoad` promise instead means the two
-    // host callbacks (`onRewiringNull`, `onNullExplanation`) can never take
-    // each other down.
-    const nullLoad = runSidecarLoad<RewiringNullLoadResult>(
+    // Four independent sidecar loads, fired in parallel directly off
+    // `artifacts.manifest`/`dataBaseUrl` — none needs another's *result*,
+    // only the manifest already in scope here (thermo-maintainability
+    // review, Important: see `runSidecarLoad`'s own doc comment for why an
+    // earlier version chained these in sequence instead, and why that made
+    // the wall-clock cost of loading all four the *sum*, not the *max*, of
+    // their fetch latencies). Fire-and-forget, deliberately not awaited
+    // here (unlike the trained-readout load just below) — "loading must not
+    // block Start" means none of these may sit in this method's own `await`
+    // chain ahead of Worker construction. `runSidecarLoad` (module-level
+    // helper above) owns the leading-`.catch`/trailing-`.catch` wrapping
+    // every fork needs: the leading one enforces each loader's own "never
+    // throws" contract at this call site too (dual review, Important —
+    // mirrors `App.svelte`'s own `onManifest` handler, which added the
+    // equivalent `.catch` around `loadPositions` for the same reason), so
+    // an unexpected throw anywhere in a loader's chain can never leave its
+    // status `undefined` forever (a ledger/panel row stuck on "Loading…")
+    // or become an unhandled rejection; the trailing one guards the
+    // *callback* instead — each `onX` is host code (`App.svelte`), and a
+    // throw there is routed to `onError` rather than becoming an unhandled
+    // rejection. Each fork's own `onUnexpectedError` maps a genuine
+    // runtime/JS error to `'unavailable'`, never `'invalid'` (thermo review,
+    // Suggestion): that status is reserved for an actual hash/shape/
+    // cross-check failure, which each panel renders as "failed
+    // verification" — a plain thrown error is not that claim.
+    void runSidecarLoad<RewiringNullLoadResult>(
       () => loadNull(artifacts.manifest, dataBaseUrl),
-      // `'unavailable'`, not `'invalid'` (thermo review, Suggestion): this
-      // is a genuine runtime/JS error — a throw somewhere in the loader's
-      // chain, not a hash/shape/cross-check failure — so it must not be
-      // described to a visitor as "failed verification" (`LedgerPanel.svelte`).
       (reason) => ({ status: 'unavailable', reason: `unexpected error while loading the rewiring null: ${reason}` }),
       () => this.destroyed,
       (result) => this.options.callbacks.onRewiringNull(result),
       (message) => this.options.callbacks.onError(message)
     );
 
-    // WP4 of `.agents/plans/null-explanation` (`04-ledger-note.md`): "Load
-    // after the null result" — sequenced after `nullLoad` *settles* (so it
-    // never races ahead of the null histogram's own load and never issues a
-    // duplicate fetch for the rewiring-null artifact), by making `nullLoad`
-    // itself part of this fork's own `load` thunk rather than chaining onto
-    // the `onRewiringNull` dispatch above (see `nullLoad`'s own comment for
-    // why). `loadExplanation` only needs `manifest`/`dataBaseUrl` (its own
-    // cross-check re-reads `manifest.rewiringNull.sha256` directly, not the
-    // resolved `RewiringNullLoadResult`), so it is attempted here
-    // unconditionally, independent of whichever status the null load itself
-    // resolved to — and independent of whether `onRewiringNull` throws.
-    // `runSidecarLoad` never pre-guards the fetch itself on `this.destroyed`
-    // (only the dispatch/onError step) — an earlier version of this fork
-    // alone added such a pre-guard, which a prior review flagged as
-    // untested and beyond what was asked; using the same shared helper as
-    // `nullLoad` above keeps both forks' `destroyed` handling identical by
-    // construction instead of two call sites that can silently disagree.
-    const explanationLoad = runSidecarLoad<NullExplanationLoadResult>(
-      () => nullLoad.then(() => loadExplanation(artifacts.manifest, dataBaseUrl)),
-      // `'unavailable'`, not `'invalid'` (mirrors `nullLoad`'s own mapping
-      // above, and `NullExplanationLoadResult`'s doc comment): a genuine
-      // runtime/JS error is not a verification failure, and
-      // `LedgerPanel.svelte` renders `'invalid'` as "Explanation failed
-      // verification".
+    // WP4 of `.agents/plans/null-explanation`: only needs `manifest`/
+    // `dataBaseUrl` (its own cross-check re-reads `manifest.rewiringNull.sha256`
+    // directly, never a resolved `RewiringNullLoadResult`), so it fires
+    // independently of the rewiring-null fork above, not after it.
+    void runSidecarLoad<NullExplanationLoadResult>(
+      () => loadExplanation(artifacts.manifest, dataBaseUrl),
       (reason) => ({ status: 'unavailable', reason: `unexpected error while loading the null explanation: ${reason}` }),
       () => this.destroyed,
       (result) => this.options.callbacks.onNullExplanation(result),
       (message) => this.options.callbacks.onError(message)
     );
 
-    // WP4 of `.agents/plans/pathway-interventions`: "Call it next to
-    // loadNullExplanation" — sequenced after `explanationLoad` *settles*
-    // (mirrors `explanationLoad`'s own reasoning for chaining after
-    // `nullLoad`: never races ahead of the note this sentence is appended
-    // to, and forked off the settled promise rather than the
-    // `onNullExplanation` dispatch, so a throwing `onNullExplanation` host
-    // callback can never silently skip this load too). `loadInterventions`
-    // only needs `manifest`/`dataBaseUrl` (its own cross-check re-reads
+    // WP4 of `.agents/plans/pathway-interventions`: only needs `manifest`/
+    // `dataBaseUrl` (its own cross-check re-reads
     // `manifest.rewiringNull.sha256`/`manifest.nullExplanation.sha256`
-    // directly), so it is attempted unconditionally, independent of
-    // whichever status the explanation load itself resolved to.
-    const interventionsLoad = runSidecarLoad<PathwayInterventionsLoadResult>(
-      () => explanationLoad.then(() => loadInterventions(artifacts.manifest, dataBaseUrl)),
+    // directly), so it fires independently of the two forks above too.
+    void runSidecarLoad<PathwayInterventionsLoadResult>(
+      () => loadInterventions(artifacts.manifest, dataBaseUrl),
       (reason) => ({ status: 'unavailable', reason: `unexpected error while loading the pathway-interventions study: ${reason}` }),
       () => this.destroyed,
       (result) => this.options.callbacks.onPathwayInterventions(result),
@@ -529,16 +509,12 @@ export class ExperimentController {
     // WP3 of `.agents/plans/repertoire-null`, wired per `findings-tour`'s
     // `01-findings-panel.md` ("Add a repertoire load behind the `destroyed`
     // guard, with an injectable seam, following `loadPathwayInterventions`.
-    // Otherwise pass `missing`") -- sequenced after `interventionsLoad`
-    // *settles*, mirroring every earlier fork's "never races ahead of the
-    // load before it" reasoning. `loadRepertoire` only needs
+    // Otherwise pass `missing`"). `loadRepertoire` only needs
     // `manifest`/`dataBaseUrl` (its own cross-check re-reads
     // `manifest.binarySha256`/`manifest.rewiringNull.sha256` directly), so
-    // it is attempted unconditionally, independent of whichever status the
-    // interventions load itself resolved to, and independent of whether
-    // `onPathwayInterventions` throws.
+    // it fires independently of the three forks above, not after them.
     void runSidecarLoad<RepertoireNullLoadResult>(
-      () => interventionsLoad.then(() => loadRepertoire(artifacts.manifest, dataBaseUrl)),
+      () => loadRepertoire(artifacts.manifest, dataBaseUrl),
       (reason) => ({ status: 'unavailable', reason: `unexpected error while loading the repertoire-null comparison: ${reason}` }),
       () => this.destroyed,
       (result) => this.options.callbacks.onRepertoireNull(result),

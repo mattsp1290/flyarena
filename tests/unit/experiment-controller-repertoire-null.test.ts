@@ -256,17 +256,16 @@ describe('ExperimentController repertoire-null loading (WP3 of .agents/plans/rep
   });
 
   /**
-   * Ordering: `loadRepertoireNull` must not be invoked until the
-   * interventions load's own promise has settled. Waits for the
-   * interventions loader to have actually been *called* (a real causal
-   * signal, not a guessed number of microtask hops) before asserting the
-   * repertoire-null loader has not been called yet, then releases the
-   * interventions loader and confirms the repertoire-null loader runs only
-   * after that.
+   * Parallelism (thermo-maintainability review, Important): the four
+   * sidecar loads used to chain each onto the previous one's settled
+   * promise purely as an authorial habit, even though none needs another's
+   * *result* -- only the manifest already in scope at the top of
+   * `initialize()`. `loadRepertoireNull` is invoked immediately, in the
+   * same microtask turn as `loadPathwayInterventions`, not gated behind it.
+   * Holds the interventions load open indefinitely to prove the
+   * repertoire-null loader does not (and never did need to) wait for it.
    */
-  it('does not invoke loadRepertoireNull before the pathway-interventions load settles', async () => {
-    let resolveInterventions: (() => void) | undefined;
-    let interventionsStarted = false;
+  it('invokes loadRepertoireNull immediately, without waiting for the pathway-interventions load to settle', async () => {
     let repertoireStarted = false;
     const callbacks = createCallbacks();
     const controller = new ExperimentController({
@@ -275,12 +274,10 @@ describe('ExperimentController repertoire-null loading (WP3 of .agents/plans/rep
       initialTopology: { left: 'biological', right: 'rewired' },
       createWorker,
       callbacks,
-      loadPathwayInterventions: () => {
-        interventionsStarted = true;
-        return new Promise((resolve) => {
-          resolveInterventions = () => resolve({ status: 'missing', reason: 'interventions settles now' });
-        });
-      },
+      // Never resolves -- if `loadRepertoireNull` were still gated behind
+      // this settling, `repertoireStarted` would stay false and
+      // `repertoireNullResults` would stay empty forever.
+      loadPathwayInterventions: () => new Promise(() => {}),
       loadRepertoireNull: async () => {
         repertoireStarted = true;
         return { status: 'missing', reason: 'repertoire settles' };
@@ -288,13 +285,7 @@ describe('ExperimentController repertoire-null loading (WP3 of .agents/plans/rep
     });
     trackController(controller);
 
-    const initializing = controller.initialize();
-    await vi.waitFor(() => expect(interventionsStarted).toBe(true));
-    expect(repertoireStarted).toBe(false);
-    expect(callbacks.repertoireNullResults).toHaveLength(0);
-
-    resolveInterventions?.();
-    await initializing;
+    await controller.initialize();
     await vi.waitFor(() => expect(callbacks.repertoireNullResults).toHaveLength(1));
     expect(repertoireStarted).toBe(true);
   });

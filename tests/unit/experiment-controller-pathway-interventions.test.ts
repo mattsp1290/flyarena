@@ -253,16 +253,17 @@ describe('ExperimentController pathway-interventions loading (WP4 of .agents/pla
   });
 
   /**
-   * Ordering: `loadPathwayInterventions` must not be invoked until the
-   * explanation load's own promise has settled. Waits for the explanation
-   * loader to have actually been *called* (a real causal signal, not a
-   * guessed number of microtask hops) before asserting the interventions
-   * loader has not been called yet, then releases the explanation loader
-   * and confirms the interventions loader runs only after that.
+   * Parallelism (thermo-maintainability review, Important): the four
+   * sidecar loads used to chain each onto the previous one's settled
+   * promise purely as an authorial habit, even though none needs another's
+   * *result* -- only the manifest already in scope at the top of
+   * `initialize()`. `loadPathwayInterventions` is invoked immediately, in
+   * the same microtask turn as `loadNullExplanation`, not gated behind it
+   * (`controller.ts`'s own `runSidecarLoad` doc comment explains why this
+   * fix landed). Holds the explanation load open indefinitely to prove the
+   * interventions loader does not (and never did need to) wait for it.
    */
-  it('does not invoke loadPathwayInterventions before the explanation load settles', async () => {
-    let resolveExplanation: (() => void) | undefined;
-    let explanationStarted = false;
+  it('invokes loadPathwayInterventions immediately, without waiting for the explanation load to settle', async () => {
     let interventionsStarted = false;
     const callbacks = createCallbacks();
     const controller = new ExperimentController({
@@ -271,12 +272,10 @@ describe('ExperimentController pathway-interventions loading (WP4 of .agents/pla
       initialTopology: { left: 'biological', right: 'rewired' },
       createWorker,
       callbacks,
-      loadNullExplanation: () => {
-        explanationStarted = true;
-        return new Promise((resolve) => {
-          resolveExplanation = () => resolve({ status: 'missing', reason: 'explanation settles now' });
-        });
-      },
+      // Never resolves -- if `loadPathwayInterventions` were still gated
+      // behind this settling, `interventionsStarted` would stay false and
+      // `pathwayInterventionsResults` would stay empty forever.
+      loadNullExplanation: () => new Promise(() => {}),
       loadPathwayInterventions: async () => {
         interventionsStarted = true;
         return { status: 'missing', reason: 'interventions settles' };
@@ -284,13 +283,7 @@ describe('ExperimentController pathway-interventions loading (WP4 of .agents/pla
     });
     trackController(controller);
 
-    const initializing = controller.initialize();
-    await vi.waitFor(() => expect(explanationStarted).toBe(true));
-    expect(interventionsStarted).toBe(false);
-    expect(callbacks.pathwayInterventionsResults).toHaveLength(0);
-
-    resolveExplanation?.();
-    await initializing;
+    await controller.initialize();
     await vi.waitFor(() => expect(callbacks.pathwayInterventionsResults).toHaveLength(1));
     expect(interventionsStarted).toBe(true);
   });
