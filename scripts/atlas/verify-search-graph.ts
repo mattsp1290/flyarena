@@ -1,20 +1,19 @@
 import { readFile } from 'node:fs/promises';
 
-import { encodeGraphBinary } from '../../src/lib/connectome/format';
+import { createDisconnectedGraph, encodeGraphBinary, type ConnectomeGraph } from '../../src/lib/connectome/format';
 import { outputNeuronIndices } from '../../src/lib/connectome/readout';
 import { validateSearch } from '../../src/lib/atlas/validation';
 import {
-  computeArmBundleSha256,
   deserializeArmBundle,
   type ArmName,
   type SerializedArmBundle
 } from '../training/export-arms';
 import { sha256Hex } from '../training/fsio';
-import { evaluateSearchOnGraph, type GraphEvaluationResult } from './publish';
+import { evaluateSearchOnGraph, isBundleSelfConsistent, type GraphEvaluationResult } from './publish';
 
 /**
  * What a search JSON's bundle is expected to identify as, for
- * `evaluateSearchForGraph`'s identity checks
+ * `verifyAndEvaluateSearchGraph`'s identity checks
  * (`.agents/plans/repertoire-null/01-generalize-atlas-pipeline.md` WP1).
  *
  * `graphArtifactSha256` is the biological parent's gzip sha256 on every arm
@@ -30,12 +29,9 @@ import { evaluateSearchOnGraph, type GraphEvaluationResult } from './publish';
  * `scripts/null/rewire-index.ts`'s `verifyRewiredFiles` checks against a raw
  * gzip file on disk -- a different check on different bytes than this
  * function's re-encoded-bundle comparison). Required for `biological`/
- * `rewired`. Optional for `disconnected` (no standalone disconnected
- * artifact exists to pin against -- see `metadata.edgeCount === 0` below),
- * but verified when a caller does supply one (e.g. derived from the
- * verified biological parent via
- * `sha256Hex(encodeGraphBinary(createDisconnectedGraph(biologicalGraph)))`)
- * rather than silently ignored.
+ * `rewired`. Optional for `disconnected` -- see
+ * `verifyAndEvaluateSearchGraph`'s doc comment for what covers it when it's
+ * omitted.
  */
 export interface ExpectedGraphIdentity {
   readonly arm: ArmName;
@@ -52,25 +48,43 @@ export interface ExpectedGraphIdentity {
  *
  * Checks, in order: the bundle's declared `arm` and parent label match
  * `expected`; the search JSON is self-consistent with its own embedded
- * bundle (the same bundle-sha/parent-sha agreement `publishAtlas` checks
- * against the shipped biological asset, applied here against the bundle
- * itself, since there is no external manifest for an arbitrary graph); a
+ * bundle (`isBundleSelfConsistent`, shared with `publishAtlas` -- there is
+ * no external manifest for an arbitrary graph to check against instead); a
  * search-JSON-level `arm` field (written by `atlas_cli.py` alongside
  * `graphArtifactSha256`), when present, agrees with the bundle's own `arm`;
  * then, after decoding the graph, that its output-neuron indices match the
- * bundle's declared ones; and finally the per-graph identity described on
- * `ExpectedGraphIdentity` (`binarySha256` for biological/rewired,
- * `metadata.edgeCount === 0` for disconnected).
+ * bundle's declared ones; and finally the per-graph identity: for
+ * `biological`/`rewired`, the bundle's own arrays must re-encode to exactly
+ * `expected.binarySha256`. For `disconnected`, `metadata.edgeCount === 0` is
+ * mandatory, and `expected.binarySha256` -- if supplied -- is checked the
+ * same way as biological/rewired.
  *
- * `requireDiversity: false` (a narrow repertoire is a valid null-graph
- * result, not an error) and `heldout: 'own'` (only the searched graph's own
- * trained-decoder control -- `disconnected`/`silenced` controls don't add
- * information for a null graph) -- both predeclared
- * (`.agents/plans/repertoire-null/00-overview.md`'s key decisions).
+ * **Beyond the plan's minimum:** `01-generalize-atlas-pipeline.md:16` scopes
+ * `disconnected`'s identity to `edgeCount === 0` alone, "because no
+ * disconnected artifact exists" to pin a `binarySha256` against. Taken
+ * literally, a `disconnected` search JSON with a self-consistent hash,
+ * `edgeCount === 0`, and the shared/predictable `parentGzipSha256` label
+ * would pass even if its neuron identities, dynamics constants
+ * (`leakRate`/`rateMin`/`rateMax`/`globalGain`/etc.), or `biologicalIds`
+ * were tampered with or came from an entirely different biological parent
+ * -- a fail-open gap a dual review demonstrated directly (a probe bundle
+ * with negated `presynapticSigns` and scaled dynamics constants passed).
+ * "No artifact exists" is true for a *file*, but a disconnected graph's
+ * expected binary IS computable, at zero extra I/O, from a graph the caller
+ * already has: `createDisconnectedGraph(verifiedBiologicalGraph)` is
+ * exactly how `export-arms.ts`'s own `toDisconnectedGraph` derives the real
+ * disconnected bundle in the first place. So when `verifiedBiologicalGraph`
+ * is supplied and `expected.binarySha256` is not, this function derives the
+ * expected disconnected identity from it instead of skipping the check --
+ * closing the gap here rather than deferring it to WP2's not-yet-written
+ * driver, which the plan's own wording could otherwise be read to invite.
+ * Omitting *both* `expected.binarySha256` and `verifiedBiologicalGraph` for
+ * a `disconnected` bundle is a hard error, not a silent pass.
  */
-export async function evaluateSearchForGraph(
+export async function verifyAndEvaluateSearchGraph(
   searchPath: string,
-  expected: ExpectedGraphIdentity
+  expected: ExpectedGraphIdentity,
+  verifiedBiologicalGraph?: Readonly<ConnectomeGraph>
 ): Promise<GraphEvaluationResult> {
   const input: unknown = JSON.parse(await readFile(searchPath, 'utf8'));
   const source = validateSearch(input);
@@ -80,18 +94,8 @@ export async function evaluateSearchForGraph(
     throw new Error(`Search graph arm mismatch: expected ${expected.arm}, bundle says ${bundle.arm}`);
   if (bundle.graphArtifactSha256 !== expected.parentGzipSha256)
     throw new Error('Search graph parent identity mismatch');
-
-  // The search JSON's own self-consistency with its embedded bundle --
-  // mirrors publishAtlas's checks against the shipped biological asset
-  // (scripts/atlas/publish.ts), applied here to the bundle itself, since a
-  // generalized entry point has no external manifest to check against.
-  if (
-    source.bundleSha256 !== computeArmBundleSha256(bundle) ||
-    bundle.sha256 !== source.bundleSha256 ||
-    bundle.graphArtifactSha256 !== source.graphArtifactSha256
-  ) {
+  if (!isBundleSelfConsistent(source, bundle))
     throw new Error('Search artifact is not self-consistent with its bundle');
-  }
   // atlas_cli.py records `arm` at the search JSON's top level alongside
   // graphArtifactSha256 (an audit field, redundant with bundle.arm by
   // design); cross-check it when present. Optional because search JSON
@@ -113,8 +117,18 @@ export async function evaluateSearchForGraph(
   if (bundle.arm === 'disconnected') {
     if (bundle.metadata.edgeCount !== 0)
       throw new Error('Disconnected search graph must have edgeCount 0');
-    if (expected.binarySha256 !== undefined && actualBinarySha256 !== expected.binarySha256)
-      throw new Error('Search graph binary identity mismatch');
+    let expectedBinarySha256 = expected.binarySha256;
+    if (expectedBinarySha256 === undefined) {
+      if (!verifiedBiologicalGraph) {
+        throw new Error(
+          'Disconnected search graph identity requires expected.binarySha256 or verifiedBiologicalGraph'
+        );
+      }
+      expectedBinarySha256 = sha256Hex(
+        new Uint8Array(encodeGraphBinary(createDisconnectedGraph(verifiedBiologicalGraph)))
+      );
+    }
+    if (actualBinarySha256 !== expectedBinarySha256) throw new Error('Search graph binary identity mismatch');
   } else {
     if (!expected.binarySha256) throw new Error(`Search graph identity requires binarySha256 for arm ${bundle.arm}`);
     if (actualBinarySha256 !== expected.binarySha256) throw new Error('Search graph binary identity mismatch');

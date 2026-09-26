@@ -15,7 +15,7 @@ from .readout import readout_parameter_count
 from .rollout import build_rollout_env
 
 
-def _validate_bundle_arm(bundle: dict) -> str:
+def _validate_bundle_arm(bundle: dict[str, object]) -> str:
     """Validate `--graph`'s bundle looks like a real `export-arms.ts`
     bundle (`formatVersion 1`, `arm` one of `ARM_NAMES`
     (biological/rewired/disconnected)) and return its `arm`. Pure function

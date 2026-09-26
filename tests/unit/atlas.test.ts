@@ -6,7 +6,7 @@ import { gunzipSync } from 'node:zlib';
 import { loadLocalAssets } from '../../scripts/experiments/local-assets';
 import { loadLocalAtlas } from '../../scripts/atlas/files';
 import { publishAtlas, evaluateSearchOnGraph } from '../../scripts/atlas/publish';
-import { evaluateSearchForGraph } from '../../scripts/atlas/verify-search-graph';
+import { verifyAndEvaluateSearchGraph } from '../../scripts/atlas/verify-search-graph';
 import { evaluateBehavior } from '../../scripts/atlas/evaluate';
 import { prepareGraph } from '../../src/lib/counterfactual/targets';
 import {
@@ -162,7 +162,7 @@ describe('selected-controller causal engine', () => {
   });
 });
 
-describe('evaluateSearchOnGraph / evaluateSearchForGraph (generalized to any verified graph)', () => {
+describe('evaluateSearchOnGraph / verifyAndEvaluateSearchGraph (generalized to any verified graph)', () => {
   // Trace-graph fixture arms (biological/rewired/disconnected), exported the
   // same way `training:export-arms --fixture-rewire` does, so these tests
   // exercise real bundle JSON, never a hand-rolled shape
@@ -273,7 +273,7 @@ describe('evaluateSearchOnGraph / evaluateSearchForGraph (generalized to any ver
     const searchPath = join(root, 'rewired-search.json');
     writeFileSync(searchPath, JSON.stringify(buildSearchArtifact(rewired)));
     const binarySha256 = sha256Hex(new Uint8Array(encodeGraphBinary(deserializeArmBundle(rewired))));
-    const result = await evaluateSearchForGraph(searchPath, {
+    const result = await verifyAndEvaluateSearchGraph(searchPath, {
       arm: 'rewired',
       binarySha256,
       parentGzipSha256: rewired.graphArtifactSha256
@@ -286,7 +286,7 @@ describe('evaluateSearchOnGraph / evaluateSearchForGraph (generalized to any ver
     const searchPath = join(root, 'rewired-search-wrong-binary.json');
     writeFileSync(searchPath, JSON.stringify(buildSearchArtifact(rewired)));
     await expect(
-      evaluateSearchForGraph(searchPath, {
+      verifyAndEvaluateSearchGraph(searchPath, {
         arm: 'rewired',
         binarySha256: 'a'.repeat(64),
         parentGzipSha256: rewired.graphArtifactSha256
@@ -299,7 +299,7 @@ describe('evaluateSearchOnGraph / evaluateSearchForGraph (generalized to any ver
     writeFileSync(searchPath, JSON.stringify(buildSearchArtifact(rewired)));
     const binarySha256 = sha256Hex(new Uint8Array(encodeGraphBinary(deserializeArmBundle(rewired))));
     await expect(
-      evaluateSearchForGraph(searchPath, {
+      verifyAndEvaluateSearchGraph(searchPath, {
         arm: 'rewired',
         binarySha256,
         parentGzipSha256: 'a'.repeat(64)
@@ -324,28 +324,68 @@ describe('evaluateSearchOnGraph / evaluateSearchForGraph (generalized to any ver
     const searchPath = join(root, 'disconnected-search-nonzero-edges.json');
     writeFileSync(searchPath, JSON.stringify(buildSearchArtifact(mislabeled)));
     await expect(
-      evaluateSearchForGraph(searchPath, {
+      verifyAndEvaluateSearchGraph(searchPath, {
         arm: 'disconnected',
         parentGzipSha256: mislabeled.graphArtifactSha256
       })
     ).rejects.toThrow('edgeCount 0');
   });
 
-  it('accepts a disconnected bundle with edgeCount 0 and requires no binarySha256', async () => {
+  it('derives the disconnected identity from verifiedBiologicalGraph when no binarySha256 is supplied', async () => {
     const searchPath = join(root, 'disconnected-search.json');
     writeFileSync(searchPath, JSON.stringify(buildSearchArtifact(disconnected)));
-    const result = await evaluateSearchForGraph(searchPath, {
-      arm: 'disconnected',
-      parentGzipSha256: disconnected.graphArtifactSha256
-    });
+    const result = await verifyAndEvaluateSearchGraph(
+      searchPath,
+      { arm: 'disconnected', parentGzipSha256: disconnected.graphArtifactSha256 },
+      deserializeArmBundle(biological)
+    );
     expect(result.cells.length).toBe(1);
+  });
+
+  it('rejects a disconnected bundle when neither binarySha256 nor verifiedBiologicalGraph is supplied', async () => {
+    const searchPath = join(root, 'disconnected-search-no-identity.json');
+    writeFileSync(searchPath, JSON.stringify(buildSearchArtifact(disconnected)));
+    await expect(
+      verifyAndEvaluateSearchGraph(searchPath, {
+        arm: 'disconnected',
+        parentGzipSha256: disconnected.graphArtifactSha256
+      })
+    ).rejects.toThrow('requires expected.binarySha256 or verifiedBiologicalGraph');
+  });
+
+  it('rejects a disconnected bundle whose non-edge content was tampered, even though it is self-consistent and edgeCount is 0', async () => {
+    // "Self-consistent" (its own sha256 matches its own current fields) but
+    // not the REAL disconnected graph: presynapticSigns is negated and a
+    // dynamics constant is scaled, simulating tampered neuron
+    // identities/dynamics rather than a corrupted edge count. edgeCount 0
+    // alone (the plan's stated minimum) cannot catch this; the derived
+    // binary-sha check (this file's "beyond the plan's minimum" fallback)
+    // must.
+    const tamperedWithoutHash: SerializedArmBundle = {
+      ...disconnected,
+      presynapticSigns: disconnected.presynapticSigns.map((sign) => -sign),
+      metadata: { ...disconnected.metadata, leakRate: disconnected.metadata.leakRate * 3 }
+    };
+    const tampered: SerializedArmBundle = {
+      ...tamperedWithoutHash,
+      sha256: computeArmBundleSha256(tamperedWithoutHash)
+    };
+    const searchPath = join(root, 'disconnected-search-tampered.json');
+    writeFileSync(searchPath, JSON.stringify(buildSearchArtifact(tampered)));
+    await expect(
+      verifyAndEvaluateSearchGraph(
+        searchPath,
+        { arm: 'disconnected', parentGzipSha256: tampered.graphArtifactSha256 },
+        deserializeArmBundle(biological)
+      )
+    ).rejects.toThrow('binary identity mismatch');
   });
 
   it('verifies a disconnected bundle\'s binarySha256 when one is supplied, rather than ignoring it', async () => {
     const searchPath = join(root, 'disconnected-search-with-binary-sha.json');
     writeFileSync(searchPath, JSON.stringify(buildSearchArtifact(disconnected)));
     const binarySha256 = sha256Hex(new Uint8Array(encodeGraphBinary(deserializeArmBundle(disconnected))));
-    const result = await evaluateSearchForGraph(searchPath, {
+    const result = await verifyAndEvaluateSearchGraph(searchPath, {
       arm: 'disconnected',
       binarySha256,
       parentGzipSha256: disconnected.graphArtifactSha256
@@ -355,7 +395,7 @@ describe('evaluateSearchOnGraph / evaluateSearchForGraph (generalized to any ver
     const searchPathWrong = join(root, 'disconnected-search-wrong-binary-sha.json');
     writeFileSync(searchPathWrong, JSON.stringify(buildSearchArtifact(disconnected)));
     await expect(
-      evaluateSearchForGraph(searchPathWrong, {
+      verifyAndEvaluateSearchGraph(searchPathWrong, {
         arm: 'disconnected',
         binarySha256: 'f'.repeat(64),
         parentGzipSha256: disconnected.graphArtifactSha256
@@ -367,7 +407,7 @@ describe('evaluateSearchOnGraph / evaluateSearchForGraph (generalized to any ver
     const searchPath = join(root, 'biological-search.json');
     writeFileSync(searchPath, JSON.stringify(buildSearchArtifact(biological)));
     const binarySha256 = sha256Hex(new Uint8Array(encodeGraphBinary(deserializeArmBundle(biological))));
-    const result = await evaluateSearchForGraph(searchPath, {
+    const result = await verifyAndEvaluateSearchGraph(searchPath, {
       arm: 'biological',
       binarySha256,
       parentGzipSha256: biological.graphArtifactSha256
@@ -379,7 +419,7 @@ describe('evaluateSearchOnGraph / evaluateSearchForGraph (generalized to any ver
     const searchPath = join(root, 'rewired-search-missing-binary-sha.json');
     writeFileSync(searchPath, JSON.stringify(buildSearchArtifact(rewired)));
     await expect(
-      evaluateSearchForGraph(searchPath, {
+      verifyAndEvaluateSearchGraph(searchPath, {
         arm: 'rewired',
         parentGzipSha256: rewired.graphArtifactSha256
       })
@@ -390,7 +430,7 @@ describe('evaluateSearchOnGraph / evaluateSearchForGraph (generalized to any ver
     const searchPath = join(root, 'arm-mismatch-search.json');
     writeFileSync(searchPath, JSON.stringify(buildSearchArtifact(rewired)));
     await expect(
-      evaluateSearchForGraph(searchPath, {
+      verifyAndEvaluateSearchGraph(searchPath, {
         arm: 'biological',
         binarySha256: sha256Hex(new Uint8Array(encodeGraphBinary(deserializeArmBundle(rewired)))),
         parentGzipSha256: rewired.graphArtifactSha256
@@ -404,7 +444,7 @@ describe('evaluateSearchOnGraph / evaluateSearchForGraph (generalized to any ver
     writeFileSync(searchPath, JSON.stringify(corrupted));
     const binarySha256 = sha256Hex(new Uint8Array(encodeGraphBinary(deserializeArmBundle(rewired))));
     await expect(
-      evaluateSearchForGraph(searchPath, {
+      verifyAndEvaluateSearchGraph(searchPath, {
         arm: 'rewired',
         binarySha256,
         parentGzipSha256: rewired.graphArtifactSha256
@@ -418,7 +458,7 @@ describe('evaluateSearchOnGraph / evaluateSearchForGraph (generalized to any ver
     writeFileSync(searchPath, JSON.stringify(corrupted));
     const binarySha256 = sha256Hex(new Uint8Array(encodeGraphBinary(deserializeArmBundle(rewired))));
     await expect(
-      evaluateSearchForGraph(searchPath, {
+      verifyAndEvaluateSearchGraph(searchPath, {
         arm: 'rewired',
         binarySha256,
         parentGzipSha256: rewired.graphArtifactSha256
