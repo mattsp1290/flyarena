@@ -31,7 +31,8 @@
     "test:subpath": "playwright test --config playwright.subpath.config.ts",
     "test:deploy-lock": "bash scripts/verify/deploy-lock.test.sh",
     "atlas:publish": "tsx scripts/atlas/cli.ts",
-    "atlas:verify": "tsx scripts/atlas/cli.ts --verify public/data/behavior-atlas-v1.json"
+    "atlas:verify": "tsx scripts/atlas/cli.ts --verify public/data/behavior-atlas-v1.json",
+    "graph-lab:bundle": "node scripts/graph-lab/bundle.mjs"
   },
   "dependencies": {
     "@noble/hashes": "2.4.0",
@@ -45,6 +46,7 @@
     "@testing-library/svelte": "^5.4.2",
     "@types/node": "^22.20.4",
     "@types/three": "^0.186.0",
+    "esbuild": "0.28.2",
     "jsdom": "^30.1.1",
     "svelte-check": "^4.7.6",
     "tsx": "4.23.15",
