@@ -4,7 +4,8 @@
   import { loadRepertoireNull, type RepertoireNullLoadResult } from '../experiment/repertoireNull';
   import type { ArenaManifest } from '../experiment/assets';
   import { githubDocUrl } from '../ui/links';
-  import { COVERAGE_EDGES, TURN_EDGES, CELL_COUNT, HELDOUT_SEEDS, CONTROL_NAMES, average, type Control, type LoadedAtlas } from './types';
+  import { isRepertoireStale, buildRepertoireStripText } from './repertoireStrip';
+  import { COVERAGE_EDGES, TURN_EDGES, HELDOUT_SEEDS, CONTROL_NAMES, average, type Control, type LoadedAtlas } from './types';
   import BehaviorReplay from './BehaviorReplay.svelte';
   import Workbench from '../counterfactual/Workbench.svelte';
   let loaded = $state<LoadedAtlas | null>(null), error = $state(''), selectedId = $state<number | null>(null);
@@ -62,51 +63,30 @@
    * that already loads both: `loaded.sha256` (from `load()`, the shipped
    * atlas's own verified sha256) and `repertoireNull.data.sources.atlasSha256`
    * (the atlas this study was computed against). Neither load waits on the
-   * other; this is a display-time check only, once both have resolved.
+   * other; this is a display-time check only, once both have resolved. The
+   * comparison itself is `isRepertoireStale` (`./repertoireStrip.ts`), a
+   * plain, DOM-free function a thermo-methodology review (Important) found
+   * had zero test coverage at any level -- `tests/unit/repertoire-strip.test.ts`
+   * now covers it directly, and `tests/e2e/atlas-repertoire.spec.ts` covers
+   * the full stale-atlas render path end-to-end.
    */
   const repertoireStale = $derived(
-    loaded !== null && repertoireNull?.status === 'ok' && repertoireNull.data.sources.atlasSha256 !== loaded.sha256
+    loaded !== null && repertoireNull?.status === 'ok' && isRepertoireStale(repertoireNull.data.sources.atlasSha256, loaded.sha256)
   );
   /**
-   * `03-artifact-and-atlas-strip.md`'s one-line strip, templated only from
-   * `repertoireNull.data`'s own verified fields — never a hard-coded number.
-   * `null` when there is nothing to show (still loading, `missing`, which
-   * hides the line entirely per spec, or `repertoireStale`, which instead
-   * renders the same "failed verification" line an `invalid` load would).
+   * `03-artifact-and-atlas-strip.md`'s one-line strip. `null` when there is
+   * nothing to show (still loading, `missing`, which hides the line
+   * entirely per spec, or `repertoireStale`, which instead renders the same
+   * "failed verification" line an `invalid` load would). The sentence
+   * itself is built by `buildRepertoireStripText` (`./repertoireStrip.ts`),
+   * a plain function extracted out of this component (thermo-
+   * maintainability review, Suggestion) so its template logic is unit-
+   * tested directly rather than only through a full Playwright run.
    */
   const repertoireStripText = $derived.by(() => {
     const result = repertoireNull;
     if (result?.status !== 'ok' || repertoireStale) return null;
-    const { primary, search, robustness } = result.data;
-    const dist = primary.rewiredDistribution.occupied;
-    // `dist.values` is guaranteed non-empty and ascending by
-    // `loadRepertoireNull`'s own shape validation, so `[0]`/`.at(-1)` are
-    // always the sample's real min/max (a maintainability review,
-    // Important, previously found this could read "undefined" for a
-    // malformed artifact — the loader now rejects that shape outright).
-    const range = `${dist.values[0]}–${dist.values.at(-1)}`;
-    const seeds = [search.primarySearchSeed, ...search.extraSearchSeeds];
-    const seedCount = seeds.length;
-    const robustClause = robustness.robust
-      ? `robust across all ${seedCount} search seeds`
-      : `not robust: seeds give ${seeds.map((seed) => `${seed}: ${robustness.perSeed[seed]}`).join(', ')}`;
-    // A maintainability review (Suggestion) found this sentence read "Seeds
-    // <blank> compare against only N seed-matched rewirings" whenever there
-    // were no extra search seeds at all -- omit the clause entirely in that
-    // case instead.
-    const coarseClause =
-      search.extraSearchSeeds.length > 0
-        ? ` Seeds ${search.extraSearchSeeds[0]}–${search.extraSearchSeeds.at(-1)} compare against only ${search.rewiredSeedMatchedCount} seed-matched rewirings.`
-        : '';
-    // `primary.tie` (a maintainability review, Suggestion): validated by
-    // the loader but previously never shown here — see `steps.ts`'s
-    // identical disclosure for the reasoning.
-    const tieSuffix = primary.tie ? ' (tie)' : '';
-    return (
-      `Repertoire vs ${search.rewiredCount} rewirings: biological occupies ${primary.bio.occupied} of ${CELL_COUNT} cells ` +
-      `(rewired median ${dist.p50}, range ${range}) — ${primary.category}${tieSuffix} at search seed ${search.primarySearchSeed}; ` +
-      `${robustClause}.${coarseClause}`
-    );
+    return buildRepertoireStripText(result.data);
   });
   const REPERTOIRE_REPORT_URL = githubDocUrl('behavior-repertoire-null-report.md');
 </script>

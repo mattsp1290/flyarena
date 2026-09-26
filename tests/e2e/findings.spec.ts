@@ -83,7 +83,10 @@ test.describe('Findings panel', () => {
     // pre-WP3 "Not yet published" placeholder.
     const step7 = panel.locator('li.step').nth(6);
     await expect(step7).toContainText(/biological occupies 28 of 36 behavior cells against a rewired median of 29/);
-    await expect(step7).toContainText(/narrower at search seed 1729/);
+    // Methodology review (Important): the category must never be stated
+    // next to only `occupied` -- `qd` and the joint basis are now shown too.
+    await expect(step7).toContainText(/qd 637 vs rewired median 763/);
+    await expect(step7).toContainText(/narrower on both metrics at search seed 1729/);
     await expect(step7).toContainText(
       /not robust across search seeds \(seed 1729: narrower, seed 1730: narrower, seed 1731: typical, seed 1732: typical, seed 1733: typical\)/
     );

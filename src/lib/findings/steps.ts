@@ -37,6 +37,7 @@ import {
   type PathwayInterventionsTrainedCategory
 } from '../experiment/pathwayInterventions';
 import type { RepertoireNullLoadResult } from '../experiment/repertoireNull';
+import { metricVerdictLabel } from '../atlas/repertoireStrip';
 import { CELL_COUNT } from '../atlas/types';
 import { githubDocUrl } from '../ui/links';
 import { describeTrainedCategory, formatPercentile, formatRho } from './format';
@@ -527,10 +528,24 @@ const buildBehaviorRepertoireStep = (inputs: BuildFindingStepsInputs): FindingSt
   // in this exact spot). Only one trailing "under this model." (a
   // maintainability review, Suggestion: an earlier version also opened
   // with "this model's", stating the same disclosure twice).
+  //
+  // A thermo-methodology review (Important) found this sentence stated the
+  // category next to only `occupied`, even though the predeclared rule
+  // decides it jointly from *both* `occupied` and `qd` -- see
+  // `../atlas/repertoireStrip.ts#buildRepertoireStripText`'s identical fix
+  // and doc comment for the full reasoning; `metricVerdictLabel` (shared
+  // from that same module, not re-implemented here) recomputes each
+  // metric's own verdict from data already on `primary`.
+  const qdDist = primary.rewiredDistribution.qd;
+  const basisClause =
+    primary.category !== 'typical'
+      ? 'on both metrics'
+      : `occupied ${metricVerdictLabel(primary.bio.occupied, primary.rewiredDistribution.occupied)}, qd ${metricVerdictLabel(primary.bio.qd, qdDist)}`;
   const sentence =
     `Under the shipped MAP-Elites search, biological occupies ${primary.bio.occupied} of ${CELL_COUNT} ` +
     `behavior cells against a rewired median of ${primary.rewiredDistribution.occupied.p50} ` +
-    `(n=${primary.rewiredDistribution.occupied.n}) — ${primary.category}${tieSuffix} at search seed ` +
+    `(n=${primary.rewiredDistribution.occupied.n}), qd ${Math.round(primary.bio.qd)} vs rewired median ${Math.round(qdDist.p50)} — ` +
+    `${primary.category}${tieSuffix} ${basisClause} at search seed ` +
     `${search.primarySearchSeed}, ${robustnessClause}, under this model.`;
   return { ...base, status: 'ok', sentence };
 };
