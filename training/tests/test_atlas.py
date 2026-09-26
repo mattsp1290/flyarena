@@ -2,10 +2,31 @@ from pathlib import Path
 import pytest
 import torch
 from flyarena_training.atlas import SearchOptions, Elite, retain, bin_index, COVERAGE_EDGES, search
+from flyarena_training.atlas_cli import _validate_bundle_arm
 from flyarena_training.atlas_rollout import evaluate_behaviors
 from flyarena_training.graph import load_graph_json
 from flyarena_training.rollout import build_rollout_env
 from flyarena_training.readout import readout_parameter_count
+
+
+@pytest.mark.parametrize("arm", ["biological", "rewired", "disconnected"])
+def test_validate_bundle_arm_accepts_every_export_arms_arm(arm):
+    assert _validate_bundle_arm({"formatVersion": 1, "arm": arm}) == arm
+
+
+@pytest.mark.parametrize(
+    "bundle",
+    [
+        {"formatVersion": 1, "arm": "trained"},
+        {"formatVersion": 1, "arm": "unknown"},
+        {"formatVersion": 1},
+        {"formatVersion": 2, "arm": "biological"},
+        {"arm": "biological"},
+    ],
+)
+def test_validate_bundle_arm_rejects_unknown_arm_or_format_version(bundle):
+    with pytest.raises(ValueError):
+        _validate_bundle_arm(bundle)
 
 
 def test_boundaries_and_stable_archive():

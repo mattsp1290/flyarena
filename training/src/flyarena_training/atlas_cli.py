@@ -9,9 +9,29 @@ import time
 import torch
 from .atlas import SearchOptions, search, DISCOVERY_SEEDS, HELDOUT_SEEDS, COVERAGE_EDGES, TURN_EDGES, HIDDEN_SIZE, SUBSTEPS, VERSION
 from .atlas_rollout import evaluate_behaviors
+from .cli import ARM_NAMES
 from .graph import load_graph_json, output_neuron_indices
 from .readout import readout_parameter_count
 from .rollout import build_rollout_env
+
+
+def _validate_bundle_arm(bundle: dict) -> str:
+    """Validate `--graph`'s bundle looks like a real `export-arms.ts`
+    bundle (`formatVersion 1`, `arm` one of `ARM_NAMES`
+    (biological/rewired/disconnected)) and return its `arm`. Pure function
+    of the parsed JSON object -- independently testable without touching
+    `torch`/CUDA/`load_graph_json` (`training/tests/test_atlas.py`).
+
+    Generalizes the original biological-only gate (this CLI previously
+    rejected any bundle whose `arm != "biological"`) so the GPU search
+    accepts the rewired/disconnected null-graph arms `training:export-arms`
+    already produces (`.agents/plans/repertoire-null/01-generalize-atlas-pipeline.md`
+    WP1), reusing `flyarena-train`'s own arm vocabulary (`cli.py`'s
+    `ARM_NAMES`) rather than redeclaring it.
+    """
+    if bundle.get("formatVersion") != 1 or bundle.get("arm") not in ARM_NAMES:
+        raise ValueError("Use a biological, rewired, or disconnected bundle from training:export-arms")
+    return bundle["arm"]
 
 
 def main():
@@ -28,8 +48,10 @@ def main():
     if args.graph.stat().st_size > 8 * 1024**2:
         parser.error("Graph bundle exceeds 8 MiB")
     bundle = json.loads(args.graph.read_text())
-    if bundle.get("formatVersion") != 1 or bundle.get("arm") != "biological":
-        parser.error("Use a biological bundle from training:export-arms")
+    try:
+        arm = _validate_bundle_arm(bundle)
+    except ValueError as error:
+        parser.error(str(error))
     torch.set_num_threads(2)
     if args.device == "cuda":
         if not torch.cuda.is_available():
@@ -53,6 +75,7 @@ def main():
                    "hiddenSize": HIDDEN_SIZE, "substeps": SUBSTEPS,
                    "discoverySeeds": DISCOVERY_SEEDS, "heldoutSeeds": HELDOUT_SEEDS,
                    "coverageEdges": COVERAGE_EDGES, "turnEdges": TURN_EDGES,
+                   "arm": arm,
                    "graphArtifactSha256": bundle["graphArtifactSha256"], "bundleSha256": bundle["sha256"], "bundle": bundle,
                    "runtime": {"device": args.device, "deviceName": torch.cuda.get_device_name() if args.device == "cuda" else "CPU",
                                "torch": str(torch.__version__), "cuda": torch.version.cuda,
