@@ -21,7 +21,7 @@
   "outputPopulationCount": 3,
   "pathwayInterventions": {
     "artifact": "pathway-interventions-v1.json",
-    "sha256": "6c789044d58b2a242fa8ca4c863a6a0d2bf43a494467fa5db29356f31962ff3b"
+    "sha256": "4da978885f6d1479fa5eef9a940d3fd55cfaf7d52e58abed58c41a5d2402db78"
   },
   "positions": {
     "artifact": "malecns-arena-v1.positions.json",

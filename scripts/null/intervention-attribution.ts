@@ -199,21 +199,38 @@ export const readAttribution = (path: string): AttributionFile => parseAttributi
  * scalar `T:rightClearance->thrust`/`T:forwardClearance->thrust` values (see
  * `AttributionInterventionResult`). This reads `index.json`'s raw entries
  * (not `intervention-report.ts`'s `readGraphListIndexInfo`, which only
- * extracts `kind`/`gzipSha256`) to get the one requested id's `transfer`
+ * extracts `kind`/`gzipSha256`) to get the requested `kind`'s `transfer`
  * table.
+ *
+ * Looks entries up by `kind`, not `id` (a maintainability-review finding):
+ * `intervention-report.ts`'s `exactlyOneOfKind` deliberately does the same,
+ * and for the identical reason — a hand-edited or corrupted index where the
+ * entry with `id: "P"` was mislabeled `kind: "C"` must be caught as "zero
+ * kind-P entries found", not silently accepted because its `id` happened to
+ * match. Also checks the matched entry's own `id` equals `kind` (mirroring
+ * `intervention-report.ts`'s own follow-up check), which catches the
+ * remaining case: some *other* entry's `kind` was mislabeled `"P"`/`"Q"`.
  */
-export const parseIndexGraphTransfer = (text: string, label: string, id: string): { readonly swaps: number; readonly transfer: Transfer3x8 } => {
+export const parseIndexGraphTransfer = (text: string, label: string, kind: 'P' | 'Q'): { readonly swaps: number; readonly transfer: Transfer3x8 } => {
   const parsed = JSON.parse(text) as { entries?: readonly Record<string, unknown>[] };
-  const entry = (parsed.entries ?? []).find((e) => e.id === id);
-  if (!entry) throw new Error(`intervention-attribution: ${label} has no entry with id "${id}"`);
+  const matches = (parsed.entries ?? []).filter((e) => e.kind === kind);
+  if (matches.length !== 1) {
+    throw new Error(`intervention-attribution: ${label} must have exactly one kind-"${kind}" entry, found ${matches.length}`);
+  }
+  const entry = matches[0];
+  if (entry.id !== kind) {
+    throw new Error(`intervention-attribution: ${label}'s kind-"${kind}" entry has id "${String(entry.id)}", expected "${kind}"`);
+  }
   const transfer = entry.transfer as Record<string, unknown> | undefined;
   if (!transfer || !isTransfer3x8(transfer.full3x8)) {
-    throw new Error(`intervention-attribution: ${label} entry "${id}" is missing a 3x8 transfer.full3x8 table`);
+    throw new Error(`intervention-attribution: ${label} entry "${kind}" is missing a 3x8 transfer.full3x8 table`);
   }
-  if (typeof entry.swaps !== 'number') throw new Error(`intervention-attribution: ${label} entry "${id}" is missing swaps`);
+  if (typeof entry.swaps !== 'number' || !Number.isInteger(entry.swaps) || entry.swaps < 0) {
+    throw new Error(`intervention-attribution: ${label} entry "${kind}" is missing a non-negative integer swaps`);
+  }
   return { swaps: entry.swaps, transfer: transfer.full3x8 };
 };
 
 /** Reads and parses `indexPath` -- see `parseIndexGraphTransfer`'s doc comment / `parseAttribution`'s own for why callers that already have the bytes in hand (`intervention-artifact.ts`) should prefer parsing them directly instead of a second `readFileSync`. */
-export const readIndexGraphTransfer = (indexPath: string, id: string): { readonly swaps: number; readonly transfer: Transfer3x8 } =>
-  parseIndexGraphTransfer(readFileSync(indexPath, 'utf8'), indexPath, id);
+export const readIndexGraphTransfer = (indexPath: string, kind: 'P' | 'Q'): { readonly swaps: number; readonly transfer: Transfer3x8 } =>
+  parseIndexGraphTransfer(readFileSync(indexPath, 'utf8'), indexPath, kind);

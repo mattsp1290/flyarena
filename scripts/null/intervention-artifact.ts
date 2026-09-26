@@ -14,7 +14,14 @@ import {
   type OutcomeCategory
 } from './intervention-report';
 import { parseAttribution, parseIndexGraphTransfer, TRANSFER_INPUT_CHANNELS, TRANSFER_OUTPUT_POPULATIONS, type Transfer3x8 } from './intervention-attribution';
-import { buildTrainedStatistics, type PTrainerSeed, type TrainedSeedResult, type TrainedArmDistribution } from './intervention-report-trained';
+import {
+  buildTrainedStatistics,
+  P_TRAINER_SEEDS,
+  type PTrainerSeed,
+  type TrainedOutcomeCategory,
+  type TrainedSeedResult,
+  type TrainedArmDistribution
+} from './intervention-report-trained';
 import type { NullTrainedInterventionEvaluationRaw } from './null-trained-evaluate-graph-list';
 
 /**
@@ -207,16 +214,44 @@ export interface BuildArtifactInputs {
  */
 export const buildPathwayInterventionsArtifact = (inputs: Readonly<BuildArtifactInputs>): PathwayInterventionsArtifact => {
   const { statistics } = inputs;
-  if (statistics.diagnosticOnly) {
+  if (statistics.version !== 1) {
+    throw new Error(`intervention-artifact: statistics.json has unsupported version ${String(statistics.version)}, expected 1`);
+  }
+  // Checked independently of `diagnosticOnly` (a maintainability-review
+  // finding): `diagnosticOnly` is only ever set by `intervention-report.ts`
+  // itself when `--allow-reproduction-mismatch` was passed, so a
+  // hand-edited/older `statistics.json` with `biologicalReproduction.matches:
+  // false` but no `diagnosticOnly` flag would otherwise sail through and get
+  // published.
+  if (statistics.diagnosticOnly || statistics.biologicalReproduction?.matches !== true) {
     throw new Error(
-      'intervention-artifact: statistics.json is diagnosticOnly (a failed biological-reproduction check) -- refusing to publish an artifact built from it'
+      'intervention-artifact: statistics.json is diagnosticOnly, or its biologicalReproduction.matches is not true -- refusing to publish an artifact built from it'
     );
+  }
+  if (
+    !statistics.inputs ||
+    typeof statistics.inputs.indexSha256 !== 'string' ||
+    typeof statistics.inputs.publishedNullSha256 !== 'string'
+  ) {
+    throw new Error('intervention-artifact: statistics.json is missing inputs.indexSha256/inputs.publishedNullSha256');
   }
 
   const indexSha = sha256Hex(inputs.indexBytes);
   if (indexSha !== statistics.inputs.indexSha256) {
     throw new Error(
       `intervention-artifact: ${inputs.indexLabel} sha256 ${indexSha} does not match statistics.json's recorded indexSha256 (${statistics.inputs.indexSha256}) -- stale statistics.json?`
+    );
+  }
+  // `trained.json`'s own recorded `graphListSha256` (`assembleInterventionRaw`
+  // in `null-trained-evaluate-graph-list.ts`) must describe this same
+  // `index.json` -- otherwise a `trained.json` scored against an older
+  // `interventions.py` run (new P/C/M graphs reusing the same ids) would
+  // publish silently, with nothing to flag that the trained arm no longer
+  // describes the same graphs the authored statistics/transfer tables do
+  // (a maintainability-review finding).
+  if (inputs.trainedRaw.graphListSha256 !== indexSha) {
+    throw new Error(
+      `intervention-artifact: trained.json graphListSha256 (${inputs.trainedRaw.graphListSha256}) does not match ${inputs.indexLabel} sha256 (${indexSha}) -- trained.json was scored against a different graph list`
     );
   }
   const rewiringNullSha = sha256Hex(inputs.rewiringNullBytes);
@@ -252,11 +287,24 @@ export const buildPathwayInterventionsArtifact = (inputs: Readonly<BuildArtifact
     throw new Error(`intervention-artifact: Q's swap count disagrees between ${inputs.indexLabel} (${qAfter.swaps}) and ${inputs.attributionLabel} (${attribution.Q.swaps})`);
   }
 
+  // A missing/empty `trained` section (or an absent `--rewiring-null` file
+  // that somehow parsed) must fail loudly, not silently degrade into an
+  // `undefined` p25/`Infinity` percentile resolution that `JSON.stringify`
+  // then quietly drops from the published artifact (a maintainability-review
+  // finding, reproduced: `sortedPublished[Math.floor(0.25 * 0)]` is
+  // `undefined`, and `1 / 0` is `Infinity`).
+  const publishedTrainedNullRewired = inputs.rewiringNullParsed.trained?.rewired;
+  if (!publishedTrainedNullRewired || publishedTrainedNullRewired.length === 0) {
+    throw new Error(
+      'intervention-artifact: the published null has no trained.rewired scores -- cannot report the trained-null context'
+    );
+  }
+
   const indexInfo = parseGraphListIndexInfo(inputs.indexText, inputs.indexLabel);
   const trained = buildTrainedStatistics(
     inputs.trainedRaw,
     indexInfo,
-    (inputs.rewiringNullParsed.trained?.rewired ?? []).map((r) => r.score),
+    publishedTrainedNullRewired.map((r) => r.score),
     inputs.bootstrapSeed,
     inputs.bootstrapResamples
   );
@@ -355,21 +403,49 @@ const AUTHORED_CATEGORY_PROSE: Record<OutcomeCategory, string> = {
   'not-supported': "**Not supported**: P stays below the null's 25th percentile."
 };
 
-const TRAINED_CATEGORY_LABEL: Record<'pathway-supported' | 'edge-class-effect' | 'no-specific-effect', string> = {
+const TRAINED_CATEGORY_LABEL: Record<TrainedOutcomeCategory, string> = {
   'pathway-supported': 'pathway-supported',
   'edge-class-effect': 'edge-class-effect',
   'no-specific-effect': 'no-specific-effect (neither pathway-supported nor edge-class; the generic-vs-not-supported split is undetermined)'
 };
 
+/**
+ * The Outcome section's trained-decoder clause, one entry per category —
+ * every claim here must be derivable from the artifact's own data, never a
+ * literal that happens to match today's run (a dual-review finding: an
+ * earlier version hard-coded "P shows no advantage ... at any of the three
+ * trainer seeds tested" as fixed prose, which would have printed a
+ * self-contradicting report for any other trained result).
+ */
+const TRAINED_OUTCOME_PROSE: Record<TrainedOutcomeCategory, string> = {
+  'pathway-supported': 'P outperforms both freshly-trained control arms',
+  'edge-class-effect': 'P outperforms the freshly-trained unrestricted (C) arm but not the class-matched (M) arm',
+  'no-specific-effect': 'P shows no advantage over either freshly-trained control arm'
+};
+
 export const renderPathwayInterventionsReportMarkdown = (artifact: Readonly<PathwayInterventionsArtifact>): string => {
   const { authored, trained, interventions, controls, transferBeforeAfter } = artifact;
 
-  const perSeedRows = ([101, 202, 303] as const)
-    .map((seed) => {
-      const s = trained.perSeed[seed];
-      return `| ${seed} | ${fmt(s.score)} | ${s.aboveC ? 'yes' : 'no'} | ${s.aboveM ? 'yes' : 'no'} | ${TRAINED_CATEGORY_LABEL[s.category]} | ${s.context.abovePublishedNullP25 ? 'above' : 'below'} |`;
-    })
-    .join('\n');
+  const perSeedRows = P_TRAINER_SEEDS.map((seed) => {
+    const s = trained.perSeed[seed];
+    return `| ${seed} | ${fmt(s.score)} | ${s.aboveC ? 'yes' : 'no'} | ${s.aboveM ? 'yes' : 'no'} | ${TRAINED_CATEGORY_LABEL[s.category]} | ${s.context.abovePublishedNullP25 ? 'above' : 'below'} |`;
+  }).join('\n');
+
+  // Every sentence below is derived from `trained.perSeed`/`trained.trainedRobust`
+  // -- never a literal describing only today's run (see `TRAINED_OUTCOME_PROSE`'s
+  // own doc comment).
+  const representativeSeed = P_TRAINER_SEEDS[0];
+  const trainedOutcomeSentence = trained.trainedRobust
+    ? `${TRAINED_OUTCOME_PROSE[trained.perSeed[representativeSeed].category]} at all ${P_TRAINER_SEEDS.length} trainer seeds tested (**${TRAINED_CATEGORY_LABEL[trained.perSeed[representativeSeed].category]}**, robust: true)`
+    : `the ${P_TRAINER_SEEDS.length} trainer seeds disagree on the category (${P_TRAINER_SEEDS.map((seed) => `seed ${seed}: ${trained.perSeed[seed].category}`).join(', ')}; robust: false)`;
+
+  const contextAboveSeeds = P_TRAINER_SEEDS.filter((seed) => trained.perSeed[seed].context.abovePublishedNullP25);
+  const contextBelowSeeds = P_TRAINER_SEEDS.filter((seed) => !trained.perSeed[seed].context.abovePublishedNullP25);
+  const contextSeedRobust = contextAboveSeeds.length === 0 || contextBelowSeeds.length === 0;
+  const contextSentence = contextSeedRobust
+    ? `**seed-consistent**: every trainer seed falls ${contextAboveSeeds.length > 0 ? 'above' : 'below'} it`
+    : `**not seed-robust**: below at trainer seed(s) ${contextBelowSeeds.join('/')} and above at trainer seed(s) ${contextAboveSeeds.join('/')}`;
+  const contextPercentileResolution = trained.perSeed[representativeSeed].context.percentileResolution;
 
   return `# Clearance -> thrust pathway interventions
 
@@ -425,12 +501,13 @@ causal effect.
 
 ### Trained decoder
 
-The same categories apply, but the **governing reference** is the freshly trained controls: 5 C graphs
-(C000-C004) and 5 M graphs (M1000-M1004), each at trainer seed 101. The published trained null
-(\`rewiring-null-v1.json\` \`trained\`, 20 full rewirings) is reported for context only and does not decide the
-category. With 5 graphs per arm, the trained cutoff is "above the maximum of that arm's 5". The result is robust
-only if all three P trainer seeds (101/202/303) agree on the category, because the trained null was
-trainer-seed-sensitive.
+The same C/M comparisons apply, but the **governing reference** is the freshly trained controls: 5 C graphs
+(C000-C004) and 5 M graphs (M1000-M1004), each at trainer seed 101 -- not the published 500-graph authored null,
+and the authored floor's null-percentile prong is not applied on this side (see the disclosure below for why).
+The published trained null (\`rewiring-null-v1.json\` \`trained\`, 20 full rewirings) is reported for context only
+and does not decide the category. With 5 graphs per arm, the trained cutoff is "above the maximum of that arm's
+5". The result is robust only if all three P trainer seeds (101/202/303) agree on the category, because the
+trained null was trainer-seed-sensitive.
 
 ${trained.note}
 
@@ -458,7 +535,11 @@ above show the full 3x8 matrix precisely so that is checkable; the category belo
 
 ## Authored results
 
-| graph | score | percentile in published null (n=500) | rank among C | rank among M | rank among MQ |
+Empirical p is the \`(k+1)/(n+1)\` rank statistic against a 100-graph control arm (\`03-evaluation.md\`'s own rank
+statistic): the smallest value it can take is 1/101 ≈ 0.0099, which means the intervention exceeded every one of
+the 100 control graphs -- not "near the bottom" of the arm.
+
+| graph | score | percentile in published null | empirical p vs C \`(k+1)/(n+1)\` | empirical p vs M | empirical p vs MQ |
 | --- | --- | --- | --- | --- | --- |
 | P | ${fmt(interventions.P.score)} | ${pct(interventions.P.percentileInPublishedNull)} | ${fmt(authored.pRankAmongC)} | ${fmt(authored.pRankAmongM)} | -- |
 | Q | ${fmt(interventions.Q.score)} | ${pct(interventions.Q.percentileInPublishedNull)} | -- | -- | ${fmt(authored.qRankAmongMQ)} |
@@ -470,8 +551,9 @@ above show the full 3x8 matrix precisely so that is checkable; the category belo
   M p50=${fmt(controls.M.p50)} p95=${fmt(controls.M.p95)}; MQ (n=${controls.MQ.n}, k_Q=${controls.MQ.kQ}) p50=${fmt(controls.MQ.p50)} p95=${fmt(controls.MQ.p95)}.
 - Biological reproduction check: computed ${fmt(authored.biologicalReproduction.computedScore)} vs published
   ${fmt(authored.biologicalReproduction.publishedScore)} (matches: ${authored.biologicalReproduction.matches}).
-- Multiple comparisons disclosed: P vs C, P vs M, Q vs MQ, and (below) 3 trainer seeds -- none of these
-  comparisons is corrected against the others; each is reported and read on its own predeclared terms.
+- Multiple comparisons disclosed: P vs C, P vs M, Q vs MQ, and (below) ${P_TRAINER_SEEDS.length} trainer seeds --
+  none of these comparisons is corrected against the others; each is reported and read on its own predeclared
+  terms.
 
 ## Trained results
 
@@ -480,19 +562,18 @@ above show the full 3x8 matrix precisely so that is checkable; the category belo
 ${perSeedRows}
 
 - Control arms (mean \`movementScore\`, trainer seed 101, n=${trained.controls.C.n} each): C max=${fmt(trained.controls.C.max)}; M max=${fmt(trained.controls.M.max)}.
-- \`trainedRobust\`: **${trained.trainedRobust}** (every P trainer seed above agrees on the category).
-- The published trained null's 25th percentile is context only (percentile resolution ${pct(1 / 20)} at n=20) and
+- \`trainedRobust\`: **${trained.trainedRobust}** (every P trainer seed above ${trained.trainedRobust ? 'agrees' : 'does not agree'} on the category).
+- The published trained null's 25th percentile is context only (percentile resolution ${pct(contextPercentileResolution)}) and
   does not decide the category -- see the disclosure above. Informally, the finer generic-vs-not-supported split
-  this context value would suggest is **not seed-robust**: it is below at trainer seed 101 and above at trainer
-  seeds 202/303.
+  this context value would suggest is ${contextSentence}.
 - Q is not evaluated with trained readouts (authored-decoder only, per the predeclared method above).
 
 ## Outcome
 
 Under the **authored decoder**, this study's mechanical outcome is **${authored.category}**, with the
-channel-specific modifier **${authored.channelSpecific ? 'holding' : 'not holding'}**. Under **trained readouts**,
-P shows no advantage over either freshly-trained control arm at any of the three trainer seeds tested
-(**${TRAINED_CATEGORY_LABEL[trained.perSeed[101].category]}**, robust: ${trained.trainedRobust}).
+channel-specific modifier **${authored.channelSpecific ? 'holding' : 'not holding'}**. This authored-decoder
+verdict is bound to the hand-written decoder; it does not by itself say what a trained readout finds. Under
+**trained readouts**, ${trainedOutcomeSentence}.
 
 ## Limitations
 
@@ -507,10 +588,16 @@ P shows no advantage over either freshly-trained control arm at any of the three
 - The trained arm compares against only 5 controls per arm (a coarse resolution), and its result depends on the
   trainer seed -- reported as robust only when all three P trainer seeds agree on the category.
 - The channel-specific test (Q against MQ) is authored-decoder only; Q was not evaluated with trained readouts.
-- The generic-vs-not-supported split is undetermined for the trained decoder under this study's predeclared
-  rules (see the disclosure above); this report does not force one of those two labels.
-- Multiple comparisons (P vs C, P vs M, Q vs MQ, and 3 trainer seeds) are disclosed above and are not corrected
-  against each other.
+- The predeclared C/M-max comparison decides pathway-supported/edge-class-effect for the trained decoder, but
+  00-overview.md does not say how to report the remaining generic-vs-not-supported split when P does not clear
+  the C arm (that needs a trained-null percentile floor, and this study's trained null is context-only).
+  'no-specific-effect' is a reporting convention this study's coordinator adopted after the trained scores were
+  known (see the disclosure above), not itself a predeclared category; this report does not force an unlicensed
+  generic/not-supported label.
+- P at trainer seeds 202/303 is compared against C/M control arms trained only at seed 101, so those two
+  comparisons mix a graph difference with a trainer-seed difference; only the seed-101 comparison is seed-matched.
+- Multiple comparisons (P vs C, P vs M, Q vs MQ, and ${P_TRAINER_SEEDS.length} trainer seeds) are disclosed above
+  and are not corrected against each other.
 `;
 };
 
@@ -595,10 +682,20 @@ export const parseIntoArtifactArgs = (argv: readonly string[]): IntoArtifactArgs
     }
   }
 
-  for (const input of [statistics, attribution, trained, index, rewiringNull, manifest]) {
-    if (resolve(out) === resolve(input)) {
-      throw new Error(`intervention-artifact: --out must not overwrite an input file (${input})`);
+  // `--report-md` is a write target too, not merely an input -- it must not
+  // collide with `--out` (which would overwrite the just-published artifact
+  // after its sha was already written to the manifest, leaving a manifest
+  // sha that never matches what is on disk) or with any input file (a
+  // maintainability-review finding: only `--out` was checked before).
+  for (const target of [out, reportMd]) {
+    for (const input of [statistics, attribution, trained, index, rewiringNull, manifest]) {
+      if (resolve(target) === resolve(input)) {
+        throw new Error(`intervention-artifact: ${target === out ? '--out' : '--report-md'} must not overwrite an input file (${input})`);
+      }
     }
+  }
+  if (resolve(out) === resolve(reportMd)) {
+    throw new Error('intervention-artifact: --out and --report-md must not be the same path');
   }
 
   return { statistics, attribution, trained, index, rewiringNull, manifest, out, reportMd, bootstrapSeed, bootstrapResamples };

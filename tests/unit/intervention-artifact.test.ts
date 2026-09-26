@@ -131,7 +131,9 @@ const trainedFixture = (): NullTrainedInterventionEvaluationRaw => ({
   seeds: { start: 30001, count: 2 },
   ticks: 20,
   substeps: 4,
-  graphListSha256: SHA('idx'),
+  // Must equal the real index fixture's own sha256 -- `buildPathwayInterventionsArtifact`
+  // now cross-checks `trainedRaw.graphListSha256` against it (a maintainability-review finding).
+  graphListSha256: indexShaFixture(),
   host: { arch: 'arm64', node: 'v22.0.0' },
   d: 48,
   evaluatorGitRev: 'deadbeef',
@@ -250,6 +252,101 @@ describe('buildPathwayInterventionsArtifact', () => {
     expect(() => buildPathwayInterventionsArtifact(buildInputs({ indexText: JSON.stringify(badIndex) }))).toThrow(
       /P's swap count disagrees/
     );
+  });
+
+  it("throws when Q's swap count disagrees between index.json and attribution.json", () => {
+    const badIndex = {
+      ...indexWithControlKinds,
+      entries: indexWithControlKinds.entries.map((e) => (e.id === 'Q' ? { ...e, swaps: 99 } : e))
+    };
+    expect(() => buildPathwayInterventionsArtifact(buildInputs({ indexText: JSON.stringify(badIndex) }))).toThrow(
+      /Q's swap count disagrees/
+    );
+  });
+
+  it('throws when statistics.json has an unsupported version', () => {
+    const statistics = { ...statisticsFixture(), version: 2 as unknown as 1 };
+    expect(() => buildPathwayInterventionsArtifact(buildInputs({ statistics }))).toThrow(/statistics\.json has unsupported version/);
+  });
+
+  // Maintainability-review finding: `diagnosticOnly` is only ever set by
+  // `intervention-report.ts` itself when `--allow-reproduction-mismatch`
+  // was passed -- a hand-edited/older `statistics.json` with a failed
+  // reproduction check but no `diagnosticOnly` flag must still be refused.
+  it('refuses to build when biologicalReproduction.matches is false, even without the diagnosticOnly flag', () => {
+    const statistics = { ...statisticsFixture(), biologicalReproduction: { ...statisticsFixture().biologicalReproduction, matches: false } };
+    expect(() => buildPathwayInterventionsArtifact(buildInputs({ statistics }))).toThrow(/diagnosticOnly, or its biologicalReproduction\.matches is not true/);
+  });
+
+  it("throws when trained.json's graphListSha256 does not match index.json's sha256 (stale trained.json)", () => {
+    const trainedRaw = { ...trainedFixture(), graphListSha256: SHA('stale') };
+    expect(() => buildPathwayInterventionsArtifact(buildInputs({ trainedRaw }))).toThrow(
+      /trained\.json graphListSha256 .* does not match .* sha256/
+    );
+  });
+
+  it('throws when the published null has no trained.rewired scores', () => {
+    expect(() => buildPathwayInterventionsArtifact(buildInputs({ rewiringNullParsed: { ...rewiringNullFixture(), trained: { rewired: [] } } }))).toThrow(
+      /the published null has no trained\.rewired scores/
+    );
+  });
+
+  it('throws when the published null has no trained section at all', () => {
+    const { trained: _omit, ...withoutTrained } = rewiringNullFixture();
+    expect(() => buildPathwayInterventionsArtifact(buildInputs({ rewiringNullParsed: withoutTrained }))).toThrow(
+      /the published null has no trained\.rewired scores/
+    );
+  });
+
+  it('throws when a trained.json run has a gzipSha256 that disagrees with index.json (stale trained.json)', () => {
+    const trainedRaw = {
+      ...trainedFixture(),
+      runs: trainedFixture().runs.map((run) => (run.id === 'C000' ? { ...run, gzipSha256: SHA('stale-c000') } : run))
+    };
+    expect(() => buildPathwayInterventionsArtifact(buildInputs({ trainedRaw }))).toThrow(
+      /"C000" was scored from a different graph file than index\.json currently lists/
+    );
+  });
+
+  /**
+   * Both reviewers flagged this as the headline finding: an earlier version
+   * of `renderPathwayInterventionsReportMarkdown` hard-coded prose that
+   * happened to be true only for this study's real (`no-specific-effect`,
+   * robust) trained result. Rendering a synthetic `pathway-supported`,
+   * non-robust trained result must change every trained-result sentence to
+   * match -- never print the fixed "P shows no advantage ..." text
+   * regardless of the actual category.
+   */
+  it('the rendered report reflects a non-current trained category and robustness, not hard-coded prose', () => {
+    const trainedRaw: NullTrainedInterventionEvaluationRaw = {
+      ...trainedFixture(),
+      runs: trainedFixture().runs.map((run) =>
+        run.id === 'P' ? { ...run, movementScore: [200, 200] } : run
+      )
+    };
+    const artifact = buildPathwayInterventionsArtifact(buildInputs({ trainedRaw }));
+    expect(artifact.trained.perSeed[101].category).toBe('pathway-supported');
+    expect(artifact.trained.trainedRobust).toBe(true);
+
+    const markdown = renderPathwayInterventionsReportMarkdown(artifact);
+    expect(markdown).not.toMatch(/P shows no advantage over either freshly-trained control arm/);
+    expect(markdown).toMatch(/P outperforms both freshly-trained control arms at all 3 trainer seeds tested/);
+    expect(markdown).toMatch(/\*\*pathway-supported\*\*, robust: true/);
+  });
+
+  it('the rendered report states a non-robust trained result as such, per seed, without forcing a single category', () => {
+    const trainedRaw: NullTrainedInterventionEvaluationRaw = {
+      ...trainedFixture(),
+      runs: trainedFixture().runs.map((run) => (run.id === 'P' && run.trainerSeed === 303 ? { ...run, movementScore: [200, 200] } : run))
+    };
+    const artifact = buildPathwayInterventionsArtifact(buildInputs({ trainedRaw }));
+    expect(artifact.trained.trainedRobust).toBe(false);
+
+    const markdown = renderPathwayInterventionsReportMarkdown(artifact);
+    expect(markdown).toMatch(/the 3 trainer seeds disagree on the category/);
+    expect(markdown).toMatch(/seed 101: no-specific-effect/);
+    expect(markdown).toMatch(/seed 303: pathway-supported/);
+    expect(markdown).not.toMatch(/P shows no advantage over either freshly-trained control arm at all 3 trainer seeds tested/);
   });
 });
 

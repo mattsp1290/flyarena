@@ -69,6 +69,7 @@ describe('loadPathwayInterventions (shape validation, with a synthetic manifest 
   const validArtifact = {
     version: 1,
     sources: {
+      biologicalSha: manifest.binarySha256,
       rewiringNullSha: manifest.rewiringNull?.sha256 ?? 'a'.repeat(64),
       nullExplanationSha: manifest.nullExplanation?.sha256 ?? 'b'.repeat(64)
     },
@@ -139,6 +140,16 @@ describe('loadPathwayInterventions (shape validation, with a synthetic manifest 
     const result = await loadPathwayInterventions(manifestForBody, '/data');
     expect(result.status).toBe('invalid');
     if (result.status === 'invalid') expect(result.reason).toMatch(/trainedRobust disagrees/);
+  });
+
+  it('is "invalid" when sources.biologicalSha does not match the manifest\'s compiled biological graph (a stale/re-pinned artifact)', async () => {
+    const { manifest: manifestForBody } = manifestServing({
+      ...validArtifact,
+      sources: { ...validArtifact.sources, biologicalSha: 'f'.repeat(64) }
+    });
+    const result = await loadPathwayInterventions(manifestForBody, '/data');
+    expect(result.status).toBe('invalid');
+    if (result.status === 'invalid') expect(result.reason).toMatch(/sources\.biologicalSha does not match/);
   });
 
   it('is "invalid" when sources.rewiringNullSha does not match the manifest\'s rewiring-null artifact (a stale/re-pinned artifact)', async () => {

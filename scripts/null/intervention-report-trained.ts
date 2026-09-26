@@ -1,5 +1,5 @@
 import { mean, type ConditionStats } from '../training/stats';
-import { graphStats } from './null-stats';
+import { graphStats, quantileIndex } from './null-stats';
 import type { GraphKind, GraphListIndexInfo } from './intervention-report';
 import type { NullTrainedInterventionEvaluationRaw, NullTrainedInterventionGraphRaw } from './null-trained-evaluate-graph-list';
 
@@ -111,11 +111,13 @@ export interface TrainedStatistics {
   readonly trainedRobust: boolean;
   readonly host: { readonly arch: string; readonly node: string };
   /**
-   * The plan-gap disclosure this study's coordinator predeclared
-   * (`bn show flyarena-cyum`'s 2026-09-26 09:39 note): states plainly that
-   * the generic-vs-not-supported split is undetermined under the
-   * predeclared trained rules, and that the published trained null used for
-   * `context` is reported for context only per `00-overview.md`. Carried in
+   * The plan-gap disclosure this study's coordinator wrote after seeing the
+   * trained scores (`bn show flyarena-cyum`'s 2026-09-26 09:39 note): states
+   * plainly that the generic-vs-not-supported split is undetermined under
+   * 00-overview.md's own predeclared trained rules (which decide only the
+   * C/M-max comparison), and that the 'no-specific-effect' merge label for
+   * that undetermined case is a post-hoc reporting convention, not itself
+   * predeclared — see `TRAINED_CATEGORY_NOTE`'s own doc comment. Carried in
    * the artifact itself (not only in the markdown report) so any consumer
    * of the raw JSON sees the same disclosure the ledger sentence and report
    * are required to state.
@@ -123,13 +125,32 @@ export interface TrainedStatistics {
   readonly note: string;
 }
 
+/**
+ * Distinguishes what `00-overview.md` actually predeclares from what this
+ * study's coordinator decided afterward (methodology review finding: an
+ * earlier version of this note said the *label* itself was "predeclared",
+ * which overstates it). `00-overview.md` predeclares only "the same
+ * categories" for the trained decoder, plus the C/M-max cutoff and the
+ * "robust only if all three seeds agree" rule — it says nothing about what
+ * to report when the null-floor prong cannot be evaluated (the trained
+ * null being context-only). The 'no-specific-effect' merge label for that
+ * undecidable case was adopted by this study's coordinator (`bn show
+ * flyarena-cyum`'s 2026-09-26 09:39 note) after the trained scores were
+ * already known — a reporting convention for an outcome the predeclared
+ * rules leave open, not itself a predeclared rule. What genuinely is
+ * predeclared and mechanically decides P's category regardless of when
+ * this note was added: the strict C/M-max comparison itself.
+ */
 export const TRAINED_CATEGORY_NOTE =
-  "The trained decoder's predeclared rules can rule pathway-supported and edge-class-effect in or out (P above/below " +
-  "the max of the freshly-trained 5-graph C/M arms at trainer seed 101), but cannot decide the finer " +
-  "generic-rewiring-effect vs not-supported split: that split needs a trained-null percentile floor, and this " +
-  "study's only trained null (rewiring-null-v1.json's published n=20 sample) is reported for context only, per " +
-  "00-overview.md, not as a decisive threshold. This category is reported as 'no-specific-effect' whenever P does " +
-  'not clear the C arm, rather than forcing an unlicensed generic/not-supported label.';
+  "The trained decoder's predeclared C/M-max comparison can rule pathway-supported and edge-class-effect in or " +
+  'out (P above/below the max of the freshly-trained 5-graph C/M arms at trainer seed 101), but 00-overview.md ' +
+  'does not say how to report the finer generic-rewiring-effect vs not-supported split when P does not clear the ' +
+  "C arm: that split needs a trained-null percentile floor, and this study's only trained null " +
+  '(rewiring-null-v1.json\'s published n=20 sample) is reported for context only, per 00-overview.md, not as a ' +
+  "decisive threshold. 'no-specific-effect' is a reporting convention this study's coordinator adopted after the " +
+  'trained scores were known (methodology review, 2026-09-26), to avoid forcing an unlicensed generic/not-supported ' +
+  "label -- it does not change which predeclared comparison P passed or failed, only how the undecidable case is " +
+  'named.';
 
 /**
  * `00-overview.md`'s trained cutoff, applied per P trainer seed: `aboveC`/
@@ -142,13 +163,21 @@ export const TRAINED_CATEGORY_NOTE =
  * "pathway-supported" or "edge-class-effect" could still hold.
  */
 export const evaluateTrainedCategory = (pScore: number, cArm: Readonly<TrainedArmDistribution>, mArm: Readonly<TrainedArmDistribution>): TrainedOutcomeCategory => {
-  const aboveC = pScore > cArm.max;
-  const aboveM = pScore > mArm.max;
+  const { aboveC, aboveM } = trainedCategoryFlags(pScore, cArm, mArm);
   if (!aboveC) return 'no-specific-effect';
   return aboveM ? 'pathway-supported' : 'edge-class-effect';
 };
 
-/** `evaluateTrainedCategory`'s two intermediate booleans, exposed separately so a caller (the artifact/report builder) can state "P cleared the C arm but not the M arm" in prose without recomputing them. */
+/**
+ * `evaluateTrainedCategory`'s two intermediate booleans, exposed separately
+ * so a caller (the artifact/report builder) can state "P cleared the C arm
+ * but not the M arm" in prose without recomputing them.
+ * `evaluateTrainedCategory` itself calls this rather than repeating the
+ * `pScore > arm.max` comparison a second time (a maintainability-review
+ * suggestion: two independent copies of the same strict cutoff could drift
+ * apart — e.g. one changed to `>=` — without any error surfacing the
+ * disagreement between the reported flags and the reported category).
+ */
 export const trainedCategoryFlags = (pScore: number, cArm: Readonly<TrainedArmDistribution>, mArm: Readonly<TrainedArmDistribution>): { readonly aboveC: boolean; readonly aboveM: boolean } => ({
   aboveC: pScore > cArm.max,
   aboveM: pScore > mArm.max
@@ -175,6 +204,24 @@ export const isTrainedRobust = (perSeed: Readonly<Record<PTrainerSeed, TrainedSe
  * rejected outright — `00-overview.md`: "Q is not evaluated with trained
  * readouts."
  */
+/**
+ * `label` identifies the run (its graph id) in the thrown message — mirrors
+ * `intervention-report-validation.ts`'s `assertFiniteScores` for the
+ * authored side. A non-finite or empty `movementScore` would otherwise
+ * silently become `NaN` through `mean()`, and `NaN > arm.max` is always
+ * `false`, so a corrupt run would silently score as `'no-specific-effect'`
+ * with no error anywhere (a maintainability-review finding).
+ */
+const assertFiniteMovementScore = (label: string, movementScore: readonly number[]): void => {
+  if (!Array.isArray(movementScore) || movementScore.length === 0) {
+    throw new Error(`intervention-report-trained: "${label}".movementScore is missing or empty`);
+  }
+  const badIndex = movementScore.findIndex((value) => typeof value !== 'number' || !Number.isFinite(value));
+  if (badIndex !== -1) {
+    throw new Error(`intervention-report-trained: "${label}".movementScore[${badIndex}] is not a finite number`);
+  }
+};
+
 const classifyRuns = (
   raw: Readonly<NullTrainedInterventionEvaluationRaw>,
   info: Readonly<GraphListIndexInfo>
@@ -183,6 +230,7 @@ const classifyRuns = (
   readonly cRuns: readonly NullTrainedInterventionGraphRaw[];
   readonly mRuns: readonly NullTrainedInterventionGraphRaw[];
 } => {
+  if (!Array.isArray(raw.runs)) throw new Error('intervention-report-trained: trained.json "runs" is not an array');
   const byKind = new Map<GraphKind, NullTrainedInterventionGraphRaw[]>();
   for (const run of raw.runs) {
     const entryInfo = info.entries.get(run.id);
@@ -190,6 +238,19 @@ const classifyRuns = (
     if (entryInfo.kind === 'Q' || entryInfo.kind === 'MQ' || entryInfo.kind === 'R') {
       throw new Error(`intervention-report-trained: trained.json has a kind-"${entryInfo.kind}" run ("${run.id}") -- Q/MQ/R are not evaluated with trained readouts`);
     }
+    // The index's own recorded `gzipSha256` for this id must match what this
+    // run was actually scored against -- otherwise a `trained.json` scored
+    // against a stale/different graph (a re-run of `interventions.py` that
+    // reused the same id) would silently be reported as if it described the
+    // graph `index.json` currently lists (a maintainability-review finding,
+    // mirroring `intervention-report-validation.ts`'s identical check on the
+    // authored side).
+    if (entryInfo.gzipSha256 !== run.gzipSha256) {
+      throw new Error(
+        `intervention-report-trained: "${run.id}" was scored from a different graph file than index.json currently lists (trained.json gzipSha256 ${run.gzipSha256}, index.json ${entryInfo.gzipSha256}) -- stale trained.json?`
+      );
+    }
+    assertFiniteMovementScore(run.id, run.movementScore);
     const list = byKind.get(entryInfo.kind) ?? [];
     list.push(run);
     byKind.set(entryInfo.kind, list);
@@ -239,6 +300,9 @@ export const buildTrainedStatistics = (
   bootstrapResamples: number
 ): TrainedStatistics => {
   if (raw.version !== 1) throw new Error(`intervention-report-trained: trained.json has unsupported version ${String(raw.version)}, expected 1`);
+  if (publishedTrainedNullScores.length === 0 || !publishedTrainedNullScores.every((value) => Number.isFinite(value))) {
+    throw new Error('intervention-report-trained: publishedTrainedNullScores must be a non-empty list of finite numbers');
+  }
   const { pBySeed, cRuns, mRuns } = classifyRuns(raw, info);
 
   const scoreOf = (run: Readonly<NullTrainedInterventionGraphRaw>): number => mean(run.movementScore);
@@ -246,8 +310,11 @@ export const buildTrainedStatistics = (
   const mArm = trainedArmDistribution(mRuns.map(scoreOf));
 
   const sortedPublished = [...publishedTrainedNullScores].sort((a, b) => a - b);
-  const p25Index = Math.floor(0.25 * sortedPublished.length);
-  const publishedTrainedNullP25 = sortedPublished[p25Index];
+  // Same low-tail-floor quantile convention as `intervention-report.ts`'s
+  // `publishedNullFloorValue` (`quantileIndex`, `null-stats.ts`) -- reused
+  // directly rather than a hand-typed `Math.floor(0.25 * n)` that could
+  // silently drift from it (a methodology-review suggestion).
+  const publishedTrainedNullP25 = sortedPublished[quantileIndex(sortedPublished.length, 0.25)];
   const percentileResolutionValue = 1 / sortedPublished.length;
 
   const perSeedEntries = P_TRAINER_SEEDS.map((seed): [PTrainerSeed, TrainedSeedResult] => {

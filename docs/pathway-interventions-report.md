@@ -52,14 +52,15 @@ causal effect.
 
 ### Trained decoder
 
-The same categories apply, but the **governing reference** is the freshly trained controls: 5 C graphs
-(C000-C004) and 5 M graphs (M1000-M1004), each at trainer seed 101. The published trained null
-(`rewiring-null-v1.json` `trained`, 20 full rewirings) is reported for context only and does not decide the
-category. With 5 graphs per arm, the trained cutoff is "above the maximum of that arm's 5". The result is robust
-only if all three P trainer seeds (101/202/303) agree on the category, because the trained null was
-trainer-seed-sensitive.
+The same C/M comparisons apply, but the **governing reference** is the freshly trained controls: 5 C graphs
+(C000-C004) and 5 M graphs (M1000-M1004), each at trainer seed 101 -- not the published 500-graph authored null,
+and the authored floor's null-percentile prong is not applied on this side (see the disclosure below for why).
+The published trained null (`rewiring-null-v1.json` `trained`, 20 full rewirings) is reported for context only
+and does not decide the category. With 5 graphs per arm, the trained cutoff is "above the maximum of that arm's
+5". The result is robust only if all three P trainer seeds (101/202/303) agree on the category, because the
+trained null was trainer-seed-sensitive.
 
-The trained decoder's predeclared rules can rule pathway-supported and edge-class-effect in or out (P above/below the max of the freshly-trained 5-graph C/M arms at trainer seed 101), but cannot decide the finer generic-rewiring-effect vs not-supported split: that split needs a trained-null percentile floor, and this study's only trained null (rewiring-null-v1.json's published n=20 sample) is reported for context only, per 00-overview.md, not as a decisive threshold. This category is reported as 'no-specific-effect' whenever P does not clear the C arm, rather than forcing an unlicensed generic/not-supported label.
+The trained decoder's predeclared C/M-max comparison can rule pathway-supported and edge-class-effect in or out (P above/below the max of the freshly-trained 5-graph C/M arms at trainer seed 101), but 00-overview.md does not say how to report the finer generic-rewiring-effect vs not-supported split when P does not clear the C arm: that split needs a trained-null percentile floor, and this study's only trained null (rewiring-null-v1.json's published n=20 sample) is reported for context only, per 00-overview.md, not as a decisive threshold. 'no-specific-effect' is a reporting convention this study's coordinator adopted after the trained scores were known (methodology review, 2026-09-26), to avoid forcing an unlicensed generic/not-supported label -- it does not change which predeclared comparison P passed or failed, only how the undecidable case is named.
 
 ## Graph construction
 
@@ -97,7 +98,11 @@ above show the full 3x8 matrix precisely so that is checkable; the category belo
 
 ## Authored results
 
-| graph | score | percentile in published null (n=500) | rank among C | rank among M | rank among MQ |
+Empirical p is the `(k+1)/(n+1)` rank statistic against a 100-graph control arm (`03-evaluation.md`'s own rank
+statistic): the smallest value it can take is 1/101 ≈ 0.0099, which means the intervention exceeded every one of
+the 100 control graphs -- not "near the bottom" of the arm.
+
+| graph | score | percentile in published null | empirical p vs C `(k+1)/(n+1)` | empirical p vs M | empirical p vs MQ |
 | --- | --- | --- | --- | --- | --- |
 | P | 3.6125 | 85.6% | 0.0099 | 0.0099 | -- |
 | Q | 3.4014 | 81.6% | -- | -- | 0.0099 |
@@ -109,8 +114,9 @@ above show the full 3x8 matrix precisely so that is checkable; the category belo
   M p50=0.0142 p95=0.3870; MQ (n=100, k_Q=5) p50=0.3818 p95=0.6084.
 - Biological reproduction check: computed -0.2199 vs published
   -0.2199 (matches: true).
-- Multiple comparisons disclosed: P vs C, P vs M, Q vs MQ, and (below) 3 trainer seeds -- none of these
-  comparisons is corrected against the others; each is reported and read on its own predeclared terms.
+- Multiple comparisons disclosed: P vs C, P vs M, Q vs MQ, and (below) 3 trainer seeds --
+  none of these comparisons is corrected against the others; each is reported and read on its own predeclared
+  terms.
 
 ## Trained results
 
@@ -122,18 +128,17 @@ above show the full 3x8 matrix precisely so that is checkable; the category belo
 
 - Control arms (mean `movementScore`, trainer seed 101, n=5 each): C max=71.5822; M max=75.4873.
 - `trainedRobust`: **true** (every P trainer seed above agrees on the category).
-- The published trained null's 25th percentile is context only (percentile resolution 5.0% at n=20) and
+- The published trained null's 25th percentile is context only (percentile resolution 5.0%) and
   does not decide the category -- see the disclosure above. Informally, the finer generic-vs-not-supported split
-  this context value would suggest is **not seed-robust**: it is below at trainer seed 101 and above at trainer
-  seeds 202/303.
+  this context value would suggest is **not seed-robust**: below at trainer seed(s) 101 and above at trainer seed(s) 202/303.
 - Q is not evaluated with trained readouts (authored-decoder only, per the predeclared method above).
 
 ## Outcome
 
 Under the **authored decoder**, this study's mechanical outcome is **pathway-supported**, with the
-channel-specific modifier **holding**. Under **trained readouts**,
-P shows no advantage over either freshly-trained control arm at any of the three trainer seeds tested
-(**no-specific-effect (neither pathway-supported nor edge-class; the generic-vs-not-supported split is undetermined)**, robust: true).
+channel-specific modifier **holding**. This authored-decoder
+verdict is bound to the hand-written decoder; it does not by itself say what a trained readout finds. Under
+**trained readouts**, P shows no advantage over either freshly-trained control arm at all 3 trainer seeds tested (**no-specific-effect (neither pathway-supported nor edge-class; the generic-vs-not-supported split is undetermined)**, robust: true).
 
 ## Limitations
 
@@ -148,7 +153,13 @@ P shows no advantage over either freshly-trained control arm at any of the three
 - The trained arm compares against only 5 controls per arm (a coarse resolution), and its result depends on the
   trainer seed -- reported as robust only when all three P trainer seeds agree on the category.
 - The channel-specific test (Q against MQ) is authored-decoder only; Q was not evaluated with trained readouts.
-- The generic-vs-not-supported split is undetermined for the trained decoder under this study's predeclared
-  rules (see the disclosure above); this report does not force one of those two labels.
-- Multiple comparisons (P vs C, P vs M, Q vs MQ, and 3 trainer seeds) are disclosed above and are not corrected
-  against each other.
+- The predeclared C/M-max comparison decides pathway-supported/edge-class-effect for the trained decoder, but
+  00-overview.md does not say how to report the remaining generic-vs-not-supported split when P does not clear
+  the C arm (that needs a trained-null percentile floor, and this study's trained null is context-only).
+  'no-specific-effect' is a reporting convention this study's coordinator adopted after the trained scores were
+  known (see the disclosure above), not itself a predeclared category; this report does not force an unlicensed
+  generic/not-supported label.
+- P at trainer seeds 202/303 is compared against C/M control arms trained only at seed 101, so those two
+  comparisons mix a graph difference with a trainer-seed difference; only the seed-101 comparison is seed-matched.
+- Multiple comparisons (P vs C, P vs M, Q vs MQ, and 3 trainer seeds) are disclosed above
+  and are not corrected against each other.

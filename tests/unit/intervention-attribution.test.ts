@@ -99,18 +99,39 @@ describe('parseIndexGraphTransfer', () => {
     ]
   });
 
-  it('finds the requested id and returns its swaps/transfer', () => {
+  it('finds the requested kind and returns its swaps/transfer', () => {
     const result = parseIndexGraphTransfer(indexText, 'index.json', 'P');
     expect(result.swaps).toBe(6);
     expect(result.transfer).toEqual(validTransfer3x8);
   });
 
-  it('throws when the id is not found', () => {
-    expect(() => parseIndexGraphTransfer(indexText, 'index.json', 'Z')).toThrow(/has no entry with id "Z"/);
+  it('throws when no entry has the requested kind', () => {
+    const withoutQ = JSON.stringify({ entries: [{ id: 'P', kind: 'P', swaps: 6, transfer: { full3x8: validTransfer3x8 } }] });
+    expect(() => parseIndexGraphTransfer(withoutQ, 'index.json', 'Q')).toThrow(/must have exactly one kind-"Q" entry, found 0/);
+  });
+
+  it('throws when more than one entry has the requested kind', () => {
+    const twoP = JSON.stringify({
+      entries: [
+        { id: 'P', kind: 'P', swaps: 6, transfer: { full3x8: validTransfer3x8 } },
+        { id: 'P2', kind: 'P', swaps: 6, transfer: { full3x8: validTransfer3x8 } }
+      ]
+    });
+    expect(() => parseIndexGraphTransfer(twoP, 'index.json', 'P')).toThrow(/must have exactly one kind-"P" entry, found 2/);
+  });
+
+  it('throws when the kind-"P" entry\'s own id is not literally "P" (kind/id mismatch)', () => {
+    const mislabeled = JSON.stringify({ entries: [{ id: 'C000', kind: 'P', swaps: 6, transfer: { full3x8: validTransfer3x8 } }] });
+    expect(() => parseIndexGraphTransfer(mislabeled, 'index.json', 'P')).toThrow(/has id "C000", expected "P"/);
   });
 
   it('throws when the entry has no transfer table', () => {
-    const badText = JSON.stringify({ entries: [{ id: 'P', swaps: 6 }] });
+    const badText = JSON.stringify({ entries: [{ id: 'P', kind: 'P', swaps: 6 }] });
     expect(() => parseIndexGraphTransfer(badText, 'index.json', 'P')).toThrow(/missing a 3x8 transfer\.full3x8 table/);
+  });
+
+  it('throws when swaps is not a non-negative integer', () => {
+    const badSwaps = JSON.stringify({ entries: [{ id: 'P', kind: 'P', swaps: -1, transfer: { full3x8: validTransfer3x8 } }] });
+    expect(() => parseIndexGraphTransfer(badSwaps, 'index.json', 'P')).toThrow(/missing a non-negative integer swaps/);
   });
 });

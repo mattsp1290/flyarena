@@ -219,4 +219,37 @@ describe('buildTrainedStatistics: end-to-end on synthetic data', () => {
     const infoWithQ = infoFor([...infoAll.entries.entries()].map(([id, e]) => [id, e.kind] as const).concat([['Q', 'Q']]));
     expect(() => buildTrainedStatistics(withQ, infoWithQ, [1], 42, 200)).toThrow(/Q\/MQ\/R are not evaluated/);
   });
+
+  it('throws when publishedTrainedNullScores is empty', () => {
+    const raw = buildRaw({ 101: 1, 202: 1, 303: 1 }, [1, 2, 3, 4, 5], [1, 2, 3, 4, 5]);
+    expect(() => buildTrainedStatistics(raw, infoAll, [], 42, 200)).toThrow(/publishedTrainedNullScores must be a non-empty list of finite numbers/);
+  });
+
+  it('throws when publishedTrainedNullScores contains a non-finite value', () => {
+    const raw = buildRaw({ 101: 1, 202: 1, 303: 1 }, [1, 2, 3, 4, 5], [1, 2, 3, 4, 5]);
+    expect(() => buildTrainedStatistics(raw, infoAll, [1, Number.NaN], 42, 200)).toThrow(/publishedTrainedNullScores must be a non-empty list of finite numbers/);
+  });
+
+  it('throws when trained.json "runs" is not an array', () => {
+    const raw = { ...buildRaw({ 101: 1, 202: 1, 303: 1 }, [1, 2, 3, 4, 5], [1, 2, 3, 4, 5]), runs: null as unknown as NullTrainedInterventionGraphRaw[] };
+    expect(() => buildTrainedStatistics(raw, infoAll, [1], 42, 200)).toThrow(/trained\.json "runs" is not an array/);
+  });
+
+  it('throws when a run has an empty movementScore', () => {
+    const raw = buildRaw({ 101: 1, 202: 1, 303: 1 }, [1, 2, 3, 4, 5], [1, 2, 3, 4, 5]);
+    const emptyScore = { ...raw, runs: raw.runs.map((r) => (r.id === 'C000' ? { ...r, movementScore: [] } : r)) };
+    expect(() => buildTrainedStatistics(emptyScore, infoAll, [1], 42, 200)).toThrow(/"C000"\.movementScore is missing or empty/);
+  });
+
+  it('throws when a run has a non-finite movementScore entry', () => {
+    const raw = buildRaw({ 101: 1, 202: 1, 303: 1 }, [1, 2, 3, 4, 5], [1, 2, 3, 4, 5]);
+    const badScore = { ...raw, runs: raw.runs.map((r) => (r.id === 'C000' ? { ...r, movementScore: [1, Number.NaN] } : r)) };
+    expect(() => buildTrainedStatistics(badScore, infoAll, [1], 42, 200)).toThrow(/"C000"\.movementScore\[1\] is not a finite number/);
+  });
+
+  it("throws when a run's gzipSha256 disagrees with the index (stale trained.json)", () => {
+    const raw = buildRaw({ 101: 1, 202: 1, 303: 1 }, [1, 2, 3, 4, 5], [1, 2, 3, 4, 5]);
+    const staleGzip = { ...raw, runs: raw.runs.map((r) => (r.id === 'C000' ? { ...r, gzipSha256: 'stale'.padEnd(64, '0') } : r)) };
+    expect(() => buildTrainedStatistics(staleGzip, infoAll, [1], 42, 200)).toThrow(/"C000" was scored from a different graph file than index\.json currently lists/);
+  });
 });

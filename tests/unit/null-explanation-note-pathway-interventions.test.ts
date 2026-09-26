@@ -40,7 +40,7 @@ describe('NullExplanationNote: pathway-interventions tested-outcome sentence', (
       status: 'ok',
       data: {
         version: 1,
-        sources: { rewiringNullSha: 'a'.repeat(64), nullExplanationSha: 'b'.repeat(64) },
+        sources: { biologicalSha: 'c'.repeat(64), rewiringNullSha: 'a'.repeat(64), nullExplanationSha: 'b'.repeat(64) },
         authored: { category: 'pathway-supported', channelSpecific: true },
         trained: {
           trainedRobust: true,
@@ -67,7 +67,7 @@ describe('NullExplanationNote: pathway-interventions tested-outcome sentence', (
       status: 'ok',
       data: {
         version: 1,
-        sources: { rewiringNullSha: 'a'.repeat(64), nullExplanationSha: 'b'.repeat(64) },
+        sources: { biologicalSha: 'c'.repeat(64), rewiringNullSha: 'a'.repeat(64), nullExplanationSha: 'b'.repeat(64) },
         authored: { category: 'edge-class-effect', channelSpecific: false },
         trained: {
           trainedRobust: true,
@@ -86,7 +86,7 @@ describe('NullExplanationNote: pathway-interventions tested-outcome sentence', (
       status: 'ok',
       data: {
         version: 1,
-        sources: { rewiringNullSha: 'a'.repeat(64), nullExplanationSha: 'b'.repeat(64) },
+        sources: { biologicalSha: 'c'.repeat(64), rewiringNullSha: 'a'.repeat(64), nullExplanationSha: 'b'.repeat(64) },
         authored: { category: 'generic-rewiring-effect', channelSpecific: false },
         trained: {
           trainedRobust: false,
@@ -96,7 +96,11 @@ describe('NullExplanationNote: pathway-interventions tested-outcome sentence', (
     };
     renderNote(ok);
     expect(screen.getByText(/the generic-rewiring-effect category holds/i)).toBeInTheDocument();
-    expect(screen.getByText(/the three trainer seeds do not agree on a category \(not robust\)/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /the three trainer seeds do not agree on a category \(seed 101: no-specific-effect, seed 202: pathway-supported, seed 303: no-specific-effect; not robust\)/i
+      )
+    ).toBeInTheDocument();
   });
 
   it('hides the sentence and link entirely when pathwayInterventions is undefined (loading) or "missing"', () => {

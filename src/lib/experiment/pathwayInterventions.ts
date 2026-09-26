@@ -48,11 +48,18 @@ const P_TRAINER_SEEDS = ['101', '202', '303'] as const;
 
 export interface PathwayInterventionsArtifact {
   readonly version: number;
-  readonly sources: { readonly rewiringNullSha: string; readonly nullExplanationSha: string };
+  readonly sources: { readonly biologicalSha: string; readonly rewiringNullSha: string; readonly nullExplanationSha: string };
   readonly authored: { readonly category: PathwayInterventionsAuthoredCategory; readonly channelSpecific: boolean };
   readonly trained: {
     readonly trainedRobust: boolean;
-    /** One representative per-seed category (any one, since a robust result means all three agree) — `perSeed['101'].category`, kept alongside `trainedRobust` so a non-robust result can still be reported honestly per seed rather than only as a bare boolean. */
+    /**
+     * Every trainer seed's own category, keyed by seed. When `trainedRobust`
+     * is true, every entry agrees, and `NullExplanationNote.svelte` reads
+     * `perSeedCategory['101']` as the representative value; when it is
+     * false, the component renders every seed's own category so a reader
+     * can see how they actually diverged, rather than only a bare
+     * "do not agree" boolean.
+     */
     readonly perSeedCategory: Readonly<Record<(typeof P_TRAINER_SEEDS)[number], PathwayInterventionsTrainedCategory>>;
   };
 }
@@ -67,8 +74,13 @@ const validateShape = (value: unknown): { ok: true; data: PathwayInterventionsAr
   if (v.version !== 1) return { ok: false, reason: `pathway-interventions artifact has unsupported version ${String(v.version)}` };
 
   const sources = v.sources as Record<string, unknown> | undefined;
-  if (!sources || typeof sources.rewiringNullSha !== 'string' || typeof sources.nullExplanationSha !== 'string') {
-    return { ok: false, reason: 'pathway-interventions artifact is missing sources.rewiringNullSha/sources.nullExplanationSha' };
+  if (
+    !sources ||
+    typeof sources.biologicalSha !== 'string' ||
+    typeof sources.rewiringNullSha !== 'string' ||
+    typeof sources.nullExplanationSha !== 'string'
+  ) {
+    return { ok: false, reason: 'pathway-interventions artifact is missing sources.biologicalSha/sources.rewiringNullSha/sources.nullExplanationSha' };
   }
 
   const authored = v.authored as Record<string, unknown> | undefined;
@@ -105,7 +117,7 @@ const validateShape = (value: unknown): { ok: true; data: PathwayInterventionsAr
     ok: true,
     data: {
       version: 1,
-      sources: { rewiringNullSha: sources.rewiringNullSha, nullExplanationSha: sources.nullExplanationSha },
+      sources: { biologicalSha: sources.biologicalSha, rewiringNullSha: sources.rewiringNullSha, nullExplanationSha: sources.nullExplanationSha },
       authored: { category: authored.category, channelSpecific: authored.channelSpecific },
       trained: {
         trainedRobust: trained.trainedRobust,
@@ -151,11 +163,20 @@ export const loadPathwayInterventions = async (
   // The sha256 check above only proves these bytes are the ones the
   // manifest's `pathwayInterventions` entry pins — it says nothing about
   // whether this study was actually computed against *this* manifest's
-  // rewiring-null/null-explanation artifacts (a hand-edited or
+  // biological/rewiring-null/null-explanation artifacts (a hand-edited or
   // merge-conflicted manifest could re-pin `pathwayInterventions` to a
-  // study computed against a different null distribution or explanation).
-  // Mirrors `loadNullExplanation`'s own `sources.rewiringNullSha256`
-  // staleness check.
+  // study computed against a different biological graph, null distribution,
+  // or explanation). Mirrors `loadNullExplanation`'s/`loadRewiringNull`'s own
+  // staleness checks (methodology-review suggestion: an earlier version
+  // cross-checked `rewiringNullSha`/`nullExplanationSha` but not
+  // `biologicalSha` against `manifest.binarySha256`, even though the
+  // producer itself already checks it).
+  if (data.sources.biologicalSha !== manifest.binarySha256) {
+    return {
+      status: 'invalid',
+      reason: `pathway-interventions sources.biologicalSha does not match the manifest's compiled biological graph (${manifest.binarySha256}) — stale artifact`
+    };
+  }
   const shippedRewiringNullSha = manifest.rewiringNull?.sha256;
   if (!shippedRewiringNullSha) {
     return { status: 'invalid', reason: 'manifest is missing rewiringNull.sha256, needed to cross-check the pathway-interventions artifact' };

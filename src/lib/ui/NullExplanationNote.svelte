@@ -215,9 +215,9 @@
     'pathway-supported':
       "the pathway-supported category holds: the accepted swap set's net effect outperforms both the unrestricted (C) and class-matched (M) random controls",
     'edge-class-effect':
-      'the edge-class-effect category holds: the accepted swap set outperforms the unrestricted (C) control but not the class-matched (M) control — any edge of this class helps about equally',
+      "the edge-class-effect category holds: the accepted swap set's net effect outperforms the unrestricted (C) control but not the class-matched (M) control — any edge of this class helps about equally",
     'generic-rewiring-effect':
-      "the generic-rewiring-effect category holds: the accepted swap set's net effect does not clearly outperform either control — any perturbation of this size helps about equally",
+      "the generic-rewiring-effect category holds: the accepted swap set's net effect does not outperform the unrestricted (C) control — any perturbation of this size helps about equally",
     'not-supported': "the not-supported category holds: the accepted swap set's net effect does not clear the null's 25th percentile"
   };
 
@@ -244,11 +244,18 @@
       : ''
   );
 
+  /** The seeds this study tests P at — mirrors `scripts/null/intervention-report-trained.ts`'s `P_TRAINER_SEEDS` (a Node-only module, not importable here). */
+  const PATHWAY_TRAINER_SEEDS = ['101', '202', '303'] as const;
+
   const pathwayTrainedClause = $derived(
     pathwayInterventions?.status === 'ok'
       ? pathwayInterventions.data.trained.trainedRobust
-        ? `under trained readouts, ${PATHWAY_TRAINED_CLAUSE[pathwayInterventions.data.trained.perSeedCategory['101']]} (robust)`
-        : 'under trained readouts, the three trainer seeds do not agree on a category (not robust)'
+        ? `Under trained readouts, ${PATHWAY_TRAINED_CLAUSE[pathwayInterventions.data.trained.perSeedCategory['101']]} (robust)`
+        : // Non-robust: state each seed's own category rather than only "do
+          // not agree" (thermo review, Suggestion — the per-seed data is
+          // already carried on the artifact, and hiding it here would leave
+          // a reader with no way to see how the seeds actually diverged).
+          `Under trained readouts, the three trainer seeds do not agree on a category (${PATHWAY_TRAINER_SEEDS.map((seed) => `seed ${seed}: ${pathwayInterventions.data.trained.perSeedCategory[seed]}`).join(', ')}; not robust)`
       : ''
   );
 
@@ -289,7 +296,7 @@
          sidecar artifact in this panel. -->
     {#if pathwayInterventions?.status === 'ok'}
       <p class="pathway-interventions-sentence">
-        Tested under this model: {PATHWAY_AUTHORED_CLAUSE[pathwayInterventions.data.authored.category]}, and {pathwayChannelSpecificClause}.
+        Tested under this model, with the authored (hand-written) decoder: {PATHWAY_AUTHORED_CLAUSE[pathwayInterventions.data.authored.category]}, and {pathwayChannelSpecificClause}. This authored-decoder result is bound to the hand-written decoder; it is not necessarily the overall finding.
         {pathwayTrainedClause}.
       </p>
       <ul class="links">
