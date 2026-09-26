@@ -3,7 +3,7 @@ import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { resolveArenaTask } from '../../src/lib/arena/tasks';
-import { assembleGraphListRaw, assembleRaw, runNullEvaluate } from '../../scripts/null/null-evaluate';
+import { assembleGraphListRaw, assembleRaw, buildTasks, runNullEvaluate } from '../../scripts/null/null-evaluate';
 
 /**
  * Extracted from `null-evaluate.test.ts` (which was already at the repo's
@@ -79,6 +79,17 @@ describe('assembleRaw / assembleGraphListRaw: --arena-task byte-identity gate', 
     const raw = assembleGraphListRaw(graphListIndex, { ...baseArgs(), arenaTask: 'crowded' }, oneGraphListResult);
     expect(raw.arenaTask).toBe('crowded');
     expect(raw.arenaTaskFingerprint).toBe(resolveArenaTask('crowded').fingerprint);
+  });
+
+  it('buildTasks: every task carries the requested arena task, undefined when omitted', () => {
+    const variantArgs = { ...baseArgs(), decoder: 'authored-flip-both' as const, arenaTask: 'hazard-heavy' as const };
+    for (const task of buildTasks(rewireIndex, variantArgs, 'bio.bin.gz')) {
+      expect(task.decoder).toBe('authored-flip-both');
+      expect(task.arenaTask).toBe('hazard-heavy');
+    }
+    for (const task of buildTasks(rewireIndex, baseArgs(), 'bio.bin.gz')) {
+      expect(task.arenaTask).toBeUndefined();
+    }
   });
 });
 

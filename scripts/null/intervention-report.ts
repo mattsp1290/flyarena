@@ -680,6 +680,37 @@ export const parseInterventionReportArgs = (argv: readonly string[]): Interventi
   return { authored, index, publishedNull, out, bootstrapSeed, bootstrapResamples, allowReproductionMismatch, arenaTask };
 };
 
+/**
+ * A non-canonical run -- a diagnostic (`--allow-reproduction-mismatch`)
+ * override, or a non-default `--arena-task` run -- must never silently
+ * overwrite the canonical `statistics.json` at the default `--out`, mirroring
+ * `null-evaluate.ts`'s own `guardCanonicalOutDefault` (added for the same
+ * class of dual-review finding: a non-canonical run overwriting the one path
+ * every other script reads by default). Folded from two separately-worded,
+ * near-duplicate checks into one (a thermo-maintainability review
+ * suggestion): both conditions share the exact same "does `--out` resolve to
+ * the default path" gate and only their message/trigger field differ.
+ * `diagnosticOnly` is scoped to that field specifically, not every
+ * `--allow-reproduction-mismatch` invocation: the flag is a no-op marker
+ * when the reproduction check actually passes, and that case is a perfectly
+ * ordinary canonical run.
+ */
+const guardCanonicalOutDefault = (out: string, output: Readonly<InterventionStatistics>): void => {
+  if (resolve(out) !== resolve(DEFAULT_OUT)) return;
+  if (output.diagnosticOnly) {
+    throw new Error(
+      `intervention-report: refusing to write a diagnosticOnly result to the default --out (${DEFAULT_OUT}) -- ` +
+        'pass an explicit --out for this diagnostic run.'
+    );
+  }
+  if (output.arenaTask) {
+    throw new Error(
+      `intervention-report: refusing to write a --arena-task "${output.arenaTask.id}" result to the default --out ` +
+        `(${DEFAULT_OUT}) -- pass an explicit --out for this task's run.`
+    );
+  }
+};
+
 export const runInterventionReport = (
   args: Readonly<InterventionReportArgs>
 ): { readonly out: string; readonly statistics: InterventionStatistics } => {
@@ -744,30 +775,7 @@ export const runInterventionReport = (
       : {})
   };
 
-  // A diagnostic (`--allow-reproduction-mismatch`) run must never silently
-  // clobber the canonical `statistics.json` at the default --out -- mirrors
-  // `null-evaluate.ts`'s `guardCanonicalOutDefault` (itself added for the
-  // same class of dual-review finding: a non-canonical run overwriting the
-  // one path every other script reads by default). Scoped to `diagnosticOnly`
-  // specifically, not every `--allow-reproduction-mismatch` invocation: the
-  // flag is a no-op marker when the reproduction check actually passes (see
-  // `diagnosticOnly`'s own construction above), and that case is a perfectly
-  // ordinary canonical run.
-  if (output.diagnosticOnly && resolve(args.out) === resolve(DEFAULT_OUT)) {
-    throw new Error(
-      `intervention-report: refusing to write a diagnosticOnly result to the default --out (${DEFAULT_OUT}) -- ` +
-        'pass an explicit --out for this diagnostic run.'
-    );
-  }
-  // Same reasoning, for a non-default `--arena-task` run: it must never
-  // silently overwrite the canonical default statistics.json every other
-  // script reads by default.
-  if (output.arenaTask && resolve(args.out) === resolve(DEFAULT_OUT)) {
-    throw new Error(
-      `intervention-report: refusing to write a --arena-task "${output.arenaTask.id}" result to the default --out ` +
-        `(${DEFAULT_OUT}) -- pass an explicit --out for this task's run.`
-    );
-  }
+  guardCanonicalOutDefault(args.out, output);
 
   mkdirSync(dirname(args.out), { recursive: true });
   atomicWriteFileSync(args.out, JSON.stringify(output));

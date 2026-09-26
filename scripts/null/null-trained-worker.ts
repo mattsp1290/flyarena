@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 
+import { resolveArenaTask } from '../../src/lib/arena/tasks';
 import type { ArmName } from '../training/arms';
 import { computeArmBundleSha256, deserializeArmBundle, type SerializedArmBundle } from '../training/export-arms';
 import { runEpisode } from '../training/episode';
@@ -65,9 +66,11 @@ export interface NullTrainedWorkerTask {
    * recorded `config.json` `arenaTaskFingerprint` in
    * `assertRunMatchesExpectedIdentity`'s fifth hard check, below. Unlike
    * `expectedArm`/`expectedTrainerSeed`/etc., a run directory trained before
-   * this field existed has no recorded fingerprint at all, so that check
-   * fails closed (treats "missing" as a mismatch) rather than silently
-   * accepting an untagged run as if it matched every possible task.
+   * this field existed has no recorded fingerprint at all ("legacy") —
+   * that check accepts a legacy run only when this expected fingerprint is
+   * itself the default task's (a legacy run can only ever have been trained
+   * under the default task, since no other task existed yet), and still
+   * fails closed for a legacy run against any specific non-default task.
    */
   readonly expectedArenaTaskFingerprint: string;
 }
@@ -122,13 +125,36 @@ const assertRunMatchesExpectedIdentity = (run: Readonly<LoadedRun>, task: Readon
     );
   }
   // Fifth hard check (task-generality WP1): the run's recorded arena-task
-  // fingerprint must equal the requested one -- `undefined` (a run
-  // directory trained before this field existed) never matches, since there
-  // is no way to know which task it was actually trained under.
-  if (run.config.arenaTaskFingerprint !== task.expectedArenaTaskFingerprint) {
+  // fingerprint must equal the requested one -- with one legacy exception.
+  // A run directory trained *before* this field existed (real, already-
+  // published `training/runs/...` directories, not just test fixtures --
+  // e.g. the hbru intervention runs and the shipped trained-readout runs)
+  // has `run.config.arenaTaskFingerprint === undefined`. There was no other
+  // task to train under before this branch, so such a run is accepted, but
+  // ONLY when the current request is also the default task (`task.
+  // expectedArenaTaskFingerprint` equals the default task's own
+  // fingerprint) -- an untagged run can never be assumed to match a
+  // specific *non-default* task, so that case still fails closed exactly as
+  // before. A *recorded* fingerprint, once present, must always match
+  // exactly; this legacy exception never weakens that half of the check.
+  // Without this exception, every pre-existing trained run directory would
+  // fail this check unconditionally, even for a plain default-task,
+  // no-`--arena-task`-flag re-score -- the one case this whole diff goes out
+  // of its way to keep byte-identical (a thermo-reproducibility review
+  // finding).
+  const recordedFingerprint = run.config.arenaTaskFingerprint;
+  const isLegacyRun = recordedFingerprint === undefined;
+  const requestIsDefaultTask = task.expectedArenaTaskFingerprint === resolveArenaTask().fingerprint;
+  const arenaTaskIdentityOk = isLegacyRun
+    ? requestIsDefaultTask
+    : recordedFingerprint === task.expectedArenaTaskFingerprint;
+  if (!arenaTaskIdentityOk) {
     throw new Error(
       `null-trained-worker: ${task.runDir}/config.json has arenaTaskFingerprint ` +
-        `${JSON.stringify(run.config.arenaTaskFingerprint)}, expected ${JSON.stringify(task.expectedArenaTaskFingerprint)}`
+        `${JSON.stringify(recordedFingerprint)}, expected ${JSON.stringify(task.expectedArenaTaskFingerprint)}` +
+        (isLegacyRun
+          ? ' (this run directory predates arena tasks -- it is only compatible with the default task)'
+          : '')
     );
   }
 };

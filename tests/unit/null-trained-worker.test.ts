@@ -123,13 +123,37 @@ describe('runTask', () => {
     );
   });
 
-  it('throws when config.json predates arena tasks (no recorded arenaTaskFingerprint at all)', () => {
-    const configPath = join(runDir, 'config.json');
-    const config = JSON.parse(readFileSync(configPath, 'utf8')) as Record<string, unknown>;
-    delete config.arenaTask;
-    delete config.arenaTaskFingerprint;
-    writeFileSync(configPath, JSON.stringify(config));
-    expect(() => runTask(baseTask())).toThrow(/has arenaTaskFingerprint undefined/);
+  /**
+   * Legacy-run rule (thermo-reproducibility review finding): a run directory
+   * trained before arena tasks existed has no recorded arenaTaskFingerprint
+   * at all. Such a run was necessarily trained under the default task (no
+   * other task existed yet), so it must still be scoreable against a plain,
+   * no-`--arena-task`-flag (default) request -- the one case this whole
+   * branch goes out of its way to keep byte-identical for re-scoring
+   * already-published trained artifacts. It must NOT be accepted against
+   * any specific non-default task, since an untagged run cannot be assumed
+   * to match one.
+   */
+  describe('legacy run directories (no recorded arenaTaskFingerprint)', () => {
+    const stripArenaTaskFields = (): void => {
+      const configPath = join(runDir, 'config.json');
+      const config = JSON.parse(readFileSync(configPath, 'utf8')) as Record<string, unknown>;
+      delete config.arenaTask;
+      delete config.arenaTaskFingerprint;
+      writeFileSync(configPath, JSON.stringify(config));
+    };
+
+    it('accepts a legacy run when the request is the default task', () => {
+      stripArenaTaskFields();
+      expect(() => runTask(baseTask())).not.toThrow();
+    });
+
+    it('rejects a legacy run when the request is a specific non-default task', () => {
+      stripArenaTaskFields();
+      expect(() =>
+        runTask(baseTask({ expectedArenaTaskFingerprint: resolveArenaTask('hazard-heavy').fingerprint }))
+      ).toThrow(/predates arena tasks/);
+    });
   });
 
   it('throws (readRunDir type validation) when config.json has a non-string arenaTaskFingerprint', () => {

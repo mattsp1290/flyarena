@@ -825,16 +825,12 @@ describe('buildTasks: --decoder propagation and --rewired-seeds filtering', () =
     expect(rewiredGraphIds).toEqual(['rewired-0', 'rewired-1', 'rewired-2']);
   });
 
-  it('every task (biological, disconnected, and each rewired seed) carries the requested decoder and arena task', () => {
+  it('every task (biological, disconnected, and each rewired seed) carries the requested decoder', () => {
     const index = indexFor([0, 1]);
-    const args = { ...baseArgs(), decoder: 'authored-flip-both' as const, arenaTask: 'hazard-heavy' as const };
+    const args = { ...baseArgs(), decoder: 'authored-flip-both' as const };
     const tasks = buildTasks(index, args, 'bio.bin.gz');
     expect(tasks.length).toBeGreaterThan(0);
-    for (const task of tasks) {
-      expect(task.decoder).toBe('authored-flip-both');
-      expect(task.arenaTask).toBe('hazard-heavy');
-    }
-    for (const task of buildTasks(index, baseArgs(), 'bio.bin.gz')) expect(task.arenaTask).toBeUndefined();
+    for (const task of tasks) expect(task.decoder).toBe('authored-flip-both');
   });
 
   it('throws when --rewired-seeds matches no seeds in the index (regression: used to silently produce an empty rewired list)', () => {
