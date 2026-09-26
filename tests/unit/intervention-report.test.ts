@@ -8,6 +8,7 @@ import {
   armDistribution,
   buildInterventionStatistics,
   checkBiologicalReproduction,
+  DEFAULT_OUT,
   evaluateCategory,
   evaluateChannelSpecific,
   parseInterventionReportArgs,
@@ -76,6 +77,15 @@ describe('parseInterventionReportArgs', () => {
   it('rejects an unknown flag', () => {
     expect(() => parseInterventionReportArgs(['--bogus'])).toThrow(/Unknown argument/);
   });
+
+  it.each(['--authored', '--index', '--null'] as const)(
+    'rejects --out pointing at the same path as %s',
+    (inputFlag) => {
+      expect(() =>
+        parseInterventionReportArgs([inputFlag, 'shared.json', '--out', 'shared.json'])
+      ).toThrow(/--out must not overwrite an input file/);
+    }
+  );
 });
 
 describe('armDistribution', () => {
@@ -686,6 +696,32 @@ describe('buildInterventionStatistics: end-to-end on synthetic data', () => {
     );
   });
 
+  it('reports the specific P-count error (not a masking arm-size error) when P is mislabeled into the C arm', () => {
+    // Regression test: assertConsistentInputs checks P/Q counts *before* the
+    // C/M/MQ controlCount loop specifically so this case (the most likely
+    // hand-edit/corruption: the real "P" id relabeled `kind: 'C'`) reports
+    // "expected exactly one graph of kind P, found 0" rather than the
+    // technically-true-but-less-helpful "arm C has 5 graph(s), but
+    // index.json declares controlCount=4" (a dual-review finding).
+    const { raw, publishedNull } = buildFixture();
+    const cIds = ['C000', 'C001', 'C002', 'C003'];
+    const mIds = ['M1000', 'M1001', 'M1002', 'M1003'];
+    const mqIds = ['MQ2000', 'MQ2001', 'MQ2002', 'MQ2003'];
+    const info = infoFor(
+      [
+        ['P', 'C'],
+        ['Q', 'Q'],
+        ...cIds.map((id) => [id, 'C'] as const),
+        ...mIds.map((id) => [id, 'M'] as const),
+        ...mqIds.map((id) => [id, 'MQ'] as const)
+      ],
+      4
+    );
+    expect(() => buildInterventionStatistics(raw, info, publishedNull, 42, 200, SCRATCH_INPUTS)).toThrow(
+      /expected exactly one graph of kind "P", found 0/
+    );
+  });
+
   it('throws when the kind-"P" graph\'s id is not literally "P" (a mislabeled index passes the "exactly one" check but not this one)', () => {
     const { raw, publishedNull } = buildFixture();
     const cIds = ['C000', 'C001', 'C002', 'C003'];
@@ -850,5 +886,23 @@ describe('runInterventionReport (CLI layer)', () => {
     expect(statistics.biologicalReproduction.matches).toBe(true);
     expect(statistics.diagnosticOnly).toBeUndefined();
     rmSync(root, { recursive: true, force: true });
+  });
+
+  it('refuses to write a diagnosticOnly result to the default --out', () => {
+    const root = mkdtempSync(join(tmpdir(), 'intervention-report-cli-repro-default-out-'));
+    writeFixtureFiles(root, 0, 999); // reproduction fails
+    const args = { ...argsFor(root, { allowReproductionMismatch: true }), out: DEFAULT_OUT };
+    expect(() => runInterventionReport(args)).toThrow(/refusing to write a diagnosticOnly result to the default --out/);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('does not block a clean (non-diagnosticOnly) run targeting the default --out for an unrelated reason', () => {
+    // Proves the guard is scoped to diagnosticOnly specifically -- a plain
+    // run at the default --out is legitimate and must not be blocked by
+    // this check. It still fails here, for the unrelated, expected reason
+    // that the fixture's default --authored/--index/--null paths don't
+    // exist on disk in this test environment.
+    const args = { ...argsFor(mkdtempSync(join(tmpdir(), 'intervention-report-cli-unused-'))), out: DEFAULT_OUT };
+    expect(() => runInterventionReport(args)).not.toThrow(/refusing to write a diagnosticOnly result/);
   });
 });

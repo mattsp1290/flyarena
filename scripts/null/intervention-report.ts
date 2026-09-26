@@ -399,6 +399,21 @@ const assertConsistentInputs = (
     armCounts.set(entryInfo.kind, (armCounts.get(entryInfo.kind) ?? 0) + 1);
   }
 
+  // Checked before the C/M/MQ arm-size loop below (a dual-review finding):
+  // the most likely hand-edit/corruption mode is a mislabeled P or Q entry
+  // (e.g. the real "P" id relabeled `kind: 'C'`), which would otherwise
+  // surface as "arm C has 101 graph(s)..." -- accurate, but it points an
+  // operator at the wrong arm instead of at P/Q directly. `exactlyOneOfKind`
+  // (used later, once `GraphOutcomeEntry`s exist) re-derives the same
+  // information from `graphs`, not `armCounts` -- this check is index-level
+  // and fires first, so the operator sees the more specific message.
+  for (const kind of ['P', 'Q'] as const) {
+    const n = armCounts.get(kind) ?? 0;
+    if (n !== 1) {
+      throw new Error(`intervention-report: expected exactly one graph of kind "${kind}", found ${n}`);
+    }
+  }
+
   for (const kind of ['C', 'M', 'MQ'] as const) {
     const n = armCounts.get(kind) ?? 0;
     if (n !== info.controlCount) {
@@ -760,7 +775,8 @@ const repoRoot = resolve(here, '../..');
 const DEFAULT_AUTHORED = resolve(repoRoot, 'training/runs/interventions/authored.json');
 const DEFAULT_INDEX = resolve(repoRoot, 'training/runs/interventions/index.json');
 const DEFAULT_PUBLISHED_NULL = resolve(repoRoot, 'public/data/rewiring-null-v1.json');
-const DEFAULT_OUT = resolve(repoRoot, 'training/runs/interventions/statistics.json');
+/** Exported so tests can exercise the `diagnosticOnly`-vs-default-`--out` guard directly, without needing a real 302-graph run just to get there (matches `null-report.ts`'s `DEFAULT_OUT` export convention). */
+export const DEFAULT_OUT = resolve(repoRoot, 'training/runs/interventions/statistics.json');
 
 /** `'PATH'` as a fixed default seed (arbitrary but stable across runs) — this study's own bootstrap seed, independent of `null-report.ts`'s `DEFAULT_BOOTSTRAP_SEED` ('NULL'), matching that file's "fixed default" convention (`03-evaluation.md`: "`--bootstrap-seed` with a fixed default"). */
 const DEFAULT_BOOTSTRAP_SEED = 0x50415448;
@@ -815,6 +831,16 @@ export const parseInterventionReportArgs = (argv: readonly string[]): Interventi
     }
   }
 
+  // `--out` overwriting one of its own inputs would replace a multi-hour
+  // `authored.json` (or `index.json`/the published null) with the much
+  // smaller statistics output -- checked before any file is touched (a
+  // dual-review finding).
+  for (const input of [authored, index, publishedNull]) {
+    if (resolve(out) === resolve(input)) {
+      throw new Error(`intervention-report: --out must not overwrite an input file (${input})`);
+    }
+  }
+
   return { authored, index, publishedNull, out, bootstrapSeed, bootstrapResamples, allowReproductionMismatch };
 };
 
@@ -861,6 +887,22 @@ export const runInterventionReport = (
     args.allowReproductionMismatch && !statistics.biologicalReproduction.matches
       ? { ...statistics, diagnosticOnly: true }
       : statistics;
+
+  // A diagnostic (`--allow-reproduction-mismatch`) run must never silently
+  // clobber the canonical `statistics.json` at the default --out -- mirrors
+  // `null-evaluate.ts`'s `guardCanonicalOutDefault` (itself added for the
+  // same class of dual-review finding: a non-canonical run overwriting the
+  // one path every other script reads by default). Scoped to `diagnosticOnly`
+  // specifically, not every `--allow-reproduction-mismatch` invocation: the
+  // flag is a no-op marker when the reproduction check actually passes (see
+  // `diagnosticOnly`'s own construction above), and that case is a perfectly
+  // ordinary canonical run.
+  if (output.diagnosticOnly && resolve(args.out) === resolve(DEFAULT_OUT)) {
+    throw new Error(
+      `intervention-report: refusing to write a diagnosticOnly result to the default --out (${DEFAULT_OUT}) -- ` +
+        'pass an explicit --out for this diagnostic run.'
+    );
+  }
 
   mkdirSync(dirname(args.out), { recursive: true });
   atomicWriteFileSync(args.out, JSON.stringify(output));
