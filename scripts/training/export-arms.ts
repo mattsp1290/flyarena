@@ -1,5 +1,4 @@
 import { createHash } from 'node:crypto';
-import { fileURLToPath } from 'node:url';
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { extname, resolve } from 'node:path';
 
@@ -518,18 +517,20 @@ export const runExportArms = (args: Readonly<ExportArmsArgs>): ExportArmsResult 
   return { outDir, written, d: entries[0][1].D };
 };
 
-const main = (): void => {
-  try {
-    const args = parseExportArmsArgs(process.argv.slice(2));
-    const { outDir, written, d } = runExportArms(args);
-    // eslint-disable-next-line no-console -- CLI tool: this is its user-facing output.
-    console.log(`export-arms: wrote ${written.length} bundle(s) to ${outDir} (D=${d}): ${written.join(', ')}`);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    // eslint-disable-next-line no-console -- CLI tool: this is its user-facing error output.
-    console.error(`export-arms failed: ${message}`);
-    process.exit(1);
-  }
-};
-
-if (process.argv[1] === fileURLToPath(import.meta.url)) main();
+// `main`/the CLI-invocation guard used to live here, ending this file with
+// `if (process.argv[1] === fileURLToPath(import.meta.url)) main();`. Moved
+// to `export-arms-cli.ts` (`.agents/plans/graph-lab/02-job-engines.md`'s
+// atlas engine needs this file's exports -- `parseExportArmsArgs`/
+// `runExportArms`/`computeArmBundleSha256`/`deserializeArmBundle` -- inside
+// an esbuild `--bundle` of `scripts/graph-lab/entry-atlas-reeval.ts`, and a
+// bare top-level `if (process.argv[1] === ...) main();` is a side effect
+// that survives bundling: every inlined module's `import.meta.url`
+// collapses to the *bundle's own* URL, so this guard would misfire and run
+// this file's CLI parser against the bundled entry's own argv the moment
+// any caller imports this module transitively -- reproduced empirically
+// before this split; see `entry-atlas-reeval.ts`'s own doc comment). Every
+// existing importer of this file only ever imported named exports (never
+// `main`, which was never exported), so this split changes no runtime
+// behavior for anything except the CLI itself, which now lives at
+// `export-arms-cli.ts` and is what `package.json`'s `training:export-arms`
+// script and any human/CI invocation should run instead.

@@ -1,6 +1,5 @@
-import { fileURLToPath } from 'node:url';
-import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
-import { basename, dirname, extname, resolve } from 'node:path';
+import { readFileSync, realpathSync } from 'node:fs';
+import { basename, extname, resolve } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 
 import { decodeAction } from '../../src/lib/arena/actions';
@@ -690,45 +689,16 @@ export const buildTaskGoldenFiles = (
   ];
 };
 
-const writeJson = (path: string, value: unknown): number => {
-  mkdirSync(dirname(path), { recursive: true });
-  const contents = JSON.stringify(value);
-  writeFileSync(path, contents);
-  return Buffer.byteLength(contents);
-};
-
-const main = (): void => {
-  const args = parseArgs(process.argv.slice(2));
-
-  const graph = args.graphPath ? loadGraphArtifact(args.graphPath) : createTraceGraph();
-  validateGraph(graph);
-  const graphId = args.graphPath ? graphIdFromPath(args.graphPath) : DEFAULT_GRAPH_ID;
-
-  const outDir = resolve(process.cwd(), args.outDir);
-  const isNonDefaultTask = args.arenaTask !== undefined && args.arenaTask !== 'default';
-  const files = isNonDefaultTask
-    ? buildTaskGoldenFiles(graph, graphId, args.substeps, resolveArenaTask(args.arenaTask).config)
-    : buildGoldenFiles(graph, graphId, args.substeps, { includeWorld: args.includeWorld });
-
-  let totalBytes = 0;
-  for (const { fileName, value } of files) {
-    totalBytes += writeJson(resolve(outDir, fileName), value);
-  }
-
-  // eslint-disable-next-line no-console -- CLI tool: this is its user-facing output.
-  console.log(
-    `Wrote ${files.length} file(s) to ${outDir} (${totalBytes} bytes total): ` +
-      files.map((f) => f.fileName).join(', ')
-  );
-};
-
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  try {
-    main();
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    // eslint-disable-next-line no-console -- CLI tool: this is its user-facing error output.
-    console.error(`export-traces failed: ${message}`);
-    process.exit(1);
-  }
-}
+// `writeJson`, `main`, and the CLI-invocation guard used to live here.
+// Moved to `export-traces-cli.ts` (which keeps its own local `writeJson`
+// -- a small, CLI-output-only helper with no other caller, so it is not
+// exported from here): `.agents/plans/graph-lab/02-job-engines.md`'s
+// atlas engine esbuild-`--bundle`s `export-arms.ts` (via
+// `scripts/atlas/publish.ts`), which unconditionally imports this file
+// for `DEFAULT_GRAPH_ID`/`graphIdFromPath`/`loadGraphArtifact` -- a
+// bundled top-level `if (process.argv[1] === ...) main();` here misfired
+// against the bundled entry's own argv (reproduced empirically; see
+// `entry-atlas-reeval.ts`'s doc comment). Every existing importer of this
+// file only ever imported named exports (never `main`, which was never
+// exported), so this split changes no runtime behavior for anything
+// except the CLI itself, which now lives at `export-traces-cli.ts`.
