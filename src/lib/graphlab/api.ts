@@ -63,6 +63,14 @@ export class GraphLabApi {
       method,
       signal: AbortSignal.any([signal, AbortSignal.timeout(15000)]),
       headers,
+      // The backend URL is user-entered, attacker-influenceable input by
+      // design (a security-review suggestion): `no-referrer` means this
+      // request never carries this site's own origin as `Referer`, purely
+      // defensive tightening beyond the browser's `strict-origin-when-
+      // cross-origin` default -- no secret is in the URL either way (the
+      // token is header-only), so this closes a hardening gap, not an
+      // active leak.
+      referrerPolicy: 'no-referrer',
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
     });
     let data: unknown;

@@ -23,11 +23,29 @@
     SwapsetResult
   } from './types';
 
+  /**
+   * `Shell.svelte` keeps this component mounted, hidden and inert for the
+   * rest of the tab's lifetime once `#graph-lab` has been visited once
+   * (the same lazy-load-then-persist pattern as the `#dgx` sandbox), so it
+   * is never destroyed by ordinary navigation -- `onDestroy` below would
+   * not fire just because the user clicked to `#arena`. `active` is
+   * `Shell.svelte`'s own `view === 'graph-lab'`, passed down so this
+   * component can tell the difference between "mounted but not the
+   * current route" and "the user is actually looking at this panel" (a
+   * thermo-security review finding, I1: without this, a token typed once
+   * lived in memory for the whole page session, not just while this route
+   * was in view). Defaults to `true` so tests that render this component
+   * directly (without a `Shell.svelte` wrapper) see the ordinary,
+   * always-active behavior.
+   */
+  let { active = true }: { active?: boolean } = $props();
+
   // -- Connection: endpoint and token live only in these two `$state`
   // variables (component memory) -- never written to `localStorage`,
   // `sessionStorage`, a cookie, or the URL, and only ever sent as this
-  // page's own fetch calls to the endpoint the user typed
-  // (`tests/unit/graphlab-storage.test.ts` asserts this directly).
+  // page's own fetch calls to the endpoint the user typed (see
+  // `tests/GraphLab.test.ts`'s "no browser storage or logging" describe
+  // block).
   let endpoint = $state('http://127.0.0.1:8766');
   let token = $state('');
   let health = $state<HealthResponse | null>(null);
@@ -89,6 +107,31 @@
   type GraphMode = 'biological' | 'disconnected' | 'rewired';
   let tab = $state<JobKind>('lesion');
   const graphId = (mode: GraphMode, seed: number) => (mode === 'rewired' ? `rewired:${seed}` : mode);
+
+  // Full WAI-ARIA "tabs with manual activation and roving tabindex" wiring
+  // (a thermo-maintainability review suggestion): each tab has a stable id
+  // referenced by the single tabpanel's `aria-labelledby`, and only the
+  // active tab is in the regular tab order (`tabindex=0`; the rest are
+  // `-1` and reachable only via arrow keys), matching
+  // https://www.w3.org/WAI/ARIA/apg/patterns/tabs/.
+  const TAB_ORDER: readonly JobKind[] = ['lesion', 'atlas', 'swapset'];
+  const tabId = (kind: JobKind) => `graphlab-tab-${kind}`;
+  function focusTab(kind: JobKind) {
+    tab = kind;
+    // The new tab's `tabindex` only becomes `0` after this state write is
+    // reflected in the DOM; deferring the actual focus call one frame
+    // avoids trying to focus an element still marked `tabindex=-1`.
+    requestAnimationFrame(() => document.getElementById(tabId(kind))?.focus());
+  }
+  function handleTabKeydown(event: KeyboardEvent) {
+    const index = TAB_ORDER.indexOf(tab);
+    if (event.key === 'ArrowRight') focusTab(TAB_ORDER[(index + 1) % TAB_ORDER.length]!);
+    else if (event.key === 'ArrowLeft') focusTab(TAB_ORDER[(index - 1 + TAB_ORDER.length) % TAB_ORDER.length]!);
+    else if (event.key === 'Home') focusTab(TAB_ORDER[0]!);
+    else if (event.key === 'End') focusTab(TAB_ORDER[TAB_ORDER.length - 1]!);
+    else return;
+    event.preventDefault();
+  }
 
   let lesionGraphMode = $state<GraphMode>('biological');
   let lesionRewiredSeed = $state(0);
@@ -216,52 +259,153 @@
       .map(([key, value]) => `${key}: ${typeof value === 'object' ? JSON.stringify(value) : String(value)}`)
       .join(' · ');
   });
+  // Guards the async gap `submit()` now has between "user clicked Submit"
+  // and "the job POST actually fires" (the submit-time `/health` re-fetch
+  // below) -- without this, `canSubmit` would stay true for that whole
+  // window (nothing about `busy`/`sessionState` has changed yet), and a
+  // fast double-click could fire two submissions.
+  let submitting = $state(false);
   const canSubmit = $derived(
-    connection === 'connected' && token.length >= MIN_TOKEN_LENGTH && !busy && currentErrors.length === 0
+    connection === 'connected' &&
+      token.length >= MIN_TOKEN_LENGTH &&
+      !busy &&
+      !submitting &&
+      currentErrors.length === 0
   );
 
-  function submit() {
-    if (!canSubmit) return;
-    // A stale selection from a previous atlas run must never silently carry
-    // over: a new result can legally contain a cell with the same `id`
-    // (cell ids are per-search, not globally unique), which would otherwise
-    // resolve `selectedCell` against the new result without the user having
-    // clicked anything (a code-review finding).
-    selectedCellId = null;
-    let request: JobRequest;
-    if (tab === 'lesion') {
-      request = {
-        kind: 'lesion',
-        graph: graphId(lesionGraphMode, lesionRewiredSeed),
-        sets: lesionParsed.sets,
-        seedStart: lesionSeedStart,
-        seedCount: lesionSeedCount,
-        ticks: lesionTicks
-      };
-    } else if (tab === 'atlas') {
-      request = {
-        kind: 'atlas',
-        graph: graphId(atlasGraphMode, atlasRewiredSeed),
-        searchSeed: atlasSearchSeed,
-        population: atlasPopulation,
-        generations: atlasGenerations,
-        ticks: atlasTicks
-      };
-    } else {
-      request = {
-        kind: 'swapset',
-        graph: 'biological',
-        swaps: swapsetParsed.swaps,
-        controls: swapsetControls,
-        seedStart: swapsetSeedStart,
-        seedCount: swapsetSeedCount,
-        ticks: swapsetTicks
-      };
+  /**
+   * `active` goes from `true` to `false` when `Shell.svelte`'s `view`
+   * navigates away from `#graph-lab` -- since this component is otherwise
+   * kept mounted, hidden and inert for the rest of the tab's lifetime (see
+   * the `active` prop's own doc comment above), this is the *only* signal
+   * this component ever gets that the user has left. Chose **cancel, then
+   * clear** over "keep polling until terminal, then clear": the token
+   * itself is cleared immediately either way (the running `GraphLabSession`
+   * already holds its own independent copy inside its own `GraphLabApi`
+   * instance, captured once at `session.start()` -- clearing this
+   * component's `token` field can never stop an already-in-flight request,
+   * including the cancel `DELETE` fired here), but an *uncancelled* job
+   * would keep that independent copy resident inside the session's own
+   * `GraphLabApi` for however much longer the job's own ceiling allows (up
+   * to 20 minutes -- `models.py`'s `CEILING_SECONDS`), even though nothing
+   * on screen shows it running any more. Cancelling first bounds that
+   * residency to the cancel round-trip instead. The cost is a job in
+   * progress when the user navigates away is lost rather than finishing in
+   * the background; reconnecting after returning always starts fresh.
+   *
+   * `leftRouteHandled` (a plain variable, not `$state`) makes this fire
+   * exactly once per "became inactive" transition rather than every time
+   * `sessionState` changes afterward: a real cancel's first response is
+   * `"cancelling"`, not yet `"cancelled"` (`jobs.py`'s `Jobs.get(...,
+   * cancel=True)` returns the snapshot right after setting that status,
+   * before the background kill actually completes), so `sessionActive(...)`
+   * stays `true` for a beat after the first cancel call -- reading it
+   * unconditionally on every run would re-trigger this same effect (it
+   * depends on `sessionState`) for as long as the job stays in
+   * `"cancelling"`, calling `session.cancel()` again each time. Guarding
+   * with a plain variable keeps `sessionState` out of this effect's
+   * tracked dependencies once the leave-route action has already run once,
+   * which is what actually stops the loop (confirmed by a real
+   * `effect_update_depth_exceeded` failure before this guard was added).
+   */
+  let leftRouteHandled = false;
+  $effect(() => {
+    if (active) {
+      leftRouteHandled = false;
+      return;
     }
-    submittedGraph = request.graph;
-    submittedKind = request.kind;
-    submittedBundleSha = health?.bundleSha256 ?? null;
-    void session.start(endpoint, token, request);
+    if (leftRouteHandled) return;
+    leftRouteHandled = true;
+    if (sessionActive(sessionState.status)) void session.cancel();
+    disconnect();
+  });
+
+  /**
+   * A plain (non-`$state`) fetch of `/health` that never mutates the
+   * visible connection/health panel -- only `checkHealth()` (the "Connect"
+   * button) does that. Used to capture a fresh provenance snapshot at two
+   * points a stale, once-per-session `Connect` click cannot cover: right
+   * before a job is submitted, and again when it completes (a thermo-
+   * maintainability review finding: the label previously combined whatever
+   * `/health` snapshot the last manual "Connect" click happened to leave
+   * cached, which can be arbitrarily stale across a session that submits
+   * several jobs, or across one job's own up-to-20-minute run). Returns
+   * `null` on any failure (network error, non-2xx, bad JSON) -- a failed
+   * refresh must never crash a submit or a completed render, it only means
+   * this particular snapshot is unavailable.
+   */
+  async function fetchHealthSnapshot(): Promise<HealthResponse | null> {
+    try {
+      const api = new GraphLabApi(endpoint, token);
+      return await api.health(new AbortController().signal);
+    } catch {
+      return null;
+    }
+  }
+
+  let submittedGraphSha = $state<string | null>(null);
+  let completionBundleSha = $state<string | null>(null);
+  let completionGraphSha = $state<string | null>(null);
+  let provenanceMismatch = $state(false);
+  let lastProvenanceCheckedJobId: string | null = null;
+
+  async function submit() {
+    if (!canSubmit) return;
+    submitting = true;
+    try {
+      // A stale selection from a previous atlas run must never silently
+      // carry over: a new result can legally contain a cell with the same
+      // `id` (cell ids are per-search, not globally unique), which would
+      // otherwise resolve `selectedCell` against the new result without the
+      // user having clicked anything (a code-review finding).
+      selectedCellId = null;
+      completionBundleSha = null;
+      completionGraphSha = null;
+      provenanceMismatch = false;
+      lastProvenanceCheckedJobId = null;
+
+      let request: JobRequest;
+      if (tab === 'lesion') {
+        request = {
+          kind: 'lesion',
+          graph: graphId(lesionGraphMode, lesionRewiredSeed),
+          sets: lesionParsed.sets,
+          seedStart: lesionSeedStart,
+          seedCount: lesionSeedCount,
+          ticks: lesionTicks
+        };
+      } else if (tab === 'atlas') {
+        request = {
+          kind: 'atlas',
+          graph: graphId(atlasGraphMode, atlasRewiredSeed),
+          searchSeed: atlasSearchSeed,
+          population: atlasPopulation,
+          generations: atlasGenerations,
+          ticks: atlasTicks
+        };
+      } else {
+        request = {
+          kind: 'swapset',
+          graph: 'biological',
+          swaps: swapsetParsed.swaps,
+          controls: swapsetControls,
+          seedStart: swapsetSeedStart,
+          seedCount: swapsetSeedCount,
+          ticks: swapsetTicks
+        };
+      }
+      submittedGraph = request.graph;
+      submittedKind = request.kind;
+      // Re-fetched right now, not read from whatever `health` a possibly
+      // long-past "Connect" click cached -- this is the submit-time
+      // provenance snapshot the completion check below compares against.
+      const freshHealth = await fetchHealthSnapshot();
+      submittedBundleSha = freshHealth?.bundleSha256 ?? health?.bundleSha256 ?? null;
+      submittedGraphSha = freshHealth?.graphSha256 ?? health?.graphSha256 ?? null;
+      void session.start(endpoint, token, request);
+    } finally {
+      submitting = false;
+    }
   }
 
   function short(sha: string | null | undefined): string {
@@ -271,24 +415,71 @@
    * Not every job kind's result reports its own `graph`/`graphSha256`
    * (only `LesionResult` does -- see `types.ts`'s own doc comment): this
    * falls back to the graph id the user actually submitted, and to the
-   * connected backend's own `/health` `graphSha256` only when that graph
+   * submit-time `/health` snapshot's `graphSha256` only when that graph
    * was `"biological"` (the only case `/health`'s single sha value
    * describes). Never invents a hash the engine did not itself report.
+   *
+   * If the post-completion `/health` re-check (below) found a different
+   * bundle or graph sha than the submit-time snapshot, the backend's
+   * identity changed mid-run (e.g. a restart on shared, manually-operated
+   * hardware) -- the label says so explicitly rather than silently
+   * presenting the submit-time sha as if it still describes the process
+   * that produced this result (a thermo-maintainability review finding).
    */
   const provenance = $derived.by(() => {
     if (!result || !submittedKind) return '';
-    const graphShaKnown = 'graphSha256' in result ? result.graphSha256 : submittedGraph === 'biological' ? health?.graphSha256 : undefined;
-    return [
+    const graphShaKnown =
+      'graphSha256' in result ? result.graphSha256 : submittedGraph === 'biological' ? submittedGraphSha : undefined;
+    const base = [
       `graph ${submittedGraph}`,
       `graph sha ${short(graphShaKnown)}`,
       `engine bundle sha ${short(submittedBundleSha)}`,
       `host ${result.host.arch}/${result.host.node}`
     ].join(' · ');
+    return provenanceMismatch ? `${base} — backend changed during this job; provenance uncertain` : base;
+  });
+
+  /**
+   * Runs once per completed job (guarded by `lastProvenanceCheckedJobId`, a
+   * plain variable -- writing to it does not itself re-trigger this
+   * effect): re-fetches `/health` and compares it against the submit-time
+   * snapshot captured in `submit()`. A `graphSha256` comparison is only
+   * meaningful when the submitted graph was `"biological"` (the one case
+   * `/health`'s single value describes); a `rewired:<seed>` or
+   * `disconnected` job is never flagged on graph sha alone.
+   */
+  $effect(() => {
+    const currentJob = job;
+    if (currentJob?.status !== 'completed' || currentJob.id === lastProvenanceCheckedJobId) return;
+    lastProvenanceCheckedJobId = currentJob.id;
+    void (async () => {
+      const freshHealth = await fetchHealthSnapshot();
+      if (currentJob.id !== sessionState.id) return; // a newer job started while this check was in flight
+      completionBundleSha = freshHealth?.bundleSha256 ?? null;
+      completionGraphSha = freshHealth?.graphSha256 ?? null;
+      const bundleChanged =
+        submittedBundleSha !== null && completionBundleSha !== null && submittedBundleSha !== completionBundleSha;
+      const graphChanged =
+        submittedGraph === 'biological' &&
+        submittedGraphSha !== null &&
+        completionGraphSha !== null &&
+        submittedGraphSha !== completionGraphSha;
+      provenanceMismatch = bundleChanged || graphChanged;
+    })();
   });
 
   function exportResult() {
     if (!job?.result) return;
-    const url = URL.createObjectURL(new Blob([JSON.stringify(job.result)], { type: 'application/json' }));
+    // `AtlasResult.dataDir` is a server-side container path (e.g.
+    // `/opt/graph-lab/data`) -- not a secret, but deployment detail that
+    // has no business in a file whose whole purpose is to be shared as
+    // "evidence" (a thermo-security review suggestion). Every other job
+    // kind's result has no such field, so this strip is a no-op for them.
+    const exportable =
+      'dataDir' in job.result
+        ? Object.fromEntries(Object.entries(job.result).filter(([key]) => key !== 'dataDir'))
+        : job.result;
+    const url = URL.createObjectURL(new Blob([JSON.stringify(exportable)], { type: 'application/json' }));
     const a = document.createElement('a');
     a.href = url;
     a.download = `graph-lab-${submittedKind}-${Date.now()}.json`;
@@ -369,18 +560,37 @@
     </section>
   {:else}
     <section class="panel jobs" aria-label="Submit a job">
-      <div class="tabs" role="tablist" aria-label="Job kind">
-        <button role="tab" aria-selected={tab === 'lesion'} disabled={busy} onclick={() => (tab = 'lesion')}
-          >Lesion sweep</button
+      <div class="tabs" role="tablist" aria-label="Job kind" tabindex="-1" onkeydown={handleTabKeydown}>
+        <button
+          id={tabId('lesion')}
+          role="tab"
+          aria-selected={tab === 'lesion'}
+          aria-controls="graphlab-tabpanel"
+          tabindex={tab === 'lesion' ? 0 : -1}
+          disabled={busy}
+          onclick={() => (tab = 'lesion')}>Lesion sweep</button
         >
-        <button role="tab" aria-selected={tab === 'atlas'} disabled={busy} onclick={() => (tab = 'atlas')}
-          >Atlas search</button
+        <button
+          id={tabId('atlas')}
+          role="tab"
+          aria-selected={tab === 'atlas'}
+          aria-controls="graphlab-tabpanel"
+          tabindex={tab === 'atlas' ? 0 : -1}
+          disabled={busy}
+          onclick={() => (tab = 'atlas')}>Atlas search</button
         >
-        <button role="tab" aria-selected={tab === 'swapset'} disabled={busy} onclick={() => (tab = 'swapset')}
-          >Swap-set intervention</button
+        <button
+          id={tabId('swapset')}
+          role="tab"
+          aria-selected={tab === 'swapset'}
+          aria-controls="graphlab-tabpanel"
+          tabindex={tab === 'swapset' ? 0 : -1}
+          disabled={busy}
+          onclick={() => (tab = 'swapset')}>Swap-set intervention</button
         >
       </div>
 
+      <div id="graphlab-tabpanel" role="tabpanel" aria-labelledby={tabId(tab)} tabindex="0">
       <form
         onsubmit={(e) => {
           e.preventDefault();
@@ -502,6 +712,7 @@
           <button class="primary" type="submit" disabled={!canSubmit}>Submit job</button>
         </fieldset>
       </form>
+      </div>
 
       {#if busy}<button class="cancel" onclick={() => session.cancel()} disabled={job?.status === 'cancelling'}
           >Cancel job</button
@@ -579,6 +790,13 @@
               {/if}
             </p>
           {/if}
+          <!-- `cells.length` IS the occupied-cell count, not an approximation:
+               `scripts/atlas/publish.ts`'s `evaluateSearchOnGraph` keys its
+               `selected` map by grid cell index, one entry per cell with at
+               least one candidate -- a second candidate landing in an
+               already-occupied cell only increments `collisions`, it never
+               adds a second map entry (a thermo-maintainability review
+               suggestion, verified against that function directly). -->
           <p class="subtle">
             {atlasResult.cells.length} of 36 cells occupied · GPU archive size {atlasResult.gpuArchiveSize} ·
             {atlasResult.collisions} collisions

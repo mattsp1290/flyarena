@@ -252,3 +252,200 @@ describe('GraphLab result rendering', () => {
     expect(screen.queryByText(/Cell #/)).toBeNull();
   });
 });
+
+describe('GraphLab route-change token lifetime (thermo-security I1)', () => {
+  it('cancels an active job and clears the token when the route is left, and never restores it on return', async () => {
+    let cancelCalled = false;
+    stubFetch((url) =>
+      url.includes('/api/graph/v1/health')
+        ? new Response(
+            JSON.stringify({ status: 'ok', modelVersion: 'v', bundleSha256: 'a'.repeat(64), graphSha256: 'b'.repeat(64), gpu: { available: false } })
+          )
+        : notFound()
+    );
+    const { container, rerender } = render(GraphLab, { props: { active: true } });
+    const secretToken = 'a-token-that-must-not-outlive-the-route';
+    await fireEvent.input(container.querySelector('input[type="password"]')!, { target: { value: secretToken } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Connect' }));
+    await waitFor(() => expect(screen.getByText(/Bundle SHA-256/)).toBeInTheDocument());
+
+    const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/api/graph/v1/jobs') && init?.method === 'POST') {
+        return Promise.resolve(new Response(JSON.stringify({ id: 'job-1', status: 'queued' }), { status: 202 }));
+      }
+      if (url.includes('/api/graph/v1/jobs/') && init?.method === 'DELETE') {
+        cancelCalled = true;
+        return Promise.resolve(
+          new Response(JSON.stringify({ id: 'job-1', kind: 'lesion', status: 'cancelling', progress: {}, error: null, result: null }))
+        );
+      }
+      if (url.includes('/api/graph/v1/jobs/')) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ id: 'job-1', kind: 'lesion', status: 'running', progress: {}, error: null, result: null }))
+        );
+      }
+      return Promise.resolve(notFound());
+    });
+    vi.stubGlobal('fetch', fetch);
+
+    await fireEvent.input(container.querySelector('textarea')!, { target: { value: '7' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Submit job' }));
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('running'));
+
+    // Simulate `Shell.svelte` navigating `view` away from `#graph-lab`.
+    await rerender({ active: false });
+
+    await waitFor(() => expect(cancelCalled).toBe(true));
+    const tokenInput = container.querySelector('input[type="password"]') as HTMLInputElement;
+    expect(tokenInput.value).toBe('');
+    // The connection/health panel is gone too -- returning to the route
+    // requires re-entering the token, exactly like a fresh visit.
+    expect(screen.queryByText(/Bundle SHA-256/)).toBeNull();
+
+    // Returning to the route must not resurrect the old token from
+    // anywhere (there is nowhere for it to have been kept: `disconnect()`
+    // clears the only `$state` field that ever held it).
+    await rerender({ active: true });
+    expect((container.querySelector('input[type="password"]') as HTMLInputElement).value).toBe('');
+  });
+
+  it('does nothing on the initial mount when active is true (no spurious disconnect)', async () => {
+    stubFetch((url) =>
+      url.includes('/api/graph/v1/health')
+        ? new Response(
+            JSON.stringify({ status: 'ok', modelVersion: 'v', bundleSha256: null, graphSha256: null, gpu: { available: false } })
+          )
+        : notFound()
+    );
+    const { container } = render(GraphLab, { props: { active: true } });
+    await fireEvent.input(container.querySelector('input[type="password"]')!, { target: { value: 'a-valid-16-char-token' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Connect' }));
+    await waitFor(() => expect(screen.getByText(/Bundle SHA-256/)).toBeInTheDocument());
+    expect((container.querySelector('input[type="password"]') as HTMLInputElement).value).toBe('a-valid-16-char-token');
+  });
+});
+
+describe('GraphLab provenance staleness (thermo-maintainability)', () => {
+  it('re-fetches /health at submit and at completion, and flags the label when the bundle sha changed mid-run', async () => {
+    let healthCallCount = 0;
+    stubFetch((url) => {
+      if (url.includes('/api/graph/v1/health')) {
+        healthCallCount += 1;
+        // First call is the manual "Connect"; second is submit-time; third
+        // is the post-completion re-check, which reports a *different*
+        // bundle sha, simulating a backend restart mid-run.
+        const bundleSha256 = healthCallCount >= 3 ? 'c'.repeat(64) : 'a'.repeat(64);
+        return new Response(
+          JSON.stringify({ status: 'ok', modelVersion: 'v', bundleSha256, graphSha256: 'b'.repeat(64), gpu: { available: false } })
+        );
+      }
+      return notFound();
+    });
+    const { container } = render(GraphLab);
+    await fireEvent.input(container.querySelector('input[type="password"]')!, { target: { value: 'a-valid-16-char-token' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Connect' }));
+    await waitFor(() => expect(screen.getByText(/Bundle SHA-256/)).toBeInTheDocument());
+    expect(healthCallCount).toBe(1);
+
+    const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/api/graph/v1/health')) {
+        healthCallCount += 1;
+        const bundleSha256 = healthCallCount >= 3 ? 'c'.repeat(64) : 'a'.repeat(64);
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ status: 'ok', modelVersion: 'v', bundleSha256, graphSha256: 'b'.repeat(64), gpu: { available: false } })
+          )
+        );
+      }
+      if (url.includes('/api/graph/v1/jobs') && init?.method === 'POST') {
+        return Promise.resolve(new Response(JSON.stringify({ id: 'job-1', status: 'queued' }), { status: 202 }));
+      }
+      if (url.includes('/api/graph/v1/jobs/')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              id: 'job-1',
+              kind: 'lesion',
+              status: 'completed',
+              progress: {},
+              error: null,
+              result: {
+                graph: 'biological',
+                graphSha256: 'b'.repeat(64),
+                host: { arch: 'arm64', node: 'v22.22.3' },
+                label: 'Computed on DGX (private, not published)',
+                baseline: { n: 4, mean: 1.5 },
+                sets: [{ indices: [7], bodyIds: ['10010'], effect: { n: 4, meanDifference: -0.4, ci95: [-0.6, -0.2] }, n: 4 }]
+              }
+            })
+          )
+        );
+      }
+      return Promise.resolve(notFound());
+    });
+    vi.stubGlobal('fetch', fetch);
+
+    await fireEvent.input(container.querySelector('textarea')!, { target: { value: '7' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Submit job' }));
+    await waitFor(() => expect(screen.getByText('Computed on DGX (private, not published)')).toBeInTheDocument());
+    await waitFor(() => expect(document.querySelector('.provenance')).toHaveTextContent(/backend changed during this job/i));
+  });
+
+  it('does not flag provenance when the backend identity stays the same across the run', async () => {
+    stubFetch((url) =>
+      url.includes('/api/graph/v1/health')
+        ? new Response(
+            JSON.stringify({ status: 'ok', modelVersion: 'v', bundleSha256: 'a'.repeat(64), graphSha256: 'b'.repeat(64), gpu: { available: false } })
+          )
+        : notFound()
+    );
+    const { container } = render(GraphLab);
+    await fireEvent.input(container.querySelector('input[type="password"]')!, { target: { value: 'a-valid-16-char-token' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Connect' }));
+    await waitFor(() => expect(screen.getByText(/Bundle SHA-256/)).toBeInTheDocument());
+
+    const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/api/graph/v1/health')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ status: 'ok', modelVersion: 'v', bundleSha256: 'a'.repeat(64), graphSha256: 'b'.repeat(64), gpu: { available: false } })
+          )
+        );
+      }
+      if (url.includes('/api/graph/v1/jobs') && init?.method === 'POST') {
+        return Promise.resolve(new Response(JSON.stringify({ id: 'job-1', status: 'queued' }), { status: 202 }));
+      }
+      if (url.includes('/api/graph/v1/jobs/')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              id: 'job-1',
+              kind: 'lesion',
+              status: 'completed',
+              progress: {},
+              error: null,
+              result: {
+                graph: 'biological',
+                graphSha256: 'b'.repeat(64),
+                host: { arch: 'arm64', node: 'v22.22.3' },
+                label: 'Computed on DGX (private, not published)',
+                baseline: { n: 4, mean: 1.5 },
+                sets: [{ indices: [7], bodyIds: ['10010'], effect: { n: 4, meanDifference: -0.4, ci95: [-0.6, -0.2] }, n: 4 }]
+              }
+            })
+          )
+        );
+      }
+      return Promise.resolve(notFound());
+    });
+    vi.stubGlobal('fetch', fetch);
+
+    await fireEvent.input(container.querySelector('textarea')!, { target: { value: '7' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Submit job' }));
+    await waitFor(() => expect(screen.getByText('Computed on DGX (private, not published)')).toBeInTheDocument());
+    await waitFor(() => expect(document.querySelector('.provenance')).not.toHaveTextContent(/backend changed/i));
+  });
+});

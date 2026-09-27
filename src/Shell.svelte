@@ -76,7 +76,7 @@
 {/if}
 {#if GraphLab}
   <!-- Same rationale as the DGX sandbox above: keep job identity and serial polling alive across navigation. -->
-  <div hidden={view !== 'graph-lab'} inert={view !== 'graph-lab'}><GraphLab /></div>
+  <div hidden={view !== 'graph-lab'} inert={view !== 'graph-lab'}><GraphLab active={view === 'graph-lab'} /></div>
 {/if}
 <style>
   nav { display:flex; flex-wrap:wrap; gap:.4rem; max-width:1500px; margin:auto; padding:1rem clamp(1rem,4vw,3rem); border-bottom:1px solid #223646; }
