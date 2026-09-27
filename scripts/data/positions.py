@@ -13,6 +13,13 @@ or editing it does not change `compilerSourceSha256` or force an unrelated
 recompile -- see docs/data-provenance.md's "Soma positions sidecar" section
 for the full rationale.
 
+The sha-verified-load, graph-load/manifest cross-check, and
+write-plus-manifest-merge plumbing below is shared with
+`scripts/data/descending_types.py` via `scripts/data/sidecar_io.py` -- see
+that module's docstring. Only this file's own schema (which columns are
+required, the soma/tosoma/none fallback order, and the structure-of-arrays
+document shape) stays local.
+
 Units: MaleCNS's own documentation (male-cns.janelia.org/download) states
 the dataset's EM/segmentation volume is 8nm isotropic and that the sibling
 `syn-points` table's coordinate columns are "voxel units, i.e. 8nm"; the
@@ -27,8 +34,6 @@ unverified rather than assumed to be 8nm voxels.
 from __future__ import annotations
 
 import argparse
-import gzip
-import hashlib
 import json
 import sys
 from pathlib import Path
@@ -37,13 +42,12 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 import pyarrow as pa
-import pyarrow.feather as feather
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import binfmt  # noqa: E402
-import fsutil  # noqa: E402
 import rewire  # noqa: E402
-from download import SOURCE_FILES, _sha256_of_file  # noqa: E402
+import sidecar_io  # noqa: E402
+from download import _sha256_of_file  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RAW_DATA_DIR = REPO_ROOT / "data" / "raw"
@@ -69,13 +73,12 @@ POSITION_SOURCE_NONE = "none"
 
 
 def _pinned_annotations_sha256() -> str:
-    for source in SOURCE_FILES:
-        if source.filename == ANNOTATIONS_FILENAME:
-            return source.sha256
-    raise RuntimeError(
-        f"{ANNOTATIONS_FILENAME} is not among download.py's pinned SOURCE_FILES; "
-        "the pinned list must be extended (URL + sha256 + size) before this script can run"
-    )
+    """Thin per-module wrapper around `sidecar_io.pinned_source_sha256`,
+    kept as a standalone module-level function (rather than inlined at each
+    call site) so tests can `monkeypatch.setattr(positions,
+    "_pinned_annotations_sha256", ...)` to point `load_annotations_verified`
+    at a fixture's hash without touching the real `download.py` pin."""
+    return sidecar_io.pinned_source_sha256(ANNOTATIONS_FILENAME)
 
 
 #: Columns `build_positions` requires. A table missing any of these would
@@ -89,11 +92,11 @@ REQUIRED_ANNOTATION_COLUMNS = ("bodyId", "somaLocation", "tosomaLocation")
 def load_annotations_verified(
     raw_dir: Path = RAW_DATA_DIR, expected_sha256: Optional[str] = None
 ) -> "tuple[pd.DataFrame, str]":
-    """Load the body-annotations feather table, refusing to proceed if its
-    sha256 doesn't match the pinned value (`expected_sha256`, defaulting to
-    download.py's pin for the real filename -- overridable so tests can
-    point this at a small fixture file with its own expected hash).
-    Returns `(dataframe, verified_sha256)`.
+    """Load the body-annotations feather table via `sidecar_io`'s shared
+    sha-verified loader, refusing to proceed if its sha256 doesn't match the
+    pinned value (`expected_sha256`, defaulting to `_pinned_annotations_sha256()`
+    -- overridable so tests can point this at a small fixture file with its
+    own expected hash). Returns `(dataframe, verified_sha256)`.
 
     Also asserts, for whichever of `somaLocation`/`tosomaLocation` are
     present, that the column's Arrow type is `list<integer>` before
@@ -101,18 +104,15 @@ def load_annotations_verified(
     variable-precision type could otherwise silently truncate or lose
     precision on the `int(...)` coercion in `_location_or_none` below,
     breaking this module's "coordinates are copied exactly" guarantee
-    without ever raising."""
-    path = raw_dir / ANNOTATIONS_FILENAME
-    if not path.exists():
-        raise RuntimeError(f"{path} does not exist; run scripts/data/download.py first")
-    actual_sha256 = _sha256_of_file(path)
+    without ever raising. This column check is `positions.py`-specific (the
+    counterpart `descending_types.py` check is a different column, a
+    different Arrow type), so it stays local here rather than moving into
+    `sidecar_io`, which only verifies the file's identity."""
     pinned_sha256 = expected_sha256 if expected_sha256 is not None else _pinned_annotations_sha256()
-    if actual_sha256 != pinned_sha256:
-        raise RuntimeError(
-            f"{path} sha256 {actual_sha256} does not match the pinned {pinned_sha256}; "
-            "refusing to join positions from a stale/tampered/unexpected file"
-        )
-    table = feather.read_table(path)
+    path = raw_dir / ANNOTATIONS_FILENAME
+    table, actual_sha256 = sidecar_io.load_verified_source_table(
+        ANNOTATIONS_FILENAME, raw_dir, expected_sha256=pinned_sha256, purpose="positions"
+    )
     for column in ("somaLocation", "tosomaLocation"):
         if column not in table.column_names:
             continue  # build_positions raises its own clearer error for a fully-missing column
@@ -284,28 +284,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ledger-path", type=Path, default=None)
     args = parser.parse_args(argv)
 
-    print(f"Loading graph from {args.graph}...")
-    gzip_bytes = args.graph.read_bytes()
-    graph_sha256 = binfmt.sha256_hex(gzip_bytes)
-    binary = gzip.decompress(gzip_bytes)
-    graph = rewire.decode_graph_binary(binary)
-    print(f"  neuronCount={graph.metadata['neuronCount']}, graph sha256(gzip)={graph_sha256}")
+    graph, graph_sha256 = sidecar_io.load_graph_for_sidecar(args.graph)
 
     # Load (but don't yet write) the manifest/ledger up front, so every
     # validation below runs -- and can fail loudly -- before anything on
     # disk is touched, and so the --graph/manifest cross-check and the
     # roleCounts/selectionCounts cross-check both have what they need.
     manifest_path = args.manifest_path or (args.out_dir / f"{ARTIFACT_NAME}.manifest.json")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else None
-    if manifest is not None and manifest.get("gzipSha256") != graph_sha256:
-        raise RuntimeError(
-            f"--graph {args.graph} has sha256 {graph_sha256}, which does not match "
-            f"{manifest_path}'s gzipSha256 ({manifest.get('gzipSha256')!r}); refusing to attach "
-            "a positions entry to a manifest that describes a different compiled graph"
-        )
+    manifest = sidecar_io.load_json_if_present(manifest_path)
+    sidecar_io.cross_check_manifest_graph_sha(
+        manifest,
+        graph_sha256,
+        graph_path=args.graph,
+        manifest_path=manifest_path,
+        entry_name="a positions entry",
+    )
 
     ledger_path = args.ledger_path or (args.out_dir / f"{ARTIFACT_NAME}.ledger.json")
-    ledger = json.loads(ledger_path.read_text(encoding="utf-8")) if ledger_path.exists() else None
+    ledger = sidecar_io.load_json_if_present(ledger_path)
 
     print("Loading + verifying pinned body-annotations...")
     annotations, source_sha256 = load_annotations_verified(args.raw_dir)
@@ -339,32 +335,21 @@ def main(argv: list[str] | None = None) -> int:
     payload = render_positions_document(
         source_sha256=source_sha256, graph_sha256=graph_sha256, fields=fields
     )
-    payload_bytes = payload.encode("utf-8")
-    positions_sha256 = hashlib.sha256(payload_bytes).hexdigest()
 
-    args.out_dir.mkdir(parents=True, exist_ok=True)
     out_path = args.out_dir / f"{ARTIFACT_NAME}.positions.json"
-    fsutil.atomic_write_text(out_path, payload)
-    print(f"Wrote {out_path} ({len(payload_bytes)} bytes)")
+    positions_sha256 = sidecar_io.write_sidecar_artifact(payload, out_path)
     print(f"positions sha256: {positions_sha256}")
 
-    if manifest is not None:
-        manifest["positions"] = {
-            "artifact": out_path.name,
-            "sha256": positions_sha256,
-            "coverage": fields["coverage"],
-        }
-        fsutil.atomic_write_text(manifest_path, json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-        print(f"Updated {manifest_path} with the positions entry")
-    else:
-        print(f"[warn] {manifest_path} does not exist; skipped manifest update")
-
-    if ledger is not None:
-        ledger["positionsCoverage"] = fields["coverage"]
-        fsutil.atomic_write_text(ledger_path, json.dumps(ledger, indent=2, sort_keys=True) + "\n")
-        print(f"Updated {ledger_path} with positionsCoverage")
-    else:
-        print(f"[warn] {ledger_path} does not exist; skipped ledger update")
+    sidecar_io.merge_json_entry(
+        manifest,
+        manifest_path,
+        "positions",
+        {"artifact": out_path.name, "sha256": positions_sha256, "coverage": fields["coverage"]},
+        label="positions entry",
+    )
+    sidecar_io.merge_json_entry(
+        ledger, ledger_path, "positionsCoverage", fields["coverage"], label="positionsCoverage"
+    )
 
     return 0
 

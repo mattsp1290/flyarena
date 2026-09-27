@@ -6,11 +6,11 @@
   },
   "binaryBytes": 399792,
   "binarySha256": "f1a0f982ffdfba12ecb2206d064c3dc1ceaae7cffa06a22049093d69a79098f7",
-  "compilerSourceSha256": "fa99a4e4ae9ea4e67e4deddae524560d47657eb49dbfb5a34d30b2f75c6dee20",
+  "compilerSourceSha256": "8cc8633400237179f21f6cfa7dbf27a0ddecaf1ae506f978dd2eddc44deada68",
   "descendingTypes": {
     "artifact": "descending-types-v1.json",
     "neuronCount": 48,
-    "sha256": "53bef7ed05f6210f6f9b0b44ab6a65c72704df1592c72b4c72bb8c8f0691a4d0"
+    "sha256": "950ab5736777511587a21f5b9ac7c3acc506c2304dcd33f37430c8af28103ac7"
   },
   "edgeCount": 46311,
   "formatVersion": 1,

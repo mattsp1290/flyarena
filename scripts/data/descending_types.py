@@ -19,8 +19,11 @@ analogous rationale this module follows.
 
 Reads the same pinned MaleCNS annotations table `positions.py` reads
 (`body-annotations-male-cns-v1.0-minconf-0.5.feather`, one of `download.py`'s
-`SOURCE_FILES`), re-verifying its sha256 independently (this module never
-imports `positions.py`, so the two sidecars can evolve without coupling).
+`SOURCE_FILES`), re-verifying its sha256 independently via the shared
+`scripts/data/sidecar_io.py` loader (this module never imports
+`positions.py` itself, so the two sidecars' *join logic* can evolve without
+coupling -- see `sidecar_io.py`'s docstring for what plumbing the two
+sidecars do share).
 
 Cell-type annotations are external metadata, not something this project
 measured: `type`/`class`/`instance`/`group`/`somaSide` are copied exactly as
@@ -28,13 +31,17 @@ the source table has them for each neuron, including `None` where the
 source itself has no value -- this module never infers, imputes, or
 otherwise fills in a missing type. The shipped graph (`.bin.gz`) is
 unchanged; only this new sidecar and its manifest key are added.
+
+Schema shape note: unlike `positions.json`'s structure-of-arrays
+(`bodyIds[]`, `role[]`, ... all parallel-indexed), this artifact is
+array-of-objects (`neurons: [{index, bodyId, ...}, ...]`) -- a deliberate
+choice for 48 rows of five optional fields each, not an oversight; the two
+sidecars' document shapes are allowed to differ per-artifact.
 """
 
 from __future__ import annotations
 
 import argparse
-import gzip
-import hashlib
 import json
 import sys
 from pathlib import Path
@@ -42,13 +49,16 @@ from typing import Optional
 
 import pandas as pd
 import pyarrow as pa
-import pyarrow.feather as feather
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import binfmt  # noqa: E402
-import fsutil  # noqa: E402
+# `rewire` is unused directly in this module's own logic (graph decoding now
+# lives in `sidecar_io.load_graph_for_sidecar`) but is re-exported here so
+# tests can call `descending_types.rewire.decode_graph_binary` directly,
+# matching `positions.py`'s identical convention for `positions.rewire`.
 import rewire  # noqa: E402
-from download import SOURCE_FILES, _sha256_of_file  # noqa: E402
+import sidecar_io  # noqa: E402
+from download import _sha256_of_file  # noqa: E402  (re-exported for tests, matching positions.py)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RAW_DATA_DIR = REPO_ROOT / "data" / "raw"
@@ -70,48 +80,43 @@ ANNOTATIONS_FILENAME = "body-annotations-male-cns-v1.0-minconf-0.5.feather"
 #: Checked eagerly here, not lazily per-row.
 REQUIRED_ANNOTATION_COLUMNS = ("bodyId", "type", "class", "instance", "group", "somaSide")
 
-#: `positions.py`'s style for validating a per-row nullable field, applied to
-#: `group` (an Arrow double column even though its real values are whole
-#: numbers -- MaleCNS group ids share the column with other tables' NaNs).
-#: A present-but-non-integral group value is a data-integrity problem this
-#: module should surface, not silently truncate.
-_STRING_COLUMNS = ("type", "class", "instance", "somaSide")
+#: The optional (per-row-nullable) fields `build_descending_types` emits per
+#: neuron, in the order `main()` reports missing-annotation counts -- also
+#: the key order of the artifact's `nullCounts` summary object.
+OPTIONAL_FIELDS = ("type", "class", "instance", "group", "somaSide")
 
 
 def _pinned_annotations_sha256() -> str:
-    for source in SOURCE_FILES:
-        if source.filename == ANNOTATIONS_FILENAME:
-            return source.sha256
-    raise RuntimeError(
-        f"{ANNOTATIONS_FILENAME} is not among download.py's pinned SOURCE_FILES; "
-        "the pinned list must be extended (URL + sha256 + size) before this script can run"
-    )
+    """Thin per-module wrapper around `sidecar_io.pinned_source_sha256`,
+    kept as a standalone module-level function (rather than inlined at each
+    call site) so tests can `monkeypatch.setattr(descending_types,
+    "_pinned_annotations_sha256", ...)` to point `load_annotations_verified`
+    at a fixture's hash without touching the real `download.py` pin."""
+    return sidecar_io.pinned_source_sha256(ANNOTATIONS_FILENAME)
 
 
 def load_annotations_verified(
     raw_dir: Path = RAW_DATA_DIR, expected_sha256: Optional[str] = None
 ) -> "tuple[pd.DataFrame, str]":
-    """Load the body-annotations feather table, refusing to proceed if its
-    sha256 doesn't match the pinned value (`expected_sha256`, defaulting to
-    download.py's pin for the real filename -- overridable so tests can
-    point this at a small fixture file with its own expected hash).
-    Returns `(dataframe, verified_sha256)`.
+    """Load the body-annotations feather table via `sidecar_io`'s shared
+    sha-verified loader, refusing to proceed if its sha256 doesn't match the
+    pinned value (`expected_sha256`, defaulting to `_pinned_annotations_sha256()`
+    -- overridable so tests can point this at a small fixture file with its
+    own expected hash). Returns `(dataframe, verified_sha256)`.
 
     Also asserts the `group` column (when present) is a numeric Arrow type,
     so a schema change to a non-numeric representation is caught here
     rather than silently producing garbage group ids on the `int(...)`
-    coercion in `_group_or_none` below."""
-    path = raw_dir / ANNOTATIONS_FILENAME
-    if not path.exists():
-        raise RuntimeError(f"{path} does not exist; run scripts/data/download.py first")
-    actual_sha256 = _sha256_of_file(path)
+    coercion in `_group_or_none` below. This column check is
+    `descending_types.py`-specific (the counterpart `positions.py` check is
+    a different column, a different Arrow type), so it stays local here
+    rather than moving into `sidecar_io`, which only verifies the file's
+    identity."""
     pinned_sha256 = expected_sha256 if expected_sha256 is not None else _pinned_annotations_sha256()
-    if actual_sha256 != pinned_sha256:
-        raise RuntimeError(
-            f"{path} sha256 {actual_sha256} does not match the pinned {pinned_sha256}; "
-            "refusing to join cell types from a stale/tampered/unexpected file"
-        )
-    table = feather.read_table(path)
+    path = raw_dir / ANNOTATIONS_FILENAME
+    table, actual_sha256 = sidecar_io.load_verified_source_table(
+        ANNOTATIONS_FILENAME, raw_dir, expected_sha256=pinned_sha256, purpose="cell types"
+    )
     if "group" in table.column_names:
         field_type = table.schema.field("group").type
         if not (pa.types.is_floating(field_type) or pa.types.is_integer(field_type)):
@@ -215,6 +220,17 @@ def build_descending_types(graph: binfmt.GraphArrays, annotations: pd.DataFrame)
     return neurons
 
 
+def null_counts(neurons: "list[dict]") -> "dict[str, int]":
+    """Per-`OPTIONAL_FIELDS` count of neurons whose value for that field is
+    `None`, in `OPTIONAL_FIELDS` order. Embedded in the artifact itself
+    (`render_descending_types_document`'s `nullCounts`) so a claim like
+    "class is null for all 48" (docs/data-provenance.md) is verifiable
+    directly from the published JSON, not only from this script's stdout or
+    from hand-counting the `neurons` array -- and stays correct automatically
+    if the real annotations ever change."""
+    return {field: sum(1 for n in neurons if n[field] is None) for field in OPTIONAL_FIELDS}
+
+
 def render_descending_types_document(
     *,
     source_sha256: str,
@@ -229,6 +245,7 @@ def render_descending_types_document(
         "sourceSha256": source_sha256,
         "graphSha256": graph_sha256,
         "neurons": neurons,
+        "nullCounts": null_counts(neurons),
     }
     return json.dumps(document, indent=2, sort_keys=True, separators=(",", ": ")) + "\n"
 
@@ -241,24 +258,20 @@ def main(argv: "list[str] | None" = None) -> int:
     parser.add_argument("--manifest-path", type=Path, default=None)
     args = parser.parse_args(argv)
 
-    print(f"Loading graph from {args.graph}...")
-    gzip_bytes = args.graph.read_bytes()
-    graph_sha256 = binfmt.sha256_hex(gzip_bytes)
-    binary = gzip.decompress(gzip_bytes)
-    graph = rewire.decode_graph_binary(binary)
-    print(f"  neuronCount={graph.metadata['neuronCount']}, graph sha256(gzip)={graph_sha256}")
+    graph, graph_sha256 = sidecar_io.load_graph_for_sidecar(args.graph)
 
     # Load (but don't yet write) the manifest up front, so every validation
     # below runs -- and can fail loudly -- before anything on disk is
     # touched, matching positions.py's --graph/manifest cross-check.
     manifest_path = args.manifest_path or (args.out_dir / f"{ARTIFACT_NAME}.manifest.json")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else None
-    if manifest is not None and manifest.get("gzipSha256") != graph_sha256:
-        raise RuntimeError(
-            f"--graph {args.graph} has sha256 {graph_sha256}, which does not match "
-            f"{manifest_path}'s gzipSha256 ({manifest.get('gzipSha256')!r}); refusing to attach "
-            "a descendingTypes entry to a manifest that describes a different compiled graph"
-        )
+    manifest = sidecar_io.load_json_if_present(manifest_path)
+    sidecar_io.cross_check_manifest_graph_sha(
+        manifest,
+        graph_sha256,
+        graph_path=args.graph,
+        manifest_path=manifest_path,
+        entry_name="a descendingTypes entry",
+    )
 
     print("Loading + verifying pinned body-annotations...")
     annotations, source_sha256 = load_annotations_verified(args.raw_dir)
@@ -267,40 +280,24 @@ def main(argv: "list[str] | None" = None) -> int:
     print("Joining cell types onto the graph's descending neurons...")
     neurons = build_descending_types(graph, annotations)
     print(f"  {len(neurons)} descending neurons")
-    missing_type_count = sum(1 for n in neurons if n["type"] is None)
-    missing_class_count = sum(1 for n in neurons if n["class"] is None)
-    missing_instance_count = sum(1 for n in neurons if n["instance"] is None)
-    missing_group_count = sum(1 for n in neurons if n["group"] is None)
-    missing_soma_side_count = sum(1 for n in neurons if n["somaSide"] is None)
-    print(
-        "  missing annotation counts: "
-        f"type={missing_type_count}, class={missing_class_count}, "
-        f"instance={missing_instance_count}, group={missing_group_count}, "
-        f"somaSide={missing_soma_side_count}"
-    )
+    counts = null_counts(neurons)
+    print("  missing annotation counts: " + ", ".join(f"{field}={counts[field]}" for field in OPTIONAL_FIELDS))
 
     payload = render_descending_types_document(
         source_sha256=source_sha256, graph_sha256=graph_sha256, neurons=neurons
     )
-    payload_bytes = payload.encode("utf-8")
-    descending_types_sha256 = hashlib.sha256(payload_bytes).hexdigest()
 
-    args.out_dir.mkdir(parents=True, exist_ok=True)
     out_path = args.out_dir / f"{OUT_ARTIFACT_NAME}.json"
-    fsutil.atomic_write_text(out_path, payload)
-    print(f"Wrote {out_path} ({len(payload_bytes)} bytes)")
+    descending_types_sha256 = sidecar_io.write_sidecar_artifact(payload, out_path)
     print(f"descending-types sha256: {descending_types_sha256}")
 
-    if manifest is not None:
-        manifest["descendingTypes"] = {
-            "artifact": out_path.name,
-            "sha256": descending_types_sha256,
-            "neuronCount": len(neurons),
-        }
-        fsutil.atomic_write_text(manifest_path, json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-        print(f"Updated {manifest_path} with the descendingTypes entry")
-    else:
-        print(f"[warn] {manifest_path} does not exist; skipped manifest update")
+    sidecar_io.merge_json_entry(
+        manifest,
+        manifest_path,
+        "descendingTypes",
+        {"artifact": out_path.name, "sha256": descending_types_sha256, "neuronCount": len(neurons)},
+        label="descendingTypes entry",
+    )
 
     return 0
 

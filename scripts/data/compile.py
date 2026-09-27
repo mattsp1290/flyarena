@@ -213,7 +213,13 @@ COMPILER_SOURCE_DIR = Path(__file__).resolve().parent
 #: `public/data/descending-types-v1.json` and its own manifest key -- it
 #: never influences `compile_graph`'s aggregation/CSR logic or the emitted
 #: `.bin.gz` bytes, so it must not change this hash either (WP1c of
-#: `.agents/plans/readout-attribution`).
+#: `.agents/plans/readout-attribution`). `scripts/data/sidecar_io.py` is a
+#: fifth sidecar: the shared sha-verified-load/graph-load/manifest-merge
+#: plumbing `positions.py` and `descending_types.py` both call into (a
+#: thermo-maintainability-review extraction of what was previously ~130
+#: duplicated lines) -- like `fsutil.py`, it is imported by sidecars, not by
+#: anything that produces `.bin.gz` bytes, and has no graph-compilation
+#: logic of its own.
 COMPILER_SOURCE_FILENAMES: tuple[str, ...] = ("binfmt.py", "compile.py", "download.py", "rewire.py")
 
 #: Every `scripts/data/*.py` file that is *not* part of "the compiler" --
@@ -229,6 +235,7 @@ NON_COMPILER_SIDECAR_FILENAMES: tuple[str, ...] = (
     "rewire_batch.py",
     "fsutil.py",
     "descending_types.py",
+    "sidecar_io.py",
 )
 
 
