@@ -18,31 +18,12 @@ trap_lib="$PWD/scripts/deploy-trap.sh"
 [[ -f "$lock_lib" ]] || { printf 'deploy-lock.test: cannot find %s\n' "$lock_lib" >&2; exit 1; }
 [[ -f "$trap_lib" ]] || { printf 'deploy-lock.test: cannot find %s\n' "$trap_lib" >&2; exit 1; }
 
-failures=0
-scratch_dirs=()
-
-pass() { printf 'ok - %s\n' "$1"; }
-fail() {
-  printf 'not ok - %s\n' "$1"
-  [[ -n "${2:-}" ]] && printf '  # %s\n' "$2"
-  failures=$((failures + 1))
-}
-
-# shellcheck disable=SC2329 # false positive: registered below via `trap cleanup EXIT`, which shellcheck's static analysis doesn't connect back to this definition.
-cleanup() {
-  local dir
-  for dir in "${scratch_dirs[@]:-}"; do
-    [[ -n "$dir" ]] && rm -rf -- "$dir"
-  done
-}
-trap cleanup EXIT
-
-new_scratch_root() {
-  local dir
-  dir=$(mktemp -d)
-  scratch_dirs+=("$dir")
-  printf '%s' "$dir"
-}
+# Shared pass/fail/cleanup/new_scratch/tap_summary scaffolding (thermo
+# review, Important I1/maintainability) -- see that file's own header
+# comment for why this is a separate file, and what is deliberately kept
+# per-file instead (run_child/child_prelude below).
+# shellcheck source=scripts/verify/lib/bash-tap.sh
+source "$PWD/scripts/verify/lib/bash-tap.sh"
 
 # A child script's shared prelude: the same `die()` deploy.sh defines
 # (exits 1 on failure) and an `ssh_options` array deploy-lock.sh expects in
@@ -116,7 +97,7 @@ run_child_secret() {
 # ---------------------------------------------------------------------------
 # 1. acquire, then a second acquire aborts (lock still fresh)
 # ---------------------------------------------------------------------------
-root=$(new_scratch_root)
+root=$(new_scratch)
 run_child "$root" 'deploy_lock_acquire "release-one"; echo ACQUIRED' "$(child_prelude)"
 if [[ $child_status -eq 0 && "$child_out" == *ACQUIRED* ]]; then
   pass 'first acquire succeeds'
@@ -144,7 +125,7 @@ fi
 # ---------------------------------------------------------------------------
 # 2. a stale lock aborts as stale, and is never broken automatically
 # ---------------------------------------------------------------------------
-root=$(new_scratch_root)
+root=$(new_scratch)
 mkdir -- "$root/.deploy.lock"
 stale_ts=$(( $(date -u +%s) - 3600 ))
 {
@@ -176,7 +157,7 @@ fi
 # root directory this user cannot write into, so `mkdir -- "$lock"` fails
 # with EACCES rather than EEXIST.
 # ---------------------------------------------------------------------------
-root=$(new_scratch_root)
+root=$(new_scratch)
 chmod 0500 -- "$root"
 run_child "$root" 'deploy_lock_acquire "release-perm"; echo ACQUIRED' "$(child_prelude)"
 chmod 0700 -- "$root" # restore write access so the outer trap can clean it up
@@ -201,7 +182,7 @@ fi
 # 2c. old lock-directory mtime (>= 30 minutes) -> reported through the
 # normal STALE path, noting the owner file is missing, with the manual-clear
 # command -- never left as an unrecoverable "indeterminate" forever.
-root=$(new_scratch_root)
+root=$(new_scratch)
 mkdir -- "$root/.deploy.lock"
 old_mtime_epoch=$(( $(date -u +%s) - 3600 ))
 touch -d "@$old_mtime_epoch" -- "$root/.deploy.lock"
@@ -222,7 +203,7 @@ fi
 # indeterminate ("retry shortly"), but with the "if this persists beyond 30
 # minutes" guidance and the same manual-clear command as a fallback --
 # never a dead end with no recovery path at all.
-root=$(new_scratch_root)
+root=$(new_scratch)
 mkdir -- "$root/.deploy.lock"
 run_child_secret "$root" 'deploy_lock_acquire "release-owner-missing-fresh"; echo ACQUIRED' "$(child_prelude)"
 if [[ $child_status -ne 0 && "$child_out" != *ACQUIRED* && "$child_out" != *STALE* \
@@ -237,7 +218,7 @@ fi
 # ---------------------------------------------------------------------------
 # 3. the trap releases the lock on EXIT, including on failure
 # ---------------------------------------------------------------------------
-root=$(new_scratch_root)
+root=$(new_scratch)
 run_child "$root" 'deploy_lock_acquire "release-trap"; false' "$(child_prelude_with_trap)"
 if [[ $child_status -ne 0 ]]; then
   pass 'the child process that acquires the lock and then fails exits nonzero'
@@ -258,7 +239,7 @@ fi
 # may acquire it before this one exits, and this run's own release must not
 # then delete that other run's lock out from under it.
 # ---------------------------------------------------------------------------
-root=$(new_scratch_root)
+root=$(new_scratch)
 run_child "$root" \
   'deploy_lock_acquire "release-mine"
    printf "timestamp=%s\nhostname=x\npid=1\nrelease=release-other\n" "$(date -u +%s)" > "$DEPLOY_LOCK_ROOT_OVERRIDE/.deploy.lock.owner"
@@ -279,7 +260,7 @@ fi
 # ---------------------------------------------------------------------------
 # 4. rollback is refused when `current` changed since this run published
 # ---------------------------------------------------------------------------
-root=$(new_scratch_root)
+root=$(new_scratch)
 mkdir -p -- "$root/releases/release-new" "$root/releases/release-previous"
 ln -s -- releases/release-new "$root/current"
 
@@ -300,7 +281,7 @@ fi
 # Positive case: rollback proceeds and matches the documented symlink swap
 # (`ln -s releases/<previous> .rollback-current && mv -Tf .rollback-current current`)
 # when current still equals the release this run published.
-root=$(new_scratch_root)
+root=$(new_scratch)
 mkdir -p -- "$root/releases/release-just-deployed" "$root/releases/release-previous"
 ln -s -- releases/release-just-deployed "$root/current"
 
@@ -317,7 +298,7 @@ fi
 # rollback interrupted between its `ln -s` and `mv -Tf` (a dropped SSH
 # connection, a killed process) must not permanently block every later
 # rollback attempt.
-root=$(new_scratch_root)
+root=$(new_scratch)
 mkdir -p -- "$root/releases/release-current" "$root/releases/release-target"
 ln -s -- releases/release-current "$root/current"
 ln -s -- releases/some-orphaned-release "$root/.rollback-current"
@@ -343,7 +324,7 @@ fi
 # ---------------------------------------------------------------------------
 live_release_id='20200101T000000Z-aaaaaaaaaaaa'
 other_release_id='20200202T000000Z-bbbbbbbbbbbb'
-root=$(new_scratch_root)
+root=$(new_scratch)
 mkdir -p -- "$root/releases/$live_release_id"
 ln -s -- "releases/$live_release_id" "$root/current"
 doc=$(mktemp)
@@ -430,7 +411,7 @@ fi
 # ---------------------------------------------------------------------------
 
 # 6a. held (fresh) path.
-root=$(new_scratch_root)
+root=$(new_scratch)
 run_child_secret "$root" 'deploy_lock_acquire "release-secret-one"' "$(child_prelude)"
 run_child_secret "$root" 'deploy_lock_acquire "release-secret-two"' "$(child_prelude)"
 if [[ $child_status -ne 0 && "$child_out" != *"$fake_ssh"* && "$child_out" != *"$fake_url"* ]]; then
@@ -440,7 +421,7 @@ else
 fi
 
 # 6b. stale path.
-root=$(new_scratch_root)
+root=$(new_scratch)
 mkdir -- "$root/.deploy.lock"
 stale_ts=$(( $(date -u +%s) - 3600 ))
 {
@@ -457,7 +438,7 @@ else
 fi
 
 # 6c. error (not lock contention) path.
-root=$(new_scratch_root)
+root=$(new_scratch)
 chmod 0500 -- "$root"
 run_child_secret "$root" 'deploy_lock_acquire "release-secret-four"' "$(child_prelude)"
 chmod 0700 -- "$root"
@@ -549,11 +530,4 @@ else
 fi
 rm -f -- "$scratch_file" # in case the check above failed and left it behind
 
-echo
-if [[ $failures -eq 0 ]]; then
-  printf 'deploy-lock.test: all checks passed.\n'
-  exit 0
-else
-  printf 'deploy-lock.test: %d check(s) failed.\n' "$failures"
-  exit 1
-fi
+tap_summary 'deploy-lock.test'

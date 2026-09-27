@@ -1,9 +1,11 @@
 # Private real-graph lab
 
-This document uses placeholders only: `<TAILNET_ORIGIN>`, `<TAILNET_ADDRESS>`,
-and `<PORT>` stand in for real values. Never put a real hostname, origin, or
-IP address in this file, in any other tracked documentation, or in a script
-(the rule enforced by `.agents/deployment.md`).
+This document uses placeholders only: `<SITE_ORIGIN>` (the **public** static
+site's own origin -- the origin of `DEPLOY_URL`, scheme + host, no path --
+never a tailnet address), `<TAILNET_ADDRESS>` (the Spark's Tailscale
+address), and `<PORT>` stand in for real values. Never put a real hostname,
+origin, or IP address in this file, in any other tracked documentation, or
+in a script (the rule enforced by `.agents/deployment.md`).
 
 ## Purpose
 
@@ -132,6 +134,23 @@ atlas check needs the GPU. Re-run it manually once the GPU is free:
 `cd backend/graph_lab && uv run pytest -m spark -v`. Missing `uv` on `PATH`
 is treated as a hard failure, not a silent skip -- only the explicit
 `GRAPH_LAB_SKIP_REPRO=1` opt-out may bypass the gate.
+
+**GPU pre-flight (automatic).** `test_reproduction.py`'s `AtlasReproductionTests`
+deliberately injects a fake, always-available GPU for test determinism
+(`gpu_free_bytes=lambda: 999 * 1024**3`), unlike the atlas *engine* itself,
+which refuses to start a real job if free GPU memory is below 2 GiB. That
+means nothing in the reproduction test would ever notice a real GPU already
+in use. `--build` closes that gap itself: before running the atlas check, it
+checks `nvidia-smi` for free GPU memory (same 2 GiB threshold) and for any
+other running compute process. If either signals contention, `--build`
+skips **only** the atlas check -- the CPU lesion/swap-set hard gate still
+runs and still blocks the image on failure -- prints a loud warning
+recorded in the build output, and still builds and tags the image. This is
+a pre-flight convenience on top of `GRAPH_LAB_SKIP_REPRO=1`, not a
+replacement for it: use the env var to skip the whole gate outright if you
+already know the GPU is busy; the pre-flight exists for when you forget to.
+If `nvidia-smi` itself is unavailable, this is not treated as evidence of
+contention -- the atlas check runs as usual.
 
 A second, smaller deviation from `02-job-engines.md`'s wording: `--build`
 runs these checks against the freshly bundled JS **before** `docker build`,

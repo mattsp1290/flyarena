@@ -139,8 +139,12 @@ subnet is denied egress by a `DOCKER-USER` iptables rule. See
 `docs/graph-lab.md` for what it is, its job types, provenance, and privacy
 model. This section is the operator runbook: build, start, stop, token
 rotation, and verification. **Every value below is a placeholder** --
-`<TAILNET_ADDRESS>`, `<TAILNET_ORIGIN>`, and `<PORT>` -- never a real
-hostname, origin, or IP address, matching this file's own rule.
+`<TAILNET_ADDRESS>` (the Spark's Tailscale address), `<SITE_ORIGIN>` (the
+**public** static site's own origin -- the origin of `DEPLOY_URL`, scheme +
+host, no path -- never a tailnet address; this is the value browsers send in
+the `Origin` header when the deployed page calls the tailnet backend), and
+`<PORT>` -- never a real hostname, origin, or IP address, matching this
+file's own rule.
 
 Phase split: `scripts/graph-lab.sh`, this runbook, and `docs/graph-lab.md`
 were written and tested without sudo, without a real container, and without
@@ -165,6 +169,17 @@ hard gate; the atlas check is tolerance-based and retried, per
 `flyarena-graph-lab:local` from `backend/graph_lab/Dockerfile`. Set
 `GRAPH_LAB_SKIP_REPRO=1` to skip the reproduction checks while another GPU
 job is already running on the Spark, and re-run them once the GPU is free.
+
+`--build` also runs its own automatic GPU pre-flight (`nvidia-smi`, same
+2 GiB free-memory threshold the atlas engine itself uses, plus a check for
+another running compute process) before the atlas check specifically --
+`test_reproduction.py`'s atlas test injects a fake always-free GPU for
+determinism, so nothing in the test itself would ever notice a real GPU
+already in use. If the pre-flight finds the GPU busy, `--build` skips only
+the atlas check (the CPU lesion/swap-set hard gate still runs) and prints a
+loud warning in the build output; it is a convenience on top of
+`GRAPH_LAB_SKIP_REPRO=1`, not a replacement for setting it when you already
+know the GPU is busy.
 
 ### Start
 
@@ -244,12 +259,16 @@ Expect no `Access-Control-Allow-Origin` header.
 
 ```bash
 curl -i -X OPTIONS http://<TAILNET_ADDRESS>:<PORT>/api/graph/v1/jobs \
-  -H "Origin: <TAILNET_ORIGIN>" \
+  -H "Origin: <SITE_ORIGIN>" \
   -H 'Access-Control-Request-Method: POST' \
   -H 'Access-Control-Request-Private-Network: true'
 ```
 
-Expect `Access-Control-Allow-Origin: <TAILNET_ORIGIN>` and
+`<SITE_ORIGIN>` here is the **public** static site's own origin (the origin
+of `DEPLOY_URL`, scheme + host, no path) -- not a tailnet address. This is
+the value a browser actually sends in the `Origin` header when the deployed
+page calls this backend, and the same value that must appear in
+`GRAPH_LAB_ORIGINS`. Expect `Access-Control-Allow-Origin: <SITE_ORIGIN>` and
 `Access-Control-Allow-Private-Network: true`.
 
 ```bash

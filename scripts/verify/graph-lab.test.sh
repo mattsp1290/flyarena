@@ -22,31 +22,12 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.."
 lib="$PWD/scripts/graph-lab.sh"
 [[ -f "$lib" ]] || { printf 'graph-lab.test: cannot find %s\n' "$lib" >&2; exit 1; }
 
-failures=0
-scratch_dirs=()
-
-pass() { printf 'ok - %s\n' "$1"; }
-fail() {
-  printf 'not ok - %s\n' "$1"
-  [[ -n "${2:-}" ]] && printf '  # %s\n' "$2"
-  failures=$((failures + 1))
-}
-
-# shellcheck disable=SC2329 # false positive: registered via `trap cleanup EXIT` below.
-cleanup() {
-  local dir
-  for dir in "${scratch_dirs[@]:-}"; do
-    [[ -n "$dir" ]] && rm -rf -- "$dir"
-  done
-}
-trap cleanup EXIT
-
-new_scratch() {
-  local dir
-  dir=$(mktemp -d)
-  scratch_dirs+=("$dir")
-  printf '%s' "$dir"
-}
+# Shared pass/fail/cleanup/new_scratch/tap_summary scaffolding (thermo
+# review, Important I1/maintainability) -- see that file's own header
+# comment for why this is a separate file, and what is deliberately kept
+# per-file instead (run_child/child_prelude below).
+# shellcheck source=scripts/verify/lib/bash-tap.sh
+source "$PWD/scripts/verify/lib/bash-tap.sh"
 
 # ---------------------------------------------------------------------------
 # Command stubs. Every stub reads a single env var, GRAPH_LAB_STUB_WORLD, and
@@ -107,9 +88,20 @@ printf "%s\n" "$*" >> "$world/docker/calls.log"
 case "${1:-}" in
   network)
     case "${2:-}" in
-      inspect) [[ -f "$world/docker/network-${3:-}" ]] && exit 0 || exit 1 ;;
+      inspect)
+        # `network inspect -f FORMAT NAME` returns the stored subnet (the
+        # network-<name> file'"'"'s contents, written by `create` below);
+        # plain `network inspect NAME` is an existence check only, matching
+        # what scripts/graph-lab.sh actually calls for each.
+        if [[ "${3:-}" == -f ]]; then
+          name="${5:-}"
+          [[ -f "$world/docker/network-$name" ]] || exit 1
+          cat -- "$world/docker/network-$name"
+          exit 0
+        fi
+        [[ -f "$world/docker/network-${3:-}" ]] && exit 0 || exit 1 ;;
       create)
-        : > "$world/docker/network-${5:-}"
+        printf "%s" "${4:-}" > "$world/docker/network-${5:-}"
         exit 0 ;;
       rm)
         if [[ -f "$world/docker-network-rm-fails" ]]; then exit 1; fi
@@ -187,6 +179,26 @@ case "$*" in
   *) exit 2 ;;
 esac'
 
+# Simulates `nvidia-smi --query-gpu=memory.free ...` and
+# `--query-compute-apps=pid ...` (the exact invocations
+# graph_lab_gpu_busy uses). Defaults to "abundant free memory, no compute
+# apps" (not busy) unless a test writes $world/nvidia-smi-free-mib and/or
+# $world/nvidia-smi-compute-apps to simulate contention.
+nvidia_smi_stub_body='#!/usr/bin/env bash
+set -euo pipefail
+world="${GRAPH_LAB_STUB_WORLD:?}"
+mkdir -p -- "$world"
+printf "%s\n" "$*" >> "$world/nvidia-smi-calls.log"
+case "$*" in
+  "--query-gpu=memory.free --format=csv,noheader,nounits")
+    cat -- "$world/nvidia-smi-free-mib" 2>/dev/null || printf "999999\n"
+    ;;
+  "--query-compute-apps=pid --format=csv,noheader")
+    cat -- "$world/nvidia-smi-compute-apps" 2>/dev/null || true
+    ;;
+  *) exit 1 ;;
+esac'
+
 stub_bin=$(new_scratch)
 write_stub "$stub_bin/tailscale" "$tailscale_stub_body"
 write_stub "$stub_bin/iptables" "$iptables_stub_body"
@@ -194,6 +206,7 @@ write_stub "$stub_bin/sudo" "$sudo_stub_body"
 write_stub "$stub_bin/docker" "$docker_stub_body"
 write_stub "$stub_bin/npm" "$npm_stub_body"
 write_stub "$stub_bin/uv" "$uv_stub_body"
+write_stub "$stub_bin/nvidia-smi" "$nvidia_smi_stub_body"
 
 stub_bin_no_sudo=$(new_scratch)
 write_stub "$stub_bin_no_sudo/tailscale" "$tailscale_stub_body"
@@ -201,6 +214,7 @@ write_stub "$stub_bin_no_sudo/iptables" "$iptables_stub_body"
 write_stub "$stub_bin_no_sudo/docker" "$docker_stub_body"
 write_stub "$stub_bin_no_sudo/npm" "$npm_stub_body"
 write_stub "$stub_bin_no_sudo/uv" "$uv_stub_body"
+write_stub "$stub_bin_no_sudo/nvidia-smi" "$nvidia_smi_stub_body"
 
 # No `uv` at all -- exercises graph_lab_run_reproduction_checks' own hard
 # failure when uv is missing (not a silent skip).
@@ -210,6 +224,31 @@ write_stub "$stub_bin_no_uv/iptables" "$iptables_stub_body"
 write_stub "$stub_bin_no_uv/sudo" "$sudo_stub_body"
 write_stub "$stub_bin_no_uv/docker" "$docker_stub_body"
 write_stub "$stub_bin_no_uv/npm" "$npm_stub_body"
+write_stub "$stub_bin_no_uv/nvidia-smi" "$nvidia_smi_stub_body"
+
+# No `nvidia-smi` at all -- exercises graph_lab_gpu_busy's "no way to check,
+# so not treated as busy" fallback.
+stub_bin_no_nvidia=$(new_scratch)
+write_stub "$stub_bin_no_nvidia/tailscale" "$tailscale_stub_body"
+write_stub "$stub_bin_no_nvidia/iptables" "$iptables_stub_body"
+write_stub "$stub_bin_no_nvidia/sudo" "$sudo_stub_body"
+write_stub "$stub_bin_no_nvidia/docker" "$docker_stub_body"
+write_stub "$stub_bin_no_nvidia/npm" "$npm_stub_body"
+write_stub "$stub_bin_no_nvidia/uv" "$uv_stub_body"
+
+# A minimal, real-coreutils-only PATH component (symlinks, no `nvidia-smi`
+# or `uv`) for the two isolated-PATH tests below: this machine has a REAL
+# `nvidia-smi` and a real `uv` (this repo's own dev environment has a real
+# GPU), so simply prepending a stub dir onto the inherited PATH is not
+# enough to simulate "missing" for either -- the real binary would still be
+# found further down the same PATH. These tests instead use a fully
+# isolated PATH (a no-nvidia-smi/no-uv stub dir plus only this directory),
+# never inheriting the real PATH at all.
+core_bin=$(new_scratch)
+for _coreutil in bash dirname mktemp cat mkdir rm grep wc head tail sort; do
+  _coreutil_path=$(command -v -- "$_coreutil") || { printf 'graph-lab.test: missing required coreutil: %s\n' "$_coreutil" >&2; exit 1; }
+  ln -s -- "$_coreutil_path" "$core_bin/$_coreutil"
+done
 
 # A child script's shared prelude: sources scripts/graph-lab.sh (defining
 # every function, running nothing -- see the guard at its own end) with a
@@ -427,6 +466,132 @@ for flag in '--name flyarena-graph-lab' '--network flyarena-graph-lab-net' '--in
 done
 
 # ---------------------------------------------------------------------------
+# 5g. --start refuses when the existing network's ACTUAL subnet (read via
+# `docker network inspect`) does not match the configured GRAPH_LAB_SUBNET
+# -- never trusts config alone (ops-security thermo review, Important 2).
+# ---------------------------------------------------------------------------
+world=$(new_scratch)
+printf '%s\n' "$fake_bind" > "$world/tailscale-ips"
+mkdir -p "$world/docker"
+printf '%s' '172.31.250.0/24' > "$world/docker/network-flyarena-graph-lab-net"
+env_file="$world/.env"
+{
+  write_env_fixture "$env_file" "$fake_token" "$fake_origin" "$fake_bind" "$fake_deploy_url"
+  printf 'GRAPH_LAB_SUBNET=%s\n' '10.99.0.0/24' >> "$env_file"
+}
+run_child 'cmd_start; echo STARTED' \
+  "$(child_prelude "$stub_bin")"$'\n'"export GRAPH_LAB_STUB_WORLD=$world GRAPH_LAB_ENV_FILE=$env_file"
+[[ $child_status -ne 0 && "$child_out" == *'does not match the configured GRAPH_LAB_SUBNET'* \
+  && "$child_out" == *'--uninstall'* && "$child_out" != *STARTED* ]] \
+  && pass '--start refuses when the existing network subnet does not match the configured GRAPH_LAB_SUBNET' \
+  || fail '--start refuses when the existing network subnet does not match the configured GRAPH_LAB_SUBNET' "status=$child_status out=$child_out"
+[[ ! -e "$world/docker/container-flyarena-graph-lab-running" ]] \
+  && pass 'no container was started on a subnet mismatch' \
+  || fail 'no container was started on a subnet mismatch'
+
+# Matching subnets: no refusal.
+world=$(new_scratch)
+printf '%s\n' "$fake_bind" > "$world/tailscale-ips"
+mkdir -p "$world/docker"
+printf '%s' '10.99.0.0/24' > "$world/docker/network-flyarena-graph-lab-net"
+env_file="$world/.env"
+{
+  write_env_fixture "$env_file" "$fake_token" "$fake_origin" "$fake_bind" "$fake_deploy_url"
+  printf 'GRAPH_LAB_SUBNET=%s\n' '10.99.0.0/24' >> "$env_file"
+}
+run_child 'cmd_start; echo STARTED' \
+  "$(child_prelude "$stub_bin")"$'\n'"export GRAPH_LAB_STUB_WORLD=$world GRAPH_LAB_ENV_FILE=$env_file"
+[[ $child_status -eq 0 && "$child_out" == *STARTED* ]] \
+  && pass '--start proceeds when the existing network subnet matches the configured GRAPH_LAB_SUBNET' \
+  || fail '--start proceeds when the existing network subnet matches the configured GRAPH_LAB_SUBNET' "status=$child_status out=$child_out"
+# The rule must be inserted for the (matching) actual/configured subnet.
+grep -qxF -- '-I DOCKER-USER -s 10.99.0.0/24 -m conntrack --ctstate NEW -j DROP' "$world/iptables-calls.log" \
+  && pass 'the egress-drop rule is inserted for the actual (matching) subnet' \
+  || fail 'the egress-drop rule is inserted for the actual (matching) subnet' "log=$(cat -- "$world/iptables-calls.log" 2>&1)"
+
+# --status also reports the mismatch (without refusing -- it is read-only).
+world=$(new_scratch)
+printf '%s\n' "$fake_bind" > "$world/tailscale-ips"
+mkdir -p "$world/docker"
+printf '%s' '172.31.250.0/24' > "$world/docker/network-flyarena-graph-lab-net"
+env_file="$world/.env"
+printf 'GRAPH_LAB_SUBNET=%s\n' '10.99.0.0/24' > "$env_file"
+run_child 'cmd_status' "$(child_prelude "$stub_bin")"$'\n'"export GRAPH_LAB_STUB_WORLD=$world GRAPH_LAB_ENV_FILE=$env_file"
+[[ $child_status -eq 0 && "$child_out" == *'network subnet: MISMATCH'* && "$child_out" == *'172.31.250.0/24'* && "$child_out" == *'10.99.0.0/24'* ]] \
+  && pass '--status reports a network-subnet mismatch (both CIDR values, no token/hostname/IP)' \
+  || fail '--status reports a network-subnet mismatch' "out=$child_out"
+
+# --uninstall removes the rule keyed on the network's ACTUAL subnet, not the
+# (mismatched) configured one.
+world=$(new_scratch)
+mkdir -p "$world/docker"
+printf '%s' '172.31.250.0/24' > "$world/docker/network-flyarena-graph-lab-net"
+: > "$world/iptables-rule"
+env_file="$world/.env"
+printf 'GRAPH_LAB_SUBNET=%s\n' '10.99.0.0/24' > "$env_file"
+run_child 'cmd_uninstall' "$(child_prelude "$stub_bin")"$'\n'"export GRAPH_LAB_STUB_WORLD=$world GRAPH_LAB_ENV_FILE=$env_file"
+grep -qxF -- '-D DOCKER-USER -s 172.31.250.0/24 -m conntrack --ctstate NEW -j DROP' "$world/iptables-calls.log" \
+  && pass "--uninstall removes the rule keyed on the network's actual subnet, not the mismatched configured one" \
+  || fail "--uninstall removes the rule keyed on the actual subnet" "log=$(cat -- "$world/iptables-calls.log" 2>&1)"
+
+# ---------------------------------------------------------------------------
+# 5h. GRAPH_LAB_SUBNET is validated as a plausible IPv4 CIDR before it
+# reaches docker/iptables (ops-security thermo review, Suggestion S1).
+# ---------------------------------------------------------------------------
+for bad_subnet in 'not-a-subnet' '172.31.250.0' '172.31.250.0/33' '0.0.0.0/0' '172.31.250.0/8'; do
+  world=$(new_scratch)
+  printf '%s\n' "$fake_bind" > "$world/tailscale-ips"
+  env_file="$world/.env"
+  {
+    write_env_fixture "$env_file" "$fake_token" "$fake_origin" "$fake_bind" "$fake_deploy_url"
+    printf 'GRAPH_LAB_SUBNET=%s\n' "$bad_subnet" >> "$env_file"
+  }
+  run_child 'cmd_start; echo STARTED' \
+    "$(child_prelude "$stub_bin")"$'\n'"export GRAPH_LAB_STUB_WORLD=$world GRAPH_LAB_ENV_FILE=$env_file"
+  [[ $child_status -ne 0 && "$child_out" != *STARTED* ]] \
+    && pass "--start refuses an invalid GRAPH_LAB_SUBNET ('$bad_subnet')" \
+    || fail "--start refuses an invalid GRAPH_LAB_SUBNET ('$bad_subnet')" "status=$child_status out=$child_out"
+done
+# A valid, in-range subnet is accepted.
+world=$(new_scratch)
+printf '%s\n' "$fake_bind" > "$world/tailscale-ips"
+env_file="$world/.env"
+{
+  write_env_fixture "$env_file" "$fake_token" "$fake_origin" "$fake_bind" "$fake_deploy_url"
+  printf 'GRAPH_LAB_SUBNET=%s\n' '10.5.0.0/28' >> "$env_file"
+}
+run_child 'cmd_start; echo STARTED' \
+  "$(child_prelude "$stub_bin")"$'\n'"export GRAPH_LAB_STUB_WORLD=$world GRAPH_LAB_ENV_FILE=$env_file"
+[[ $child_status -eq 0 && "$child_out" == *STARTED* ]] \
+  && pass "--start accepts a valid, in-range GRAPH_LAB_SUBNET ('10.5.0.0/28')" \
+  || fail "--start accepts a valid, in-range GRAPH_LAB_SUBNET" "status=$child_status out=$child_out"
+
+# ---------------------------------------------------------------------------
+# 5i. The bind-check failure message distinguishes "tailscale printed no
+# addresses at all" from "addresses were printed, but none matched"
+# (ops-security thermo review, Suggestion S3), without ever printing an
+# address either way.
+# ---------------------------------------------------------------------------
+world=$(new_scratch)
+: > "$world/tailscale-ips" # tailscale prints nothing at all
+env_file="$world/.env"
+write_env_fixture "$env_file" "$fake_token" "$fake_origin" "$fake_bind" "$fake_deploy_url"
+run_child 'cmd_start' "$(child_prelude "$stub_bin")"$'\n'"export GRAPH_LAB_STUB_WORLD=$world GRAPH_LAB_ENV_FILE=$env_file"
+[[ $child_status -ne 0 && "$child_out" == *'printed no addresses at all'* && "$child_out" != *"$fake_bind"* ]] \
+  && pass 'the bind-check failure distinguishes "no addresses at all" (tailscaled likely down)' \
+  || fail 'the bind-check failure distinguishes "no addresses at all"' "out=$child_out"
+
+world=$(new_scratch)
+printf '%s\n' '100.1.2.3' > "$world/tailscale-ips" # prints an address, just not $fake_bind
+env_file="$world/.env"
+write_env_fixture "$env_file" "$fake_token" "$fake_origin" "$fake_bind" "$fake_deploy_url"
+run_child 'cmd_start' "$(child_prelude "$stub_bin")"$'\n'"export GRAPH_LAB_STUB_WORLD=$world GRAPH_LAB_ENV_FILE=$env_file"
+[[ $child_status -ne 0 && "$child_out" == *'none matched'* && "$child_out" != *'printed no addresses at all'* \
+  && "$child_out" != *"$fake_bind"* && "$child_out" != *'100.1.2.3'* ]] \
+  && pass 'the bind-check failure distinguishes "addresses printed but none matched" (stale/mistyped GRAPH_LAB_BIND)' \
+  || fail 'the bind-check failure distinguishes "addresses printed but none matched"' "out=$child_out"
+
+# ---------------------------------------------------------------------------
 # 6. --status reporting.
 # ---------------------------------------------------------------------------
 
@@ -547,11 +712,11 @@ build_line=$(grep '^build ' "$world/docker/calls.log")
 # 8b. uv missing on PATH is a hard failure, not a silent skip (the fix for
 # the "an accidental PATH gap reaches the same outcome as an explicit
 # GRAPH_LAB_SKIP_REPRO=1 opt-out" finding). Uses a fully isolated PATH
-# (stub dir + bare coreutils only), not a prepend onto the real inherited
-# PATH -- prepending alone would still find this machine's real `uv`
-# further down the real PATH and defeat the point of this test.
+# (stub dir + bare coreutils only, via $core_bin), not a prepend onto the
+# real inherited PATH -- prepending alone would still find this machine's
+# real `uv` further down the real PATH and defeat the point of this test.
 world=$(new_scratch)
-script="$(printf 'set -euo pipefail\nexport PATH="%s:/usr/bin:/bin"\nsource "%s"\n%s\n' "$stub_bin_no_uv" "$lib" 'graph_lab_run_reproduction_checks; echo RAN')"
+script="$(printf 'set -euo pipefail\nexport PATH="%s:%s"\nsource "%s"\n%s\n' "$stub_bin_no_uv" "$core_bin" "$lib" 'graph_lab_run_reproduction_checks; echo RAN')"
 set +e
 child_out=$(GRAPH_LAB_STUB_WORLD="$world" bash -c "$script" 2>&1)
 child_status=$?
@@ -611,6 +776,66 @@ run_child 'cmd_build; echo BUILT' \
 [[ $child_status -eq 0 && "$child_out" == *BUILT* && "$child_out" != *'WARNING'* ]] \
   && pass '--build succeeds with no warning when the atlas check recovers on retry' \
   || fail '--build succeeds with no warning when the atlas check recovers on retry' "status=$child_status out=$child_out"
+
+# ---------------------------------------------------------------------------
+# 8f2-8f5. GPU-busy pre-flight (ops-security thermo review, Important 3):
+# --build skips only the atlas check (never the CPU lesion/swap-set hard
+# gate) when the GPU pre-flight finds it busy, and records the skip loudly
+# in the build output.
+# ---------------------------------------------------------------------------
+
+# 8f2. Free GPU memory below the 2 GiB threshold -> atlas skipped, hard gate
+# still runs, image still built, skip recorded in the output.
+world=$(new_scratch)
+printf '1024\n' > "$world/nvidia-smi-free-mib" # under 2048 MiB
+run_child 'cmd_build; echo BUILT' "$(child_prelude "$stub_bin")"$'\n'"export GRAPH_LAB_STUB_WORLD=$world"
+[[ $child_status -eq 0 && "$child_out" == *BUILT* && "$child_out" == *'GPU pre-flight found it busy'* \
+  && "$child_out" == *'SKIPPED this run'* ]] \
+  && pass '--build skips the atlas check with a loud warning when free GPU memory is below 2 GiB' \
+  || fail '--build skips the atlas check when free GPU memory is below 2 GiB' "status=$child_status out=$child_out"
+grep -qxF -- "run --locked python -I -m pytest -q -m spark -k not AtlasReproductionTests" "$world/uv-calls.log" \
+  && pass 'the CPU lesion/swap-set hard gate still runs when the atlas check is skipped for a busy GPU' \
+  || fail 'the CPU lesion/swap-set hard gate still runs when the atlas check is skipped for a busy GPU' "log=$(cat -- "$world/uv-calls.log" 2>&1)"
+! grep -qxF -- 'run --locked python -I -m pytest -q -m spark -k AtlasReproductionTests' "$world/uv-calls.log" \
+  && pass 'the atlas check itself is never invoked when skipped for a busy GPU' \
+  || fail 'the atlas check itself is never invoked when skipped for a busy GPU' "log=$(cat -- "$world/uv-calls.log" 2>&1)"
+[[ -f "$world/docker/image-built" ]] \
+  && pass 'the image is still built when only the atlas check is skipped' \
+  || fail 'the image is still built when only the atlas check is skipped'
+
+# 8f3. Another compute process running (free memory otherwise fine) also
+# triggers the skip.
+world=$(new_scratch)
+printf '999999\n' > "$world/nvidia-smi-free-mib"
+printf '12345\n' > "$world/nvidia-smi-compute-apps"
+run_child 'cmd_build; echo BUILT' "$(child_prelude "$stub_bin")"$'\n'"export GRAPH_LAB_STUB_WORLD=$world"
+[[ $child_status -eq 0 && "$child_out" == *BUILT* && "$child_out" == *'GPU pre-flight found it busy'* ]] \
+  && pass '--build skips the atlas check when another compute process is running' \
+  || fail '--build skips the atlas check when another compute process is running' "status=$child_status out=$child_out"
+
+# 8f4. Plenty of free memory and no compute apps (the default stub state):
+# GPU pre-flight finds it free, atlas check runs as normal, no skip message.
+world=$(new_scratch)
+run_child 'cmd_build; echo BUILT' "$(child_prelude "$stub_bin")"$'\n'"export GRAPH_LAB_STUB_WORLD=$world"
+[[ $child_status -eq 0 && "$child_out" == *BUILT* && "$child_out" != *'GPU pre-flight found it busy'* && "$child_out" != *'SKIPPED this run'* ]] \
+  && pass '--build runs the atlas check normally when the GPU pre-flight finds it free' \
+  || fail '--build runs the atlas check normally when the GPU pre-flight finds it free' "status=$child_status out=$child_out"
+grep -qxF -- 'run --locked python -I -m pytest -q -m spark -k AtlasReproductionTests' "$world/uv-calls.log" \
+  && pass 'the atlas check is actually invoked when the GPU is free' \
+  || fail 'the atlas check is actually invoked when the GPU is free' "log=$(cat -- "$world/uv-calls.log" 2>&1)"
+
+# 8f5. nvidia-smi missing entirely: no evidence of contention, so not
+# treated as busy -- the atlas check still runs (this environment's own
+# fallback, not a false "safe" skip).
+world=$(new_scratch)
+script="$(printf 'set -euo pipefail\nexport PATH="%s:%s"\nsource "%s"\n%s\n' "$stub_bin_no_nvidia" "$core_bin" "$lib" 'cmd_build; echo BUILT')"
+set +e
+child_out=$(GRAPH_LAB_STUB_WORLD="$world" bash -c "$script" 2>&1)
+child_status=$?
+set -e
+[[ $child_status -eq 0 && "$child_out" == *BUILT* && "$child_out" != *'GPU pre-flight found it busy'* ]] \
+  && pass '--build runs the atlas check normally when nvidia-smi is unavailable (no evidence of contention)' \
+  || fail '--build runs the atlas check normally when nvidia-smi is unavailable' "status=$child_status out=$child_out"
 
 # 8g. A failing `npm run graph-lab:bundle` aborts before any reproduction
 # check or docker build runs (ordinary `set -e` propagation).
@@ -751,11 +976,4 @@ write_env_fixture "$env_file" "$fake_token" "$fake_origin" "$fake_bind" "$fake_d
 run_child 'cmd_start' "$(child_prelude "$stub_bin")"$'\n'"export GRAPH_LAB_STUB_WORLD=$world GRAPH_LAB_ENV_FILE=$env_file"
 leak_check 'a failing docker run' "$child_out"
 
-echo
-if [[ $failures -eq 0 ]]; then
-  printf 'graph-lab.test: all checks passed.\n'
-  exit 0
-else
-  printf 'graph-lab.test: %d check(s) failed.\n' "$failures"
-  exit 1
-fi
+tap_summary 'graph-lab.test'

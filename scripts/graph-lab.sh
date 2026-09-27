@@ -75,17 +75,25 @@ graph_lab_origin_in_list() {
   return 1
 }
 
-# True iff $1 is non-empty and exactly matches one address printed by
-# `tailscale ip -4`. This is what rejects `0.0.0.0`, LAN addresses, and an
+# True (exit 0) iff $1 is non-empty and exactly matches one address printed
+# by `tailscale ip -4`. This is what rejects `0.0.0.0`, LAN addresses, and an
 # empty/unset bind: none of those can ever appear in that command's output.
+# On failure, distinguishes two different operator problems via exit status
+# (never by printing an address): exit 2 means `tailscale ip -4` printed no
+# addresses at all (tailscaled likely down or not connected); exit 1 means
+# it printed at least one address, but none matched (a stale/mistyped
+# GRAPH_LAB_BIND is more likely) -- ops-security thermo review, Suggestion
+# S3.
 graph_lab_check_bind() {
-  local bind=$1 addr
+  local bind=$1 addr found_any=0
   [[ -n "$bind" ]] || return 1
   while IFS= read -r addr; do
     [[ -n "$addr" ]] || continue
+    found_any=1
     [[ "$addr" == "$bind" ]] && return 0
   done < <(tailscale ip -4 2>/dev/null || true)
-  return 1
+  [[ "$found_any" == 1 ]] && return 1
+  return 2
 }
 
 # True iff the DOCKER-USER egress-DROP rule for $1 (the subnet) is present.
@@ -109,12 +117,65 @@ graph_lab_ensure_rule() {
   sudo iptables -I DOCKER-USER -s "$subnet" -m conntrack --ctstate NEW -j DROP
 }
 
-# Creates the dedicated bridge network with a fixed subnet, idempotently.
+# The dedicated network's ACTUAL configured subnet, straight from docker --
+# never trusted from GRAPH_LAB_SUBNET/config alone. Empty (and nonzero) if
+# the network doesn't exist or has no IPAM config.
+graph_lab_network_subnet() {
+  docker network inspect -f '{{(index .IPAM.Config 0).Subnet}}' "$GRAPH_LAB_NETWORK_NAME" 2>/dev/null
+}
+
+# Creates the dedicated bridge network with a fixed subnet, idempotently. If
+# the network already exists, its ACTUAL subnet (read via `docker network
+# inspect`, never assumed) must equal the configured one -- otherwise a
+# stale network from a previous, differently-configured GRAPH_LAB_SUBNET
+# could silently keep running while the egress-drop rule gets inserted for
+# the *new* subnet, covering a network the container isn't actually on
+# (ops-security thermo review, Important 2). Refuses loudly instead.
 graph_lab_ensure_network() {
   local subnet=$1
-  docker network inspect "$GRAPH_LAB_NETWORK_NAME" >/dev/null 2>&1 && return 0
+  if docker network inspect "$GRAPH_LAB_NETWORK_NAME" >/dev/null 2>&1; then
+    local actual
+    actual=$(graph_lab_network_subnet) || actual=""
+    if [[ -n "$actual" && "$actual" != "$subnet" ]]; then
+      die "The existing docker network $GRAPH_LAB_NETWORK_NAME has subnet $actual, which does not match the configured GRAPH_LAB_SUBNET ($subnet). Run './scripts/graph-lab.sh --uninstall' first (this removes the egress-drop rule and the network), then --start again, rather than leaving a stale network and a rule mismatch."
+    fi
+    return 0
+  fi
   docker network create --subnet "$subnet" "$GRAPH_LAB_NETWORK_NAME" >/dev/null \
     || die "Failed to create the docker network $GRAPH_LAB_NETWORK_NAME (subnet $subnet)."
+}
+
+# The subnet to actually check/manage the egress-drop rule against: the
+# network's real, current subnet if the network exists (authoritative --
+# this is what the container is actually attached to), falling back to the
+# configured value only when there is no network yet to read from docker.
+# Never trusts GRAPH_LAB_SUBNET/config alone when the network already
+# exists (ops-security thermo review, Important 2).
+graph_lab_effective_subnet() {
+  local configured=$1 actual
+  actual=$(graph_lab_network_subnet) || actual=""
+  if [[ -n "$actual" ]]; then
+    printf '%s' "$actual"
+  else
+    printf '%s' "$configured"
+  fi
+}
+
+# Validates GRAPH_LAB_SUBNET is a plausible IPv4 CIDR (dotted-quad + prefix
+# length) before it ever reaches `docker network create`/`iptables` -- a
+# malformed or absurdly wide value (e.g. a typo'd mask, or `0.0.0.0/0`)
+# would otherwise silently produce a network/rule pair that are internally
+# consistent with each other but not with the operator's intent
+# (ops-security thermo review, Suggestion S1). Not a security boundary (the
+# value is always double-quoted before reaching docker/iptables, so this is
+# a footgun guard, not an injection fix).
+graph_lab_validate_subnet() {
+  local subnet=$1
+  [[ "$subnet" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]] \
+    || die "GRAPH_LAB_SUBNET '$subnet' is not a valid IPv4 CIDR (e.g. 172.31.250.0/24)."
+  local prefix=${subnet##*/}
+  (( prefix >= 16 && prefix <= 30 )) \
+    || die "GRAPH_LAB_SUBNET '$subnet' must have a prefix length between /16 and /30 (got /$prefix) -- this is meant to be a small, dedicated bridge subnet, not a wide range."
 }
 
 # Gate 2 of `.agents/plans/graph-lab/00-overview.md`, re-run on every build
@@ -155,11 +216,23 @@ graph_lab_ensure_network() {
 # function is ever called) may bypass the hard gate -- an accidental PATH
 # gap (a fresh shell, a systemd unit, a misconfigured cron) must never reach
 # the same "checks never ran" outcome as a deliberate operator choice.
+#
+# $1, if "1", skips only the atlas check (the lesion/swap-set hard gate
+# still runs) -- used by cmd_build's own GPU pre-flight below, since
+# `test_reproduction.py`'s `AtlasReproductionTests` injects a fake,
+# always-available GPU (`gpu_free_bytes=lambda: 999 * 1024**3`) for test
+# determinism, so nothing in the reproduction test itself would ever refuse
+# to run a real ~1-2 minute GPU job just because the GPU is actually busy.
 graph_lab_run_reproduction_checks() {
+  local skip_atlas=${1:-0}
   command -v uv >/dev/null 2>&1 || die 'uv not found on PATH; cannot run the reproduction checks. Install uv, or explicitly skip with GRAPH_LAB_SKIP_REPRO=1 (only while another GPU job needs the GPU) and re-run them once uv is available: cd backend/graph_lab && uv run pytest -m spark -v'
   printf 'graph-lab: running the lesion/swap-set reproduction checks (exact-match; hard gate)...\n'
   if ! (cd backend/graph_lab && uv run --locked python -I -m pytest -q -m spark -k 'not AtlasReproductionTests'); then
     die 'the lesion/swap-set reproduction checks failed (exact-match, deterministic). Refusing to build or tag flyarena-graph-lab:local. See backend/graph_lab/tests/test_reproduction.py.'
+  fi
+  if [[ "$skip_atlas" == 1 ]]; then
+    printf 'graph-lab: atlas reproduction check SKIPPED this run (GPU pre-flight found the GPU busy) -- see the WARNING above. Re-run it manually once the GPU is free: cd backend/graph_lab && uv run pytest -m spark -k AtlasReproductionTests -v\n'
+    return 0
   fi
   printf 'graph-lab: running the atlas reproduction check (tolerance-based; retried on failure, never a hard gate)...\n'
   local attempt ok=0
@@ -175,6 +248,30 @@ graph_lab_run_reproduction_checks() {
   fi
 }
 
+# Mirrors the production atlas engine's own "GPU busy" guard
+# (`02-job-engines.md`: refuses to start if free GPU memory is below 2 GiB,
+# read via `torch.cuda.mem_get_info`) so `--build`'s reproduction gate does
+# not blindly launch a real GPU job while another one (e.g. a multi-day
+# training run) is already using the GPU -- `test_reproduction.py`'s own
+# `AtlasReproductionTests` injects an always-free fake GPU for test
+# determinism, so nothing in the test itself would ever catch this
+# (ops-security thermo review, Important 3). True (busy) iff free memory is
+# under 2 GiB, or another compute process is already running. `nvidia-smi`
+# missing entirely is not treated as "busy" -- there is no real evidence of
+# contention, just no way to check; the atlas check then runs as before.
+graph_lab_gpu_busy() {
+  command -v nvidia-smi >/dev/null 2>&1 || return 1
+  local free_mib
+  free_mib=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -n1)
+  if [[ "$free_mib" =~ ^[0-9]+$ ]] && (( free_mib < 2048 )); then
+    return 0
+  fi
+  if nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -q '[0-9]'; then
+    return 0
+  fi
+  return 1
+}
+
 # `--build`: bundle the TS entries/workers, run the reproduction gate
 # (unless skipped), then build and tag the image. Exact docker invocation
 # per `.agents/plans/graph-lab/04-launch-and-runbook.md`'s change-surface
@@ -184,9 +281,12 @@ cmd_build() {
   command -v docker >/dev/null 2>&1 || die 'Missing command: docker'
   npm run graph-lab:bundle
   if [[ "${GRAPH_LAB_SKIP_REPRO:-0}" == 1 ]]; then
-    printf 'graph-lab: GRAPH_LAB_SKIP_REPRO=1 set; skipping the spark-marked reproduction checks. Re-run them once the GPU is free: cd backend/graph_lab && uv run pytest -m spark -v\n' >&2
+    printf 'graph-lab: GRAPH_LAB_SKIP_REPRO=1 set; skipping the spark-marked reproduction checks entirely (including the CPU lesion/swap-set checks). Re-run them once the GPU is free: cd backend/graph_lab && uv run pytest -m spark -v\n' >&2
+  elif graph_lab_gpu_busy; then
+    printf 'graph-lab: WARNING: the GPU pre-flight found it busy (free memory below 2 GiB, or another compute process already running) -- skipping only the atlas reproduction check this run (it needs the GPU); the CPU lesion/swap-set checks still run as a hard gate. Consider GRAPH_LAB_SKIP_REPRO=1 to skip the whole gate outright, or re-run the atlas check manually once the GPU is free: cd backend/graph_lab && uv run pytest -m spark -k AtlasReproductionTests -v\n' >&2
+    graph_lab_run_reproduction_checks 1
   else
-    graph_lab_run_reproduction_checks
+    graph_lab_run_reproduction_checks 0
   fi
   docker build -t "$GRAPH_LAB_IMAGE" -f backend/graph_lab/Dockerfile .
   printf 'graph-lab: built and tagged %s\n' "$GRAPH_LAB_IMAGE"
@@ -220,18 +320,33 @@ cmd_start() {
   origin=$(graph_lab_derive_origin "$deploy_url") || die 'DEPLOY_URL is not a valid http(s) URL; cannot derive its origin.'
   graph_lab_origin_in_list "$origin" "$origins" || die 'GRAPH_LAB_ORIGINS must include the origin derived from DEPLOY_URL.'
 
-  graph_lab_check_bind "$bind" || die 'GRAPH_LAB_BIND must exactly equal an address printed by `tailscale ip -4`. This rejects 0.0.0.0, LAN addresses, and an unset/empty value.'
+  local bind_status=0
+  graph_lab_check_bind "$bind" || bind_status=$?
+  case "$bind_status" in
+    0) : ;;
+    2) die 'GRAPH_LAB_BIND must exactly equal an address printed by `tailscale ip -4`, but that command printed no addresses at all -- tailscaled is likely not running or not connected. This check also rejects 0.0.0.0, LAN addresses, and an unset/empty value.' ;;
+    *) die 'GRAPH_LAB_BIND must exactly equal an address printed by `tailscale ip -4`; that command printed at least one address, but none matched -- check for a stale or mistyped GRAPH_LAB_BIND. This check also rejects 0.0.0.0, LAN addresses, and an unset/empty value.' ;;
+  esac
 
   command -v docker >/dev/null 2>&1 || die 'Missing command: docker'
 
   local subnet
   subnet=$(graph_lab_subnet)
+  graph_lab_validate_subnet "$subnet"
   graph_lab_ensure_network "$subnet"
 
-  if ! graph_lab_rule_present "$subnet"; then
-    graph_lab_ensure_rule "$subnet" || true
+  # Never trust $subnet (config) alone for the rule once a network may
+  # already exist: graph_lab_ensure_network above already refused on a real
+  # mismatch, but re-deriving it here from docker directly (rather than
+  # reusing the config value) keeps this check correct even if that guard
+  # is ever weakened later (ops-security thermo review, Important 2).
+  local rule_subnet
+  rule_subnet=$(graph_lab_effective_subnet "$subnet")
+
+  if ! graph_lab_rule_present "$rule_subnet"; then
+    graph_lab_ensure_rule "$rule_subnet" || true
   fi
-  graph_lab_rule_present "$subnet" || die 'The DOCKER-USER egress-drop rule for the graph-lab subnet is not present and could not be inserted (sudo may be required, or iptables is unavailable). Refusing to start the container without it.'
+  graph_lab_rule_present "$rule_subnet" || die 'The DOCKER-USER egress-drop rule for the graph-lab subnet is not present and could not be inserted (sudo may be required, or iptables is unavailable). Refusing to start the container without it.'
 
   local port=${GRAPH_LAB_PORT:-8766}
   export GRAPH_LAB_TOKEN="$token" GRAPH_LAB_ORIGINS="$origins"
@@ -241,7 +356,11 @@ cmd_start() {
   # must never print (see this file's header comment). Captured to a local
   # file instead of left connected to our own stderr; on failure, only a
   # generic, secret-free message is printed, pointing at that file for local
-  # inspection rather than echoing its contents here.
+  # inspection rather than echoing its contents here. That file is
+  # deliberately left on disk on failure (mode 0600, owner-only, per
+  # `mktemp`'s default) rather than auto-deleted -- delete it yourself once
+  # you're done inspecting it, since its name is random per attempt and this
+  # script has no reliable way to find and clean up a prior run's copy.
   local run_err
   run_err=$(mktemp)
   if ! docker run -d --name "$GRAPH_LAB_CONTAINER_NAME" --network "$GRAPH_LAB_NETWORK_NAME" --init --gpus all \
@@ -250,7 +369,7 @@ cmd_start() {
     -p "${bind}:${port}:8000" \
     -e GRAPH_LAB_TOKEN -e GRAPH_LAB_ORIGINS \
     "$GRAPH_LAB_IMAGE" >/dev/null 2>"$run_err"; then
-    die "docker run failed to start the container. Its stderr was saved to $run_err for local inspection (it may include the configured bind address -- do not paste it into a shared channel). Common causes: the port is already bound, or the GPU is unavailable."
+    die "docker run failed to start the container. Its stderr was saved to $run_err for local inspection, then delete it (it may include the configured bind address -- do not paste it into a shared channel). Common causes: the port is already bound, or the GPU is unavailable."
   fi
   rm -f -- "$run_err"
 
@@ -272,11 +391,21 @@ cmd_status() {
 
   if docker network inspect "$GRAPH_LAB_NETWORK_NAME" >/dev/null 2>&1; then
     printf 'network: present (%s)\n' "$GRAPH_LAB_NETWORK_NAME"
+    local actual_subnet
+    actual_subnet=$(graph_lab_network_subnet) || actual_subnet=""
+    if [[ -n "$actual_subnet" && "$actual_subnet" != "$subnet" ]]; then
+      printf 'network subnet: MISMATCH -- the network is actually on %s, but the configured GRAPH_LAB_SUBNET is %s. --start will refuse until you run --uninstall then --start again.\n' "$actual_subnet" "$subnet"
+    fi
   else
     printf 'network: MISSING (%s)\n' "$GRAPH_LAB_NETWORK_NAME"
   fi
 
-  if graph_lab_rule_present "$subnet"; then
+  # Never trust $subnet (config) alone: check the rule against the
+  # network's ACTUAL subnet when it exists (ops-security thermo review,
+  # Important 2), matching cmd_start's own logic.
+  local rule_subnet
+  rule_subnet=$(graph_lab_effective_subnet "$subnet")
+  if graph_lab_rule_present "$rule_subnet"; then
     printf 'egress-drop rule: present\n'
   else
     printf 'egress-drop rule: MISSING -- run --start to insert it (requires sudo)\n'
@@ -323,22 +452,31 @@ cmd_uninstall() {
   fi
   local subnet
   subnet=$(graph_lab_subnet)
+  graph_lab_validate_subnet "$subnet"
+  # Remove the rule keyed on the network's ACTUAL subnet (read before the
+  # network itself is torn down below), not just the configured value --
+  # if GRAPH_LAB_SUBNET drifted from the network's real subnet (the exact
+  # state graph_lab_ensure_network's mismatch check now prevents going
+  # forward), the rule that actually needs removing is the one covering
+  # the real subnet, not the currently-configured one.
+  local rule_subnet
+  rule_subnet=$(graph_lab_effective_subnet "$subnet")
 
   docker stop "$GRAPH_LAB_CONTAINER_NAME" >/dev/null 2>&1 || true
   docker rm "$GRAPH_LAB_CONTAINER_NAME" >/dev/null 2>&1 || true
 
-  if graph_lab_rule_present "$subnet"; then
+  if graph_lab_rule_present "$rule_subnet"; then
     command -v sudo >/dev/null 2>&1 || die 'sudo is required to remove the DOCKER-USER egress-drop rule.'
-    sudo iptables -D DOCKER-USER -s "$subnet" -m conntrack --ctstate NEW -j DROP || true
+    sudo iptables -D DOCKER-USER -s "$rule_subnet" -m conntrack --ctstate NEW -j DROP || true
   fi
   # Re-verify rather than trust the `-D` exit code (swallowed by `|| true`
   # above): a failed removal is not an exposure (a leftover DROP rule is
   # more restrictive, not less), but reporting "removed" when it is not
   # would be dishonest and could mislead a later --uninstall/--start.
   local rule_status
-  if graph_lab_rule_present "$subnet"; then
+  if graph_lab_rule_present "$rule_subnet"; then
     rule_status='still present'
-    printf 'graph-lab: WARNING: the egress-drop rule is still present after attempting removal. Remove it manually: sudo iptables -D DOCKER-USER -s %s -m conntrack --ctstate NEW -j DROP\n' "$subnet" >&2
+    printf 'graph-lab: WARNING: the egress-drop rule is still present after attempting removal. Remove it manually: sudo iptables -D DOCKER-USER -s %s -m conntrack --ctstate NEW -j DROP\n' "$rule_subnet" >&2
   else
     rule_status='removed'
   fi
