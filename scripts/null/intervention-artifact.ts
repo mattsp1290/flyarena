@@ -147,7 +147,12 @@ export interface PathwayInterventionsArtifact {
   readonly k: number;
   readonly kQ: number;
   readonly interventions: {
-    readonly P: PathwayInterventionGraphSummary & { readonly pRankAmongC: number; readonly pRankAmongM: number; readonly category: OutcomeCategory };
+    readonly P: PathwayInterventionGraphSummary & {
+      readonly pRankAmongC: number;
+      readonly pRankAmongM: number;
+      /** Never `'degenerate'` here -- `buildPathwayInterventionsArtifact` refuses any `--stats-only` input before this field is ever set (see `rejectDegenerateCategory`). */
+      readonly category: Exclude<OutcomeCategory, 'degenerate'>;
+    };
     readonly Q: PathwayInterventionGraphSummary & { readonly qRankAmongMQ: number; readonly channelSpecific: boolean };
     readonly R: { readonly applicable: boolean; readonly edgeCount: number; readonly reason: string };
   };
@@ -158,7 +163,8 @@ export interface PathwayInterventionsArtifact {
     readonly MQ: ArmDistribution & { readonly kQ: number };
   };
   readonly authored: {
-    readonly category: OutcomeCategory;
+    /** Never `'degenerate'` here -- see `PathwayInterventionsArtifact.interventions.P.category`'s own doc comment. */
+    readonly category: Exclude<OutcomeCategory, 'degenerate'>;
     readonly pRankAmongC: number;
     readonly pRankAmongM: number;
     readonly qRankAmongMQ: number;
@@ -212,6 +218,30 @@ export interface BuildArtifactInputs {
 }
 
 /**
+ * Narrows `OutcomeCategory` (which, since task-generality WP2, may be
+ * `'degenerate'`) down to the type `PathwayInterventionsArtifact`'s own
+ * `category` fields actually declare. Only ever throws as a
+ * defense-in-depth backstop: `buildPathwayInterventionsArtifact`'s own
+ * `--stats-only`/`armDegeneracy` guard already refuses any input that
+ * could produce `'degenerate'` here, so reaching this throw would mean that
+ * guard itself had a bug.
+ */
+const rejectDegenerateCategory = (category: OutcomeCategory, label: string): Exclude<OutcomeCategory, 'degenerate'> => {
+  if (category === 'degenerate') {
+    throw new Error(`intervention-artifact: ${label} is "degenerate" -- refusing to publish (the --stats-only guard above should have already caught this)`);
+  }
+  return category;
+};
+
+/** Same narrowing as `rejectDegenerateCategory`, for `QArmResult.channelSpecific` (`boolean | 'degenerate'` since task-generality WP2). */
+const rejectDegenerateChannelSpecific = (channelSpecific: boolean | 'degenerate', label: string): boolean => {
+  if (channelSpecific === 'degenerate') {
+    throw new Error(`intervention-artifact: ${label} is "degenerate" -- refusing to publish (the --stats-only guard above should have already caught this)`);
+  }
+  return channelSpecific;
+};
+
+/**
  * Pure builder: every input is already-read bytes/already-parsed objects
  * (no `readFileSync` inside this function) so `runPathwayInterventionsArtifact`
  * below can hash the exact bytes it also parses (the same TOCTOU-avoidance
@@ -243,6 +273,22 @@ export const buildPathwayInterventionsArtifact = (inputs: Readonly<BuildArtifact
       'intervention-artifact: statistics.json is diagnosticOnly, or its biologicalReproduction.matches is not true -- refusing to publish an artifact built from it'
     );
   }
+  // `.agents/plans/task-generality/00-overview.md`'s degenerate guard
+  // (task-generality WP2's `--stats-only` mode) can widen
+  // `statistics.p.category`/`statistics.q.channelSpecific` to `'degenerate'`
+  // -- a value this always-default-task published artifact must never
+  // carry (`pathway-interventions-v1.json`'s own schema predates that
+  // guard and has no `'degenerate'` case in `AUTHORED_CATEGORY_PROSE`
+  // below). Checked independently of `armDegeneracy`'s mere presence (a
+  // hand-edited/older `statistics.json` could theoretically carry one
+  // without the other) so this can't be bypassed by omitting one field.
+  if (statistics.statsOnly || statistics.armDegeneracy !== undefined) {
+    throw new Error(
+      'intervention-artifact: statistics.json is a --stats-only (per-task, task-generality WP2) result -- refusing to publish the default pathway-interventions-v1.json artifact from it'
+    );
+  }
+  const category = rejectDegenerateCategory(statistics.p.category, 'p.category');
+  const channelSpecific = rejectDegenerateChannelSpecific(statistics.q.channelSpecific, 'q.channelSpecific');
   if (
     !statistics.inputs ||
     typeof statistics.inputs.indexSha256 !== 'string' ||
@@ -347,7 +393,7 @@ export const buildPathwayInterventionsArtifact = (inputs: Readonly<BuildArtifact
         percentileInPublishedNull: statistics.p.percentileInPublishedNull,
         pRankAmongC: statistics.p.pRankAmongC,
         pRankAmongM: statistics.p.pRankAmongM,
-        category: statistics.p.category
+        category
       },
       Q: {
         id: 'Q',
@@ -357,7 +403,7 @@ export const buildPathwayInterventionsArtifact = (inputs: Readonly<BuildArtifact
         stopReason: attribution.Q.stopReason,
         percentileInPublishedNull: statistics.q.percentileInPublishedNull,
         qRankAmongMQ: statistics.q.qRankAmongMQ,
-        channelSpecific: statistics.q.channelSpecific
+        channelSpecific
       },
       R: attribution.R
     },
@@ -368,11 +414,11 @@ export const buildPathwayInterventionsArtifact = (inputs: Readonly<BuildArtifact
       MQ: { ...statistics.controls.MQ, kQ: attribution.Q.swaps }
     },
     authored: {
-      category: statistics.p.category,
+      category,
       pRankAmongC: statistics.p.pRankAmongC,
       pRankAmongM: statistics.p.pRankAmongM,
       qRankAmongMQ: statistics.q.qRankAmongMQ,
-      channelSpecific: statistics.q.channelSpecific,
+      channelSpecific,
       publishedNullFloor: statistics.publishedNullFloor,
       biologicalReproduction: statistics.biologicalReproduction,
       decoder: 'authored',
@@ -424,7 +470,7 @@ const renderTransferTable = (table: Transfer3x8): string => {
  * `- **Pathway supported:** ...`; this record holds everything from
  * `**Pathway supported:**` onward, unchanged).
  */
-const AUTHORED_CATEGORY_PROSE: Record<OutcomeCategory, string> = {
+const AUTHORED_CATEGORY_PROSE: Record<Exclude<OutcomeCategory, 'degenerate'>, string> = {
   'pathway-supported': "**Pathway supported:** P's score is at or above the null's 25th percentile **and** above the 95th percentile of both the C and M distributions.",
   'edge-class-effect': "**Edge-class effect:** P is at or above the null's 25th percentile and above C's 95th percentile, **but** at or below M's 95th percentile. Any input→thrust edges of this class help about equally, and the specific optimized edges do not matter.",
   'generic-rewiring-effect': "**Generic rewiring effect:** P is at or above the null's 25th percentile **but** at or below C's 95th percentile. Any `k` swaps help about equally.",

@@ -9,6 +9,7 @@ import type { ArenaConfig } from '../../src/lib/arena/config';
 import { requireNonNegativeInt, requirePositiveInt, requireValue } from '../training/cli';
 import { atomicWriteFileSync, sha256Hex } from '../training/fsio';
 import { buildSeedTrace, parseGraphArtifactBytes, TRACE_SUBSTEPS } from '../training/export-traces';
+import { collectRepoRelativeDependencies, computeSourceIdentitySha256 } from '../lib/import-graph';
 import { quantileIndex } from './null-stats';
 import { parseArenaTaskArg } from './arena-task-fields';
 
@@ -154,6 +155,21 @@ export const collectClearanceSamples = (
   return samples;
 };
 
+/**
+ * `scripts/lib/import-graph.ts`'s code-identity scheme (`regime-check.ts`'s
+ * `regimeProducer`, `repertoire-report.ts`'s `repertoireNullProducer`,
+ * `intervention-artifact.ts`'s own `producer` all follow this exact shape)
+ * -- a maintainability-review finding: this file was the one report script
+ * in this family that omitted it, so no downstream consumer (WP4) could
+ * verify a `clearance.json` was produced by the code at the commit being
+ * published.
+ */
+export interface TaskClearanceProducer {
+  readonly script: string;
+  readonly sourceSha256: string;
+  readonly dependencies: readonly string[];
+}
+
 export interface TaskClearanceReport {
   readonly version: 1;
   readonly arenaTask: { readonly id: string; readonly fingerprint: string };
@@ -163,9 +179,29 @@ export interface TaskClearanceReport {
   readonly ticks: number;
   readonly substeps: number;
   readonly channels: Record<ClearanceChannel, ChannelPercentiles>;
+  readonly producer: TaskClearanceProducer;
+  readonly host: { readonly arch: string; readonly node: string };
 }
 
-/** Pure: takes an already-loaded/validated graph and its already-hashed bytes, so this has no filesystem dependency of its own (see `runTaskClearance` for the I/O-performing caller). */
+/**
+ * `taskClearanceProducer()`'s own doc comment for why this exists. Computed
+ * once and passed in by the caller (`runTaskClearance`, or a test) rather
+ * than read from `import.meta.url`/the filesystem inside this function --
+ * this keeps `buildTaskClearanceReport` itself pure (deterministic given
+ * its arguments, no I/O of its own), matching every other pure function in
+ * this file.
+ */
+export const taskClearanceProducer = (): TaskClearanceProducer => {
+  const entryFile = fileURLToPath(import.meta.url);
+  const dependencies = collectRepoRelativeDependencies(entryFile, repoRoot);
+  return {
+    script: 'scripts/null/task-clearance.ts',
+    sourceSha256: computeSourceIdentitySha256(repoRoot, dependencies),
+    dependencies
+  };
+};
+
+/** Pure: takes an already-loaded/validated graph, its already-hashed bytes, and its already-computed producer/host info, so this has no filesystem or `process.*` dependency of its own (see `runTaskClearance` for the I/O-performing caller). */
 export const buildTaskClearanceReport = (
   graph: Readonly<ConnectomeGraph>,
   graphPath: string,
@@ -174,7 +210,9 @@ export const buildTaskClearanceReport = (
   seedStart: number,
   seedCount: number,
   ticks: number,
-  substeps: number
+  substeps: number,
+  producer: Readonly<TaskClearanceProducer>,
+  host: { readonly arch: string; readonly node: string }
 ): TaskClearanceReport => {
   const resolved = resolveArenaTask(arenaTaskId);
   const samples = collectClearanceSamples(graph, resolved, seedStart, seedCount, ticks, substeps);
@@ -189,7 +227,9 @@ export const buildTaskClearanceReport = (
     seeds: { start: seedStart, count: seedCount },
     ticks,
     substeps,
-    channels
+    channels,
+    producer,
+    host
   };
 };
 
@@ -294,7 +334,9 @@ export const runTaskClearance = (
     args.seedStart,
     args.seedCount,
     args.ticks,
-    args.substeps
+    args.substeps,
+    taskClearanceProducer(),
+    { arch: process.arch, node: process.version }
   );
 
   mkdirSync(dirname(args.out), { recursive: true });

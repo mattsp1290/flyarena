@@ -290,6 +290,31 @@ describe('buildPathwayInterventionsArtifact', () => {
     expect(() => buildPathwayInterventionsArtifact(buildInputs({ statistics }))).toThrow(/diagnosticOnly, or its biologicalReproduction\.matches is not true/);
   });
 
+  // Task-generality WP2's --stats-only mode can widen p.category/
+  // q.channelSpecific to 'degenerate' -- this always-default-task published
+  // artifact must never carry that value.
+  it('refuses to build when statistics.statsOnly is true', () => {
+    const statistics = { ...statisticsFixture(), statsOnly: true as const };
+    expect(() => buildPathwayInterventionsArtifact(buildInputs({ statistics }))).toThrow(
+      /--stats-only \(per-task, task-generality WP2\) result/
+    );
+  });
+
+  it('refuses to build when statistics.armDegeneracy is present, even without statsOnly (independent check)', () => {
+    const armDegeneracy = {
+      nullArm: { iqr: 1, degenerate: false },
+      cArm: { iqr: 1, degenerate: false },
+      mArm: { iqr: 1, degenerate: false },
+      mqArm: { iqr: 1, degenerate: false },
+      categoryDegenerate: false,
+      channelSpecificDegenerate: false
+    };
+    const statistics = { ...statisticsFixture(), armDegeneracy };
+    expect(() => buildPathwayInterventionsArtifact(buildInputs({ statistics }))).toThrow(
+      /--stats-only \(per-task, task-generality WP2\) result/
+    );
+  });
+
   it("throws when trained.json's graphListSha256 does not match index.json's sha256 (stale trained.json)", () => {
     const trainedRaw = { ...trainedFixture(), graphListSha256: SHA('stale') };
     expect(() => buildPathwayInterventionsArtifact(buildInputs({ trainedRaw }))).toThrow(

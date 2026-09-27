@@ -12,6 +12,7 @@ import {
   computeChannelPercentiles,
   parseTaskClearanceArgs,
   runTaskClearance,
+  taskClearanceProducer,
   type TaskClearanceArgs
 } from '../../scripts/null/task-clearance';
 import { dirname, resolve as resolvePath } from 'node:path';
@@ -112,9 +113,22 @@ describe('collectClearanceSamples', () => {
 describe('buildTaskClearanceReport', () => {
   const graph = createTraceGraph();
   const graphSha256 = 'f'.repeat(64);
+  const FIXTURE_PRODUCER = { script: 'scripts/null/task-clearance.ts', sourceSha256: 'p'.repeat(64), dependencies: ['a.ts', 'b.ts'] };
+  const FIXTURE_HOST = { arch: 'arm64', node: 'v22.22.3' };
 
   it('records the resolved arena task id/fingerprint and every clearance channel', () => {
-    const report = buildTaskClearanceReport(graph, '/fixture/graph.bin.gz', graphSha256, 'hazard-heavy', 1, 4, 25, 4);
+    const report = buildTaskClearanceReport(
+      graph,
+      '/fixture/graph.bin.gz',
+      graphSha256,
+      'hazard-heavy',
+      1,
+      4,
+      25,
+      4,
+      FIXTURE_PRODUCER,
+      FIXTURE_HOST
+    );
     expect(report.version).toBe(1);
     expect(report.arenaTask).toEqual({ id: 'hazard-heavy', fingerprint: resolveArenaTask('hazard-heavy').fingerprint });
     expect(report.graph).toEqual({ path: '/fixture/graph.bin.gz', sha256: graphSha256 });
@@ -122,26 +136,61 @@ describe('buildTaskClearanceReport', () => {
     expect(report.ticks).toBe(25);
     expect(report.substeps).toBe(4);
     expect(report.sensorRange).toBe(resolveArenaTask('hazard-heavy').config.sensorRange);
+    expect(report.producer).toEqual(FIXTURE_PRODUCER);
+    expect(report.host).toEqual(FIXTURE_HOST);
     for (const channel of CLEARANCE_CHANNELS) {
       expect(report.channels[channel].n).toBe(4 * 25);
     }
   });
 
   it('defaults to the default task when arenaTask is omitted', () => {
-    const report = buildTaskClearanceReport(graph, '/fixture/graph.bin.gz', graphSha256, undefined, 1, 2, 10, 4);
+    const report = buildTaskClearanceReport(
+      graph,
+      '/fixture/graph.bin.gz',
+      graphSha256,
+      undefined,
+      1,
+      2,
+      10,
+      4,
+      FIXTURE_PRODUCER,
+      FIXTURE_HOST
+    );
     expect(report.arenaTask.id).toBe('default');
   });
 
   it('is byte-identical across two runs against the same inputs (JSON.stringify)', () => {
-    const first = buildTaskClearanceReport(graph, '/fixture/graph.bin.gz', graphSha256, 'no-movement', 1, 3, 20, 4);
-    const second = buildTaskClearanceReport(graph, '/fixture/graph.bin.gz', graphSha256, 'no-movement', 1, 3, 20, 4);
+    const first = buildTaskClearanceReport(
+      graph,
+      '/fixture/graph.bin.gz',
+      graphSha256,
+      'no-movement',
+      1,
+      3,
+      20,
+      4,
+      FIXTURE_PRODUCER,
+      FIXTURE_HOST
+    );
+    const second = buildTaskClearanceReport(
+      graph,
+      '/fixture/graph.bin.gz',
+      graphSha256,
+      'no-movement',
+      1,
+      3,
+      20,
+      4,
+      FIXTURE_PRODUCER,
+      FIXTURE_HOST
+    );
     expect(JSON.stringify(first)).toBe(JSON.stringify(second));
   });
 
   it('rejects an unknown arena task id', () => {
-    expect(() => buildTaskClearanceReport(graph, '/fixture/graph.bin.gz', graphSha256, 'bogus-task', 1, 2, 10, 4)).toThrow(
-      /unknown arena task id/
-    );
+    expect(() =>
+      buildTaskClearanceReport(graph, '/fixture/graph.bin.gz', graphSha256, 'bogus-task', 1, 2, 10, 4, FIXTURE_PRODUCER, FIXTURE_HOST)
+    ).toThrow(/unknown arena task id/);
   });
 });
 
@@ -215,6 +264,25 @@ describe('runTaskClearance (file I/O)', () => {
     expect(report.graph.sha256).toBe(sha256Hex(readFileSync(graphPath)));
   });
 
+  it('stamps a real producer (code-identity) and host block, matching a direct taskClearanceProducer() call', () => {
+    const graphPath = writeFixtureGraph();
+    const { report } = runTaskClearance({
+      graph: graphPath,
+      arenaTask: 'crowded',
+      seedStart: 1,
+      seedCount: 1,
+      ticks: 5,
+      substeps: 4,
+      out: join(root, 'clearance.json')
+    });
+    expect(report.producer).toEqual(taskClearanceProducer());
+    expect(report.producer.script).toBe('scripts/null/task-clearance.ts');
+    expect(report.producer.sourceSha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(report.producer.dependencies).toContain('scripts/null/task-clearance.ts');
+    expect(report.producer.dependencies).toContain('scripts/lib/import-graph.ts');
+    expect(report.host).toEqual({ arch: process.arch, node: process.version });
+  });
+
   it('records the graph path relative to the repo root when the graph lives inside it (reproducible across checkouts)', () => {
     const out = join(root, 'clearance.json');
     const { report } = runTaskClearance({
@@ -273,5 +341,19 @@ describe('runTaskClearance (file I/O)', () => {
     runTaskClearance(args);
     runTaskClearance({ ...args, out: join(root, 'run2.json') });
     expect(readFileSync(join(root, 'run1.json'), 'utf8')).toBe(readFileSync(join(root, 'run2.json'), 'utf8'));
+  });
+});
+
+describe('taskClearanceProducer', () => {
+  it('is deterministic (same dependency set and sourceSha256 across two calls)', () => {
+    expect(taskClearanceProducer()).toEqual(taskClearanceProducer());
+  });
+
+  it('walks a real, non-trivial dependency closure including its own imports', () => {
+    const producer = taskClearanceProducer();
+    expect(producer.dependencies.length).toBeGreaterThan(5);
+    expect(producer.dependencies).toContain('scripts/training/export-traces.ts');
+    expect(producer.dependencies).toContain('scripts/null/null-stats.ts');
+    expect(producer.dependencies).toContain('scripts/null/arena-task-fields.ts');
   });
 });

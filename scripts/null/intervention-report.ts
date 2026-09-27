@@ -9,6 +9,7 @@ import { conditionRng, mean, pairedStats, type ConditionStats, type PairedStats 
 import { parseArenaTaskArg } from './arena-task-fields';
 import { assertConsistentInputs } from './intervention-report-validation';
 import { graphStats, quantileIndex, rankStatistics, type RankStatistics } from './null-stats';
+import { evaluateDegenerateGuard, type DegenerateGuardResult } from './intervention-degenerate-guard';
 import type { NullDecoderKind } from './null-worker';
 import type { NullGraphListEvaluationRaw } from './null-evaluate';
 
@@ -375,7 +376,22 @@ export const publishedNullFloorValue = (publishedNull: Readonly<PublishedNull>):
   return sorted[quantileIndex(sorted.length, NULL_FLOOR_PERCENTILE)];
 };
 
-export type OutcomeCategory = 'pathway-supported' | 'edge-class-effect' | 'generic-rewiring-effect' | 'not-supported';
+export type OutcomeCategory =
+  | 'pathway-supported'
+  | 'edge-class-effect'
+  | 'generic-rewiring-effect'
+  | 'not-supported'
+  /**
+   * `.agents/plans/task-generality/00-overview.md`'s predeclared degenerate
+   * guard (quoted on `evaluateDegenerateGuard`'s own doc comment below) --
+   * never returned by `evaluateCategory` itself (a pure function with no
+   * notion of arm degeneracy); only `runInterventionReport`'s `--stats-only`
+   * path overrides a raw `evaluateCategory` result to this value. Reusing
+   * `evaluateCategory`'s own return type (rather than a separate wrapper
+   * type) means a `--stats-only` consumer's `switch` over `OutcomeCategory`
+   * is forced by the type checker to handle this case.
+   */
+  | 'degenerate';
 
 /**
  * `00-overview.md`'s "Predeclared outcome categories (authored decoder)",
@@ -415,6 +431,14 @@ export const evaluateChannelSpecific = (
   mqArm: Readonly<ArmDistribution>
 ): boolean => qScore > nullFloorScore && qScore > mqArm.p95;
 
+// `evaluateDegenerateGuard`/`ArmDegeneracyInfo`/`DegenerateGuardResult` live
+// in `./intervention-degenerate-guard` (extracted out of this file -- a
+// thermo-maintainability finding: this file was already near the repo's
+// 1000-line review-blocker threshold). Re-exported here so an existing
+// `import { evaluateDegenerateGuard } from './intervention-report'` still
+// works.
+export { evaluateDegenerateGuard, type ArmDegeneracyInfo, type DegenerateGuardResult } from './intervention-degenerate-guard';
+
 // ---------------------------------------------------------------------------
 // Full report
 // ---------------------------------------------------------------------------
@@ -438,7 +462,14 @@ export interface QArmResult {
   readonly percentileInPublishedNull: number;
   /** `(k+1)/(n+1)` rank statistic of Q among its own size-matched class control MQ (smaller means Q ranks higher; see `PArmResult.pRankAmongC`'s doc comment). Q is never ranked against C or M. */
   readonly qRankAmongMQ: number;
-  readonly channelSpecific: boolean;
+  /**
+   * `evaluateChannelSpecific`'s raw boolean, except in a `--stats-only` run
+   * where `evaluateDegenerateGuard(...).channelSpecificDegenerate` is true
+   * -- see that function's own doc comment for why (a repo-specific
+   * extension of the plan's degenerate guard to MQ/the channel-specific
+   * result, which the plan itself does not cover).
+   */
+  readonly channelSpecific: boolean | 'degenerate';
 }
 
 export interface InterventionStatistics {
@@ -508,6 +539,12 @@ export interface InterventionStatistics {
    * input.
    */
   readonly statsOnly?: true;
+  /**
+   * `evaluateDegenerateGuard`'s result — present only when `--stats-only`
+   * was passed. `p.category`/`q.channelSpecific` above already reflect this
+   * guard (never left for a downstream reader to separately apply).
+   */
+  readonly armDegeneracy?: DegenerateGuardResult;
 }
 
 /** `id < id` string ordering — matches `null-evaluate.ts`'s `sortedGraphListEntries`, so this module's output key order is independent of `authored.json`'s own array order (itself already sorted the same way, but this does not assume that). */
@@ -890,13 +927,42 @@ export const runInterventionReport = (
   // it, so a clean run's output is byte-identical whether or not the flag
   // was passed. `statistics` itself (from the pure `buildInterventionStatistics`)
   // never carries this field.
+  // `evaluateDegenerateGuard`, `--stats-only` only -- see its own doc
+  // comment. Uses the already-sorted `statistics.controls.*.scores` and
+  // `publishedNull.scores` (the same array `null-report.ts` fed its own
+  // `nullSummary` call), so this stays consistent with that file's
+  // `null.degenerate` flag by construction.
+  const degenerateGuard = args.statsOnly
+    ? evaluateDegenerateGuard(
+        publishedNull.scores,
+        statistics.controls.C.scores,
+        statistics.controls.M.scores,
+        statistics.controls.MQ.scores
+      )
+    : undefined;
+
   const output: InterventionStatistics = {
     ...statistics,
     ...(args.allowReproductionMismatch && !statistics.biologicalReproduction.matches ? { diagnosticOnly: true } : {}),
     ...(args.arenaTask !== undefined
       ? { arenaTask: { id: resolvedArenaTask.id, fingerprint: resolvedArenaTask.fingerprint } }
       : {}),
-    ...(args.statsOnly ? { statsOnly: true } : {})
+    ...(args.statsOnly ? { statsOnly: true } : {}),
+    ...(degenerateGuard
+      ? {
+          armDegeneracy: degenerateGuard,
+          p: {
+            ...statistics.p,
+            category: degenerateGuard.categoryDegenerate ? ('degenerate' as const) : statistics.p.category
+          },
+          q: {
+            ...statistics.q,
+            channelSpecific: degenerateGuard.channelSpecificDegenerate
+              ? ('degenerate' as const)
+              : statistics.q.channelSpecific
+          }
+        }
+      : {})
   };
 
   guardCanonicalOutDefault(args.out, output);
