@@ -130,6 +130,166 @@ restart that image with the same approved token/origins. Active jobs are ephemer
 export before restarting. Static release rollback and backend rollback are separate.
 This integration does not replace an already-running backend automatically.
 
+## Real-graph lab (WP4 of `.agents/plans/graph-lab`)
+
+The private real-graph lab is a separate service from the synthetic sandbox
+above: `backend/graph_lab/`, launched with `scripts/graph-lab.sh`, bound only
+to the Spark's Tailscale address, on a dedicated Docker bridge network whose
+subnet is denied egress by a `DOCKER-USER` iptables rule. See
+`docs/graph-lab.md` for what it is, its job types, provenance, and privacy
+model. This section is the operator runbook: build, start, stop, token
+rotation, and verification. **Every value below is a placeholder** --
+`<TAILNET_ADDRESS>`, `<TAILNET_ORIGIN>`, and `<PORT>` -- never a real
+hostname, origin, or IP address, matching this file's own rule.
+
+Phase split: `scripts/graph-lab.sh`, this runbook, and `docs/graph-lab.md`
+were written and tested without sudo, without a real container, and without
+touching the tailnet (`scripts/verify/graph-lab.test.sh`, run against
+PATH-stubbed `tailscale`/`iptables`/`sudo`/`docker`). The steps below are for
+the owner to run for real, on the Spark, with a token the owner supplies.
+The launch record (date, commit, image digest, bundle sha, and the bind
+**interface name** `tailscale0` -- never the token, hostname, or IP) is left
+for the owner to add here after a real launch, in the same dated-entry style
+as the sections above.
+
+### Build
+
+```bash
+./scripts/graph-lab.sh --build
+```
+
+Runs `npm run graph-lab:bundle`, then the gate-2 reproduction checks from
+`backend/graph_lab/tests/test_reproduction.py` (lesion and swap-set are a
+hard gate; the atlas check is tolerance-based and retried, per
+`docs/graph-lab.md`'s "Reproduction checks" section), then builds and tags
+`flyarena-graph-lab:local` from `backend/graph_lab/Dockerfile`. Set
+`GRAPH_LAB_SKIP_REPRO=1` to skip the reproduction checks while another GPU
+job is already running on the Spark, and re-run them once the GPU is free.
+
+### Start
+
+1. In `.env` (copied from `.env.example`, never committed), set
+   `GRAPH_LAB_TOKEN` (at least 16 characters, owner-supplied),
+   `GRAPH_LAB_ORIGINS` (must include the origin of `DEPLOY_URL`), and
+   `GRAPH_LAB_BIND` to the exact value printed by `tailscale ip -4` on the
+   Spark. `GRAPH_LAB_BIND` is rejected if it is `0.0.0.0`, a LAN address, or
+   anything else `tailscale ip -4` does not itself print.
+2. Run:
+
+   ```bash
+   ./scripts/graph-lab.sh --start
+   ```
+
+   This creates the dedicated bridge network (`flyarena-graph-lab-net`, a
+   fixed subnet, `GRAPH_LAB_SUBNET` if you need to override the default
+   `172.31.250.0/24`) idempotently, confirms the `DOCKER-USER` egress-drop
+   rule is present (inserting it with `sudo` only if `iptables -C` reports it
+   missing), and refuses to start the container at all if that rule cannot
+   be confirmed present afterward. It never prints the token, origins, or
+   bind address.
+3. Check status any time with `./scripts/graph-lab.sh --status`. It reports
+   network/rule/container state and whether the bind is still valid
+   (`bind: OK (tailscale0)` or `bind: MISMATCH`), never the address itself.
+
+### Stop / uninstall
+
+- `./scripts/graph-lab.sh --stop` stops and removes the container only. The
+  egress-drop rule and network are left in place (they only ever affect the
+  dedicated subnet, so leaving them is harmless).
+- `./scripts/graph-lab.sh --uninstall` also removes the egress-drop rule and
+  the network -- use this to fully tear the lab down, not for a routine
+  restart (a routine restart is `--stop` then `--start`).
+
+### Token rotation
+
+1. Generate a new token (at least 16 characters) and update `GRAPH_LAB_TOKEN`
+   in `.env`. Do not reuse the old token.
+2. `./scripts/graph-lab.sh --stop && ./scripts/graph-lab.sh --start` --
+   the container always reads `GRAPH_LAB_TOKEN` fresh from the environment at
+   start, so this is the only way to rotate it (there is no live-reload).
+3. Update the token in whatever browser session(s) hold the old one; it lives
+   only in page memory there, so each open tab needs the new value entered
+   by hand.
+4. Confirm the old token is rejected (401) and the new one is accepted,
+   using the verification steps below.
+
+### Verification (run each as its own command)
+
+```bash
+curl http://<TAILNET_ADDRESS>:<PORT>/api/graph/v1/health
+```
+
+Expect HTTP 200 with `bundleSha256` and `graphSha256` populated.
+
+```bash
+curl http://127.0.0.1:<PORT>/api/graph/v1/health
+```
+
+Expect this to fail (connection refused) -- the service must not be
+reachable on loopback or any interface other than the tailnet address.
+
+```bash
+curl -i http://<TAILNET_ADDRESS>:<PORT>/api/graph/v1/jobs
+```
+
+Expect 401 (no token).
+
+```bash
+curl -i -X OPTIONS http://<TAILNET_ADDRESS>:<PORT>/api/graph/v1/jobs \
+  -H 'Origin: http://evil.example' \
+  -H 'Access-Control-Request-Method: POST'
+```
+
+Expect no `Access-Control-Allow-Origin` header.
+
+```bash
+curl -i -X OPTIONS http://<TAILNET_ADDRESS>:<PORT>/api/graph/v1/jobs \
+  -H "Origin: <TAILNET_ORIGIN>" \
+  -H 'Access-Control-Request-Method: POST' \
+  -H 'Access-Control-Request-Private-Network: true'
+```
+
+Expect `Access-Control-Allow-Origin: <TAILNET_ORIGIN>` and
+`Access-Control-Allow-Private-Network: true`.
+
+```bash
+docker exec flyarena-graph-lab python -c "import socket; socket.create_connection(('1.1.1.1', 443), 3)"
+```
+
+Expect this to fail (no egress) -- confirms the `DOCKER-USER` rule is
+actually enforced from inside the container, not just present in the
+ruleset.
+
+```bash
+sudo systemctl restart tailscaled
+```
+
+With the container still running, re-check `/health` on `<TAILNET_ADDRESS>`.
+Record the observed behavior here once run (does the binding survive a
+`tailscaled` restart, or is it lost?). If it is lost, the documented
+recovery is `./scripts/graph-lab.sh --stop && ./scripts/graph-lab.sh --start`,
+which `--status` also detects and reports (`bind: MISMATCH`).
+
+### Reboot / iptables persistence
+
+`iptables` rules, including the `DOCKER-USER` egress-drop rule this script
+manages, **do not persist across a host reboot** unless a separate
+persistence mechanism (e.g. `iptables-persistent`, a systemd unit that
+restores the ruleset at boot) is configured on the Spark -- this script does
+not install one. After any reboot, run `./scripts/graph-lab.sh --status`
+before assuming the lab is safe to use, and `--start` (which re-checks and
+re-inserts the rule if needed) before relying on it. **Any future
+auto-restart (e.g. a systemd unit) must call `scripts/graph-lab.sh --start`,
+never a bare `docker start`** -- only `--start` re-verifies and re-inserts
+the egress-drop rule; a bare `docker start` would bring the container back
+up with no guarantee the rule survived the reboot.
+
+### Launch record
+
+_(Left for the owner to fill in after a real launch on the Spark: date,
+commit, image digest, bundle sha, and the bind interface name `tailscale0`
+-- never the token, hostname, or IP address.)_
+
 ## Integrated workbench release
 
 On 2026-09-24, main revision `bc10c22` was deployed as
