@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { dirname, resolve, sep } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { requireNonNegativeInt, requirePositiveInt, requireValue } from '../training/cli';
@@ -278,49 +278,10 @@ export const parseInterventionReportArgs = (argv: readonly string[]): Interventi
   };
 };
 
-/**
- * `.agents/plans/selection-robustness/02-per-selection-chain.md` WP2: the
- * same "only the shipped graph may write into the shipped tree" refusal
- * `scripts/null/null-report.ts`'s `guardSelectionScratchTarget` enforces,
- * mirrored here for `intervention-report.ts`'s own `--out` (its only write
- * path). Keyed on `sourceGraphSha256` (the graph `--authored`/`--index`
- * were actually scored against — `raw.sourceGraphSha256`) versus the
- * *shipped* manifest's `binarySha256`, read from `publicDataDir` — never
- * `--null`, which for a selection's own scratch null would trivially
- * "match itself". A directory-*prefix* check (like `null-report-variant.
- * ts`'s `guardVariantOutPath` tree block), not an exact-path one — a
- * differently-named file under `public/` or `docs/` must be refused too.
- * Applies unconditionally. Fails safe: an unreadable/missing shipped
- * manifest is treated as "graph not shipped". `intervention-report.ts`
- * itself has no default `--out` under `public/`/`docs/` today (`DEFAULT_OUT`
- * is under `training/runs/`), so this guard only ever fires for a caller
- * who explicitly pointed `--out` there.
- */
-export const guardSelectionScratchOut = (
-  outPath: string,
-  sourceGraphSha256: string,
-  publicDataDir: string,
-  docsDir: string
-): void => {
-  const shippedManifestPath = resolve(publicDataDir, 'malecns-arena-v1.manifest.json');
-  let shippedSha256: string | undefined;
-  try {
-    const shippedManifest = JSON.parse(readFileSync(shippedManifestPath, 'utf8')) as { binarySha256?: string };
-    shippedSha256 = shippedManifest.binarySha256;
-  } catch {
-    shippedSha256 = undefined;
-  }
-  if (shippedSha256 !== undefined && shippedSha256 === sourceGraphSha256) return;
-  const resolved = resolve(outPath);
-  for (const shippedDir of [resolve(publicDataDir, '..'), resolve(docsDir)]) {
-    if (resolved === shippedDir || resolved.startsWith(shippedDir + sep)) {
-      throw new Error(
-        `intervention-report: --out (${resolved}) resolves under ${shippedDir}, but this run was scored ` +
-          `against a graph with sha256 ${sourceGraphSha256}, which does not match the shipped biological graph` +
-          `${shippedSha256 !== undefined ? ` (${shippedSha256})` : ' (the shipped manifest could not be read)'} ` +
-          '-- refusing to write a non-shipped-graph artifact into a shipped tree. Pass an explicit scratch path ' +
-          'outside public/ and docs/ (e.g. training/runs/selections/<id>/...).'
-      );
-    }
-  }
-};
+// Selection-scratch mode guard (`.agents/plans/selection-robustness/
+// 02-per-selection-chain.md` WP2) -- see `./selection-scratch-guard.ts`'s
+// doc comment for the full rationale. Extracted there (a thermo-
+// maintainability review finding) because this module's `guardSelectionScratchOut`
+// duplicated `null-report.ts`'s identical `guardSelectionScratchTarget`;
+// `intervention-report.ts` now imports the shared
+// `guardSelectionScratchTarget` directly from `./selection-scratch-guard`.

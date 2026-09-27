@@ -68,14 +68,25 @@ def guard_selection_scratch_target(
     republish path only, where writing the shipped graph's own artifacts
     back to their shipped paths is the entire point.
 
-    Fails safe: an unreadable/missing shipped manifest is treated as
-    "graph not shipped".
+    Fails safe: an unreadable/missing/corrupt shipped manifest is treated
+    as "graph not shipped" -- both a missing file (``FileNotFoundError``,
+    via ``.exists()``) and a present-but-corrupt one (``OSError``/
+    ``json.JSONDecodeError``, e.g. a half-written ``git merge`` conflict or
+    an interrupted editor save) are caught here, matching the TypeScript
+    sibling guard's ``try { ... } catch { shippedSha256 = undefined; }``
+    (a thermo-methodology review finding: this call site previously only
+    guarded against a *missing* file via ``.exists()``, so a corrupt one
+    raised an uncaught ``JSONDecodeError`` instead of the documented
+    graceful refusal).
     """
     shipped_manifest_path = public_data_dir / "malecns-arena-v1.manifest.json"
     shipped_sha256: str | None = None
     if shipped_manifest_path.exists():
-        with shipped_manifest_path.open("r") as fh:
-            shipped_sha256 = json.load(fh).get("binarySha256")
+        try:
+            with shipped_manifest_path.open("r") as fh:
+                shipped_sha256 = json.load(fh).get("binarySha256")
+        except (OSError, json.JSONDecodeError):
+            shipped_sha256 = None
     if not selection_mode and shipped_sha256 is not None and shipped_sha256 == source_graph_sha256:
         return
     resolved = path.resolve()

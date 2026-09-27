@@ -1045,3 +1045,32 @@ def test_non_selection_mode_allows_public_data_out_when_graph_sha_matches_shippe
         docs_dir=fake_docs,
         selection_mode=False,
     )  # must not raise
+
+
+def test_guard_selection_scratch_target_fails_safe_on_a_corrupt_shipped_manifest(tmp_path) -> None:
+    # A thermo-methodology review finding: an earlier version of this guard
+    # only handled a MISSING shipped manifest (`.exists()`) -- a
+    # present-but-corrupt one (e.g. a half-written `git merge` conflict or
+    # an interrupted editor save) raised an uncaught `JSONDecodeError`
+    # instead of the documented "fails safe: unreadable/missing/corrupt ...
+    # treated as 'graph not shipped'" refusal. This never crosses a write
+    # boundary either way (both the crash and the graceful refusal happen
+    # before anything is written), but the graceful refusal is what the doc
+    # comment promises, so it's what must actually happen.
+    fake_public_data = tmp_path / "shipped" / "public" / "data"
+    fake_docs = tmp_path / "shipped" / "docs"
+    fake_public_data.mkdir(parents=True)
+    fake_docs.mkdir(parents=True)
+    (fake_public_data / "malecns-arena-v1.manifest.json").write_text("{not valid json")
+
+    out_path = fake_public_data / "null-explanation-selection-larger.json"
+    with pytest.raises(ValueError, match="resolves under"):
+        explain.explain_selection_mode.guard_selection_scratch_target(
+            out_path,
+            "--out",
+            "a" * 64,
+            public_data_dir=fake_public_data,
+            docs_dir=fake_docs,
+            selection_mode=False,
+        )
+    assert not out_path.exists()

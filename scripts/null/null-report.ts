@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
-import { basename, dirname, resolve, sep } from 'node:path';
+import { basename, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { requireNonNegativeInt, requirePositiveInt, requireValue } from '../training/cli';
@@ -21,6 +21,7 @@ import { buildTrainedSection, renderTrainedSection, type TrainedSection } from '
 import { guardVariantOutPath, resolveCondition, type RewiringNullCondition } from './null-report-variant';
 import type { NullTrainedEvaluationRaw } from './null-trained-evaluate';
 import type { NullDecoderKind } from './null-worker';
+import { guardSelectionScratchTarget } from './selection-scratch-guard';
 
 /**
  * `.agents/plans/rewiring-null/02-authored-null-evaluation.md`'s
@@ -45,6 +46,9 @@ const DEFAULT_TRAINED = resolve(repoRoot, 'training/runs/null/trained.json');
 export const DEFAULT_OUT = resolve(repoRoot, 'public/data/rewiring-null-v1.json');
 export const DEFAULT_REPORT_MD = resolve(repoRoot, 'docs/rewiring-null-report.md');
 export const DEFAULT_MANIFEST = resolve(repoRoot, 'public/data/malecns-arena-v1.manifest.json');
+/** `guardSelectionScratchTarget`'s shipped-tree roots (selection-robustness WP2), matching `intervention-report.ts`'s own `PUBLIC_DATA_DIR`/`DOCS_DIR` convention. */
+const PUBLIC_DATA_DIR = resolve(repoRoot, 'public/data');
+const DOCS_DIR = resolve(repoRoot, 'docs');
 /** The already-merged trained-readout study this report's trained section cites `gpuRerunFitnessDelta` from (see `buildTrainedSection`). */
 export const DEFAULT_TRAINED_READOUT_MANIFEST = resolve(repoRoot, 'public/data/trained-readout-v1.manifest.json');
 
@@ -795,54 +799,12 @@ const verifySourceGraphMatchesManifest = (
   }
 };
 
-/**
- * Selection-scratch mode guard (`.agents/plans/selection-robustness/
- * 02-per-selection-chain.md` WP2): a per-selection chain reuses this file's
- * ordinary (non-`--variant-out`) publish path against a scratch
- * `training/runs/selections/<id>/` output tree, with a real
- * 500-rewired-graph `--authored` input -- so `guardShippedDefault` above
- * (keyed on *exact-path equality* with the three shipped defaults) never
- * fires for it, the same way it never fires for any other explicit scratch
- * `--out`/`--report-md`/`--manifest`. But that exact-path check is the
- * *only* thing standing between an arbitrary explicit `--out` and a write
- * anywhere under `public/data/` or `docs/` -- `--out
- * public/data/rewiring-null-selection-larger.json` (a different filename,
- * not the shipped default) sails straight past it today.
- *
- * This closes that gap for any artifact scored against a graph other than
- * the one the shipped manifest actually describes: `--out`/`--report-md`/
- * `--manifest` may resolve under `public/` or `docs/` only when the scored
- * graph's `sourceGraphSha256` matches the shipped manifest's own
- * `binarySha256` -- the same "only the shipped graph may write into the
- * shipped tree" invariant `scripts/data/selections.py`'s
- * `refuse_unsafe_variant_target` already enforces on the compiler side,
- * mirrored here with a directory-*prefix* check (like
- * `guardVariantOutPath`'s tree block), not `guardShippedDefault`'s
- * exact-path one. Fails safe: if the shipped manifest cannot be read at all
- * (missing/corrupt), the graph is treated as not-shipped, since there is
- * then no basis to prove the write is safe.
- */
-/** Exported (like `guardVariantOutPath`/`guardShippedTimingProvenance`) so tests can exercise the sibling-prefix and shipped-sha-allow paths directly. */
-export const guardSelectionScratchTarget = (path: string, flagLabel: string, sourceGraphSha256: string): void => {
-  let shippedSha256: string | undefined;
-  if (existsSync(DEFAULT_MANIFEST)) {
-    const shippedManifest = JSON.parse(readFileSync(DEFAULT_MANIFEST, 'utf8')) as { binarySha256?: string };
-    shippedSha256 = shippedManifest.binarySha256;
-  }
-  if (shippedSha256 !== undefined && shippedSha256 === sourceGraphSha256) return;
-  const resolved = resolve(path);
-  for (const shippedDir of [resolve(repoRoot, 'public'), resolve(repoRoot, 'docs')]) {
-    if (resolved === shippedDir || resolved.startsWith(shippedDir + sep)) {
-      throw new Error(
-        `null-report: ${flagLabel} (${resolved}) resolves under ${shippedDir}, but this artifact was scored ` +
-          `against a graph with sha256 ${sourceGraphSha256}, which does not match the shipped biological graph` +
-          `${shippedSha256 !== undefined ? ` (${shippedSha256})` : ' (the shipped manifest could not be read)'} ` +
-          '-- refusing to write a non-shipped-graph artifact into a shipped tree. Pass an explicit scratch path ' +
-          'outside public/ and docs/ (e.g. training/runs/selections/<id>/...).'
-      );
-    }
-  }
-};
+// Selection-scratch mode guard (`.agents/plans/selection-robustness/
+// 02-per-selection-chain.md` WP2) -- see `./selection-scratch-guard.ts`'s
+// doc comment for the full rationale. Extracted there (a thermo-
+// maintainability review finding) because `intervention-report-run-mode.ts`
+// implemented the identical algorithm; both call sites now share one
+// implementation.
 
 export const runNullReport = (args: Readonly<NullReportArgs>): RunNullReportResult => {
   const raw = JSON.parse(readFileSync(args.authored, 'utf8')) as NullEvaluationRaw;
@@ -935,9 +897,21 @@ export const runNullReport = (args: Readonly<NullReportArgs>): RunNullReportResu
   guardShippedDefault(args.out, DEFAULT_OUT, 'published artifact', artifact.rewired.length);
   guardShippedDefault(args.reportMd, DEFAULT_REPORT_MD, 'report', artifact.rewired.length);
   guardShippedDefault(args.manifest, DEFAULT_MANIFEST, 'manifest', artifact.rewired.length);
-  guardSelectionScratchTarget(args.out, '--out', artifact.sourceGraphSha256);
-  guardSelectionScratchTarget(args.reportMd, '--report-md', artifact.sourceGraphSha256);
-  guardSelectionScratchTarget(args.manifest, '--manifest', artifact.sourceGraphSha256);
+  guardSelectionScratchTarget(args.out, 'null-report: --out', artifact.sourceGraphSha256, PUBLIC_DATA_DIR, DOCS_DIR);
+  guardSelectionScratchTarget(
+    args.reportMd,
+    'null-report: --report-md',
+    artifact.sourceGraphSha256,
+    PUBLIC_DATA_DIR,
+    DOCS_DIR
+  );
+  guardSelectionScratchTarget(
+    args.manifest,
+    'null-report: --manifest',
+    artifact.sourceGraphSha256,
+    PUBLIC_DATA_DIR,
+    DOCS_DIR
+  );
   guardShippedTimingProvenance(args.out, DEFAULT_OUT, runMeta);
   verifySourceGraphMatchesManifest(args.manifest, artifact, args.authored);
   verifyManifestRoundTrips(args.manifest);

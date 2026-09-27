@@ -11,7 +11,6 @@ import {
   DEFAULT_OUT,
   DEFAULT_REPORT_MD,
   buildArtifact,
-  guardSelectionScratchTarget,
   guardShippedTimingProvenance,
   parseNullReportArgs,
   resolveRunMeta,
@@ -21,6 +20,7 @@ import {
   type NullReportArgs
 } from '../../scripts/null/null-report';
 import { CONDITION_LABELS } from '../../scripts/null/null-report-variant';
+import { guardSelectionScratchTarget } from '../../scripts/null/selection-scratch-guard';
 import { resolveArenaTask } from '../../src/lib/arena/tasks';
 
 /**
@@ -414,8 +414,12 @@ describe('runNullReport', () => {
     it('does not block a sibling directory that merely shares a string prefix with public/ or docs/', () => {
       const publicOldSibling = join(dirname(DEFAULT_OUT), '..', '..', 'public-old', 'x.json');
       const docs2Sibling = join(dirname(DEFAULT_REPORT_MD), '..', 'docs2', 'x.md');
-      expect(() => guardSelectionScratchTarget(publicOldSibling, '--out', HEX64('a'))).not.toThrow();
-      expect(() => guardSelectionScratchTarget(docs2Sibling, '--report-md', HEX64('a'))).not.toThrow();
+      expect(() =>
+        guardSelectionScratchTarget(publicOldSibling, '--out', HEX64('a'), dirname(DEFAULT_OUT), dirname(DEFAULT_REPORT_MD))
+      ).not.toThrow();
+      expect(() =>
+        guardSelectionScratchTarget(docs2Sibling, '--report-md', HEX64('a'), dirname(DEFAULT_OUT), dirname(DEFAULT_REPORT_MD))
+      ).not.toThrow();
     });
 
     it('allows a write under the real public/data tree when the sha matches the real shipped manifest', () => {
@@ -424,7 +428,15 @@ describe('runNullReport', () => {
       // -- proves the guard doesn't over-trigger for a legitimate default
       // publish, without needing a real 500-rewired-graph fixture scored
       // against the shipped graph to drive it through `runNullReport`.
-      expect(() => guardSelectionScratchTarget(DEFAULT_OUT, '--out', shippedManifest.binarySha256)).not.toThrow();
+      expect(() =>
+        guardSelectionScratchTarget(
+          DEFAULT_OUT,
+          '--out',
+          shippedManifest.binarySha256,
+          dirname(DEFAULT_OUT),
+          dirname(DEFAULT_REPORT_MD)
+        )
+      ).not.toThrow();
     });
   });
 

@@ -10,10 +10,12 @@ its input channel despite having an incoming edge from it.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "selections"))
@@ -21,6 +23,7 @@ sys.path.insert(0, str(REPO_ROOT / "scripts" / "analysis"))
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "data"))
 
 import binfmt  # noqa: E402
+import coverage  # noqa: E402
 from coverage import compute_coverage  # noqa: E402
 
 
@@ -215,3 +218,84 @@ def test_dead_end_bridge_does_not_count_for_its_input_channel() -> None:
     # exactly one covering bridge (bridge 2); every other pair is 0.
     channel_row = coverage["pairCoverage"][0]  # foodBearing is index 0
     assert channel_row == [1, 0, 0]  # thrust, yaw, brake
+
+
+# ---------------------------------------------------------------------------
+# `coverage.py main()`'s selection-scratch guard (thermo-maintainability
+# review finding I3): every invocation of this script is, by construction,
+# a selection-scratch invocation (there is no shipped `coverage-v1.json`
+# under `public/data`, and no CLI mode distinguishing "ordinary republish"
+# from "selection scratch" the way `explain.py --selection-mode` does), so
+# `guard_selection_scratch_target` must be called with `selection_mode=True`
+# unconditionally -- mirroring `test_explain.py`'s
+# `test_selection_mode_guard_refuses_public_data_out_even_when_graph_sha_matches_shipped`.
+# ---------------------------------------------------------------------------
+
+
+def _write_tiny_graph_gz(path: Path) -> str:
+    """Encodes `_tiny_graph()` (adding the dynamics metadata fields
+    `compute_coverage` doesn't need but `binfmt.validate_graph`/
+    `encode_graph_binary` require) to a deterministic gzip file at `path`,
+    returning its decompressed sha256 (the value `--manifest`'s
+    `binarySha256` and the shipped manifest fixture must both carry for
+    `load_verified_graph`/the guard's sha comparison to line up)."""
+    graph = _tiny_graph()
+    graph.metadata.update(
+        {
+            "timestepSeconds": 1.0 / 30.0,
+            "leakRate": 0.1,
+            "rateMin": -2.0,
+            "rateMax": 2.0,
+            "inputClampMin": -1.0,
+            "inputClampMax": 1.0,
+            "globalGain": 1.0,
+        }
+    )
+    binary = binfmt.encode_graph_binary(binfmt.validate_graph(graph))
+    binfmt.write_gzip_deterministic(binary, path)
+    return binfmt.sha256_hex(binary)
+
+
+def test_main_guard_refuses_public_data_out_even_when_graph_sha_matches_shipped(tmp_path, monkeypatch) -> None:
+    graph_path = tmp_path / "graph.bin.gz"
+    graph_sha256 = _write_tiny_graph_gz(graph_path)
+
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps({"binarySha256": graph_sha256}))
+
+    # The fake "shipped" manifest's binarySha256 deliberately MATCHES the
+    # selection's own graph sha -- proving the guard still refuses (unlike
+    # explain.py's non-selection-mode path, which would allow this).
+    fake_public_data = tmp_path / "shipped" / "public" / "data"
+    fake_docs = tmp_path / "shipped" / "docs"
+    fake_public_data.mkdir(parents=True)
+    fake_docs.mkdir(parents=True)
+    (fake_public_data / "malecns-arena-v1.manifest.json").write_text(json.dumps({"binarySha256": graph_sha256}))
+    monkeypatch.setattr(coverage, "PUBLIC_DATA_DIR", fake_public_data)
+    monkeypatch.setattr(coverage, "DOCS_DIR", fake_docs)
+
+    out_path = fake_public_data / "coverage-selection-larger.json"
+    with pytest.raises(ValueError, match="resolves under"):
+        coverage.main(["--graph", str(graph_path), "--manifest", str(manifest_path), "--out", str(out_path)])
+    assert not out_path.exists()
+
+
+def test_main_guard_allows_a_scratch_out_outside_public_and_docs(tmp_path, monkeypatch) -> None:
+    graph_path = tmp_path / "graph.bin.gz"
+    graph_sha256 = _write_tiny_graph_gz(graph_path)
+
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps({"binarySha256": graph_sha256}))
+
+    fake_public_data = tmp_path / "shipped" / "public" / "data"
+    fake_docs = tmp_path / "shipped" / "docs"
+    fake_public_data.mkdir(parents=True)
+    fake_docs.mkdir(parents=True)
+    (fake_public_data / "malecns-arena-v1.manifest.json").write_text(json.dumps({"binarySha256": graph_sha256}))
+    monkeypatch.setattr(coverage, "PUBLIC_DATA_DIR", fake_public_data)
+    monkeypatch.setattr(coverage, "DOCS_DIR", fake_docs)
+
+    out_path = tmp_path / "selections" / "fake-id" / "coverage.json"
+    coverage.main(["--graph", str(graph_path), "--manifest", str(manifest_path), "--out", str(out_path)])
+    assert out_path.exists()
+    assert json.loads(out_path.read_text())["sourceGraphSha256"] == graph_sha256

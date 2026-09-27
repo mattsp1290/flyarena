@@ -203,9 +203,24 @@ def main(argv: list[str] | None = None) -> None:
     # Selection-robustness WP2: the same "only the shipped graph may write
     # into the shipped tree" guard the other three chain producers carry
     # (dual-review finding: coverage.py was new write-path code left
-    # unguarded).
+    # unguarded). `selection_mode=True` unconditionally (a thermo-
+    # maintainability review finding): unlike `explain.py`, `coverage.py`
+    # has no shipped/canonical publish path at all -- there is no
+    # `coverage-v1.json` anywhere under `public/data`, and no CLI mode that
+    # distinguishes "ordinary republish" from "selection scratch" the way
+    # `explain.py --selection-mode` does. Every invocation of this script
+    # is, by construction, a selection-scratch invocation, so it must
+    # always take the unconditional-refusal branch, the same way
+    # `explain.py` does when `args.selection_mode` is set -- otherwise a
+    # selection's compiled graph hashing identically to the shipped
+    # biological graph would let this guard's sha-based allowance through.
     explain_selection_mode.guard_selection_scratch_target(
-        args.out, "--out", expected_sha256, public_data_dir=PUBLIC_DATA_DIR, docs_dir=DOCS_DIR
+        args.out,
+        "--out",
+        expected_sha256,
+        public_data_dir=PUBLIC_DATA_DIR,
+        docs_dir=DOCS_DIR,
+        selection_mode=True,
     )
 
     graph = graph_io.load_verified_graph(args.graph, expected_sha256)

@@ -142,6 +142,33 @@ check_sha() {
   fi
 }
 
+# Step 3d's skip check (below) must not treat "both output files exist" as
+# "step 3d fully completed" -- explain.py's write order is args.out (982) ->
+# args.report_out (985) -> update_manifest(args.manifest, ...) (987), i.e.
+# the manifest's `nullExplanation` key is written LAST. A crash between the
+# report write and the manifest write leaves both `null-explanation.json`
+# and `null-explanation-report.md` on disk while `$MANIFEST`'s own
+# `nullExplanation` entry is missing or stale -- a re-invocation must not
+# silently treat that as done (a thermo-methodology review finding: this
+# is the exact "partial output treated as done" case resumability must
+# never allow, and `intervention-artifact.ts` later hard-requires
+# `manifest.nullExplanation.sha256` to be present). `explain.py`'s
+# `update_manifest` records `{"artifact": args.out.name, "sha256":
+# sha256_hex(canonical_json_text(explanation))}` -- the artifact's sha256
+# is over the exact bytes `atomic_write_text` puts on disk, so comparing
+# it against `sha256sum "$B/null-explanation.json"` (already used the same
+# way by scripts/null/train-sample.sh) proves the manifest entry actually
+# describes the file currently on disk, not a stale one from a prior run.
+null_explanation_manifest_matches() {
+  local recorded_artifact recorded_sha256 actual_sha256
+  recorded_artifact="$(jq -r '.nullExplanation.artifact // empty' "$MANIFEST")"
+  recorded_sha256="$(jq -r '.nullExplanation.sha256 // empty' "$MANIFEST")"
+  [[ -n "$recorded_artifact" && -n "$recorded_sha256" ]] || return 1
+  [[ "$recorded_artifact" == "$(basename "$B/null-explanation.json")" ]] || return 1
+  actual_sha256="$(sha256sum "$B/null-explanation.json" | cut -d' ' -f1)"
+  [[ "$recorded_sha256" == "$actual_sha256" ]]
+}
+
 if [[ "$DRY_RUN" == 1 ]]; then
   log "dry-run-fixture: structural self-check only, no real compute will run"
   GRAPH_SHA="<dry-run: not read>"
@@ -236,9 +263,13 @@ fi
 # Skip only when both of explain.py's write-order outputs exist (out ->
 # report -> manifest, explain.py:982-986) -- a crash between writes would
 # otherwise leave null-explanation-report.md (an acceptance artifact)
-# silently missing (a dual-review finding, same class as step 2's above).
-if [[ "$DRY_RUN" != 1 && -f "$B/null-explanation.json" && -f "$B/null-explanation-report.md" ]]; then
-  log "step 3d (explain --selection-mode): both outputs exist, skipping"
+# silently missing (a dual-review finding, same class as step 2's above)
+# -- AND the manifest's own `nullExplanation` entry (written LAST, see
+# `null_explanation_manifest_matches`'s doc comment above) is present and
+# still matches the file actually on disk.
+if [[ "$DRY_RUN" != 1 && -f "$B/null-explanation.json" && -f "$B/null-explanation-report.md" ]] \
+  && null_explanation_manifest_matches; then
+  log "step 3d (explain --selection-mode): both outputs exist and manifest nullExplanation entry matches, skipping"
 else
   # Every path flag given explicitly (never a default), per the plan --
   # the public/docs refusal in explain.py applies to --out/--report-out/

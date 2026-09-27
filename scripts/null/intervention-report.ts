@@ -10,7 +10,6 @@ import { graphStats, quantileIndex, rankStatistics, type RankStatistics } from '
 import { evaluateDegenerateGuard, type DegenerateGuardResult } from './intervention-degenerate-guard';
 import {
   DEFAULT_OUT,
-  guardSelectionScratchOut,
   parseInterventionReportArgs,
   parsePublishedNull,
   statsOnlyNullMatchesTask,
@@ -19,10 +18,11 @@ import {
 } from './intervention-report-run-mode';
 import type { NullDecoderKind } from './null-worker';
 import type { NullGraphListEvaluationRaw } from './null-evaluate';
+import { guardSelectionScratchTarget } from './selection-scratch-guard';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, '../..');
-/** `guardSelectionScratchOut`'s shipped-tree roots (selection-robustness WP2) — this file's own `--out` has no shipped default under either (`DEFAULT_OUT` is under `training/runs/`), but an explicit `--out` can still point there. */
+/** `guardSelectionScratchTarget`'s shipped-tree roots (selection-robustness WP2) — this file's own `--out` has no shipped default under either (`DEFAULT_OUT` is under `training/runs/`), but an explicit `--out` can still point there. */
 const PUBLIC_DATA_DIR = resolve(repoRoot, 'public/data');
 const DOCS_DIR = resolve(repoRoot, 'docs');
 
@@ -772,7 +772,7 @@ export const runInterventionReport = (
   };
 
   guardCanonicalOutDefault(args.out, output);
-  guardSelectionScratchOut(args.out, raw.sourceGraphSha256, PUBLIC_DATA_DIR, DOCS_DIR);
+  guardSelectionScratchTarget(args.out, 'intervention-report: --out', raw.sourceGraphSha256, PUBLIC_DATA_DIR, DOCS_DIR);
 
   mkdirSync(dirname(args.out), { recursive: true });
   atomicWriteFileSync(args.out, JSON.stringify(output));
