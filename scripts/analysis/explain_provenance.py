@@ -127,9 +127,11 @@ def verify_provenance(
     variants: Mapping[str, dict],
     transfer_json: dict,
     features_json: dict,
-    features_exploratory_json: dict,
+    features_exploratory_json: dict | None,
     regime_json: dict,
     repo_root,
+    *,
+    selection_mode: bool = False,
 ) -> None:
     """`variants` is every loaded decoder-variant payload (flip-both, plus
     any provided single-axis ones), checked in one loop (an edge-case-review
@@ -149,19 +151,33 @@ def verify_provenance(
     design (feature 6's pre-adjudication run -- rerunning it against current
     code would defeat its purpose as a historical snapshot), so only its
     graph identity and content sha (set in `explain.main()`) are pinned.
+    `features_exploratory_json` may also be `None`
+    (`.agents/plans/selection-robustness/02-per-selection-chain.md` WP2's
+    `--selection-mode`) -- accepted only when `selection_mode=True`, since a
+    selection variant's rewired graphs have no per-selection exploratory
+    snapshot to regenerate; every graph/producer-identity check involving it
+    is simply skipped in that case, not weakened for the other inputs.
     `repo_root` is the single directory every producer's entry file and
     search-directory set is derived from (see `_analysis_dir`/`_data_dir`
     above) -- replacing the old `analysis_source_dir`/`null_source_dir`
     pair, which could not express a dependency closure spanning more than
     one directory (`scripts/training/`, `src/lib/...`, `scripts/data/`)."""
+    if features_exploratory_json is None and not selection_mode:
+        raise ValueError(
+            "explain: features_exploratory_json is required unless selection_mode is set -- "
+            "explain.py's own --selection-mode/--features-exploratory-unrestricted parsing should already "
+            "have refused this combination; a direct caller of verify_provenance must pass one explicitly"
+        )
+
     expected_source = rewiring_null["sourceGraphSha256"]
     expected_rewire = rewiring_null["rewireSourceSha256"]
     payloads: list[tuple[str, dict]] = [(f"variant-{key}", payload) for key, payload in variants.items()]
     payloads += [
         ("transfer.json", transfer_json),
         ("features.json", features_json),
-        ("features-exploratory-unrestricted.json", features_exploratory_json),
     ]
+    if features_exploratory_json is not None:
+        payloads.append(("features-exploratory-unrestricted.json", features_exploratory_json))
     for label, payload in payloads:
         _require_matching_source(f"{label}.sourceGraphSha256", payload["sourceGraphSha256"], expected_source)
         _require_matching_source(f"{label}.rewireSourceSha256", payload["rewireSourceSha256"], expected_rewire)

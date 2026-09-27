@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
-import { basename, dirname, resolve } from 'node:path';
+import { basename, dirname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { requireNonNegativeInt, requirePositiveInt, requireValue } from '../training/cli';
@@ -795,6 +795,54 @@ const verifySourceGraphMatchesManifest = (
   }
 };
 
+/**
+ * Selection-scratch mode guard (`.agents/plans/selection-robustness/
+ * 02-per-selection-chain.md` WP2): a per-selection chain reuses this file's
+ * ordinary (non-`--variant-out`) publish path against a scratch
+ * `training/runs/selections/<id>/` output tree, with a real
+ * 500-rewired-graph `--authored` input -- so `guardShippedDefault` above
+ * (keyed on *exact-path equality* with the three shipped defaults) never
+ * fires for it, the same way it never fires for any other explicit scratch
+ * `--out`/`--report-md`/`--manifest`. But that exact-path check is the
+ * *only* thing standing between an arbitrary explicit `--out` and a write
+ * anywhere under `public/data/` or `docs/` -- `--out
+ * public/data/rewiring-null-selection-larger.json` (a different filename,
+ * not the shipped default) sails straight past it today.
+ *
+ * This closes that gap for any artifact scored against a graph other than
+ * the one the shipped manifest actually describes: `--out`/`--report-md`/
+ * `--manifest` may resolve under `public/` or `docs/` only when the scored
+ * graph's `sourceGraphSha256` matches the shipped manifest's own
+ * `binarySha256` -- the same "only the shipped graph may write into the
+ * shipped tree" invariant `scripts/data/selections.py`'s
+ * `refuse_unsafe_variant_target` already enforces on the compiler side,
+ * mirrored here with a directory-*prefix* check (like
+ * `guardVariantOutPath`'s tree block), not `guardShippedDefault`'s
+ * exact-path one. Fails safe: if the shipped manifest cannot be read at all
+ * (missing/corrupt), the graph is treated as not-shipped, since there is
+ * then no basis to prove the write is safe.
+ */
+const guardSelectionScratchTarget = (path: string, flagLabel: string, sourceGraphSha256: string): void => {
+  let shippedSha256: string | undefined;
+  if (existsSync(DEFAULT_MANIFEST)) {
+    const shippedManifest = JSON.parse(readFileSync(DEFAULT_MANIFEST, 'utf8')) as { binarySha256?: string };
+    shippedSha256 = shippedManifest.binarySha256;
+  }
+  if (shippedSha256 !== undefined && shippedSha256 === sourceGraphSha256) return;
+  const resolved = resolve(path);
+  for (const shippedDir of [resolve(repoRoot, 'public'), resolve(repoRoot, 'docs')]) {
+    if (resolved === shippedDir || resolved.startsWith(shippedDir + sep)) {
+      throw new Error(
+        `null-report: ${flagLabel} (${resolved}) resolves under ${shippedDir}, but this artifact was scored ` +
+          `against a graph with sha256 ${sourceGraphSha256}, which does not match the shipped biological graph` +
+          `${shippedSha256 !== undefined ? ` (${shippedSha256})` : ' (the shipped manifest could not be read)'} ` +
+          '-- refusing to write a non-shipped-graph artifact into a shipped tree. Pass an explicit scratch path ' +
+          'outside public/ and docs/ (e.g. training/runs/selections/<id>/...).'
+      );
+    }
+  }
+};
+
 export const runNullReport = (args: Readonly<NullReportArgs>): RunNullReportResult => {
   const raw = JSON.parse(readFileSync(args.authored, 'utf8')) as NullEvaluationRaw;
   // Missing (or explicitly null, from a hand-edited/corrupted file) on any
@@ -878,9 +926,17 @@ export const runNullReport = (args: Readonly<NullReportArgs>): RunNullReportResu
     artifact = { ...authoredArtifact, trained: trainedSection };
   }
 
+  // `guardShippedDefault` first: for the three exact shipped default paths,
+  // its message (an under-500-rewired-graph run) is the more specific and
+  // more common diagnostic. `guardSelectionScratchTarget` is the backstop
+  // that also catches a *differently-named* non-shipped-graph write under
+  // public/docs, which `guardShippedDefault`'s exact-path check cannot.
   guardShippedDefault(args.out, DEFAULT_OUT, 'published artifact', artifact.rewired.length);
   guardShippedDefault(args.reportMd, DEFAULT_REPORT_MD, 'report', artifact.rewired.length);
   guardShippedDefault(args.manifest, DEFAULT_MANIFEST, 'manifest', artifact.rewired.length);
+  guardSelectionScratchTarget(args.out, '--out', artifact.sourceGraphSha256);
+  guardSelectionScratchTarget(args.reportMd, '--report-md', artifact.sourceGraphSha256);
+  guardSelectionScratchTarget(args.manifest, '--manifest', artifact.sourceGraphSha256);
   guardShippedTimingProvenance(args.out, DEFAULT_OUT, runMeta);
   verifySourceGraphMatchesManifest(args.manifest, artifact, args.authored);
   verifyManifestRoundTrips(args.manifest);

@@ -828,3 +828,140 @@ def test_transfer_features_producer_host_arch_mismatch_is_rejected(tmp_path, syn
     synthetic_inputs["transfer.json"].write_text(json.dumps(transfer_json))
     with pytest.raises(ValueError, match="producer host arch"):
         _run_main(tmp_path, synthetic_inputs, [])
+
+
+# ---------------------------------------------------------------------------
+# --selection-mode (.agents/plans/selection-robustness/02-per-selection-chain.md
+# WP2): --features-exploratory-unrestricted becomes optional, and the
+# public/docs refusal guard applies to --out/--report-out/--manifest.
+# ---------------------------------------------------------------------------
+
+
+def _run_main_selection_mode(tmp_path, synthetic_inputs, out_path, report_path, extra_args=()):
+    explain.main(
+        [
+            "--selection-mode",
+            "--rewiring-null",
+            str(synthetic_inputs["rewiring-null.json"]),
+            "--variant-flip-both",
+            str(synthetic_inputs["variant-flip-both.json"]),
+            "--transfer",
+            str(synthetic_inputs["transfer.json"]),
+            "--features",
+            str(synthetic_inputs["features.json"]),
+            "--regime",
+            str(synthetic_inputs["regime.json"]),
+            "--out",
+            str(out_path),
+            "--report-out",
+            str(report_path),
+            "--skip-manifest-update",
+            *extra_args,
+        ]
+    )
+
+
+def test_selection_mode_omits_exploratory_and_records_a_reason(tmp_path, synthetic_inputs):
+    out_path = tmp_path / "out.json"
+    _run_main_selection_mode(tmp_path, synthetic_inputs, out_path, tmp_path / "report.md")
+    payload = json.loads(out_path.read_bytes())
+    assert payload["exploratory"] is None
+    assert "no per-selection counterpart" in payload["exploratoryOmittedReason"]
+    assert payload["finding"]["definitionSensitive"] is None
+
+
+def test_selection_mode_runs_twice_byte_identical_with_exploratory_omitted(tmp_path, synthetic_inputs):
+    out_a, report_a = tmp_path / "out-a.json", tmp_path / "report-a.md"
+    out_b, report_b = tmp_path / "out-b.json", tmp_path / "report-b.md"
+    _run_main_selection_mode(tmp_path, synthetic_inputs, out_a, report_a)
+    _run_main_selection_mode(tmp_path, synthetic_inputs, out_b, report_b)
+    assert out_a.read_bytes() == out_b.read_bytes()
+    assert report_a.read_bytes() == report_b.read_bytes()
+
+
+def test_without_selection_mode_features_exploratory_unrestricted_is_still_required(tmp_path, synthetic_inputs):
+    with pytest.raises(SystemExit):
+        explain.main(
+            [
+                "--rewiring-null",
+                str(synthetic_inputs["rewiring-null.json"]),
+                "--variant-flip-both",
+                str(synthetic_inputs["variant-flip-both.json"]),
+                "--transfer",
+                str(synthetic_inputs["transfer.json"]),
+                "--features",
+                str(synthetic_inputs["features.json"]),
+                "--regime",
+                str(synthetic_inputs["regime.json"]),
+                "--out",
+                str(tmp_path / "out.json"),
+                "--report-out",
+                str(tmp_path / "report.md"),
+                "--skip-manifest-update",
+            ]
+        )
+
+
+def test_selection_mode_still_requires_exploratory_json_shas_for_verify_provenance_direct_call(synthetic_inputs):
+    rewiring_null = json.loads(synthetic_inputs["rewiring-null.json"].read_text())
+    variant_flip_both = json.loads(synthetic_inputs["variant-flip-both.json"].read_text())
+    transfer_json = json.loads(synthetic_inputs["transfer.json"].read_text())
+    features_json = json.loads(synthetic_inputs["features.json"].read_text())
+    regime_json = json.loads(synthetic_inputs["regime.json"].read_text())
+    # Omitting features_exploratory_json without selection_mode=True must be
+    # refused even calling verify_provenance directly (not only via the CLI's
+    # own argparse gate) -- explain_provenance.py's own defense in depth.
+    with pytest.raises(ValueError, match="required unless selection_mode"):
+        explain.verify_provenance(
+            rewiring_null, {"flipBoth": variant_flip_both}, transfer_json, features_json, None, regime_json
+        )
+    # selection_mode=True accepts it (no producer/graph-identity checks run
+    # against a None exploratory input).
+    explain.verify_provenance(
+        rewiring_null,
+        {"flipBoth": variant_flip_both},
+        transfer_json,
+        features_json,
+        None,
+        regime_json,
+        selection_mode=True,
+    )
+
+
+def test_selection_mode_guard_refuses_public_data_out_for_non_shipped_graph(tmp_path, synthetic_inputs, monkeypatch):
+    # A fake "shipped" tree with a manifest describing a DIFFERENT graph sha
+    # than the fixture's own ("a" * 64) -- exercises the refusal without
+    # touching the real repo's public/data or docs directories.
+    fake_public_data = tmp_path / "shipped" / "public" / "data"
+    fake_docs = tmp_path / "shipped" / "docs"
+    fake_public_data.mkdir(parents=True)
+    fake_docs.mkdir(parents=True)
+    (fake_public_data / "malecns-arena-v1.manifest.json").write_text(json.dumps({"binarySha256": "f" * 64}))
+    monkeypatch.setattr(explain, "PUBLIC_DATA_DIR", fake_public_data)
+    monkeypatch.setattr(explain, "DOCS_DIR", fake_docs)
+
+    with pytest.raises(ValueError, match="resolves under"):
+        _run_main_selection_mode(tmp_path, synthetic_inputs, fake_public_data / "null-explanation-selection-larger.json", tmp_path / "report.md")
+    assert not (fake_public_data / "null-explanation-selection-larger.json").exists()
+
+    with pytest.raises(ValueError, match="resolves under"):
+        _run_main_selection_mode(tmp_path, synthetic_inputs, tmp_path / "out.json", fake_docs / "selection-larger-report.md")
+
+
+def test_selection_mode_guard_allows_public_data_out_when_graph_sha_matches_shipped(
+    tmp_path, synthetic_inputs, monkeypatch
+):
+    # Same fake tree, but this time the "shipped" manifest's sha matches the
+    # fixture's sourceGraphSha256 ("a" * 64) -- confirms the guard does not
+    # over-trigger for a run that legitimately describes the shipped graph.
+    fake_public_data = tmp_path / "shipped" / "public" / "data"
+    fake_docs = tmp_path / "shipped" / "docs"
+    fake_public_data.mkdir(parents=True)
+    fake_docs.mkdir(parents=True)
+    (fake_public_data / "malecns-arena-v1.manifest.json").write_text(json.dumps({"binarySha256": "a" * 64}))
+    monkeypatch.setattr(explain, "PUBLIC_DATA_DIR", fake_public_data)
+    monkeypatch.setattr(explain, "DOCS_DIR", fake_docs)
+
+    out_path = fake_public_data / "null-explanation-v1.json"
+    _run_main_selection_mode(tmp_path, synthetic_inputs, out_path, tmp_path / "report.md")  # must not raise
+    assert out_path.exists()

@@ -60,6 +60,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from functools import partial
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -88,6 +89,7 @@ from explain_stats import (  # noqa: E402
 )
 from explain_report import render_report_markdown  # noqa: E402
 import explain_provenance  # noqa: E402
+import explain_selection_mode  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PUBLIC_DATA_DIR = REPO_ROOT / "public" / "data"
@@ -622,21 +624,12 @@ def _require_complete_seed_coverage(label: str, seeds: Sequence[int]) -> None:
 
 
 def verify_provenance(
-    rewiring_null: dict,
-    variants: Mapping[str, dict],
-    transfer_json: dict,
-    features_json: dict,
-    features_exploratory_json: dict,
-    regime_json: dict,
+    rewiring_null: dict, variants: Mapping[str, dict], transfer_json: dict, features_json: dict,
+    features_exploratory_json: dict | None, regime_json: dict, *, selection_mode: bool = False
 ) -> None:
     explain_provenance.verify_provenance(
-        rewiring_null,
-        variants,
-        transfer_json,
-        features_json,
-        features_exploratory_json,
-        regime_json,
-        REPO_ROOT,
+        rewiring_null, variants, transfer_json, features_json, features_exploratory_json, regime_json, REPO_ROOT,
+        selection_mode=selection_mode
     )
 
 
@@ -656,12 +649,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--features-exploratory-unrestricted",
         type=Path,
-        required=True,
+        default=None,
         help=(
-            "pre-adjudication features.json computed with feature 6 (weightedInDegree) unrestricted "
-            "(any presynaptic neuron, not only input-labeled ones) -- disclosed in the report as "
-            "exploratory/non-predeclared, never used in the outcome-category evaluation "
-            "(.agents/plans/null-explanation/02-transfer-and-features.md's feature-6 adjudication note)"
+            "pre-adjudication features.json with feature 6 unrestricted "
+            "(.agents/plans/null-explanation/02-transfer-and-features.md); required unless --selection-mode"
         ),
     )
     parser.add_argument("--regime", type=Path, required=True)
@@ -673,7 +664,15 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="do not touch the shipped manifest (for tests against a temp copy)",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--selection-mode",
+        action="store_true",
+        help="selection-robustness WP2: makes --features-exploratory-unrestricted optional (exploratory: null)",
+    )
+    args = parser.parse_args(argv)
+    if not args.selection_mode and args.features_exploratory_unrestricted is None:
+        parser.error("--features-exploratory-unrestricted is required unless --selection-mode is given")
+    return args
 
 
 def _load(path: Path) -> dict:
@@ -732,8 +731,24 @@ def main(argv: list[str] | None = None) -> None:
     variant_flip_both = _load(args.variant_flip_both)
     transfer_json = _load(args.transfer)
     features_json = _load(args.features)
-    features_exploratory_json = _load(args.features_exploratory_unrestricted)
+    features_exploratory_json = (
+        _load(args.features_exploratory_unrestricted) if args.features_exploratory_unrestricted is not None else None
+    )
     regime_json = _load(args.regime)
+
+    # Refuse a non-shipped-graph artifact write into public/docs, before any
+    # other work runs (see `guard_selection_scratch_target`'s doc comment).
+    source_graph_sha256 = rewiring_null["sourceGraphSha256"]
+    guard = partial(
+        explain_selection_mode.guard_selection_scratch_target,
+        source_graph_sha256=source_graph_sha256,
+        public_data_dir=PUBLIC_DATA_DIR,
+        docs_dir=DOCS_DIR,
+    )
+    guard(args.out, "--out")
+    guard(args.report_out, "--report-out")
+    if not args.skip_manifest_update:
+        guard(args.manifest, "--manifest")
 
     decoder_bio_percentile = variant_flip_both["bioPercentile"]
     single_axis_paths = {"flipThrust": args.variant_flip_thrust, "flipYaw": args.variant_flip_yaw}
@@ -762,7 +777,10 @@ def main(argv: list[str] | None = None) -> None:
     provided_single_axis = {key: _load(path) for key, path in provided_single_axis_paths.items()}
 
     variants_loaded: dict[str, dict] = {"flipBoth": variant_flip_both, **provided_single_axis}
-    verify_provenance(rewiring_null, variants_loaded, transfer_json, features_json, features_exploratory_json, regime_json)
+    verify_provenance(
+        rewiring_null, variants_loaded, transfer_json, features_json, features_exploratory_json, regime_json,
+        selection_mode=args.selection_mode
+    )
     _require_complete_seed_coverage("regime.json rewired", [entry["seed"] for entry in regime_json["rewired"]])
     _require_complete_seed_coverage("rewiring-null-v1.json rewired", [entry["seed"] for entry in rewiring_null["rewired"]])
 
@@ -798,21 +816,24 @@ def main(argv: list[str] | None = None) -> None:
     for metric in metrics:
         metrics_by_kind[metric["kind"]].append(metric)
 
-    # Feature 6's exploratory, non-predeclared unrestricted reading: the
-    # same `weightedInDegree:*` metrics, computed by the same `build_metric`
-    # pipeline, from `--features-exploratory-unrestricted` instead of the
-    # frozen `--features`. No per-graph regime exclusion (features never
-    # depend on the linear regime, same as the predeclared feature metrics).
-    exploratory_metrics = [
-        metric
-        for name in (f"weightedInDegree:{population}" for population in OUTPUT_POPULATIONS)
-        if (
-            metric := build_metric(
-                name, "feature", extract_feature_value, features_exploratory_json["graphs"], score_by_seed, frozenset(), BOOTSTRAP_BASE_SEED
+    # Feature 6's exploratory unrestricted reading, same `build_metric`
+    # pipeline as the predeclared features. `None` when
+    # `--features-exploratory-unrestricted` was omitted (selection mode
+    # only -- see `explain_selection_mode.EXPLORATORY_OMITTED_REASON`).
+    exploratory_metrics = (
+        [
+            metric
+            for name in (f"weightedInDegree:{population}" for population in OUTPUT_POPULATIONS)
+            if (
+                metric := build_metric(
+                    name, "feature", extract_feature_value, features_exploratory_json["graphs"], score_by_seed, frozenset(), BOOTSTRAP_BASE_SEED
+                )
             )
-        )
-        is not None
-    ]
+            is not None
+        ]
+        if features_exploratory_json is not None
+        else None
+    )
 
     finding_internal = evaluate_categories(
         decoder_bio_percentile,
@@ -821,12 +842,17 @@ def main(argv: list[str] | None = None) -> None:
         regime,
     )
     structural_detail = finding_internal["structuralDetail"]
-    # Reuses the single module-scope `qualifies` predicate (M3) instead of a
-    # second hand-written copy of `evaluate_categories`'s own boolean.
-    definition_sensitive = bool(
-        structural_detail is not None
-        and structural_detail["name"].startswith("weightedInDegree:")
-        and not any(qualifies(m) for m in exploratory_metrics)
+    # `None` (not `False`) when `exploratory_metrics` is `None`: there is no
+    # basis to say the structural finding is or is not definition-sensitive
+    # without it, and `False` would misreport "not evaluated" as "checked".
+    definition_sensitive = (
+        None
+        if exploratory_metrics is None
+        else bool(
+            structural_detail is not None
+            and structural_detail["name"].startswith("weightedInDegree:")
+            and not any(qualifies(m) for m in exploratory_metrics)
+        )
     )
     finding = {
         "categories": finding_internal["categories"],
@@ -924,12 +950,16 @@ def main(argv: list[str] | None = None) -> None:
         "variants": variants,
         "regime": regime,
         "metrics": ordered_metrics,
-        "exploratory": {
-            "featureSixUnrestricted": {
-                "sourceSha256": sha256_hex(args.features_exploratory_unrestricted.read_bytes()),
-                "metrics": exploratory_metrics,
-            }
-        },
+        # `exploratory: null` (with a sibling `exploratoryOmittedReason`)
+        # only for a `--selection-mode` run with the flag omitted -- see
+        # `explain_selection_mode.build_exploratory_field`'s doc comment.
+        **explain_selection_mode.build_exploratory_field(
+            features_exploratory_json,
+            exploratory_metrics,
+            sha256_hex(args.features_exploratory_unrestricted.read_bytes())
+            if features_exploratory_json is not None
+            else None,
+        ),
         "calibration": calibration,
         "finding": finding,
         "host": host,

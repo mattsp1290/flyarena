@@ -99,7 +99,20 @@ def render_feature6_disclosure(explanation: dict) -> list[str]:
     score, before the restricted reading was adopted) contradict. This
     version states what actually happened and computes every number from a
     sha-pinned input (`--features-exploratory-unrestricted`) instead of an
-    unpinned, session-local `/tmp` citation."""
+    unpinned, session-local `/tmp` citation.
+
+    `explanation["exploratory"] is None` only for a `--selection-mode` run
+    with `--features-exploratory-unrestricted` omitted
+    (`.agents/plans/selection-robustness/02-per-selection-chain.md` WP2:
+    this historical snapshot has no per-selection counterpart to regenerate)
+    -- a short note replaces the disclosure table in that case, rather than
+    fabricating exploratory statistics that were never computed for this
+    selection."""
+    if explanation["exploratory"] is None:
+        return [
+            "**Feature 6 adjudication.** Not computed for this run: "
+            f"{explanation.get('exploratoryOmittedReason', 'no reason recorded')}."
+        ]
     exploratory = explanation["exploratory"]["featureSixUnrestricted"]
     restricted_by_name = {
         m["name"]: m

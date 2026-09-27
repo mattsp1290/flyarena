@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -369,6 +369,42 @@ describe('runNullReport', () => {
     expect(() => runNullReport({ ...args, out: DEFAULT_OUT })).toThrow(/refusing to overwrite the shipped/);
     expect(() => runNullReport({ ...args, reportMd: DEFAULT_REPORT_MD })).toThrow(/refusing to overwrite the shipped/);
     expect(() => runNullReport({ ...args, manifest: DEFAULT_MANIFEST })).toThrow(/refusing to overwrite the shipped/);
+  });
+
+  describe('guardSelectionScratchTarget (selection-robustness WP2)', () => {
+    // `buildRaw()`'s sourceGraphSha256 (HEX64('a')) never matches the real
+    // shipped manifest's binarySha256 -- every test in this describe block
+    // is therefore the "non-shipped graph" case, and every path it tries
+    // resolves under the REAL public/data or docs directories (a sibling of
+    // the exact shipped default, not the default itself -- guardShippedDefault's
+    // exact-path check would never catch these). Only refusal is asserted
+    // here (never a successful write), the same discipline the test above
+    // follows, so this suite never actually writes into the real public/data
+    // or docs trees.
+    it('refuses a --out under public/data with a different filename than the shipped default', () => {
+      const otherPublicPath = join(dirname(DEFAULT_OUT), 'rewiring-null-selection-larger.json');
+      expect(() => runNullReport({ ...args, out: otherPublicPath })).toThrow(/resolves under/);
+      expect(existsSync(otherPublicPath)).toBe(false);
+    });
+
+    it('refuses a --report-md under docs/ with a different filename than the shipped default', () => {
+      const otherDocsPath = join(dirname(DEFAULT_REPORT_MD), 'selection-larger-null-report.md');
+      expect(() => runNullReport({ ...args, reportMd: otherDocsPath })).toThrow(/resolves under/);
+      expect(existsSync(otherDocsPath)).toBe(false);
+    });
+
+    it('refuses a --manifest under public/data with a different filename than the shipped default', () => {
+      const otherManifestPath = join(dirname(DEFAULT_MANIFEST), 'malecns-arena-selection-larger.manifest.json');
+      expect(() => runNullReport({ ...args, manifest: otherManifestPath })).toThrow(/resolves under/);
+    });
+
+    it('does not refuse a scratch --out/--report-md/--manifest outside public/ and docs/ (the normal selection-scratch case)', () => {
+      // `args` (the beforeEach default) already writes under a temp `root`
+      // dir with a non-shipped sourceGraphSha256 -- this is exactly what a
+      // selection chain's own training/runs/selections/<id>/ scratch tree
+      // looks like, and it must keep working unmodified.
+      expect(() => runNullReport(args)).not.toThrow();
+    });
   });
 
   it('refuses to publish when the authored graph sha does not match the manifest being updated', () => {

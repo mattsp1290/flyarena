@@ -1,7 +1,7 @@
 // @vitest-environment node
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
@@ -294,6 +294,51 @@ describe('runInterventionReport: --arena-task / --stats-only (task-generality)',
       );
       expect(statistics.statsOnly).toBe(true);
       expect(statistics.diagnosticOnly).toBe(true);
+    });
+
+    // `.agents/plans/selection-robustness/02-per-selection-chain.md` WP2:
+    // a per-selection chain's own null is itself a default-task run (no
+    // recorded `arenaTask`, same as the shipped default null) -- `--null`
+    // must not be refused just because it carries no stamp when the
+    // *requested* task is explicitly `'default'`.
+    it('accepts an unstamped (default-task) --null when --arena-task default is explicitly requested', () => {
+      writeFixtureFiles(0, 0); // authored.json and null.json both default-task, no arenaTask field on either
+      const { statistics } = runInterventionReport(argsFor({ arenaTask: 'default', statsOnly: true }));
+      expect(statistics.statsOnly).toBe(true);
+      expect(statistics.arenaTask).toEqual({ id: 'default', fingerprint: resolveArenaTask('default').fingerprint });
+    });
+
+    it('still refuses --stats-only --arena-task default when --null is stamped under a non-default task', () => {
+      writeFixtureFiles(0, 0);
+      patchPublishedNullArenaTask('hazard-heavy');
+      expect(() => runInterventionReport(argsFor({ arenaTask: 'default', statsOnly: true }))).toThrow(
+        /requires --null to be a per-task null.*is recorded under arena task "hazard-heavy"/
+      );
+    });
+  });
+
+  describe('guardSelectionScratchOut (selection-robustness WP2)', () => {
+    // Every fixture in this describe block uses SOURCE_SHA ('x'.repeat(64)),
+    // which never matches the real shipped manifest's binarySha256 -- so
+    // every path here is the "non-shipped graph" case. Only refusal is
+    // asserted (never a successful write into the real public/data or docs
+    // trees), matching `null-report.test.ts`'s own discipline for its
+    // sibling guard.
+    it('refuses an explicit --out under the real public/data tree for a non-shipped-graph run', () => {
+      writeFixtureFiles(0, 0);
+      // dirname(DEFAULT_OUT) is <repoRoot>/training/runs/interventions -- three
+      // levels up is <repoRoot>, matching intervention-report-run-mode.ts's own
+      // `repoRoot` derivation.
+      const repoRoot = join(dirname(DEFAULT_OUT), '..', '..', '..');
+      const otherPublicPath = join(repoRoot, 'public', 'data', 'intervention-stats-selection-larger.json');
+      const args = argsFor({ out: otherPublicPath });
+      expect(() => runInterventionReport(args)).toThrow(/resolves under/);
+      expect(existsSync(otherPublicPath)).toBe(false);
+    });
+
+    it('does not refuse a scratch --out outside public/ and docs/ (the normal selection-scratch case)', () => {
+      writeFixtureFiles(0, 0);
+      expect(() => runInterventionReport(argsFor())).not.toThrow();
     });
   });
 
