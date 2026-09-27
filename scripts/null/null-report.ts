@@ -822,7 +822,8 @@ const verifySourceGraphMatchesManifest = (
  * (missing/corrupt), the graph is treated as not-shipped, since there is
  * then no basis to prove the write is safe.
  */
-const guardSelectionScratchTarget = (path: string, flagLabel: string, sourceGraphSha256: string): void => {
+/** Exported (like `guardVariantOutPath`/`guardShippedTimingProvenance`) so tests can exercise the sibling-prefix and shipped-sha-allow paths directly. */
+export const guardSelectionScratchTarget = (path: string, flagLabel: string, sourceGraphSha256: string): void => {
   let shippedSha256: string | undefined;
   if (existsSync(DEFAULT_MANIFEST)) {
     const shippedManifest = JSON.parse(readFileSync(DEFAULT_MANIFEST, 'utf8')) as { binarySha256?: string };

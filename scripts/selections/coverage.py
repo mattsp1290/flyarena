@@ -3,16 +3,33 @@
 4: per-selection bridge coverage, as predeclared in `00-overview.md`'s
 "Coverage check" bullet.
 
-For each of the 8 predeclared input channels, counts the selected bridge
-neurons with at least one edge *from* a sensory neuron assigned to that
-channel. For each of the 3 predeclared output populations, counts the
-selected bridge neurons with at least one edge *to* a descending neuron
-assigned to that population. A channel or population with zero coverage is
-flagged -- `00-overview.md`: "Any channel or population with zero coverage
-is flagged, and a selection with a flagged channel is not categorized for
-the pathway finding" (the categorization decision itself is
-`selection-report.ts`'s job, WP3; this script only computes and records the
-counts and the flag).
+`00-overview.md`: "per input channel and output population, the number of
+selected bridge neurons with at least one edge from that channel's sensory
+neurons **and** at least one edge to that population's descending neurons.
+Any channel or population with zero coverage is flagged, and a selection
+with a flagged channel is not categorized for the pathway finding" (the
+categorization decision itself is `selection-report.ts`'s job, WP3; this
+script only computes and records the counts and the flag).
+
+A dual-review finding on an earlier version of this file: it counted each
+side of that "and" independently (bridges reached from a channel, bridges
+reaching a population), which is a weaker, non-conjunctive statistic -- a
+bridge reached from channel c but with no path onward to *any* descending
+population would still count as "covering" c. `compile.py`'s bridge
+candidates are computed on the full traced-edge graph (`select_subgraph`'s
+`forward_from_sensory & backward_from_descending`) *before* `select_edges`
+drops edges below `SYNAPSE_THRESHOLD`, so a compiled bridge can genuinely
+keep its sensory input while losing every edge to a descending neuron (or
+the reverse) -- exactly the "dead-end bridge" the predeclared check exists
+to catch, and exactly what `random-bridge` (uniform sampling, which favors
+low-degree candidates) makes more likely. This version computes the full
+8x3 joint (channel, population) matrix (`pairCoverage`) and derives each
+marginal conjunctively: a bridge counts for channel c only if it also has
+an edge to *some* descending population (not only to `c`'s own paired
+population -- `perChannel`/`perPopulation` are one-dimensional summaries,
+matching WP3's published `coverage: {perChannel[8], perPopulation[3],
+flagged}` schema (`03-artifact-and-findings.md`), and `pairCoverage` is
+recorded alongside for WP3 to consume at whichever granularity it needs.
 
 "Bridge neuron" is derived from the compiled graph alone, not from any
 raw-data node list: `compile.py`'s `select_subgraph` builds
@@ -39,6 +56,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import platform
 import sys
 from pathlib import Path
 
@@ -53,10 +71,37 @@ assert_single_threaded_blas()
 import numpy as np  # noqa: E402
 
 import graph_io  # noqa: E402
+import explain_selection_mode  # noqa: E402
 from features import OBSERVATION_CHANNELS  # noqa: E402
 from transfer import OBSERVATION_CHANNEL_INDEX, OUTPUT_POPULATION_INDEX  # noqa: E402
 
 VERSION = 1
+
+#: This script's own real import-graph closure -- `scripts/selections/`
+#: (itself), `scripts/analysis/` (`graph_io`/`features`/`transfer`/
+#: `explain_selection_mode`/`env_guard`), and `scripts/data/` (`graph_io.py`'s
+#: own `sys.path.insert` of that directory, which is how `binfmt`/`rewire`
+#: resolve) -- matching `transfer.py`'s `TRANSFER_ENTRY`/`TRANSFER_SEARCH_DIRS`
+#: convention exactly, so a `coverage.json` can be told apart from one
+#: produced by stale code the same way every other producer in this study
+#: already is.
+COVERAGE_ENTRY = Path(__file__).resolve()
+COVERAGE_SOURCE_DIR = COVERAGE_ENTRY.parent
+COVERAGE_SEARCH_DIRS: tuple[Path, ...] = (COVERAGE_SOURCE_DIR, COVERAGE_SOURCE_DIR.parent / "analysis")
+REPO_ROOT = COVERAGE_SOURCE_DIR.parents[1]
+PUBLIC_DATA_DIR = REPO_ROOT / "public" / "data"
+DOCS_DIR = REPO_ROOT / "docs"
+
+
+def coverage_producer() -> dict:
+    """See `transfer.py`'s `transfer_producer()` doc comment -- identical shape and rationale."""
+    dependencies = graph_io.python_dependency_closure(COVERAGE_ENTRY, REPO_ROOT, COVERAGE_SEARCH_DIRS)
+    return {
+        "script": "scripts/selections/coverage.py",
+        "sourceSha256": graph_io.source_identity_sha256(REPO_ROOT, dependencies),
+        "dependencies": dependencies,
+        "host": {"arch": platform.machine(), "python": platform.python_version()},
+    }
 
 
 def compute_coverage(graph: "graph_io.binfmt.GraphArrays") -> dict:
@@ -66,6 +111,8 @@ def compute_coverage(graph: "graph_io.binfmt.GraphArrays") -> dict:
     channel_index = graph.input_channel_index
     population_index = graph.output_population_index
     is_bridge = (channel_index < 0) & (population_index < 0)
+    channel_count = len(OBSERVATION_CHANNEL_INDEX)
+    population_count = len(OUTPUT_POPULATION_INDEX)
 
     offsets = graph.presynaptic_offsets.astype(np.int64)
     post_indices = graph.postsynaptic_indices.astype(np.int64)
@@ -79,26 +126,44 @@ def compute_coverage(graph: "graph_io.binfmt.GraphArrays") -> dict:
 
     bridge_selected_count = int(np.count_nonzero(is_bridge))
 
+    # `bridge_in_from_channel[c, b]`: bridge neuron b has >=1 incoming edge
+    # from a channel-c sensory neuron. `bridge_out_to_population[p, b]`:
+    # bridge neuron b has >=1 outgoing edge to a population-p descending
+    # neuron. Both are boolean per-(index, bridge-neuron) membership, built
+    # once from the full edge list (not per channel/population in a Python
+    # loop), then combined below for both the joint matrix and the
+    # conjunctive marginals.
+    bridge_in_from_channel = np.zeros((channel_count, neuron_count), dtype=bool)
+    in_mask = is_bridge[post_of_edge] & (channel_index[pre_of_edge] >= 0)
+    bridge_in_from_channel[channel_index[pre_of_edge[in_mask]], post_of_edge[in_mask]] = True
+
+    bridge_out_to_population = np.zeros((population_count, neuron_count), dtype=bool)
+    out_mask = is_bridge[pre_of_edge] & (population_index[post_of_edge] >= 0)
+    bridge_out_to_population[population_index[post_of_edge[out_mask]], pre_of_edge[out_mask]] = True
+
+    has_any_in = bridge_in_from_channel.any(axis=0)  # bridge has *some* sensory input
+    has_any_out = bridge_out_to_population.any(axis=0)  # bridge has *some* descending output
+
+    # The predeclared joint statistic: for each (channel, population) pair,
+    # the number of bridges with an edge from that channel AND an edge to
+    # that population.
+    joint = bridge_in_from_channel[:, None, :] & bridge_out_to_population[None, :, :]  # (channel, population, N)
+    pair_coverage = joint.sum(axis=2).astype(np.int64)  # (channel, population)
+
     per_channel = []
-    for channel_name in OBSERVATION_CHANNELS:
-        c = OBSERVATION_CHANNEL_INDEX[channel_name]
-        # Edges whose presynaptic neuron is a channel-c sensory neuron and
-        # whose postsynaptic neuron is a selected bridge neuron.
-        from_channel = channel_index[pre_of_edge] == c
-        to_bridge = is_bridge[post_of_edge]
-        covered_bridge_ids = np.unique(post_of_edge[from_channel & to_bridge])
-        count = int(covered_bridge_ids.size)
+    for c, channel_name in enumerate(OBSERVATION_CHANNELS):
+        # Conjunctive marginal: a bridge counts for channel c only if it also
+        # reaches *some* descending population (a complete, if not
+        # necessarily population-c-paired, sensory->bridge->descending path)
+        # -- not a plain count of bridges merely reached from channel c,
+        # which is what a dual-review finding flagged as under-strict.
+        count = int(np.count_nonzero(bridge_in_from_channel[c] & has_any_out))
         per_channel.append({"channel": channel_name, "coveredBridgeCount": count, "flagged": count == 0})
 
     per_population = []
     for population_name in OUTPUT_POPULATION_INDEX:
         p = OUTPUT_POPULATION_INDEX[population_name]
-        # Edges whose presynaptic neuron is a selected bridge neuron and
-        # whose postsynaptic neuron is a population-p descending neuron.
-        from_bridge = is_bridge[pre_of_edge]
-        to_population = population_index[post_of_edge] == p
-        covered_bridge_ids = np.unique(pre_of_edge[from_bridge & to_population])
-        count = int(covered_bridge_ids.size)
+        count = int(np.count_nonzero(bridge_out_to_population[p] & has_any_in))
         per_population.append({"population": population_name, "coveredBridgeCount": count, "flagged": count == 0})
 
     flagged = any(entry["flagged"] for entry in per_channel) or any(entry["flagged"] for entry in per_population)
@@ -107,6 +172,10 @@ def compute_coverage(graph: "graph_io.binfmt.GraphArrays") -> dict:
         "bridgeSelectedCount": bridge_selected_count,
         "perChannel": per_channel,
         "perPopulation": per_population,
+        # `pairCoverage[c][p]`: bridges with an edge from channel c AND an
+        # edge to population p (the plan's literal, fully joint reading),
+        # in `OBSERVATION_CHANNELS` x `OUTPUT_POPULATION_INDEX` order.
+        "pairCoverage": pair_coverage.tolist(),
         "flagged": flagged,
     }
 
@@ -131,12 +200,21 @@ def main(argv: list[str] | None = None) -> None:
         manifest = json.load(fh)
     expected_sha256 = manifest["binarySha256"]
 
+    # Selection-robustness WP2: the same "only the shipped graph may write
+    # into the shipped tree" guard the other three chain producers carry
+    # (dual-review finding: coverage.py was new write-path code left
+    # unguarded).
+    explain_selection_mode.guard_selection_scratch_target(
+        args.out, "--out", expected_sha256, public_data_dir=PUBLIC_DATA_DIR, docs_dir=DOCS_DIR
+    )
+
     graph = graph_io.load_verified_graph(args.graph, expected_sha256)
     coverage = compute_coverage(graph)
 
     artifact = {
         "version": VERSION,
         "sourceGraphSha256": expected_sha256,
+        "producer": coverage_producer(),
         **coverage,
     }
     graph_io.write_canonical_json(args.out, artifact)

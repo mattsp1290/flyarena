@@ -948,12 +948,60 @@ def test_selection_mode_guard_refuses_public_data_out_for_non_shipped_graph(tmp_
         _run_main_selection_mode(tmp_path, synthetic_inputs, tmp_path / "out.json", fake_docs / "selection-larger-report.md")
 
 
-def test_selection_mode_guard_allows_public_data_out_when_graph_sha_matches_shipped(
+def test_selection_mode_guard_covers_manifest_too(tmp_path, synthetic_inputs, monkeypatch):
+    # Every other selection-mode guard test passes --skip-manifest-update
+    # (a dual-review gap flagged directly), so `guard(args.manifest,
+    # "--manifest")` (explain.py, right after the --out/--report-out guard
+    # calls) was never actually exercised. The guard runs before any
+    # manifest file is read (explain.main() calls it immediately after
+    # loading rewiring_null, well before check_manifest_round_trips), so
+    # --manifest need not even point at a real file for this to prove the
+    # guard fires.
+    fake_public_data = tmp_path / "shipped" / "public" / "data"
+    fake_docs = tmp_path / "shipped" / "docs"
+    fake_public_data.mkdir(parents=True)
+    fake_docs.mkdir(parents=True)
+    (fake_public_data / "malecns-arena-v1.manifest.json").write_text(json.dumps({"binarySha256": "f" * 64}))
+    monkeypatch.setattr(explain, "PUBLIC_DATA_DIR", fake_public_data)
+    monkeypatch.setattr(explain, "DOCS_DIR", fake_docs)
+
+    manifest_path = fake_public_data / "malecns-arena-selection-larger.manifest.json"
+    with pytest.raises(ValueError, match="resolves under"):
+        explain.main(
+            [
+                "--selection-mode",
+                "--rewiring-null",
+                str(synthetic_inputs["rewiring-null.json"]),
+                "--variant-flip-both",
+                str(synthetic_inputs["variant-flip-both.json"]),
+                "--transfer",
+                str(synthetic_inputs["transfer.json"]),
+                "--features",
+                str(synthetic_inputs["features.json"]),
+                "--regime",
+                str(synthetic_inputs["regime.json"]),
+                "--out",
+                str(tmp_path / "out.json"),
+                "--report-out",
+                str(tmp_path / "report.md"),
+                "--manifest",
+                str(manifest_path),
+            ]
+        )
+    assert not manifest_path.exists()
+
+
+def test_selection_mode_guard_refuses_public_data_out_even_when_graph_sha_matches_shipped(
     tmp_path, synthetic_inputs, monkeypatch
 ):
-    # Same fake tree, but this time the "shipped" manifest's sha matches the
-    # fixture's sourceGraphSha256 ("a" * 64) -- confirms the guard does not
-    # over-trigger for a run that legitimately describes the shipped graph.
+    # A dual-review finding: an earlier version of the guard returned early
+    # whenever the scored graph's sha happened to match the shipped one,
+    # even in --selection-mode -- so `explain.py --selection-mode` run
+    # against the shipped graph, with default --out/--report-out, would
+    # silently overwrite the shipped null-explanation-v1.json with
+    # `exploratory: null`/`finding.definitionSensitive: null`, which the
+    # browser's shape validator rejects. Selection mode must refuse
+    # public/docs unconditionally -- it is never the canonical publish path.
     fake_public_data = tmp_path / "shipped" / "public" / "data"
     fake_docs = tmp_path / "shipped" / "docs"
     fake_public_data.mkdir(parents=True)
@@ -963,5 +1011,37 @@ def test_selection_mode_guard_allows_public_data_out_when_graph_sha_matches_ship
     monkeypatch.setattr(explain, "DOCS_DIR", fake_docs)
 
     out_path = fake_public_data / "null-explanation-v1.json"
-    _run_main_selection_mode(tmp_path, synthetic_inputs, out_path, tmp_path / "report.md")  # must not raise
-    assert out_path.exists()
+    with pytest.raises(ValueError, match="resolves under"):
+        _run_main_selection_mode(tmp_path, synthetic_inputs, out_path, tmp_path / "report.md")
+    assert not out_path.exists()
+
+
+def test_non_selection_mode_allows_public_data_out_when_graph_sha_matches_shipped(
+    tmp_path, synthetic_inputs, monkeypatch
+):
+    # The sha-based allowance is for the ordinary (non-selection-mode)
+    # republish path only, where writing the shipped graph's own artifacts
+    # back to their shipped paths is the entire point (the normal
+    # `npm run` … / `uv run python scripts/analysis/explain.py` flow, with
+    # no --selection-mode, republishing null-explanation-v1.json).
+    fake_public_data = tmp_path / "shipped" / "public" / "data"
+    fake_docs = tmp_path / "shipped" / "docs"
+    fake_public_data.mkdir(parents=True)
+    fake_docs.mkdir(parents=True)
+    (fake_public_data / "malecns-arena-v1.manifest.json").write_text(json.dumps({"binarySha256": "a" * 64}))
+    monkeypatch.setattr(explain, "PUBLIC_DATA_DIR", fake_public_data)
+    monkeypatch.setattr(explain, "DOCS_DIR", fake_docs)
+
+    out_path = fake_public_data / "null-explanation-v1.json"
+    # Exercised directly against the guard (the ordinary, non-selection-mode
+    # call site's exact arguments) -- a full `explain.main()` run would also
+    # need a real `--manifest` round-trip fixture, which is incidental to
+    # what this test is checking.
+    explain.explain_selection_mode.guard_selection_scratch_target(
+        out_path,
+        "--out",
+        "a" * 64,
+        public_data_dir=fake_public_data,
+        docs_dir=fake_docs,
+        selection_mode=False,
+    )  # must not raise

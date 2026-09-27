@@ -3,7 +3,9 @@
 6-neuron graph (2 sensory, 2 bridge, 2 descending) with edges wired through
 only 2 of the 8 input channels and 2 of the 3 output populations, so the
 other 6 channels and 1 population are exercised as the "zero coverage"
-flagged case.
+flagged case. Also covers the conjunctive (channel AND population) coverage
+definition directly, including a dead-end bridge that must not count for
+its input channel despite having an incoming edge from it.
 """
 
 from __future__ import annotations
@@ -156,3 +158,60 @@ def test_fully_covered_graph_is_not_flagged() -> None:
     assert coverage["flagged"] is False
     assert all(entry["coveredBridgeCount"] == 1 for entry in coverage["perChannel"])
     assert all(entry["coveredBridgeCount"] == 1 for entry in coverage["perPopulation"])
+    # Every channel pairs with every population through the one shared bridge.
+    assert coverage["pairCoverage"] == [[1] * 3 for _ in range(8)]
+
+
+def test_dead_end_bridge_does_not_count_for_its_input_channel() -> None:
+    """A dual-review finding on an earlier version of `compute_coverage`:
+    it counted a bridge for channel c merely because it had an incoming
+    edge from a channel-c sensory neuron, even if that bridge had no
+    outgoing edge to any descending neuron at all -- exactly the "dead-end
+    bridge" `compile.py` can produce (bridge candidates are chosen on the
+    full traced-edge graph, before `select_edges` drops edges below
+    `SYNAPSE_THRESHOLD`). `foodBearing` must NOT count a bridge that is
+    reached but goes nowhere."""
+    # neurons: 0=sensory(foodBearing), 1=bridge (dead end, no out-edge),
+    #          2=bridge (real path), 3=descending(thrust)
+    # edges: 0->1 (dead end), 0->2, 2->3
+    neuron_count = 4
+    presynaptic_offsets = np.array([0, 2, 2, 3, 3], dtype=np.uint32)
+    postsynaptic_indices = np.array([1, 2, 3], dtype=np.uint32)
+    contact_magnitudes = np.ones(3, dtype=np.float32)
+    presynaptic_signs = np.ones(neuron_count, dtype=np.int8)
+    input_channel_index = np.array([0, -1, -1, -1], dtype=np.int32)
+    input_weight = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    output_population_index = np.array([-1, -1, -1, 0], dtype=np.int32)
+    output_weight = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+    metadata = {
+        "formatVersion": 1,
+        "neuronCount": neuron_count,
+        "edgeCount": 3,
+        "inputChannelCount": 8,
+        "outputPopulationCount": 3,
+    }
+    graph = binfmt.GraphArrays(
+        metadata=metadata,
+        biological_ids=np.arange(neuron_count, dtype=np.uint64),
+        presynaptic_offsets=presynaptic_offsets,
+        postsynaptic_indices=postsynaptic_indices,
+        contact_magnitudes=contact_magnitudes,
+        presynaptic_signs=presynaptic_signs,
+        input_channel_index=input_channel_index,
+        input_weight=input_weight,
+        output_population_index=output_population_index,
+        output_weight=output_weight,
+    )
+    coverage = compute_coverage(graph)
+    assert coverage["bridgeSelectedCount"] == 2  # both bridge 1 (dead end) and bridge 2 are selected
+    by_channel = {entry["channel"]: entry for entry in coverage["perChannel"]}
+    # Only bridge 2 has BOTH an in-edge from foodBearing and an out-edge to
+    # a descending neuron; bridge 1 has the in-edge but no out-edge, so it
+    # must not be counted -- the conjunctive marginal, not a plain "reached
+    # from foodBearing" count (which would wrongly be 2).
+    assert by_channel["foodBearing"]["coveredBridgeCount"] == 1
+    assert by_channel["foodBearing"]["flagged"] is False
+    # The joint (channel, population) matrix: foodBearing x thrust has
+    # exactly one covering bridge (bridge 2); every other pair is 0.
+    channel_row = coverage["pairCoverage"][0]  # foodBearing is index 0
+    assert channel_row == [1, 0, 0]  # thrust, yaw, brake

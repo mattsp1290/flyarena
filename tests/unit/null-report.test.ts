@@ -11,6 +11,7 @@ import {
   DEFAULT_OUT,
   DEFAULT_REPORT_MD,
   buildArtifact,
+  guardSelectionScratchTarget,
   guardShippedTimingProvenance,
   parseNullReportArgs,
   resolveRunMeta,
@@ -404,6 +405,26 @@ describe('runNullReport', () => {
       // selection chain's own training/runs/selections/<id>/ scratch tree
       // looks like, and it must keep working unmodified.
       expect(() => runNullReport(args)).not.toThrow();
+    });
+
+    // A dual-review gap: every test above only exercises refusal. Calling
+    // `guardSelectionScratchTarget` directly (rather than through a full
+    // `runNullReport`) lets these two boundary cases be checked without
+    // needing a real 500-graph shipped-sha fixture.
+    it('does not block a sibling directory that merely shares a string prefix with public/ or docs/', () => {
+      const publicOldSibling = join(dirname(DEFAULT_OUT), '..', '..', 'public-old', 'x.json');
+      const docs2Sibling = join(dirname(DEFAULT_REPORT_MD), '..', 'docs2', 'x.md');
+      expect(() => guardSelectionScratchTarget(publicOldSibling, '--out', HEX64('a'))).not.toThrow();
+      expect(() => guardSelectionScratchTarget(docs2Sibling, '--report-md', HEX64('a'))).not.toThrow();
+    });
+
+    it('allows a write under the real public/data tree when the sha matches the real shipped manifest', () => {
+      const shippedManifest = JSON.parse(readFileSync(DEFAULT_MANIFEST, 'utf8')) as { binarySha256: string };
+      // The exact call site's arguments (path, flagLabel, sourceGraphSha256)
+      // -- proves the guard doesn't over-trigger for a legitimate default
+      // publish, without needing a real 500-rewired-graph fixture scored
+      // against the shipped graph to drive it through `runNullReport`.
+      expect(() => guardSelectionScratchTarget(DEFAULT_OUT, '--out', shippedManifest.binarySha256)).not.toThrow();
     });
   });
 

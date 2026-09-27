@@ -31,13 +31,18 @@
 #   --shards N        null-evaluate.ts/regime-check.ts shard count (default 12,
 #                      this bean's machine-sharing cap)
 #   --workers N       transfer.py/features.py process-pool size (default 12)
-#   --dry-run-fixture structural self-check only (script/binary existence,
-#                      argument wiring) -- prints every step's command
-#                      without running any of the real (hours-long) compute.
-#                      Does not exercise the tools themselves; see the
-#                      script's own doc comment in the implementation PR for
-#                      why a true fixture-scale end-to-end run was out of
-#                      scope for this pass.
+#   --dry-run-fixture structural self-check only: validates the selection id,
+#                      that every CLI this chain invokes (uv/npm/jq) and every
+#                      script path it references exist, and that every npm
+#                      script name it calls is declared in package.json --
+#                      then prints every step's command without running any
+#                      of the real (hours-long) compute. It does NOT run any
+#                      producer against real or fixture data (a full
+#                      fixture-scale end-to-end run through all eight
+#                      downstream tools was out of scope for WP2 -- see
+#                      .agents/plans/selection-robustness/02-per-selection-chain.md's
+#                      own change-surface note), so it cannot catch a flag
+#                      whose *meaning* changed without also changing its name.
 
 set -euo pipefail
 
@@ -49,6 +54,20 @@ usage() {
 [[ $# -ge 1 ]] || usage
 SELECTION="$1"
 shift
+
+# Validated unconditionally (not only in --dry-run-fixture): matches
+# scripts/data/selections.py's SELECTIONS keys exactly -- a dual-review
+# finding: an earlier version accepted any string here and only discovered
+# a typo'd/unknown id hours later, when the first real step failed (or, in
+# dry-run mode, never discovered it at all).
+case "$SELECTION" in
+  default | larger | smaller | random-bridge | alt-sensory-mapping) ;;
+  *)
+    echo "run-chain.sh: unknown selection id '${SELECTION}' (expected one of: default, larger, smaller," >&2
+    echo "  random-bridge, alt-sensory-mapping -- scripts/data/selections.py's SELECTIONS keys)" >&2
+    exit 1
+    ;;
+esac
 
 SHARDS=12
 WORKERS=12
@@ -126,6 +145,20 @@ check_sha() {
 if [[ "$DRY_RUN" == 1 ]]; then
   log "dry-run-fixture: structural self-check only, no real compute will run"
   GRAPH_SHA="<dry-run: not read>"
+
+  for cmd in uv npm jq; do
+    command -v "$cmd" >/dev/null 2>&1 || { echo "run-chain.sh: dry-run-fixture: '$cmd' not on PATH" >&2; exit 1; }
+  done
+  for script in scripts/data/rewire_batch.py scripts/analysis/transfer.py scripts/analysis/features.py \
+    scripts/analysis/explain.py scripts/analysis/interventions.py scripts/selections/coverage.py \
+    scripts/null/null-evaluate.ts scripts/null/null-report.ts scripts/null/regime-check.ts \
+    scripts/null/intervention-report.ts; do
+    require_file "$script"
+  done
+  for npm_script in null:evaluate null:report null:regime-check intervention:report; do
+    jq -e --arg s "$npm_script" '.scripts[$s] != null' package.json >/dev/null \
+      || { echo "run-chain.sh: dry-run-fixture: package.json has no \"$npm_script\" script" >&2; exit 1; }
+  done
 else
   require_file "$GRAPH"
   require_file "$MANIFEST"
@@ -141,16 +174,27 @@ fi
 check_sha "graphs/index.json sourceSha256" "$B/graphs/index.json" '.sourceSha256' "$GRAPH_SHA"
 
 # --- Step 2: authored null ---
-if [[ "$DRY_RUN" != 1 && -f "$B/rewiring-null.json" ]]; then
-  log "step 2 (authored null): $B/rewiring-null.json exists, skipping"
+# Skip only when EVERY output null-report.ts writes exists -- not just the
+# first (rewiring-null.json). null-report.ts's write order is out -> manifest
+# rewiringNull key -> report md, so a crash between writes would otherwise
+# leave rewiring-null-report.md silently missing (a dual-review finding).
+if [[ "$DRY_RUN" != 1 && -f "$B/rewiring-null.json" && -f "$B/rewiring-null-report.md" ]]; then
+  log "step 2 (authored null): $B/rewiring-null.json and .../rewiring-null-report.md exist, skipping"
 else
   if [[ "$DRY_RUN" == 1 || ! -f "$B/null-raw.json" ]]; then
     run npm run null:evaluate -- --biological --graph "$GRAPH" --rewired-index "$B/graphs/index.json" \
       --graphs-dir "$B/graphs" --held-out-start "$HELD_OUT_START" --held-out-count "$HELD_OUT_COUNT" \
       --ticks "$TICKS" --shards "$SHARDS" --out "$B/null-raw.json"
   fi
+  # --trained points at a path that is never created for a selection run: a
+  # dual-review finding -- null-report.ts's ordinary path merges a `trained`
+  # section whenever ITS DEFAULT --trained path (training/runs/null/trained.json,
+  # the shipped rewiring-null study's own trained-readout output) happens to
+  # exist on this machine, with no graph-sha check (NullTrainedEvaluationRaw
+  # carries none). Left at its default, a selection's rewiring-null.json
+  # would silently carry the *shipped* graph's trained-readout percentile.
   run npm run null:report -- --authored "$B/null-raw.json" --out "$B/rewiring-null.json" \
-    --report-md "$B/rewiring-null-report.md" --manifest "$MANIFEST"
+    --report-md "$B/rewiring-null-report.md" --manifest "$MANIFEST" --trained "$B/no-trained-arm.json"
 fi
 check_sha "rewiring-null.json sourceGraphSha256" "$B/rewiring-null.json" '.sourceGraphSha256' "$GRAPH_SHA"
 
@@ -189,8 +233,12 @@ else
     --graphs-dir "$B/graphs" --steady-state-dir "$B/steady-state" --shards "$SHARDS" --out "$B/regime.json"
 fi
 
-if [[ "$DRY_RUN" != 1 && -f "$B/null-explanation.json" ]]; then
-  log "step 3d (explain --selection-mode): exists, skipping"
+# Skip only when both of explain.py's write-order outputs exist (out ->
+# report -> manifest, explain.py:982-986) -- a crash between writes would
+# otherwise leave null-explanation-report.md (an acceptance artifact)
+# silently missing (a dual-review finding, same class as step 2's above).
+if [[ "$DRY_RUN" != 1 && -f "$B/null-explanation.json" && -f "$B/null-explanation-report.md" ]]; then
+  log "step 3d (explain --selection-mode): both outputs exist, skipping"
 else
   # Every path flag given explicitly (never a default), per the plan --
   # the public/docs refusal in explain.py applies to --out/--report-out/
@@ -209,10 +257,15 @@ if [[ "$DRY_RUN" != 1 && -f "$B/coverage.json" ]]; then
 else
   run uv run python scripts/selections/coverage.py --graph "$GRAPH" --manifest "$MANIFEST" --out "$B/coverage.json"
 fi
+check_sha "coverage.json sourceGraphSha256" "$B/coverage.json" '.sourceGraphSha256' "$GRAPH_SHA"
 
 # --- Step 5: interventions (rebuild P/C/M from this selection's own null/explanation, then score + stats) ---
-if [[ "$DRY_RUN" != 1 && -f "$B/interventions/index.json" ]]; then
-  log "step 5a (interventions): exists, skipping"
+# Skip only when both of interventions.py's outputs exist (index.json ->
+# attribution.json, interventions.py:879,901) -- attribution.json holds P's
+# search-budget disclosure (k, targetReached) that WP3 needs; a crash
+# between writes would otherwise leave it silently missing.
+if [[ "$DRY_RUN" != 1 && -f "$B/interventions/index.json" && -f "$B/interventions/attribution.json" ]]; then
+  log "step 5a (interventions): both outputs exist, skipping"
 else
   run uv run python scripts/analysis/interventions.py --biological "$GRAPH" --null "$B/rewiring-null.json" \
     --explanation "$B/null-explanation.json" --out-dir "$B/interventions"

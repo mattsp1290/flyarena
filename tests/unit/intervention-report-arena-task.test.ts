@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -9,6 +9,7 @@ import {
   runInterventionReport,
   type InterventionReportArgs
 } from '../../scripts/null/intervention-report';
+import { guardSelectionScratchOut } from '../../scripts/null/intervention-report-run-mode';
 import type { NullGraphListEvaluationRaw } from '../../scripts/null/null-evaluate';
 import { resolveArenaTask } from '../../src/lib/arena/tasks';
 
@@ -339,6 +340,29 @@ describe('runInterventionReport: --arena-task / --stats-only (task-generality)',
     it('does not refuse a scratch --out outside public/ and docs/ (the normal selection-scratch case)', () => {
       writeFixtureFiles(0, 0);
       expect(() => runInterventionReport(argsFor())).not.toThrow();
+    });
+
+    // A dual-review gap: every test above only exercises refusal against
+    // the real repo tree. `guardSelectionScratchOut` takes injectable
+    // `publicDataDir`/`docsDir`, so the allow-path and the sibling-prefix
+    // boundary can be checked directly, without a real repo write.
+    it('guardSelectionScratchOut: allows public/ when sha matches shipped; never blocks a sibling prefix', () => {
+      const root = mkdtempSync(join(tmpdir(), 'guard-selection-scratch-out-'));
+      try {
+        const pub = join(root, 'public', 'data');
+        mkdirSync(pub, { recursive: true });
+        writeFileSync(join(pub, 'malecns-arena-v1.manifest.json'), JSON.stringify({ binarySha256: 'a'.repeat(64) }));
+        const docs = join(root, 'docs');
+        mkdirSync(docs, { recursive: true });
+
+        expect(() => guardSelectionScratchOut(join(pub, 'x.json'), 'a'.repeat(64), pub, docs)).not.toThrow();
+        expect(() => guardSelectionScratchOut(join(pub, 'x.json'), 'b'.repeat(64), pub, docs)).toThrow(/resolves under/);
+        expect(() => guardSelectionScratchOut(join(root, 'public-old', 'x.json'), 'b'.repeat(64), pub, docs)).not.toThrow();
+        expect(() => guardSelectionScratchOut(join(root, 'docs2', 'x.md'), 'b'.repeat(64), pub, docs)).not.toThrow();
+        expect(() => guardSelectionScratchOut(pub, 'b'.repeat(64), pub, docs)).toThrow(/resolves under/);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
     });
   });
 

@@ -744,6 +744,7 @@ def main(argv: list[str] | None = None) -> None:
         source_graph_sha256=source_graph_sha256,
         public_data_dir=PUBLIC_DATA_DIR,
         docs_dir=DOCS_DIR,
+        selection_mode=args.selection_mode,
     )
     guard(args.out, "--out")
     guard(args.report_out, "--report-out")
