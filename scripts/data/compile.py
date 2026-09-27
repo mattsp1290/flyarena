@@ -99,6 +99,24 @@ BRIDGE_TARGET = 800
 #: connection-level (not synapse-level) threshold applied on top.
 SYNAPSE_THRESHOLD = 3
 
+#: Predeclared alternative subgraph selections
+#: (`.agents/plans/selection-robustness`, WP1); `"default"` is the unchanged
+#: policy above, used when `--selection` is omitted. `larger`/`smaller` only
+#: change `bridge_target`; `random-bridge` swaps `select_subgraph`'s
+#: `bridge_mode` for a seeded uniform sample; `alt-sensory-mapping` swaps
+#: `assign_channels`'s `channel_mode` for a seeded permutation of the
+#: sensory-to-channel assignment (descending assignment is always
+#: unchanged). Recorded verbatim in the emitted ledger/manifest `selection`
+#: key, same as the rest of the policy.
+SELECTIONS: Mapping[str, Mapping[str, object]] = {
+    "default": {},
+    "larger": {"bridge_target": 1600},
+    "smaller": {"bridge_target": 400},
+    "random-bridge": {"bridge_mode": "seeded-uniform", "seed": 20260927},
+    "alt-sensory-mapping": {"channel_mode": "seeded-permutation", "seed": 20260927},
+}
+
+
 #: Presynaptic sign policy (Dale's law: this format applies one +-1 sign per
 #: presynaptic neuron to every edge it emits). `consensus_nt` is the source
 #: dataset's per-neuron aggregate neurotransmitter prediction (an
@@ -492,11 +510,27 @@ def _rank_by_degree(candidates: pd.DataFrame, degree: pd.Series) -> pd.DataFrame
     ).sort_values(["degree", "bodyId"], ascending=[False, True])
 
 
-def select_subgraph(annotations: pd.DataFrame, weights: pd.DataFrame) -> dict:
+def select_subgraph(
+    annotations: pd.DataFrame,
+    weights: pd.DataFrame,
+    selection: Mapping[str, object] | None = None,
+) -> dict:
     """Implements the SENSORY_* / DESCENDING_* / BRIDGE_TARGET policy
     documented above. Returns a dict with `sensory_ids`, `descending_ids`,
     `bridge_ids`, `node_ids` (their union, deduplicated) and the before/
-    after candidate counts the ledger records."""
+    after candidate counts the ledger records.
+
+    `selection` may override two bridge-only knobs (sensory/descending
+    selection is unaffected): `bridge_target` (default `BRIDGE_TARGET`), the
+    bridge population cap; and `bridge_mode`, `"degree-rank"` (default, the
+    existing `_rank_by_degree` top-N) or `"seeded-uniform"`, a
+    `numpy.random.default_rng(selection["seed"])` sample of `bridge_target`
+    candidates (or all, if fewer) drawn over the candidates sorted ascending
+    by body id, so the draw is deterministic and set-order-independent.
+    """
+    selection = selection if selection is not None else SELECTIONS["default"]
+    bridge_target = int(selection.get("bridge_target", BRIDGE_TARGET))
+    bridge_mode = str(selection.get("bridge_mode", "degree-rank"))
     duplicate_body_ids = annotations.loc[annotations["bodyId"].duplicated(keep=False), "bodyId"].unique()
     if len(duplicate_body_ids) > 0:
         raise ValueError(
@@ -546,9 +580,20 @@ def select_subgraph(annotations: pd.DataFrame, weights: pd.DataFrame) -> dict:
         (forward_from_sensory & backward_from_descending) - set(sensory_ids) - set(descending_ids)
     )
 
-    bridge_frame = pd.DataFrame({"bodyId": sorted(bridge_candidates)})
-    bridge_ranked = _rank_by_degree(bridge_frame, degree)
-    bridge_ids = bridge_ranked["bodyId"].head(BRIDGE_TARGET).astype(np.int64).tolist()
+    if bridge_mode == "degree-rank":
+        bridge_frame = pd.DataFrame({"bodyId": sorted(bridge_candidates)})
+        bridge_ranked = _rank_by_degree(bridge_frame, degree)
+        bridge_ids = bridge_ranked["bodyId"].head(bridge_target).astype(np.int64).tolist()
+    elif bridge_mode == "seeded-uniform":
+        # Sort first so the array handed to the RNG -- and therefore which
+        # indices it draws -- does not depend on `set` iteration order.
+        sorted_candidates = np.array(sorted(bridge_candidates), dtype=np.int64)
+        rng = np.random.default_rng(int(selection["seed"]))
+        sample_size = min(bridge_target, len(sorted_candidates))
+        chosen_positions = rng.choice(len(sorted_candidates), size=sample_size, replace=False)
+        bridge_ids = sorted(int(body) for body in sorted_candidates[chosen_positions])
+    else:
+        raise ValueError(f"select_subgraph: unknown bridge_mode {bridge_mode!r}")
 
     node_ids = sorted(set(sensory_ids) | set(descending_ids) | set(bridge_ids))
 
@@ -622,7 +667,9 @@ def assign_signs(node_ids: Sequence[int], neurotransmitters: pd.DataFrame) -> "t
 
 
 def assign_channels(
-    sensory_ids: Sequence[int], descending_ids: Sequence[int]
+    sensory_ids: Sequence[int],
+    descending_ids: Sequence[int],
+    selection: Mapping[str, object] | None = None,
 ) -> "tuple[dict, dict]":
     """Authored (not biologically derived) input/output wiring: neurons are
     sorted by ascending body ID and partitioned into equal contiguous
@@ -637,15 +684,33 @@ def assign_channels(
     duplicate slipping through here would otherwise silently consume two
     partition slots for one body and skew the channel/population boundary
     math for every neuron after it).
+
+    `selection["channel_mode"]` (default `"contiguous-blocks"`) may switch
+    sensory-to-channel assignment only: `"seeded-permutation"` permutes the
+    sorted sensory ids with `numpy.random.default_rng(selection["seed"])`
+    before the same contiguous split. Descending-to-population assignment is
+    always the unchanged contiguous split -- `selection` never touches
+    `descending_ids`/`output_assignment`.
     """
     if len(sensory_ids) == 0:
         raise ValueError("assign_channels: sensory_ids must be non-empty")
     if len(descending_ids) == 0:
         raise ValueError("assign_channels: descending_ids must be non-empty")
 
+    selection = selection if selection is not None else SELECTIONS["default"]
+    channel_mode = str(selection.get("channel_mode", "contiguous-blocks"))
     sensory_sorted = sorted(set(sensory_ids))
+    if channel_mode == "contiguous-blocks":
+        sensory_order = sensory_sorted
+    elif channel_mode == "seeded-permutation":
+        rng = np.random.default_rng(int(selection["seed"]))
+        permuted_positions = rng.permutation(len(sensory_sorted))
+        sensory_order = [sensory_sorted[i] for i in permuted_positions.tolist()]
+    else:
+        raise ValueError(f"assign_channels: unknown channel_mode {channel_mode!r}")
+
     input_assignment: dict[int, "tuple[int, float]"] = {}
-    for position, body in enumerate(sensory_sorted):
+    for position, body in enumerate(sensory_order):
         # Contiguous equal-ish blocks: body at sorted position p goes to
         # channel floor(p * INPUT_CHANNEL_COUNT / len(sensory_sorted)).
         channel = min(
@@ -703,13 +768,25 @@ def build_manifest_and_ledger(
     binary_gzip_size: int,
     binary_size: int,
     compiler_source_sha256_value: str,
+    artifact_name: str = ARTIFACT_NAME,
+    selection_id: str = "default",
+    selection_params: Mapping[str, object] | None = None,
 ) -> "tuple[dict, dict]":
+    """`selection` is `select_subgraph`'s *return value*, not the
+    `SELECTIONS` policy entry -- that's `selection_id`/`selection_params`,
+    recorded verbatim as a `selection: {id, params}` key in both outputs.
+    `artifact_name` (default `ARTIFACT_NAME`) names every emitted `artifact`
+    field so a variant's manifest/ledger match its actual `.bin.gz` name.
+    """
     from download import SOURCE_FILES  # local import to avoid a hard dependency for fixture tests
+
+    selection_params = selection_params if selection_params is not None else SELECTIONS["default"]
+    selection_record = {"id": selection_id, "params": dict(selection_params)}
 
     meta = graph.metadata
     manifest = {
         "formatVersion": meta["formatVersion"],
-        "artifact": f"{ARTIFACT_NAME}.bin.gz",
+        "artifact": f"{artifact_name}.bin.gz",
         "neuronCount": stats["neuronCount"],
         "edgeCount": stats["edgeCount"],
         "inputChannelCount": meta["inputChannelCount"],
@@ -725,10 +802,11 @@ def build_manifest_and_ledger(
         # (below) so either file alone proves which compiler code produced
         # this artifact.
         "compilerSourceSha256": compiler_source_sha256_value,
+        "selection": selection_record,
     }
 
     ledger = {
-        "artifact": f"{ARTIFACT_NAME}.bin.gz",
+        "artifact": f"{artifact_name}.bin.gz",
         # sha256 over COMPILER_SOURCE_FILENAMES (binfmt.py, compile.py,
         # download.py, rewire.py) at compile time -- see
         # compiler_source_sha256()'s docstring in scripts/data/compile.py.
@@ -773,6 +851,7 @@ def build_manifest_and_ledger(
             "synapseThreshold": SYNAPSE_THRESHOLD,
         },
         "selectionCounts": selection["counts"],
+        "selection": selection_record,
         "compileStats": stats,
         "unknownTransmitters": {
             "totalCount": sum(unknown_by_label.values()),
@@ -801,19 +880,62 @@ def build_manifest_and_ledger(
     return manifest, ledger
 
 
+def _refuse_unsafe_variant_target(selection_id: str, artifact_name: str, out_dir: Path) -> str | None:
+    """Returns an error message (writes nothing) if `selection_id` is a
+    non-default selection that would (a) reuse the default artifact name,
+    (b) use an `artifact_name` that embeds `/`, `.`, or `..` -- rejected so
+    it can only ever contribute a filename, never directory structure, to
+    the real write path (`out_dir / f"{artifact_name}.bin.gz"` in `main()`;
+    without this, `--out-dir . --artifact-name public/data/malecns-arena-v1`
+    would resolve to the shipped path although `out_dir` alone is not
+    "inside public/data" -- a bypass a dual review found and this closes) --
+    or (c) resolve `--out-dir` inside `public/data`. `None` means safe.
+    Checked before any raw data is loaded or any file is written.
+    """
+    if selection_id == "default":
+        return None
+    if artifact_name == ARTIFACT_NAME:
+        return (
+            f"--selection {selection_id!r} requires --artifact-name different from the "
+            f"default ({ARTIFACT_NAME!r}); refusing to compile a variant under the default name"
+        )
+    if not artifact_name or artifact_name in (".", "..") or Path(artifact_name).name != artifact_name:
+        return (
+            f"--artifact-name {artifact_name!r} must be a plain filename stem (no path "
+            "separators, '.', or '..'); refusing an ambiguous variant output path"
+        )
+    resolved_out_dir = out_dir.resolve()
+    resolved_public_data = PUBLIC_DATA_DIR.resolve()
+    if resolved_out_dir == resolved_public_data or resolved_public_data in resolved_out_dir.parents:
+        return (
+            f"--selection {selection_id!r} resolves --out-dir to {resolved_out_dir}, which is "
+            f"inside {resolved_public_data}; refusing to write a variant into public/data"
+        )
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--raw-dir", type=Path, default=RAW_DATA_DIR)
     parser.add_argument("--out-dir", type=Path, default=PUBLIC_DATA_DIR)
+    parser.add_argument("--selection", choices=sorted(SELECTIONS), default="default", help="see SELECTIONS")
+    parser.add_argument("--artifact-name", default=ARTIFACT_NAME, help="output filename stem")
     args = parser.parse_args(argv)
+
+    refusal = _refuse_unsafe_variant_target(args.selection, args.artifact_name, args.out_dir)
+    if refusal is not None:
+        print(f"error: {refusal}", file=sys.stderr)
+        return 1
+
+    selection_params = SELECTIONS[args.selection]
 
     print("Loading raw MaleCNS tables...")
     annotations = load_annotations(args.raw_dir)
     neurotransmitters = load_neurotransmitters(args.raw_dir)
     weights = load_weights(args.raw_dir)
 
-    print("Selecting subgraph...")
-    selection = select_subgraph(annotations, weights)
+    print(f"Selecting subgraph (selection={args.selection!r})...")
+    selection = select_subgraph(annotations, weights, selection=selection_params)
     print(f"  selection counts: {json.dumps(selection['counts'], indent=2)}")
 
     edges = select_edges(weights, selection["node_ids"])
@@ -821,7 +943,7 @@ def main(argv: list[str] | None = None) -> int:
 
     signs, unknown_by_label = assign_signs(selection["node_ids"], neurotransmitters)
     input_assignment, output_assignment = assign_channels(
-        selection["sensory_ids"], selection["descending_ids"]
+        selection["sensory_ids"], selection["descending_ids"], selection=selection_params
     )
     global_gain = calibrate_global_gain(edges)
     print(f"  calibrated globalGain = {global_gain}")
@@ -852,7 +974,7 @@ def main(argv: list[str] | None = None) -> int:
     binary_sha256 = binfmt.sha256_hex(binary)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    bin_gz_path = args.out_dir / f"{ARTIFACT_NAME}.bin.gz"
+    bin_gz_path = args.out_dir / f"{args.artifact_name}.bin.gz"
     binfmt.write_gzip_deterministic(binary, bin_gz_path)
     gzip_bytes = bin_gz_path.read_bytes()
     gzip_sha256 = binfmt.sha256_hex(gzip_bytes)
@@ -870,12 +992,15 @@ def main(argv: list[str] | None = None) -> int:
         binary_gzip_size=len(gzip_bytes),
         binary_size=len(binary),
         compiler_source_sha256_value=compiler_source_sha256_value,
+        artifact_name=args.artifact_name,
+        selection_id=args.selection,
+        selection_params=selection_params,
     )
 
-    (args.out_dir / f"{ARTIFACT_NAME}.manifest.json").write_text(
+    (args.out_dir / f"{args.artifact_name}.manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     )
-    (args.out_dir / f"{ARTIFACT_NAME}.ledger.json").write_text(
+    (args.out_dir / f"{args.artifact_name}.ledger.json").write_text(
         json.dumps(ledger, indent=2, sort_keys=True) + "\n"
     )
 
