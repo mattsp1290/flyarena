@@ -141,16 +141,29 @@ deliberately injects a fake, always-available GPU for test determinism
 which refuses to start a real job if free GPU memory is below 2 GiB. That
 means nothing in the reproduction test would ever notice a real GPU already
 in use. `--build` closes that gap itself: before running the atlas check, it
-checks `nvidia-smi` for free GPU memory (same 2 GiB threshold) and for any
-other running compute process. If either signals contention, `--build`
-skips **only** the atlas check -- the CPU lesion/swap-set hard gate still
-runs and still blocks the image on failure -- prints a loud warning
-recorded in the build output, and still builds and tags the image. This is
-a pre-flight convenience on top of `GRAPH_LAB_SKIP_REPRO=1`, not a
-replacement for it: use the env var to skip the whole gate outright if you
-already know the GPU is busy; the pre-flight exists for when you forget to.
-If `nvidia-smi` itself is unavailable, this is not treated as evidence of
-contention -- the atlas check runs as usual.
+reads free GPU memory the same way production does
+(`backend/graph_lab/service.py`'s `_real_gpu_free_bytes`,
+`torch.cuda.mem_get_info()`), through the same training-venv interpreter the
+reproduction checks themselves use for real torch/CUDA work (`uv run
+--project training`, reaching `training/.venv`), against the same 2 GiB
+threshold. **`nvidia-smi --query-gpu=memory.free` is deliberately not used**:
+it reports `[N/A]` on this GB10's unified-memory architecture (see
+`backend/graph_lab/service.py:34-38`'s own comment), which would make a
+pre-flight built on it always read "unknown" on the one host this matters
+on. There is also no "another process is using the GPU at all" fallback
+check: the resident synthetic-lab uvicorn process holds the GPU permanently
+on this host, so that signal would always fire and always skip the atlas
+check regardless of actual free memory -- free memory is the only signal
+used. If the probe fails for any reason (no `uv`, no `training/` venv, no
+`torch`, no CUDA device, or the query itself raising), the GPU is treated as
+busy (**fail closed**), matching production's own `None`-means-busy
+contract exactly. On any of these outcomes, `--build` skips **only** the
+atlas check -- the CPU lesion/swap-set hard gate still runs and still blocks
+the image on failure -- prints a loud warning recorded in the build output,
+and still builds and tags the image. This is a pre-flight convenience on top
+of `GRAPH_LAB_SKIP_REPRO=1`, not a replacement for it: use the env var to
+skip the whole gate outright if you already know the GPU is busy; the
+pre-flight exists for when you forget to.
 
 A second, smaller deviation from `02-job-engines.md`'s wording: `--build`
 runs these checks against the freshly bundled JS **before** `docker build`,

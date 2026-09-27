@@ -248,28 +248,50 @@ graph_lab_run_reproduction_checks() {
   fi
 }
 
-# Mirrors the production atlas engine's own "GPU busy" guard
-# (`02-job-engines.md`: refuses to start if free GPU memory is below 2 GiB,
-# read via `torch.cuda.mem_get_info`) so `--build`'s reproduction gate does
-# not blindly launch a real GPU job while another one (e.g. a multi-day
-# training run) is already using the GPU -- `test_reproduction.py`'s own
-# `AtlasReproductionTests` injects an always-free fake GPU for test
-# determinism, so nothing in the test itself would ever catch this
-# (ops-security thermo review, Important 3). True (busy) iff free memory is
-# under 2 GiB, or another compute process is already running. `nvidia-smi`
-# missing entirely is not treated as "busy" -- there is no real evidence of
-# contention, just no way to check; the atlas check then runs as before.
+GRAPH_LAB_GPU_BUSY_THRESHOLD_BYTES=$((2 * 1024 * 1024 * 1024))
+
+# Reads free GPU memory the same way production does
+# (`backend/graph_lab/service.py`'s `_real_gpu_free_bytes`, via
+# `torch.cuda.mem_get_info()`), through the same training-venv interpreter
+# the reproduction checks already use for real torch/CUDA work
+# (`backend/graph_lab/tests/test_reproduction.py`'s `TRAINING_PYTHON_BIN`
+# points at `training/.venv/bin/python3`; `uv run --project training` reaches
+# that exact venv without this script needing to assume its absolute path).
+# `nvidia-smi --query-gpu=memory.free` is deliberately NOT used here: it
+# reports `[N/A]` on this GB10's unified-memory architecture (confirmed
+# empirically -- see `backend/graph_lab/service.py:34-38`'s own comment on
+# exactly this), which would make a pre-flight built on it always read
+# "unknown" and, combined with fail-closed, always skip the atlas check —
+# silently defeating the whole point of the pre-flight on the one host that
+# matters. Prints only an integer byte count on stdout; prints nothing and
+# fails (nonzero) on any error -- missing `uv`, no `training/` venv, no
+# `torch`, no CUDA device, or the query itself raising -- so callers can
+# treat any failure as "unknown, fail closed" without parsing error text.
+graph_lab_gpu_free_bytes() {
+  command -v uv >/dev/null 2>&1 || return 1
+  local out
+  out=$(uv run --project training --locked python -I -c 'import torch; print(int(torch.cuda.mem_get_info()[0]))' 2>/dev/null) || return 1
+  [[ "$out" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$out"
+}
+
+# True (busy) iff the probe above fails for any reason (fail CLOSED,
+# matching production's `_real_gpu_free_bytes`: `None` -- unknown -- is
+# treated the same as "known busy", never optimistically "probably fine"),
+# or free memory is below the same 2 GiB threshold the production atlas
+# engine itself uses (`GRAPH_LAB_GPU_BUSY_THRESHOLD_BYTES`, matching
+# `backend/graph_lab/service.py`'s `GPU_BUSY_THRESHOLD_BYTES`). No
+# process-presence check: on this host the resident synthetic-lab uvicorn
+# process holds the GPU permanently, which would make a "some process is
+# using the GPU at all" rule always true and always skip the atlas check --
+# actual free memory is the only signal that means anything here
+# (ops-security thermo review, Important 3, and its regression-fix
+# follow-up).
 graph_lab_gpu_busy() {
-  command -v nvidia-smi >/dev/null 2>&1 || return 1
-  local free_mib
-  free_mib=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -n1)
-  if [[ "$free_mib" =~ ^[0-9]+$ ]] && (( free_mib < 2048 )); then
-    return 0
-  fi
-  if nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -q '[0-9]'; then
-    return 0
-  fi
-  return 1
+  local free_bytes
+  free_bytes=$(graph_lab_gpu_free_bytes) || return 0
+  (( free_bytes >= GRAPH_LAB_GPU_BUSY_THRESHOLD_BYTES )) && return 1
+  return 0
 }
 
 # `--build`: bundle the TS entries/workers, run the reproduction gate
@@ -283,7 +305,7 @@ cmd_build() {
   if [[ "${GRAPH_LAB_SKIP_REPRO:-0}" == 1 ]]; then
     printf 'graph-lab: GRAPH_LAB_SKIP_REPRO=1 set; skipping the spark-marked reproduction checks entirely (including the CPU lesion/swap-set checks). Re-run them once the GPU is free: cd backend/graph_lab && uv run pytest -m spark -v\n' >&2
   elif graph_lab_gpu_busy; then
-    printf 'graph-lab: WARNING: the GPU pre-flight found it busy (free memory below 2 GiB, or another compute process already running) -- skipping only the atlas reproduction check this run (it needs the GPU); the CPU lesion/swap-set checks still run as a hard gate. Consider GRAPH_LAB_SKIP_REPRO=1 to skip the whole gate outright, or re-run the atlas check manually once the GPU is free: cd backend/graph_lab && uv run pytest -m spark -k AtlasReproductionTests -v\n' >&2
+    printf 'graph-lab: WARNING: the GPU pre-flight found it busy (free memory below 2 GiB, or the free-memory probe itself failed -- treated as busy either way) -- skipping only the atlas reproduction check this run (it needs the GPU); the CPU lesion/swap-set checks still run as a hard gate. Consider GRAPH_LAB_SKIP_REPRO=1 to skip the whole gate outright, or re-run the atlas check manually once the GPU is free: cd backend/graph_lab && uv run pytest -m spark -k AtlasReproductionTests -v\n' >&2
     graph_lab_run_reproduction_checks 1
   else
     graph_lab_run_reproduction_checks 0

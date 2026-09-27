@@ -176,27 +176,21 @@ case "$*" in
       exit 1
     fi
     exit 0 ;;
+  "run --project training --locked python -I -c "*"mem_get_info"*)
+    # Simulates graph_lab_gpu_free_bytes'"'"' own invocation
+    # (`uv run --project training --locked python -I -c
+    # "import torch; print(int(torch.cuda.mem_get_info()[0]))"`).
+    # GRAPH_LAB_STUB_GPU_PROBE_FAILS=1 simulates any failure mode this
+    # function fails closed on (no training venv, no torch, no CUDA device,
+    # the query itself raising) -- prints nothing and exits nonzero, exactly
+    # like the real command would. Otherwise prints
+    # GRAPH_LAB_STUB_GPU_FREE_BYTES (default: abundant free memory).
+    if [[ "${GRAPH_LAB_STUB_GPU_PROBE_FAILS:-0}" == 1 ]]; then
+      exit 1
+    fi
+    printf "%s\n" "${GRAPH_LAB_STUB_GPU_FREE_BYTES:-999999999999}"
+    exit 0 ;;
   *) exit 2 ;;
-esac'
-
-# Simulates `nvidia-smi --query-gpu=memory.free ...` and
-# `--query-compute-apps=pid ...` (the exact invocations
-# graph_lab_gpu_busy uses). Defaults to "abundant free memory, no compute
-# apps" (not busy) unless a test writes $world/nvidia-smi-free-mib and/or
-# $world/nvidia-smi-compute-apps to simulate contention.
-nvidia_smi_stub_body='#!/usr/bin/env bash
-set -euo pipefail
-world="${GRAPH_LAB_STUB_WORLD:?}"
-mkdir -p -- "$world"
-printf "%s\n" "$*" >> "$world/nvidia-smi-calls.log"
-case "$*" in
-  "--query-gpu=memory.free --format=csv,noheader,nounits")
-    cat -- "$world/nvidia-smi-free-mib" 2>/dev/null || printf "999999\n"
-    ;;
-  "--query-compute-apps=pid --format=csv,noheader")
-    cat -- "$world/nvidia-smi-compute-apps" 2>/dev/null || true
-    ;;
-  *) exit 1 ;;
 esac'
 
 stub_bin=$(new_scratch)
@@ -206,7 +200,6 @@ write_stub "$stub_bin/sudo" "$sudo_stub_body"
 write_stub "$stub_bin/docker" "$docker_stub_body"
 write_stub "$stub_bin/npm" "$npm_stub_body"
 write_stub "$stub_bin/uv" "$uv_stub_body"
-write_stub "$stub_bin/nvidia-smi" "$nvidia_smi_stub_body"
 
 stub_bin_no_sudo=$(new_scratch)
 write_stub "$stub_bin_no_sudo/tailscale" "$tailscale_stub_body"
@@ -214,36 +207,24 @@ write_stub "$stub_bin_no_sudo/iptables" "$iptables_stub_body"
 write_stub "$stub_bin_no_sudo/docker" "$docker_stub_body"
 write_stub "$stub_bin_no_sudo/npm" "$npm_stub_body"
 write_stub "$stub_bin_no_sudo/uv" "$uv_stub_body"
-write_stub "$stub_bin_no_sudo/nvidia-smi" "$nvidia_smi_stub_body"
 
 # No `uv` at all -- exercises graph_lab_run_reproduction_checks' own hard
-# failure when uv is missing (not a silent skip).
+# failure when uv is missing (not a silent skip), and
+# graph_lab_gpu_free_bytes' own "no uv, fail closed" path.
 stub_bin_no_uv=$(new_scratch)
 write_stub "$stub_bin_no_uv/tailscale" "$tailscale_stub_body"
 write_stub "$stub_bin_no_uv/iptables" "$iptables_stub_body"
 write_stub "$stub_bin_no_uv/sudo" "$sudo_stub_body"
 write_stub "$stub_bin_no_uv/docker" "$docker_stub_body"
 write_stub "$stub_bin_no_uv/npm" "$npm_stub_body"
-write_stub "$stub_bin_no_uv/nvidia-smi" "$nvidia_smi_stub_body"
 
-# No `nvidia-smi` at all -- exercises graph_lab_gpu_busy's "no way to check,
-# so not treated as busy" fallback.
-stub_bin_no_nvidia=$(new_scratch)
-write_stub "$stub_bin_no_nvidia/tailscale" "$tailscale_stub_body"
-write_stub "$stub_bin_no_nvidia/iptables" "$iptables_stub_body"
-write_stub "$stub_bin_no_nvidia/sudo" "$sudo_stub_body"
-write_stub "$stub_bin_no_nvidia/docker" "$docker_stub_body"
-write_stub "$stub_bin_no_nvidia/npm" "$npm_stub_body"
-write_stub "$stub_bin_no_nvidia/uv" "$uv_stub_body"
-
-# A minimal, real-coreutils-only PATH component (symlinks, no `nvidia-smi`
-# or `uv`) for the two isolated-PATH tests below: this machine has a REAL
-# `nvidia-smi` and a real `uv` (this repo's own dev environment has a real
-# GPU), so simply prepending a stub dir onto the inherited PATH is not
-# enough to simulate "missing" for either -- the real binary would still be
-# found further down the same PATH. These tests instead use a fully
-# isolated PATH (a no-nvidia-smi/no-uv stub dir plus only this directory),
-# never inheriting the real PATH at all.
+# A minimal, real-coreutils-only PATH component (symlinks, no `uv`) for the
+# isolated-PATH test below: this machine has a REAL `uv` (this repo's own
+# dev environment has a real GPU and a real training venv), so simply
+# prepending a stub dir onto the inherited PATH is not enough to simulate
+# "missing" -- the real binary would still be found further down the same
+# PATH. That test instead uses a fully isolated PATH (a no-uv stub dir plus
+# only this directory), never inheriting the real PATH at all.
 core_bin=$(new_scratch)
 for _coreutil in bash dirname mktemp cat mkdir rm grep wc head tail sort; do
   _coreutil_path=$(command -v -- "$_coreutil") || { printf 'graph-lab.test: missing required coreutil: %s\n' "$_coreutil" >&2; exit 1; }
@@ -538,13 +519,19 @@ grep -qxF -- '-D DOCKER-USER -s 172.31.250.0/24 -m conntrack --ctstate NEW -j DR
 # 5h. GRAPH_LAB_SUBNET is validated as a plausible IPv4 CIDR before it
 # reaches docker/iptables (ops-security thermo review, Suggestion S1).
 # ---------------------------------------------------------------------------
-for bad_subnet in 'not-a-subnet' '172.31.250.0' '172.31.250.0/33' '0.0.0.0/0' '172.31.250.0/8'; do
+for bad_subnet in 'not-a-subnet' '172.31.250.0' '172.31.250.0/33' '0.0.0.0/0' '172.31.250.0/8' \
+  '172.31.250.0/24 -j ACCEPT'; do
   world=$(new_scratch)
   printf '%s\n' "$fake_bind" > "$world/tailscale-ips"
   env_file="$world/.env"
   {
     write_env_fixture "$env_file" "$fake_token" "$fake_origin" "$fake_bind" "$fake_deploy_url"
-    printf 'GRAPH_LAB_SUBNET=%s\n' "$bad_subnet" >> "$env_file"
+    # `%q` (not a bare `%s`): shell-quotes the value so an injection-shaped
+    # entry like '172.31.250.0/24 -j ACCEPT' reaches GRAPH_LAB_SUBNET as one
+    # literal string when `source`d, exactly as it would from a real,
+    # quoted .env value -- not split into extra shell tokens that `source`
+    # would try to execute as a separate command.
+    printf 'GRAPH_LAB_SUBNET=%q\n' "$bad_subnet" >> "$env_file"
   }
   run_child 'cmd_start; echo STARTED' \
     "$(child_prelude "$stub_bin")"$'\n'"export GRAPH_LAB_STUB_WORLD=$world GRAPH_LAB_ENV_FILE=$env_file"
@@ -748,9 +735,9 @@ run_child 'cmd_build; echo BUILT' "$(child_prelude "$stub_bin")"$'\n'"export GRA
   && pass 'docker build runs once both checks pass' \
   || fail 'docker build runs once both checks pass'
 uv_call_count=$(wc -l < "$world/uv-calls.log")
-[[ "$uv_call_count" -eq 2 ]] \
-  && pass 'uv is called exactly twice (hard gate once, atlas once) when atlas passes immediately' \
-  || fail 'uv is called exactly twice (hard gate once, atlas once) when atlas passes immediately' "count=$uv_call_count"
+[[ "$uv_call_count" -eq 3 ]] \
+  && pass 'uv is called exactly 3 times (GPU pre-flight probe, hard gate, atlas) when atlas passes immediately' \
+  || fail 'uv is called exactly 3 times (GPU pre-flight probe, hard gate, atlas) when atlas passes immediately' "count=$uv_call_count"
 
 # 8e. Hard gate passes, atlas fails all 3 attempts: never a hard gate --
 # --build still tags the image, but prints the documented warning.
@@ -764,9 +751,9 @@ run_child 'cmd_build; echo BUILT' \
   && pass 'docker build still runs despite the persistent atlas-check failure' \
   || fail 'docker build still runs despite the persistent atlas-check failure'
 uv_call_count=$(wc -l < "$world/uv-calls.log")
-[[ "$uv_call_count" -eq 4 ]] \
-  && pass 'uv is called exactly 4 times (hard gate once, atlas 3 retries) when atlas never passes' \
-  || fail 'uv is called exactly 4 times (hard gate once, atlas 3 retries) when atlas never passes' "count=$uv_call_count"
+[[ "$uv_call_count" -eq 5 ]] \
+  && pass 'uv is called exactly 5 times (GPU pre-flight probe, hard gate, atlas 3 retries) when atlas never passes' \
+  || fail 'uv is called exactly 5 times (GPU pre-flight probe, hard gate, atlas 3 retries) when atlas never passes' "count=$uv_call_count"
 
 # 8f. Atlas fails twice, then recovers on the 3rd attempt: no warning, build
 # proceeds -- this is the "signal to re-run" behavior actually working.
@@ -778,20 +765,27 @@ run_child 'cmd_build; echo BUILT' \
   || fail '--build succeeds with no warning when the atlas check recovers on retry' "status=$child_status out=$child_out"
 
 # ---------------------------------------------------------------------------
-# 8f2-8f5. GPU-busy pre-flight (ops-security thermo review, Important 3):
-# --build skips only the atlas check (never the CPU lesion/swap-set hard
-# gate) when the GPU pre-flight finds it busy, and records the skip loudly
-# in the build output.
+# 8f2-8f5. GPU-busy pre-flight (ops-security thermo review, Important 3, and
+# its regression-fix follow-up): --build skips only the atlas check (never
+# the CPU lesion/swap-set hard gate) when the `torch.cuda.mem_get_info()`
+# probe (via `uv run --project training`) finds it busy or fails, and
+# records the skip loudly in the build output. No `nvidia-smi`/process-count
+# fallback exists any more (see graph_lab_gpu_busy's own comment for why:
+# `nvidia-smi --query-gpu=memory.free` reports `[N/A]` on this GB10, and a
+# process-presence check would always fire here since a resident synthetic-
+# lab process holds the GPU permanently) -- these tests exercise the probe
+# stub's three real outcomes instead: succeeds with plenty of memory, low
+# memory, and the probe failing outright.
 # ---------------------------------------------------------------------------
 
-# 8f2. Free GPU memory below the 2 GiB threshold -> atlas skipped, hard gate
-# still runs, image still built, skip recorded in the output.
+# 8f2. The probe succeeds but reports free memory below the 2 GiB threshold
+# -> atlas skipped, hard gate still runs, image still built, skip recorded.
 world=$(new_scratch)
-printf '1024\n' > "$world/nvidia-smi-free-mib" # under 2048 MiB
-run_child 'cmd_build; echo BUILT' "$(child_prelude "$stub_bin")"$'\n'"export GRAPH_LAB_STUB_WORLD=$world"
+run_child 'cmd_build; echo BUILT' \
+  "$(child_prelude "$stub_bin")"$'\n'"export GRAPH_LAB_STUB_WORLD=$world GRAPH_LAB_STUB_GPU_FREE_BYTES=1073741824" # 1 GiB
 [[ $child_status -eq 0 && "$child_out" == *BUILT* && "$child_out" == *'GPU pre-flight found it busy'* \
   && "$child_out" == *'SKIPPED this run'* ]] \
-  && pass '--build skips the atlas check with a loud warning when free GPU memory is below 2 GiB' \
+  && pass '--build skips the atlas check with a loud warning when the probe reports free memory below 2 GiB' \
   || fail '--build skips the atlas check when free GPU memory is below 2 GiB' "status=$child_status out=$child_out"
 grep -qxF -- "run --locked python -I -m pytest -q -m spark -k not AtlasReproductionTests" "$world/uv-calls.log" \
   && pass 'the CPU lesion/swap-set hard gate still runs when the atlas check is skipped for a busy GPU' \
@@ -803,39 +797,53 @@ grep -qxF -- "run --locked python -I -m pytest -q -m spark -k not AtlasReproduct
   && pass 'the image is still built when only the atlas check is skipped' \
   || fail 'the image is still built when only the atlas check is skipped'
 
-# 8f3. Another compute process running (free memory otherwise fine) also
-# triggers the skip.
+# 8f3. The probe itself fails (no training venv, no torch, no CUDA device,
+# or the query raising -- all indistinguishable from here) -> fail CLOSED,
+# treated exactly like "busy".
 world=$(new_scratch)
-printf '999999\n' > "$world/nvidia-smi-free-mib"
-printf '12345\n' > "$world/nvidia-smi-compute-apps"
-run_child 'cmd_build; echo BUILT' "$(child_prelude "$stub_bin")"$'\n'"export GRAPH_LAB_STUB_WORLD=$world"
+run_child 'cmd_build; echo BUILT' \
+  "$(child_prelude "$stub_bin")"$'\n'"export GRAPH_LAB_STUB_WORLD=$world GRAPH_LAB_STUB_GPU_PROBE_FAILS=1"
 [[ $child_status -eq 0 && "$child_out" == *BUILT* && "$child_out" == *'GPU pre-flight found it busy'* ]] \
-  && pass '--build skips the atlas check when another compute process is running' \
-  || fail '--build skips the atlas check when another compute process is running' "status=$child_status out=$child_out"
+  && pass '--build fails closed (skips the atlas check) when the GPU-free-memory probe itself fails' \
+  || fail '--build fails closed when the GPU-free-memory probe itself fails' "status=$child_status out=$child_out"
+! grep -qxF -- 'run --locked python -I -m pytest -q -m spark -k AtlasReproductionTests' "$world/uv-calls.log" \
+  && pass 'the atlas check itself is never invoked when the probe fails' \
+  || fail 'the atlas check itself is never invoked when the probe fails' "log=$(cat -- "$world/uv-calls.log" 2>&1)"
 
-# 8f4. Plenty of free memory and no compute apps (the default stub state):
-# GPU pre-flight finds it free, atlas check runs as normal, no skip message.
+# 8f4. The probe succeeds and reports plenty of free memory (the default
+# stub value): GPU pre-flight finds it free, atlas check runs as normal, no
+# skip message.
 world=$(new_scratch)
 run_child 'cmd_build; echo BUILT' "$(child_prelude "$stub_bin")"$'\n'"export GRAPH_LAB_STUB_WORLD=$world"
 [[ $child_status -eq 0 && "$child_out" == *BUILT* && "$child_out" != *'GPU pre-flight found it busy'* && "$child_out" != *'SKIPPED this run'* ]] \
-  && pass '--build runs the atlas check normally when the GPU pre-flight finds it free' \
-  || fail '--build runs the atlas check normally when the GPU pre-flight finds it free' "status=$child_status out=$child_out"
+  && pass '--build runs the atlas check normally when the probe reports plenty of free memory' \
+  || fail '--build runs the atlas check normally when the probe reports plenty of free memory' "status=$child_status out=$child_out"
 grep -qxF -- 'run --locked python -I -m pytest -q -m spark -k AtlasReproductionTests' "$world/uv-calls.log" \
   && pass 'the atlas check is actually invoked when the GPU is free' \
   || fail 'the atlas check is actually invoked when the GPU is free' "log=$(cat -- "$world/uv-calls.log" 2>&1)"
 
-# 8f5. nvidia-smi missing entirely: no evidence of contention, so not
-# treated as busy -- the atlas check still runs (this environment's own
-# fallback, not a false "safe" skip).
+# 8f5. Exactly at the 2 GiB threshold is still "free" (the production engine
+# and this pre-flight both use `< threshold`, i.e. `>=` is free).
 world=$(new_scratch)
-script="$(printf 'set -euo pipefail\nexport PATH="%s:%s"\nsource "%s"\n%s\n' "$stub_bin_no_nvidia" "$core_bin" "$lib" 'cmd_build; echo BUILT')"
+run_child 'cmd_build; echo BUILT' \
+  "$(child_prelude "$stub_bin")"$'\n'"export GRAPH_LAB_STUB_WORLD=$world GRAPH_LAB_STUB_GPU_FREE_BYTES=2147483648" # exactly 2 GiB
+[[ $child_status -eq 0 && "$child_out" == *BUILT* && "$child_out" != *'GPU pre-flight found it busy'* ]] \
+  && pass 'exactly 2 GiB free is treated as free, not busy (matching production'"'"'s own >= threshold)' \
+  || fail 'exactly 2 GiB free is treated as free, not busy' "status=$child_status out=$child_out"
+
+# 8f6. `uv` missing entirely also fails closed (skips the atlas check) --
+# graph_lab_gpu_free_bytes' own "no uv" branch, exercised through a fully
+# isolated PATH (see $core_bin's own comment on why a plain PATH-prepend
+# does not suffice on this machine).
+world=$(new_scratch)
+script="$(printf 'set -euo pipefail\nexport PATH="%s:%s"\nsource "%s"\n%s\n' "$stub_bin_no_uv" "$core_bin" "$lib" 'graph_lab_gpu_busy && echo BUSY || echo NOT_BUSY')"
 set +e
 child_out=$(GRAPH_LAB_STUB_WORLD="$world" bash -c "$script" 2>&1)
 child_status=$?
 set -e
-[[ $child_status -eq 0 && "$child_out" == *BUILT* && "$child_out" != *'GPU pre-flight found it busy'* ]] \
-  && pass '--build runs the atlas check normally when nvidia-smi is unavailable (no evidence of contention)' \
-  || fail '--build runs the atlas check normally when nvidia-smi is unavailable' "status=$child_status out=$child_out"
+[[ $child_status -eq 0 && "$child_out" == *BUSY* && "$child_out" != *NOT_BUSY* ]] \
+  && pass 'graph_lab_gpu_busy fails closed (reports busy) when uv itself is missing' \
+  || fail 'graph_lab_gpu_busy fails closed when uv is missing' "status=$child_status out=$child_out"
 
 # 8g. A failing `npm run graph-lab:bundle` aborts before any reproduction
 # check or docker build runs (ordinary `set -e` propagation).

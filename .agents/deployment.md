@@ -170,12 +170,19 @@ hard gate; the atlas check is tolerance-based and retried, per
 `GRAPH_LAB_SKIP_REPRO=1` to skip the reproduction checks while another GPU
 job is already running on the Spark, and re-run them once the GPU is free.
 
-`--build` also runs its own automatic GPU pre-flight (`nvidia-smi`, same
-2 GiB free-memory threshold the atlas engine itself uses, plus a check for
-another running compute process) before the atlas check specifically --
-`test_reproduction.py`'s atlas test injects a fake always-free GPU for
-determinism, so nothing in the test itself would ever notice a real GPU
-already in use. If the pre-flight finds the GPU busy, `--build` skips only
+`--build` also runs its own automatic GPU pre-flight before the atlas check
+specifically -- `test_reproduction.py`'s atlas test injects a fake
+always-free GPU for determinism, so nothing in the test itself would ever
+notice a real GPU already in use. The pre-flight reads free memory the same
+way production does (`torch.cuda.mem_get_info()`, via `uv run --project
+training`, against the same 2 GiB threshold) -- **not** `nvidia-smi
+--query-gpu=memory.free`, which reports `[N/A]` on this GB10's
+unified-memory architecture and would make a pre-flight built on it always
+read "unknown". There is also no "some process is using the GPU at all"
+fallback: the resident synthetic-lab uvicorn process holds the GPU
+permanently here, so that check would always fire regardless of actual free
+memory. If the probe itself fails for any reason, the GPU is treated as busy
+(fail closed). If the pre-flight finds the GPU busy, `--build` skips only
 the atlas check (the CPU lesion/swap-set hard gate still runs) and prints a
 loud warning in the build output; it is a convenience on top of
 `GRAPH_LAB_SKIP_REPRO=1`, not a replacement for setting it when you already
