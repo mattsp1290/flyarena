@@ -1,0 +1,258 @@
+/* Matches `src/lib/lab/lab.css`'s dark, fixed `color-scheme` (the whole site
+   is permanently dark-themed -- see `src/app.css` -- there is no light-mode
+   toggle to support here) and its phone-width breakpoint convention. */
+.graph-lab {
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+  color: #e1eaf0;
+  background: #080e14;
+  color-scheme: dark;
+  font-size: 14px;
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 1.5rem clamp(1rem, 4vw, 2rem) 4rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+.graph-lab * {
+  box-sizing: border-box;
+}
+.graph-lab button,
+.graph-lab input,
+.graph-lab select,
+.graph-lab textarea {
+  font: inherit;
+  color: inherit;
+}
+.graph-lab button {
+  cursor: pointer;
+  border: 1px solid #345058;
+  border-radius: 6px;
+  background: #15272c;
+  color: #daeee9;
+  padding: 0.6rem 0.85rem;
+}
+.graph-lab button:hover {
+  border-color: #77f0ca;
+}
+.graph-lab button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.graph-lab button:focus-visible,
+.graph-lab input:focus-visible,
+.graph-lab select:focus-visible,
+.graph-lab textarea:focus-visible {
+  outline: 2px solid #77f0ca;
+  outline-offset: 3px;
+}
+.graph-lab button.primary {
+  background: #143a34;
+  border-color: #3f8f72;
+}
+.graph-lab button.quiet {
+  background: transparent;
+}
+.graph-lab button.cancel {
+  border-color: #7a3a3a;
+}
+.graph-lab h1,
+.graph-lab h2,
+.graph-lab p {
+  margin: 0;
+}
+.graph-lab h1 {
+  font-size: clamp(1.6rem, 3.4vw, 2.6rem);
+  line-height: 1.15;
+  font-weight: 500;
+}
+.graph-lab h1 em {
+  font-style: normal;
+  color: #8aecce;
+}
+.graph-lab .eyebrow {
+  font-size: 0.7rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: #6d99a3;
+}
+.graph-lab .intro {
+  color: #b6cad4;
+  max-width: 60ch;
+}
+.graph-lab .subtle {
+  color: #93aab3;
+  font-size: 0.85rem;
+}
+.graph-lab .panel {
+  border: 1px solid #223646;
+  border-radius: 10px;
+  padding: 1.25rem;
+  background: #0d151d;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+.graph-lab .fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  gap: 0.75rem;
+}
+.graph-lab label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.8rem;
+  color: #b6cad4;
+}
+.graph-lab input,
+.graph-lab select,
+.graph-lab textarea {
+  background: #0a1319;
+  border: 1px solid #2a4049;
+  border-radius: 6px;
+  padding: 0.5rem 0.6rem;
+}
+.graph-lab .actions {
+  display: flex;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+.graph-lab .health {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  gap: 0.5rem 1rem;
+  margin: 0;
+}
+.graph-lab .health div {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+.graph-lab dt {
+  font-size: 0.7rem;
+  color: #6d99a3;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.graph-lab dd {
+  margin: 0;
+}
+.graph-lab .hash {
+  font-family: ui-monospace, monospace;
+  font-size: 0.8rem;
+}
+.graph-lab .warning {
+  color: #f0c877;
+  border: 1px solid #6a5326;
+  background: #241e0c;
+  border-radius: 6px;
+  padding: 0.6rem 0.8rem;
+}
+.graph-lab .error {
+  color: #f0a1a1;
+}
+.graph-lab .tabs {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+.graph-lab .tabs button[aria-selected='true'] {
+  border-color: #77f0ca;
+  color: #b0f0da;
+}
+.graph-lab fieldset {
+  border: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+.graph-lab .form-errors {
+  margin: 0;
+  padding-left: 1.1rem;
+  color: #f0a1a1;
+  font-size: 0.8rem;
+}
+.graph-lab .table-scroll {
+  overflow-x: auto;
+  max-width: 100%;
+}
+.graph-lab table {
+  width: 100%;
+  min-width: max-content;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+.graph-lab th,
+.graph-lab td {
+  text-align: left;
+  padding: 0.4rem 0.6rem;
+  border-bottom: 1px solid #1c2c37;
+}
+.graph-lab .swap-rows input {
+  width: 5.5rem;
+}
+.graph-lab .job-status {
+  display: flex;
+  gap: 0.6rem;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+.graph-lab .section-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+.graph-lab .provenance-label {
+  color: #8aecce;
+  font-weight: 500;
+}
+.graph-lab .provenance {
+  font-family: ui-monospace, monospace;
+  font-size: 0.75rem;
+  word-break: break-word;
+}
+.graph-lab .grid {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 3px;
+  max-width: 420px;
+}
+.graph-lab .grid button,
+.graph-lab .grid .empty {
+  height: 56px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  font-size: 0.7rem;
+}
+.graph-lab .grid button[aria-pressed='true'] {
+  outline: 2px solid #77f0ca;
+}
+.graph-lab .grid .empty {
+  border: 1px dashed #223646;
+  color: #3a545e;
+  cursor: default;
+}
+.graph-lab .provenance-notice {
+  border-color: #2a4049;
+  color: #b6cad4;
+  font-size: 0.85rem;
+}
+@media (max-width: 760px) {
+  .graph-lab {
+    padding: 1rem 1rem 3rem;
+  }
+  .graph-lab .fields {
+    grid-template-columns: 1fr;
+  }
+  .graph-lab .grid {
+    max-width: 100%;
+  }
+}

@@ -2,15 +2,18 @@
   import { onMount } from 'svelte';
   import Arena from './App.svelte';
   import type { GraphMode } from './lib/connectome/format';
-  type View = 'arena' | 'counterfactual' | 'dgx' | 'atlas';
+  type View = 'arena' | 'counterfactual' | 'dgx' | 'atlas' | 'graph-lab';
   const readView = (): View => {
     const hash = window.location.hash.slice(1);
-    return hash === 'counterfactual' || hash === 'dgx' || hash === 'atlas' ? hash : 'arena';
+    return hash === 'counterfactual' || hash === 'dgx' || hash === 'atlas' || hash === 'graph-lab'
+      ? hash
+      : 'arena';
   };
   let view = $state<View>(readView());
   let Workbench = $state<typeof import('./lib/counterfactual/Workbench.svelte').default>();
   let Lab = $state<typeof import('./lib/lab/Lab.svelte').default>();
   let Atlas = $state<typeof import('./lib/atlas/Atlas.svelte').default>();
+  let GraphLab = $state<typeof import('./lib/graphlab/GraphLab.svelte').default>();
   let error = $state('');
   let setup = $state<{seed:number; topology:GraphMode} | undefined>();
   let destroyed = false;
@@ -32,6 +35,10 @@
         const component = (await import('./lib/lab/Lab.svelte')).default;
         if (!destroyed) Lab = component;
       }
+      if (view === 'graph-lab' && !GraphLab) {
+        const component = (await import('./lib/graphlab/GraphLab.svelte')).default;
+        if (!destroyed) GraphLab = component;
+      }
     } catch (e) {
       if (!destroyed && current === navigation) error = e instanceof Error ? e.message : 'Unable to load view';
     }
@@ -44,12 +51,13 @@
     return () => { destroyed = true; window.removeEventListener('hashchange', route); };
   });
 </script>
-<svelte:head><title>FlyArena — {view === 'arena' ? '3D Connectome Arena' : view === 'counterfactual' ? 'Counterfactual workbench' : view === 'atlas' ? 'Behavior atlas' : 'DGX synthetic sandbox'}</title><meta name="description" content="Explore measured connectome topology, paired model interventions, and a separate GPU synthetic circuit sandbox." /></svelte:head>
+<svelte:head><title>FlyArena — {view === 'arena' ? '3D Connectome Arena' : view === 'counterfactual' ? 'Counterfactual workbench' : view === 'atlas' ? 'Behavior atlas' : view === 'graph-lab' ? 'Real-graph lab (private)' : 'DGX synthetic sandbox'}</title><meta name="description" content="Explore measured connectome topology, paired model interventions, and a separate GPU synthetic circuit sandbox." /></svelte:head>
 <nav aria-label="Experiment views">
   <a href="#arena" aria-current={view === 'arena' ? 'page' : undefined}><span>01</span> Arena</a>
   <a href="#counterfactual" aria-current={view === 'counterfactual' ? 'page' : undefined}><span>02</span> Counterfactual workbench</a>
   <a href="#atlas" aria-current={view === 'atlas' ? 'page' : undefined}><span>03</span> Behavior atlas</a>
   <a href="#dgx" aria-current={view === 'dgx' ? 'page' : undefined}><span>04</span> DGX sandbox <small>optional backend</small></a>
+  <a href="#graph-lab" aria-current={view === 'graph-lab' ? 'page' : undefined}><span>05</span> Real-graph lab <small>private DGX backend</small></a>
 </nav>
 {#if error}<div class="load-error" role="alert">{error} <button onclick={route}>Retry loading view</button></div>{/if}
 {#if view === 'arena'}<Arena onProbe={probe} />
@@ -57,10 +65,18 @@
   {#if Workbench}<Workbench {setup} />{:else if !error}<p class="loading" role="status">Loading workbench…</p>{/if}
 {:else if view === 'atlas'}
   {#if Atlas}<Atlas />{:else if !error}<p class="loading" role="status">Loading behavior atlas…</p>{/if}
-{:else if !Lab && !error}<p class="loading" role="status">Loading DGX sandbox…</p>{/if}
+{:else if view === 'dgx'}
+  {#if !Lab && !error}<p class="loading" role="status">Loading DGX sandbox…</p>{/if}
+{:else if view === 'graph-lab'}
+  {#if !GraphLab && !error}<p class="loading" role="status">Loading real-graph lab…</p>{/if}
+{/if}
 {#if Lab}
   <!-- Keep job identity and serial polling alive across navigation, including completion while hidden. -->
   <div hidden={view !== 'dgx'} inert={view !== 'dgx'}><Lab /></div>
+{/if}
+{#if GraphLab}
+  <!-- Same rationale as the DGX sandbox above: keep job identity and serial polling alive across navigation. -->
+  <div hidden={view !== 'graph-lab'} inert={view !== 'graph-lab'}><GraphLab /></div>
 {/if}
 <style>
   nav { display:flex; flex-wrap:wrap; gap:.4rem; max-width:1500px; margin:auto; padding:1rem clamp(1rem,4vw,3rem); border-bottom:1px solid #223646; }

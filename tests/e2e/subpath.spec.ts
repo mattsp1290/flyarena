@@ -78,6 +78,18 @@ test('all views work beneath /fly/ with root asset routes deliberately unavailab
   await expect(page.getByLabel('Access token')).toBeVisible();
   await page.setViewportSize({width:390,height:844});
   expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+  // WP3 of `.agents/plans/graph-lab`: `GraphLab.svelte`'s `onMount` fetches
+  // the central manifest and the positions sidecar (for its own health-panel
+  // graph-sha comparison and its neuron-index/body-id lookup) under this
+  // same /fly/-prefixed base path -- if either fell back to the
+  // deliberately-404ing root /data/ path instead, that would show up as an
+  // unexpected 4xx in `failed`, asserted at the end of this test, exactly
+  // like every other base-path tripwire above. Scoped to `.graph-lab`
+  // throughout: `Lab.svelte` (already mounted, hidden, above) has its own
+  // identically-labeled "Backend URL"/"Access token" inputs.
+  await page.getByRole('link',{name:/05 Real-graph lab/}).click();
+  await expect(page.locator('.graph-lab').getByLabel('Backend URL')).toBeVisible();
+  expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
   await page.getByRole('link',{name:'01 Arena',exact:true}).click();
   await expect(page.getByRole('status')).toHaveText('ready');
   expect(errors).toEqual([]);expect(failed).toEqual([]);
