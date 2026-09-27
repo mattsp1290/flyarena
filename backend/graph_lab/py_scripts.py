@@ -25,11 +25,38 @@ warns against).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+
+
+def require_sha256(data: bytes, expected_sha256: "str | None", *, what: str) -> None:
+    """Fail **closed**: `expected_sha256` must be present *and* match
+    `data`'s own sha256, or this raises `ValueError`. Never silently skips
+    the check just because the expected hash is absent.
+
+    A dual-review finding: `engine_lesion.py`'s and `engine_swapset.py`'s
+    own previous per-call-site checks were each gated
+    `if expected_sha256 and hashlib.sha256(data).hexdigest() != expected_sha256:
+    raise ...` -- if `expected_sha256` were ever `None` (a manifest missing
+    the recorded field, e.g. a future regeneration script that drops or
+    renames it), that whole condition short-circuited to `False` and the
+    sha check was **skipped entirely**, silently trusting unverified data --
+    exactly the failure mode each function's own docstring said it existed
+    to prevent. Today's production manifest does have the field (not
+    currently exploitable through any client-reachable path), but the
+    pattern was a real "fail open" bug against a stated integrity
+    invariant, duplicated verbatim in two files. Consolidated here so
+    both call sites fail closed identically and can't independently drift
+    again."""
+    if not expected_sha256:
+        raise ValueError(f"manifest is missing the expected sha256 for {what} -- cannot verify it")
+    actual_sha256 = hashlib.sha256(data).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise ValueError(f"{what} does not match the manifest's recorded sha256")
 
 
 def _ensure_on_path(directory: Path) -> None:

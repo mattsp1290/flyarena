@@ -50,9 +50,9 @@ def regenerate_rewired_graph(*, scripts_dir: Path, data_dir: Path, job_dir: Path
 
     rewiring_null_path = data_dir / "rewiring-null-v1.json"
     rewiring_null_raw = rewiring_null_path.read_bytes()
-    expected_rewiring_null_sha256 = manifest.get("rewiringNull", {}).get("sha256")
-    if expected_rewiring_null_sha256 and hashlib.sha256(rewiring_null_raw).hexdigest() != expected_rewiring_null_sha256:
-        raise ValueError("rewiring-null-v1.json does not match the manifest's recorded sha256")
+    py_scripts.require_sha256(
+        rewiring_null_raw, manifest.get("rewiringNull", {}).get("sha256"), what="rewiring-null-v1.json"
+    )
     rewired_entries = json.loads(rewiring_null_raw)["rewired"]
     if not (0 <= seed < len(rewired_entries)):
         raise ValueError(f"rewired seed {seed} has no published null entry")
@@ -63,8 +63,7 @@ def regenerate_rewired_graph(*, scripts_dir: Path, data_dir: Path, job_dir: Path
     biological_gzip_path = data_dir / manifest["artifact"]
     with gzip.open(biological_gzip_path, "rb") as fh:
         biological_binary = fh.read()
-    if hashlib.sha256(biological_binary).hexdigest() != manifest["binarySha256"]:
-        raise ValueError("biological graph binary does not match the manifest's recorded sha256")
+    py_scripts.require_sha256(biological_binary, manifest.get("binarySha256"), what="the biological graph binary")
 
     rewire = py_scripts.load_rewire(scripts_dir)
     graph = rewire.decode_graph_binary(biological_binary)

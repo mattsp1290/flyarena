@@ -34,6 +34,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from graph_lab import engine_lesion, engine_swapset
 from graph_lab.service import create_app
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -79,6 +80,25 @@ def _build_data_dir(tmp_dir: Path) -> Path:
         "rewiringNull": {"sha256": hashlib.sha256(rewiring_null_raw.encode()).hexdigest()},
     }
     (tmp_dir / "malecns-arena-v1.manifest.json").write_text(json.dumps(manifest))
+    return tmp_dir
+
+
+def _build_data_dir_with_rewiring_null_sha256(tmp_dir: Path, *, rewiring_null_sha256) -> Path:
+    """Like `_build_data_dir`, but the manifest's `rewiringNull.sha256` is
+    caller-controlled (omitted entirely when `rewiring_null_sha256` is
+    `None`) -- used to prove the published-null sha check
+    (`py_scripts.require_sha256`, via `engine_lesion.regenerate_rewired_graph`/
+    `engine_swapset._load_verified_published_null`) fails **closed**: a
+    missing or wrong recorded hash must raise, never silently skip the
+    check (a dual-review finding on an earlier version that failed open)."""
+    _build_data_dir(tmp_dir)
+    manifest_path = tmp_dir / "malecns-arena-v1.manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    if rewiring_null_sha256 is None:
+        manifest.pop("rewiringNull", None)
+    else:
+        manifest["rewiringNull"] = {"sha256": rewiring_null_sha256}
+    manifest_path.write_text(json.dumps(manifest))
     return tmp_dir
 
 
@@ -330,6 +350,70 @@ class AtlasEngineTests(unittest.TestCase):
         with TestClient(app) as client:
             response = client.post("/api/graph/v1/jobs", json=body, headers=HEADERS)
             self.assertEqual(response.status_code, 503)
+
+
+class PublishedNullShaFailsClosedTests(unittest.TestCase):
+    """`py_scripts.require_sha256` (used by both `engine_lesion.
+    regenerate_rewired_graph` and `engine_swapset._load_verified_published_null`
+    to verify `rewiring-null-v1.json` against the manifest's recorded
+    hash) must fail **closed**: a missing or mismatched recorded hash is a
+    hard error, never a silently-skipped check. Does not need `node`/a
+    built bundle -- these call the Python engine functions directly, never
+    reaching a subprocess."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_require_sha256_raises_when_expected_is_missing(self):
+        from graph_lab import py_scripts
+
+        with self.assertRaises(ValueError):
+            py_scripts.require_sha256(b"anything", None, what="test data")
+        with self.assertRaises(ValueError):
+            py_scripts.require_sha256(b"anything", "", what="test data")
+
+    def test_require_sha256_raises_when_expected_does_not_match(self):
+        from graph_lab import py_scripts
+
+        with self.assertRaises(ValueError):
+            py_scripts.require_sha256(b"real bytes", "0" * 64, what="test data")
+
+    def test_require_sha256_passes_when_expected_matches(self):
+        import hashlib as _hashlib
+
+        from graph_lab import py_scripts
+
+        data = b"real bytes"
+        py_scripts.require_sha256(data, _hashlib.sha256(data).hexdigest(), what="test data")  # must not raise
+
+    def test_lesion_rewired_regeneration_fails_closed_on_missing_manifest_hash(self):
+        data_dir = _build_data_dir_with_rewiring_null_sha256(Path(self._tmp.name), rewiring_null_sha256=None)
+        with tempfile.TemporaryDirectory() as job_dir:
+            with self.assertRaises(ValueError):
+                engine_lesion.regenerate_rewired_graph(
+                    scripts_dir=SCRIPTS_DIR, data_dir=data_dir, job_dir=Path(job_dir), seed=0
+                )
+
+    def test_lesion_rewired_regeneration_fails_closed_on_mismatched_manifest_hash(self):
+        data_dir = _build_data_dir_with_rewiring_null_sha256(Path(self._tmp.name), rewiring_null_sha256="0" * 64)
+        with tempfile.TemporaryDirectory() as job_dir:
+            with self.assertRaises(ValueError):
+                engine_lesion.regenerate_rewired_graph(
+                    scripts_dir=SCRIPTS_DIR, data_dir=data_dir, job_dir=Path(job_dir), seed=0
+                )
+
+    def test_swapset_published_null_load_fails_closed_on_missing_manifest_hash(self):
+        data_dir = _build_data_dir_with_rewiring_null_sha256(Path(self._tmp.name), rewiring_null_sha256=None)
+        with self.assertRaises(ValueError):
+            engine_swapset._load_verified_published_null(data_dir)
+
+    def test_swapset_published_null_load_fails_closed_on_mismatched_manifest_hash(self):
+        data_dir = _build_data_dir_with_rewiring_null_sha256(Path(self._tmp.name), rewiring_null_sha256="0" * 64)
+        with self.assertRaises(ValueError):
+            engine_swapset._load_verified_published_null(data_dir)
 
 
 if __name__ == "__main__":

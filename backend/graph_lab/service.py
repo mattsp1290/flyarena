@@ -173,6 +173,16 @@ def default_runner(
         return [node_bin, str(bundle_dir / "entry-lesion.mjs"), str(args_path)]
 
     def _atlas_argv(request: AtlasJobRequest, job_dir: Path) -> "list[str]":
+        # A point-in-time snapshot, not a reservation (a thermo-review
+        # suggestion, worth documenting): this reads free GPU memory once,
+        # synchronously, before the job is accepted -- it does not re-check
+        # once the nested `flyarena_training.atlas_cli` step actually starts
+        # allocating, and nothing here reserves memory against a
+        # concurrent job that starts *after* this check passes. Bounded by
+        # "one active graph-lab job at a time" (`Jobs.submit`'s own single-
+        # active-job limit) plus this submit-time gate, not by anything
+        # that adapts to a concurrent trainer's footprint growing after the
+        # gate passes.
         free_bytes = check_gpu_free_bytes()
         if free_bytes is None or free_bytes < GPU_BUSY_THRESHOLD_BYTES:
             raise HTTPException(503, "GPU busy")

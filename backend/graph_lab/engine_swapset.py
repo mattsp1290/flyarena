@@ -136,8 +136,7 @@ def _load_verified_biological(swap_ops: Any, data_dir: Path) -> "tuple[Any, dict
     biological_gzip_path = data_dir / manifest["artifact"]
     with gzip.open(biological_gzip_path, "rb") as fh:
         biological_binary = fh.read()
-    if hashlib.sha256(biological_binary).hexdigest() != manifest["binarySha256"]:
-        raise ValueError("biological graph binary does not match the manifest's recorded sha256")
+    py_scripts.require_sha256(biological_binary, manifest.get("binarySha256"), what="the biological graph binary")
     bio_graph = swap_ops_decode(swap_ops, biological_binary)
     return bio_graph, manifest, biological_binary
 
@@ -263,9 +262,7 @@ def _load_verified_published_null(data_dir: Path) -> dict:
     manifest = json.loads((data_dir / "malecns-arena-v1.manifest.json").read_text())
     published_null_path = data_dir / "rewiring-null-v1.json"
     raw = published_null_path.read_bytes()
-    expected_sha256 = manifest.get("rewiringNull", {}).get("sha256")
-    if expected_sha256 and hashlib.sha256(raw).hexdigest() != expected_sha256:
-        raise ValueError("rewiring-null-v1.json does not match the manifest's recorded sha256")
+    py_scripts.require_sha256(raw, manifest.get("rewiringNull", {}).get("sha256"), what="rewiring-null-v1.json")
     return json.loads(raw)
 
 

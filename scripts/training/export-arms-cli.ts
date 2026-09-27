@@ -15,17 +15,22 @@ import { parseExportArmsArgs, runExportArms } from './export-arms';
  * hazard here (this file is never bundled) and no test imports it either.
  */
 const main = (): void => {
-  try {
-    const args = parseExportArmsArgs(process.argv.slice(2));
-    const { outDir, written, d } = runExportArms(args);
-    // eslint-disable-next-line no-console -- CLI tool: this is its user-facing output.
-    console.log(`export-arms: wrote ${written.length} bundle(s) to ${outDir} (D=${d}): ${written.join(', ')}`);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    // eslint-disable-next-line no-console -- CLI tool: this is its user-facing error output.
-    console.error(`export-arms failed: ${message}`);
-    process.exit(1);
-  }
+  const args = parseExportArmsArgs(process.argv.slice(2));
+  const { outDir, written, d } = runExportArms(args);
+  // eslint-disable-next-line no-console -- CLI tool: this is its user-facing output.
+  console.log(`export-arms: wrote ${written.length} bundle(s) to ${outDir} (D=${d}): ${written.join(', ')}`);
 };
 
-main();
+// try/catch wraps the top-level `main()` call (not `main`'s own body) --
+// matches `export-traces-cli.ts`'s identical shape (a thermo-review
+// suggestion: the two CLI files this WP split out were inconsistent here,
+// both a faithful move of the pre-split code but not aligned with each
+// other).
+try {
+  main();
+} catch (error) {
+  const message = error instanceof Error ? error.message : String(error);
+  // eslint-disable-next-line no-console -- CLI tool: this is its user-facing error output.
+  console.error(`export-arms failed: ${message}`);
+  process.exit(1);
+}
