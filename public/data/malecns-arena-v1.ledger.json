@@ -10,8 +10,8 @@
     "neuronCount": 1008,
     "selfLoopCount": 0
   },
-  "compiledFromGitRevision": "e6d65f6072d3f172de095dc4862ad411ffc52527",
-  "compilerSourceSha256": "8cc8633400237179f21f6cfa7dbf27a0ddecaf1ae506f978dd2eddc44deada68",
+  "compiledFromGitRevision": "c4b2e0efbfa4f5046baa799a9aee107a36d508a7",
+  "compilerSourceSha256": "9b2b68d21a75417bf2bae387517d330be51d5caca3ec6e6e05c93ba3af4119ef",
   "dynamics": {
     "globalGain": 0.00019837727389950208,
     "globalGainCalibration": {
@@ -32,6 +32,10 @@
     "none": 165,
     "soma": 834,
     "tosoma": 9
+  },
+  "selection": {
+    "id": "default",
+    "params": {}
   },
   "selectionCounts": {
     "bridgeCandidateCount": 2557,

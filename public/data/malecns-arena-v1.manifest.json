@@ -6,7 +6,7 @@
   },
   "binaryBytes": 399792,
   "binarySha256": "f1a0f982ffdfba12ecb2206d064c3dc1ceaae7cffa06a22049093d69a79098f7",
-  "compilerSourceSha256": "8cc8633400237179f21f6cfa7dbf27a0ddecaf1ae506f978dd2eddc44deada68",
+  "compilerSourceSha256": "9b2b68d21a75417bf2bae387517d330be51d5caca3ec6e6e05c93ba3af4119ef",
   "descendingTypes": {
     "artifact": "descending-types-v1.json",
     "neuronCount": 48,
@@ -64,6 +64,10 @@
   "rewiringNull": {
     "artifact": "rewiring-null-v1.json",
     "sha256": "06294ee5d631e26669ae52c999534b959a4156fa1a558f47c335033a58c4005f"
+  },
+  "selection": {
+    "id": "default",
+    "params": {}
   },
   "sourceDataset": "male-cns:v1.0 (Janelia FlyEM Male CNS connectome)"
 }
