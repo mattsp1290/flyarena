@@ -61,6 +61,15 @@ jobs:
         # surface during an actual deploy attempt.
         run: npm run test:deploy-lock
 
+      - name: Graph-lab launch script test suite (bash, no sudo/docker/tailnet)
+        # scripts/verify/graph-lab.test.sh exercises scripts/graph-lab.sh's
+        # bind/origin/token validation, its DOCKER-USER egress-drop rule
+        # check-and-insert logic, and --status/--uninstall reporting entirely
+        # against PATH-stubbed tailscale/iptables/sudo/docker/npm -- no sudo,
+        # no real container, and no real tailnet, so it needs nothing beyond
+        # what this job already has.
+        run: npm run test:graph-lab
+
       - name: Production build
         run: npm run build
 
