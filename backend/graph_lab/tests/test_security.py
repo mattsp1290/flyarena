@@ -273,11 +273,17 @@ class GraphIdValidationTests(unittest.TestCase):
 
     def test_every_closed_set_member_passes_validation_through_the_real_default_runner(self):
         """Uses the real `default_runner` (not a test fake): `biological`/
-        `disconnected` pass validation and dispatch (202) -- `rewired:*`
+        `disconnected` pass validation and dispatch (202). `rewired:*`
         passes the *same* validation (it is a real closed-set member, not
-        rejected at 422) but its engine is not wired until WP2, so
-        `default_runner` itself rejects it with a clean 501. A malformed id
-        (see `GraphIdValidationTests`) never even reaches the runner."""
+        rejected at 422) -- WP2 wires its engine
+        (`engine_lesion.regenerate_rewired_graph`) for real, so it is no
+        longer a static 501; this fixture's `data_dir` has no real
+        `rewiring-null-v1.json`/graph binary for it to regenerate against,
+        so regeneration fails and `default_runner` reports a clean 500 (see
+        `WiredJobKindDispatchTests` for the equivalent atlas/swapset check,
+        and `test_engines.py` for `rewired:<seed>` succeeding end to end
+        against a real fixture). A malformed id (see `GraphIdValidationTests`)
+        never even reaches the runner."""
         with tempfile.TemporaryDirectory() as data_dir, tempfile.TemporaryDirectory() as bundle_dir:
             manifest = Path(data_dir) / "malecns-arena-v1.manifest.json"
             manifest.write_text(json.dumps({"artifact": "malecns-arena-v1.bin.gz", "binarySha256": "0" * 64}))
@@ -286,8 +292,8 @@ class GraphIdValidationTests(unittest.TestCase):
             for graph, expected_status in (
                 ("biological", 202),
                 ("disconnected", 202),
-                ("rewired:0", 501),
-                ("rewired:499", 501),
+                ("rewired:0", 500),
+                ("rewired:499", 500),
             ):
                 app = create_app(token=TOKEN, data_dir=data_dir, bundle_dir=bundle_dir)
                 with TestClient(app) as client:
@@ -328,42 +334,135 @@ SWAPSET_BODY = {
 }
 
 
-class UnwiredJobKindDispatchTests(unittest.TestCase):
-    """A thermo-review finding: the one `isinstance` branch this WP adds
-    specifically to reject `atlas`/`swapset` (`service.py`'s `default_runner`:
-    `if isinstance(request, (AtlasJobRequest, SwapsetJobRequest)): raise
-    HTTPException(501, ...)`) had zero direct test coverage -- only the
-    `rewired:*` 501 path (a different branch, for `LesionJobRequest`) was
-    exercised. A future reordering of that `isinstance` chain, or a typo in
-    the discriminator match, could silently start 500ing (or worse,
-    mis-dispatching) an `atlas`/`swapset` request with nothing failing here."""
+class WiredJobKindDispatchTests(unittest.TestCase):
+    """Originally `UnwiredJobKindDispatchTests` (a thermo-review finding: the
+    one `isinstance` branch WP1 added specifically to reject `atlas`/
+    `swapset` with a clean 501 had zero direct test coverage -- only the
+    `rewired:*` 501 path, a different branch for `LesionJobRequest`, was
+    exercised). WP2 (`.agents/plans/graph-lab/02-job-engines.md`) wires
+    both kinds for real, so the blanket 501 this class used to assert is
+    gone -- these tests now assert the opposite regression: `atlas`/
+    `swapset` must **not** fall back to the generic-501/400 path (a future
+    reordering of `default_runner`'s `isinstance` chain, or a typo in the
+    discriminator match, could silently start mis-dispatching one kind as
+    another, or drop back to 501/400, with nothing else here failing).
+    Full engine correctness (real fixture graphs, real scoring) is
+    `test_engines.py`'s job, not this security-focused suite's -- these
+    tests use fake/missing data on purpose and only check the *shape* of
+    the response: never 501, never 400."""
 
     @staticmethod
-    def _real_default_runner_app():
+    def _real_default_runner_app(*, gpu_free_bytes):
         # `make_app()`'s default `runner=instant_runner` is a test fake that
         # bypasses `default_runner` entirely (it would return 202 for
         # *any* kind) -- these tests specifically exercise the real
         # dispatch `isinstance` chain, so `runner` must be left unset here,
         # matching `test_every_closed_set_member_passes_validation_through_the_real_default_runner`'s
-        # own pattern. `data_dir`/`bundle_dir` are never read on this path
-        # (the 501 fires before either kind touches the filesystem), but a
-        # temp dir is still supplied for consistency/safety.
+        # own pattern. `gpu_free_bytes` is always injected (never the real
+        # `torch.cuda.mem_get_info`): this package's own venv has no
+        # `torch` at all (see `pyproject.toml`'s header comment), so a
+        # real GPU check would `ImportError` before ever reaching the
+        # dispatch branch this class actually tests.
         data_dir = tempfile.mkdtemp()
         bundle_dir = tempfile.mkdtemp()
         os.environ["GRAPH_LAB_ORIGINS"] = ALLOWED_ORIGIN
-        return create_app(token=TOKEN, data_dir=data_dir, bundle_dir=bundle_dir)
+        return create_app(
+            token=TOKEN, data_dir=data_dir, bundle_dir=bundle_dir, gpu_free_bytes=gpu_free_bytes
+        )
 
-    def test_atlas_returns_501(self):
-        app = self._real_default_runner_app()
+    def test_atlas_no_longer_returns_501_when_the_gpu_is_free(self):
+        app = self._real_default_runner_app(gpu_free_bytes=lambda: 999 * 1024**3)
         with TestClient(app) as client:
             response = client.post("/api/graph/v1/jobs", json=ATLAS_BODY, headers=HEADERS)
-            self.assertEqual(response.status_code, 501)
+            self.assertNotEqual(response.status_code, 501)
+            self.assertNotEqual(response.status_code, 400)
 
-    def test_swapset_returns_501(self):
-        app = self._real_default_runner_app()
+    def test_atlas_reports_gpu_busy_before_touching_any_engine_file(self):
+        """`02-job-engines.md`'s atlas bound: "refuses to start... if free
+        GPU memory is below 2 GiB". `gpu_free_bytes` returning a value
+        under the 2 GiB threshold must short-circuit *before*
+        `default_runner` ever reads the (nonexistent, in this fixture)
+        manifest -- proven by the 503 firing even though `data_dir` here
+        has no `malecns-arena-v1.manifest.json` at all (a `FileNotFoundError`
+        reading it would surface as 500, not 503)."""
+        app = self._real_default_runner_app(gpu_free_bytes=lambda: 1024**2)
+        with TestClient(app) as client:
+            response = client.post("/api/graph/v1/jobs", json=ATLAS_BODY, headers=HEADERS)
+            self.assertEqual(response.status_code, 503)
+
+    def test_atlas_reports_gpu_busy_when_free_memory_is_unknown(self):
+        """`gpu_free_bytes` returning `None` (no `torch`, no CUDA device,
+        or the query itself raised) is treated the same as "known busy" --
+        refuse rather than silently proceed without ever having checked."""
+        app = self._real_default_runner_app(gpu_free_bytes=lambda: None)
+        with TestClient(app) as client:
+            response = client.post("/api/graph/v1/jobs", json=ATLAS_BODY, headers=HEADERS)
+            self.assertEqual(response.status_code, 503)
+
+    def test_swapset_no_longer_returns_501(self):
+        app = self._real_default_runner_app(gpu_free_bytes=lambda: 999 * 1024**3)
         with TestClient(app) as client:
             response = client.post("/api/graph/v1/jobs", json=SWAPSET_BODY, headers=HEADERS)
-            self.assertEqual(response.status_code, 501)
+            self.assertNotEqual(response.status_code, 501)
+            self.assertNotEqual(response.status_code, 400)
+
+    def test_each_kind_actually_reaches_its_own_engine_not_a_neighbor(self):
+        """A dual-review finding on an earlier version of this class: the
+        "not 501/400" checks above pass whether or not the `isinstance`
+        chain routes each kind to its *own* engine -- a reordering that
+        mis-dispatched, say, `swapset` into `_atlas_argv` would still give
+        some non-501/400 status (likely a 500 from the wrong code path)
+        and none of the tests above would catch it. This test patches each
+        kind's own engine entry point with a distinct sentinel exception
+        and asserts that submitting that kind's body surfaces *that*
+        sentinel's message -- proving the dispatch reached the right
+        engine, not merely *an* engine."""
+        data_dir = tempfile.mkdtemp()
+        # `regenerate_rewired_graph` is patched below with a sentinel, but
+        # `_lesion_argv` still reads the manifest *before* calling it --
+        # without a real one here, a `FileNotFoundError` would fire first
+        # and mask whether dispatch ever reached the sentinel at all.
+        (Path(data_dir) / "malecns-arena-v1.manifest.json").write_text(
+            json.dumps({"artifact": "malecns-arena-v1.bin.gz", "binarySha256": "0" * 64})
+        )
+        os.environ["GRAPH_LAB_ORIGINS"] = ALLOWED_ORIGIN
+        app = create_app(
+            token=TOKEN,
+            data_dir=data_dir,
+            bundle_dir=tempfile.mkdtemp(),
+            gpu_free_bytes=lambda: 999 * 1024**3,
+        )
+        with TestClient(app) as client:
+            with patch(
+                "graph_lab.service.engine_swapset.build_candidate",
+                side_effect=ValueError("swapset-sentinel"),
+            ):
+                response = client.post("/api/graph/v1/jobs", json=SWAPSET_BODY, headers=HEADERS)
+                self.assertEqual(response.status_code, 422)
+                self.assertIn("swapset-sentinel", response.text)
+
+            with patch(
+                "graph_lab.service.engine_lesion.regenerate_rewired_graph",
+                side_effect=ValueError("rewired-sentinel"),
+            ):
+                body = dict(LESION_BODY, graph="rewired:0")
+                response = client.post("/api/graph/v1/jobs", json=body, headers=HEADERS)
+                self.assertEqual(response.status_code, 500)
+                self.assertIn("rewired-sentinel", response.text)
+
+            # Atlas's own submit-time gate is the GPU check -- confirm a
+            # rejecting `gpu_free_bytes` fires specifically for `kind:
+            # "atlas"` and not for `lesion`/`swapset` (which never call it).
+            gpu_checked_for = []
+
+            def recording_gpu_free_bytes():
+                gpu_checked_for.append(True)
+                return 999 * 1024**3
+
+            app2 = self._real_default_runner_app(gpu_free_bytes=recording_gpu_free_bytes)
+            with TestClient(app2) as client2:
+                client2.post("/api/graph/v1/jobs", json=LESION_BODY, headers=HEADERS)
+                self.assertEqual(len(gpu_checked_for), 0, "the GPU check must not run for a lesion request")
 
 
 class SeedRangeTests(unittest.TestCase):

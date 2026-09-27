@@ -1,0 +1,17 @@
+{
+  "rewired": [
+    {
+      "seed": 0,
+      "gzipSha256": "053d2bfb4ed1d2ce0b9e05a1a0fff2d48be6357109403b63e1afb9373e9972f1",
+      "acceptedSwaps": 271,
+      "attempts": 1020,
+      "score": 0.0,
+      "median": 0.0,
+      "std": 0.0,
+      "ci": [
+        0.0,
+        0.0
+      ]
+    }
+  ]
+}
