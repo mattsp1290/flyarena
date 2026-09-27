@@ -74,29 +74,6 @@ def make_app(origins=ALLOWED_ORIGIN, runner=instant_runner, token=TOKEN):
     return create_app(token=token, runner=runner)
 
 
-def submit_when_idle(client, timeout=2):
-    """A terminal `job.status` (per `jobs.py`'s `_execute` docstring) is
-    only ever published after that job's `_final_sweep`/`rmtree` cleanup
-    has actually finished -- so `submit()`'s 409 check
-    (`self.thread.is_alive()`) should already be clear by the time a
-    poller observes it. What can still lag by a hair is the worker thread
-    itself finishing its return out of `_execute` and back into
-    `Thread.run()`, which is the instant `is_alive()` actually flips --
-    typically on the order of microseconds, not the multi-millisecond
-    kill/cleanup window the terminal-status ordering fix closes. This
-    bounded retry absorbs that unavoidable scheduling gap. It is not the
-    regression detector for the original bug -- `TerminalStatusVisibilityTests`
-    is, since it blocks cleanup on a `threading.Event` instead of relying
-    on timing -- so a reintroduced ordering bug should be caught there even
-    if it happened to slip past a short retry here."""
-    deadline = time.monotonic() + timeout
-    while True:
-        response = client.post("/api/graph/v1/jobs", json=LESION_BODY, headers=HEADERS)
-        if response.status_code != 409 or time.monotonic() > deadline:
-            return response.json()
-        time.sleep(0.005)
-
-
 class HealthTests(unittest.TestCase):
     def test_health_is_unauthenticated_and_returns_only_documented_fields(self):
         app = make_app()
@@ -667,8 +644,8 @@ class JobStoreBoundsTests(unittest.TestCase):
         with TestClient(app) as client:
             ids = []
             for _ in range(5):
-                submitted = submit_when_idle(client)
-                identifier = submitted["id"]
+                submitted = client.post("/api/graph/v1/jobs", json=LESION_BODY, headers=HEADERS)
+                identifier = submitted.json()["id"]
                 ids.append(identifier)
                 self._wait_for_terminal(client, identifier)
             self.assertEqual(client.get(f"/api/graph/v1/jobs/{ids[0]}", headers=HEADERS).status_code, 404)
@@ -743,15 +720,15 @@ class TerminalStatusVisibilityTests(unittest.TestCase):
             self.assertEqual(final["status"], "completed")
 
             # And a submit made right after the status turns terminal --
-            # the exact sequence that raised `KeyError: 'id'` in CI --
-            # must succeed. `submit_when_idle` (see its docstring) absorbs
-            # only the same microseconds-scale scheduling gap the sibling
-            # `test_at_most_four_jobs_retained` does; the actual proof that
-            # cleanup, not timing, gates this is everything above -- the
-            # 409 observed *while the event is still unset*.
-            resubmitted = submit_when_idle(client)
-            self.assertIn("id", resubmitted, f"expected a new job, got: {resubmitted}")
-            client.delete(f"/api/graph/v1/jobs/{resubmitted['id']}", headers=HEADERS)
+            # the exact sequence that raised `KeyError: 'id'` in CI -- must
+            # succeed deterministically, with no retry: `submit()`'s busy
+            # check reads `job.status` directly (see its own comment), and
+            # cleanup has already finished by the time `_wait_for_terminal`
+            # observed `"completed"` above, so there is nothing left for
+            # this submit to race against.
+            resubmitted = client.post("/api/graph/v1/jobs", json=LESION_BODY, headers=HEADERS)
+            self.assertEqual(resubmitted.status_code, 202)
+            client.delete(f"/api/graph/v1/jobs/{resubmitted.json()['id']}", headers=HEADERS)
 
     @staticmethod
     def _wait_for_terminal(client, identifier, timeout=5):

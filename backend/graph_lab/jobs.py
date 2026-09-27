@@ -52,6 +52,10 @@ POLL_INTERVAL_SECONDS = 0.2
 # reader's captured stderr tail -- neither is ever unbounded, so a runaway
 # child can't grow a retained job's memory footprint by printing endlessly.
 MAX_ERROR_CHARS = 500
+# `submit()`'s one-active-job check is keyed off a job's `status`, not off
+# `Jobs.thread.is_alive()` (see `submit()`'s own comment for why): these are
+# every status a job can hold before `_execute` has published its outcome.
+NON_TERMINAL_STATUSES = ("queued", "running", "cancelling")
 
 
 def parse_graph_id(graph: str) -> tuple[str, int | None]:
@@ -103,6 +107,11 @@ class Jobs:
         self.lock = threading.Lock()
         self.jobs: dict[str, Job] = {}
         self.thread: threading.Thread | None = None
+        # The job the most recent `submit()` started, if any. Tracked
+        # separately from `self.jobs` (which `MAX_RETAINED_JOBS` eviction
+        # can prune) so `submit()`'s busy check always has the right
+        # object to read `.status` from, however old it's gotten.
+        self.current_job: Job | None = None
         self.closing = False
 
     def submit(self, request: JobRequest) -> dict:
@@ -117,8 +126,28 @@ class Jobs:
         # "failed" job discovered later by polling -- `HTTPException`
         # raised from inside a background thread would never reach the
         # client at all.
+        #
+        # The busy check itself is keyed off `self.current_job.status`,
+        # not `self.thread.is_alive()`: `_execute` now only ever publishes
+        # a terminal status (see its own docstring) *after* its cleanup --
+        # `_final_sweep` plus removing `job_dir` -- has actually finished,
+        # so once `current_job.status` is terminal, the previous job's
+        # process group is already guaranteed dead and its `job_dir` is
+        # already gone; there's nothing left that a new job could collide
+        # with. Keying this check off `is_alive()` instead would still be
+        # correct but needlessly conservative: the worker thread stays
+        # "alive" for a few more interpreter instructions after publishing
+        # (unwinding back out of `_execute` into `Thread.run()`), and a
+        # client that polls to a terminal status and immediately submits
+        # -- exactly what a caller is entitled to do -- could still land
+        # in that gap and get a spurious 409 (this is what the bounded
+        # retry in `test_at_most_four_jobs_retained` used to paper over;
+        # closing the race here removes the need for it).
         with self.lock:
-            if self.closing or (self.thread and self.thread.is_alive()):
+            busy = self.closing or (
+                self.current_job is not None and self.current_job.status in NON_TERMINAL_STATUSES
+            )
+            if busy:
                 raise HTTPException(409, "A job is already active or the service is stopping")
 
             job_dir = Path(tempfile.mkdtemp(prefix="graph-lab-job-", dir=self.scratch_dir))
@@ -133,10 +162,22 @@ class Jobs:
                 shutil.rmtree(job_dir, ignore_errors=True)
                 raise HTTPException(500, "Failed to prepare job") from error
 
+            # Not busy means any previous job is already terminal, i.e.
+            # its thread has already published under this same lock and
+            # has at most a handful of instructions left before it
+            # actually exits. Join it here -- bounded, and safe to do
+            # while holding `self.lock` since nothing left in that thread
+            # ever touches the lock again -- so a new worker thread is
+            # never running concurrently with a stale one, and
+            # `self.thread` always names the job actually in flight.
+            if self.thread is not None:
+                self.thread.join(timeout=1)
+
             while len(self.jobs) >= MAX_RETAINED_JOBS:
                 del self.jobs[next(iter(self.jobs))]
             job = Job(id=uuid.uuid4().hex, kind=request.kind)
             self.jobs[job.id] = job
+            self.current_job = job
             self.thread = threading.Thread(target=self._execute, args=(job, argv, job_dir), daemon=False)
             self.thread.start()
             return {"id": job.id, "status": job.status}
@@ -213,14 +254,15 @@ class Jobs:
 
         This ordering (rather than publishing terminal state as soon as
         the outcome is known, and cleaning up afterwards in `finally`)
-        closes a real race: `submit()`'s one-active-job check is keyed off
-        `self.thread.is_alive()`, and a Python thread stays alive for the
-        whole of its `finally` block, not just its `try`. If a terminal
-        status were visible before `finally` ran, a client polling GET
-        could see e.g. `"completed"` and immediately POST the next job
-        while this thread -- and the process group it might still be
-        sweeping -- was still alive, so `submit()` would 409 a client that
-        did exactly what the API told it to do (this is the CI failure in
+        closes a real race. `submit()`'s one-active-job check is keyed off
+        `self.current_job.status` (see `submit()`'s own comment for why
+        that's the right thing to key it off, not `self.thread
+        .is_alive()`): if a terminal status were visible before this
+        method's cleanup ran, a client polling GET could see e.g.
+        `"completed"` and immediately POST the next job while the previous
+        job's process group might still be alive and its `job_dir` still
+        on disk, so a new job could start while the old one's resources
+        were still being torn down (this is the CI failure in
         `JobStoreBoundsTests.test_at_most_four_jobs_retained`, which polls
         to a terminal status and then submits: it passed locally 30/30 but
         hit the window on a slower CI runner). It would also be a lie in
@@ -312,8 +354,10 @@ class Jobs:
             # process is actually gone via `process.wait()` succeeding --
             # with no bound on that wait, a process group SIGKILL somehow
             # can't reap (e.g. stuck in uninterruptible I/O) would loop
-            # here forever, keeping `self.thread` alive and therefore
-            # `submit()`'s "one active job" check permanently 409ing every
+            # here forever, which means `_execute` never reaches its
+            # publish step (see this method's own docstring) and
+            # `job.status` never leaves `"cancelling"` -- keeping
+            # `submit()`'s one-active-job check permanently 409ing every
             # future request (an Important finding from review: "a job
             # that can't be killed blocks the service"). Giving up after a
             # bounded extra wait accepts a documented residual risk (a
@@ -399,13 +443,12 @@ class Jobs:
             # here (`_final_sweep` normally only swallows
             # `ProcessLookupError`; a stranger `OSError` from `killpg` is
             # conceivable) can never skip the publish below by propagating
-            # out of this `finally` block. Before this method's terminal
-            # status was gated on cleanup finishing, a cleanup failure was
-            # harmless because the status had already been published; now
-            # that publish happens last, a cleanup exception must not be
-            # allowed to leave `job.status` stuck on "running" forever --
-            # the thread would still die (unblocking `submit()`), but the
-            # job itself would never show a result the caller could see.
+            # out of this `finally` block. That publish is no longer
+            # incidental cleanup -- `submit()`'s busy check reads
+            # `self.current_job.status` directly (see `submit()`'s own
+            # comment), so a cleanup exception that stranded `job.status`
+            # on `"running"` would block every future submission
+            # indefinitely, even long after this thread itself has exited.
             try:
                 self._final_sweep(job)
             except Exception:
@@ -416,11 +459,12 @@ class Jobs:
                 logging.exception("graph-lab job %s (%s): job_dir cleanup failed", job.id, job.kind)
             # The publish -- and only the publish -- happens last, after
             # everything above in `finally` has completed. That is what
-            # keeps a racing `submit()` (which checks `self.thread
-            # .is_alive()`, not `job.status`) from ever running concurrently
-            # with a process group or `job_dir` this job might still be
-            # cleaning up: by the time any status here is *visible* as
-            # terminal, this thread has nothing left to do but return.
+            # keeps a racing `submit()` (which reads `self.current_job
+            # .status` directly, not `self.thread.is_alive()` -- see
+            # `submit()`'s own comment) from ever starting a new job while
+            # this one's process group or `job_dir` might still be
+            # cleaning up: by the time this status is *visible* as
+            # terminal, both are already gone.
             with self.lock:
                 job.status = final_status
                 job.result = final_result
