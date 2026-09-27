@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -45,6 +46,16 @@ def instant_runner(_request, _job_dir):
     return ["true"]
 
 
+def completing_runner(_request, _job_dir):
+    """Unlike `instant_runner` (`["true"]`, which prints nothing and so
+    never populates `outcome["result"]`), this actually reports a
+    `{"type": "result", ...}` line -- for tests that need to assert a
+    genuine `"completed"` status rather than merely "some terminal
+    status"."""
+    script = "import json; print(json.dumps({'type': 'result', 'result': {'ok': True}}))"
+    return ["python3", "-c", script]
+
+
 def env_probing_runner(_request, _job_dir):
     """Prints whatever the child's own environment holds for
     `GRAPH_LAB_TOKEN`, as a structured result -- proves the child truly
@@ -61,6 +72,29 @@ def env_probing_runner(_request, _job_dir):
 def make_app(origins=ALLOWED_ORIGIN, runner=instant_runner, token=TOKEN):
     os.environ["GRAPH_LAB_ORIGINS"] = origins
     return create_app(token=token, runner=runner)
+
+
+def submit_when_idle(client, timeout=2):
+    """A terminal `job.status` (per `jobs.py`'s `_execute` docstring) is
+    only ever published after that job's `_final_sweep`/`rmtree` cleanup
+    has actually finished -- so `submit()`'s 409 check
+    (`self.thread.is_alive()`) should already be clear by the time a
+    poller observes it. What can still lag by a hair is the worker thread
+    itself finishing its return out of `_execute` and back into
+    `Thread.run()`, which is the instant `is_alive()` actually flips --
+    typically on the order of microseconds, not the multi-millisecond
+    kill/cleanup window the terminal-status ordering fix closes. This
+    bounded retry absorbs that unavoidable scheduling gap. It is not the
+    regression detector for the original bug -- `TerminalStatusVisibilityTests`
+    is, since it blocks cleanup on a `threading.Event` instead of relying
+    on timing -- so a reintroduced ordering bug should be caught there even
+    if it happened to slip past a short retry here."""
+    deadline = time.monotonic() + timeout
+    while True:
+        response = client.post("/api/graph/v1/jobs", json=LESION_BODY, headers=HEADERS)
+        if response.status_code != 409 or time.monotonic() > deadline:
+            return response.json()
+        time.sleep(0.005)
 
 
 class HealthTests(unittest.TestCase):
@@ -633,13 +667,91 @@ class JobStoreBoundsTests(unittest.TestCase):
         with TestClient(app) as client:
             ids = []
             for _ in range(5):
-                submitted = client.post("/api/graph/v1/jobs", json=LESION_BODY, headers=HEADERS)
-                identifier = submitted.json()["id"]
+                submitted = submit_when_idle(client)
+                identifier = submitted["id"]
                 ids.append(identifier)
                 self._wait_for_terminal(client, identifier)
             self.assertEqual(client.get(f"/api/graph/v1/jobs/{ids[0]}", headers=HEADERS).status_code, 404)
             last = client.get(f"/api/graph/v1/jobs/{ids[-1]}", headers=HEADERS)
             self.assertEqual(last.status_code, 200)
+
+    @staticmethod
+    def _wait_for_terminal(client, identifier, timeout=5):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            body = client.get(f"/api/graph/v1/jobs/{identifier}", headers=HEADERS).json()
+            if body["status"] not in ("queued", "running", "cancelling"):
+                return body
+            time.sleep(0.02)
+        raise AssertionError(f"job {identifier} did not reach a terminal status within {timeout}s")
+
+
+class TerminalStatusVisibilityTests(unittest.TestCase):
+    """Regression test for the race fixed in `jobs.py`'s `_execute`: a
+    job's terminal status must not become visible over the API until that
+    job's cleanup (`_final_sweep` plus removing `job_dir`) has actually
+    finished. Blocks that cleanup deterministically on a
+    `threading.Event`, rather than relying on timing luck the way the
+    original bug report did (it passed 30/30 locally and only failed on a
+    slower CI runner) -- so this test fails reliably, not intermittently,
+    if the publish-before-cleanup ordering ever regresses.
+    """
+
+    def test_terminal_status_is_hidden_until_cleanup_finishes(self):
+        app = make_app(runner=completing_runner)
+        jobs = app.state.jobs
+        release_cleanup = threading.Event()
+        real_final_sweep = jobs._final_sweep
+
+        def blocking_final_sweep(job):
+            release_cleanup.wait(timeout=5)
+            real_final_sweep(job)
+
+        jobs._final_sweep = blocking_final_sweep
+
+        with TestClient(app) as client:
+            submitted = client.post("/api/graph/v1/jobs", json=LESION_BODY, headers=HEADERS)
+            self.assertEqual(submitted.status_code, 202)
+            identifier = submitted.json()["id"]
+
+            # `completing_runner` exits almost immediately, so
+            # `_execute` reaches `finally` -- and blocks on
+            # `release_cleanup` -- well within this window. While it's
+            # blocked there the job must still read as in-flight, never a
+            # terminal status, even though the child process itself is
+            # long since dead.
+            deadline = time.monotonic() + 5
+            observed_running = False
+            while time.monotonic() < deadline:
+                status = client.get(f"/api/graph/v1/jobs/{identifier}", headers=HEADERS).json()["status"]
+                self.assertIn(status, ("queued", "running"), "status went terminal before cleanup finished")
+                if status == "running":
+                    observed_running = True
+                    break
+                time.sleep(0.01)
+            self.assertTrue(observed_running, "job never reached running before the test's own timeout")
+
+            # The one-active-job invariant must hold for the whole cleanup
+            # window, not just while the child process is literally
+            # running: a submit here must still be refused.
+            still_active = client.post("/api/graph/v1/jobs", json=LESION_BODY, headers=HEADERS)
+            self.assertEqual(still_active.status_code, 409)
+
+            release_cleanup.set()
+
+            final = self._wait_for_terminal(client, identifier)
+            self.assertEqual(final["status"], "completed")
+
+            # And a submit made right after the status turns terminal --
+            # the exact sequence that raised `KeyError: 'id'` in CI --
+            # must succeed. `submit_when_idle` (see its docstring) absorbs
+            # only the same microseconds-scale scheduling gap the sibling
+            # `test_at_most_four_jobs_retained` does; the actual proof that
+            # cleanup, not timing, gates this is everything above -- the
+            # 409 observed *while the event is still unset*.
+            resubmitted = submit_when_idle(client)
+            self.assertIn("id", resubmitted, f"expected a new job, got: {resubmitted}")
+            client.delete(f"/api/graph/v1/jobs/{resubmitted['id']}", headers=HEADERS)
 
     @staticmethod
     def _wait_for_terminal(client, identifier, timeout=5):

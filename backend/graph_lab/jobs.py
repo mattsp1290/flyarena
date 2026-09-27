@@ -205,10 +205,48 @@ class Jobs:
         return env
 
     def _execute(self, job: Job, argv: list[str], job_dir: Path) -> None:
+        """Runs the whole child-process lifecycle for one job, then --
+        only after this method's own cleanup (`_final_sweep` plus removing
+        `job_dir`) has actually finished -- publishes the job's terminal
+        status/result/error under `self.lock`, as the very last thing this
+        method does.
+
+        This ordering (rather than publishing terminal state as soon as
+        the outcome is known, and cleaning up afterwards in `finally`)
+        closes a real race: `submit()`'s one-active-job check is keyed off
+        `self.thread.is_alive()`, and a Python thread stays alive for the
+        whole of its `finally` block, not just its `try`. If a terminal
+        status were visible before `finally` ran, a client polling GET
+        could see e.g. `"completed"` and immediately POST the next job
+        while this thread -- and the process group it might still be
+        sweeping -- was still alive, so `submit()` would 409 a client that
+        did exactly what the API told it to do (this is the CI failure in
+        `JobStoreBoundsTests.test_at_most_four_jobs_retained`, which polls
+        to a terminal status and then submits: it passed locally 30/30 but
+        hit the window on a slower CI runner). It would also be a lie in
+        the other direction -- a job reported "completed"/"failed" while
+        its process group, or an unbounded grandchild fork tree under it
+        (see `_final_sweep`'s own comment), could still be running.
+
+        So every exit path below -- normal completion, cancel-before-spawn,
+        cancel, timeout, and the generic exception handler -- computes its
+        outcome into the `final_status`/`final_result`/`final_error`
+        locals only; the actual publish happens once, in `finally`, after
+        cleanup. `"running"` and `"cancelling"` are the only statuses ever
+        written to `job.status` directly while this method is still doing
+        work, and both are non-terminal, so publishing them immediately is
+        exactly what callers need to keep polling correctly -- both
+        `GraphLab.svelte`'s cancel button and `session.ts`'s
+        `sessionActive` treat `"cancelling"` as still in flight, never as
+        done.
+        """
+        final_status = "failed"
+        final_result: dict | None = None
+        final_error: str | None = None
         try:
             with self.lock:
                 if job.status == "cancelling":
-                    job.status = "cancelled"
+                    final_status = "cancelled"
                     return
                 job.status = "running"
 
@@ -284,6 +322,13 @@ class Jobs:
             # itself staying usable for new jobs.
             killing = False
             give_up_deadline = 0.0
+            # Recorded locally, not published to `job.status`, the moment
+            # the deadline fires: while this loop is still trying to kill
+            # the process group, `job.status` only needs to keep showing
+            # "running" (or "cancelling", if a client requested that) --
+            # the terminal "timed-out" status is published, with
+            # everything else, once cleanup below has actually finished.
+            timed_out = False
             while True:
                 try:
                     process.wait(timeout=POLL_INTERVAL_SECONDS)
@@ -305,8 +350,7 @@ class Jobs:
                     if cancelling:
                         killing = True
                     elif time.monotonic() > deadline:
-                        with self.lock:
-                            job.status = "timed-out"
+                        timed_out = True
                         self._kill_group(job)
                         killing = True
                     if killing:
@@ -314,43 +358,73 @@ class Jobs:
             reader.join(timeout=2)
 
             with self.lock:
-                if job.status == "timed-out":
-                    job.error = "Job exceeded its time limit and was terminated"
-                elif job.status == "cancelling":
-                    job.status = "cancelled"
-                elif process.returncode == 0 and "result" in outcome:
-                    job.result = outcome["result"]
-                    job.status = "completed"
-                else:
-                    job.status = "failed"
-                    # Never surface the child's own stderr in the API
-                    # response (it can quote argv, which can carry
-                    # request-derived data): only a structured
-                    # `{"type": "error", ...}` message the child itself
-                    # chose to report, or a generic fallback. The captured
-                    # stderr tail still goes to the server's own log, for
-                    # an operator to read from the container's logs -- it
-                    # never reaches a client.
-                    job.error = (outcome.get("error") or "Job process exited without a result")[:MAX_ERROR_CHARS]
-                    if stderr_tail:
-                        logging.error("graph-lab job %s (%s) stderr: %s", job.id, job.kind, "".join(stderr_tail))
+                cancelling = job.status == "cancelling"
+            if timed_out:
+                final_status = "timed-out"
+                final_error = "Job exceeded its time limit and was terminated"
+            elif cancelling:
+                final_status = "cancelled"
+            elif process.returncode == 0 and "result" in outcome:
+                final_result = outcome["result"]
+                final_status = "completed"
+            else:
+                final_status = "failed"
+                # Never surface the child's own stderr in the API
+                # response (it can quote argv, which can carry
+                # request-derived data): only a structured
+                # `{"type": "error", ...}` message the child itself
+                # chose to report, or a generic fallback. The captured
+                # stderr tail still goes to the server's own log, for
+                # an operator to read from the container's logs -- it
+                # never reaches a client.
+                final_error = (outcome.get("error") or "Job process exited without a result")[:MAX_ERROR_CHARS]
+                if stderr_tail:
+                    logging.error("graph-lab job %s (%s) stderr: %s", job.id, job.kind, "".join(stderr_tail))
         except Exception:
             logging.exception("graph-lab job failed")
-            with self.lock:
-                job.status = "failed"
-                job.error = "Job failed; check backend logs"
+            final_status = "failed"
+            final_error = "Job failed; check backend logs"
         finally:
             # Unconditional final sweep, on every exit path (normal
-            # completion, cancel, timeout, or the generic exception handler
-            # above): `process.wait()` only waits for the *leader* --
-            # if it exits (cleanly or via a crash) while its own forked
-            # shard workers (`child_process.fork()` in the Node entries)
-            # are still alive, those workers are never otherwise killed
-            # and would keep computing, unbounded, after this job is
-            # already marked done and a new submission has been accepted.
-            # Confirmed reproducible in review before this was added.
-            self._final_sweep(job)
-            shutil.rmtree(job_dir, ignore_errors=True)
+            # completion, cancel-before-spawn, cancel, timeout, or the
+            # generic exception handler above): `process.wait()` only
+            # waits for the *leader* -- if it exits (cleanly or via a
+            # crash) while its own forked shard workers (`child_process
+            # .fork()` in the Node entries) are still alive, those workers
+            # are never otherwise killed and would keep computing,
+            # unbounded, after this job is already marked done and a new
+            # submission has been accepted. Confirmed reproducible in
+            # review before this was added.
+            # Both cleanup steps are wrapped so that an unexpected failure
+            # here (`_final_sweep` normally only swallows
+            # `ProcessLookupError`; a stranger `OSError` from `killpg` is
+            # conceivable) can never skip the publish below by propagating
+            # out of this `finally` block. Before this method's terminal
+            # status was gated on cleanup finishing, a cleanup failure was
+            # harmless because the status had already been published; now
+            # that publish happens last, a cleanup exception must not be
+            # allowed to leave `job.status` stuck on "running" forever --
+            # the thread would still die (unblocking `submit()`), but the
+            # job itself would never show a result the caller could see.
+            try:
+                self._final_sweep(job)
+            except Exception:
+                logging.exception("graph-lab job %s (%s): final sweep failed", job.id, job.kind)
+            try:
+                shutil.rmtree(job_dir, ignore_errors=True)
+            except Exception:
+                logging.exception("graph-lab job %s (%s): job_dir cleanup failed", job.id, job.kind)
+            # The publish -- and only the publish -- happens last, after
+            # everything above in `finally` has completed. That is what
+            # keeps a racing `submit()` (which checks `self.thread
+            # .is_alive()`, not `job.status`) from ever running concurrently
+            # with a process group or `job_dir` this job might still be
+            # cleaning up: by the time any status here is *visible* as
+            # terminal, this thread has nothing left to do but return.
+            with self.lock:
+                job.status = final_status
+                job.result = final_result
+                job.error = final_error
 
     def _final_sweep(self, job: Job) -> None:
         """SIGKILL `job.pgid` one more time, unconditionally. Idempotent
