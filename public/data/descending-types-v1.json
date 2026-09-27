@@ -1,0 +1,488 @@
+{
+  "graphSha256": "ce247668a63df9a84d8e9969227de7b85d5eba679c45821644812ce0740dfb90",
+  "neurons": [
+    {
+      "bodyId": "10010",
+      "class": null,
+      "group": 10001,
+      "index": 0,
+      "instance": "DNp01(GF)_L",
+      "population": 0,
+      "somaSide": "L",
+      "type": "DNp01"
+    },
+    {
+      "bodyId": "10030",
+      "class": null,
+      "group": 10030,
+      "index": 1,
+      "instance": "pIP1_L",
+      "population": 0,
+      "somaSide": "L",
+      "type": "pIP1"
+    },
+    {
+      "bodyId": "10038",
+      "class": null,
+      "group": 10030,
+      "index": 2,
+      "instance": "pIP1_R",
+      "population": 0,
+      "somaSide": "R",
+      "type": "pIP1"
+    },
+    {
+      "bodyId": "10045",
+      "class": null,
+      "group": 10045,
+      "index": 3,
+      "instance": "DNg100_L",
+      "population": 0,
+      "somaSide": "L",
+      "type": "DNg100"
+    },
+    {
+      "bodyId": "10056",
+      "class": null,
+      "group": 10045,
+      "index": 4,
+      "instance": "DNg100_R",
+      "population": 0,
+      "somaSide": "R",
+      "type": "DNg100"
+    },
+    {
+      "bodyId": "10065",
+      "class": null,
+      "group": 10065,
+      "index": 5,
+      "instance": "DNb05_R",
+      "population": 0,
+      "somaSide": "R",
+      "type": "DNb05"
+    },
+    {
+      "bodyId": "10090",
+      "class": null,
+      "group": 10090,
+      "index": 6,
+      "instance": "aSP22(DNa12)_L",
+      "population": 0,
+      "somaSide": "L",
+      "type": "aSP22"
+    },
+    {
+      "bodyId": "10118",
+      "class": null,
+      "group": 10065,
+      "index": 8,
+      "instance": "DNb05_L",
+      "population": 0,
+      "somaSide": "L",
+      "type": "DNb05"
+    },
+    {
+      "bodyId": "10124",
+      "class": null,
+      "group": 10124,
+      "index": 10,
+      "instance": "DNg105_L",
+      "population": 0,
+      "somaSide": "L",
+      "type": "DNg105"
+    },
+    {
+      "bodyId": "10131",
+      "class": null,
+      "group": 10131,
+      "index": 11,
+      "instance": "DNg74_a_R",
+      "population": 0,
+      "somaSide": "R",
+      "type": "DNg74_a"
+    },
+    {
+      "bodyId": "10177",
+      "class": null,
+      "group": 10177,
+      "index": 14,
+      "instance": "DNg16_L",
+      "population": 0,
+      "somaSide": "L",
+      "type": "DNg16"
+    },
+    {
+      "bodyId": "10192",
+      "class": null,
+      "group": 10192,
+      "index": 16,
+      "instance": "DNg75(hb1874217622)_L",
+      "population": 0,
+      "somaSide": "L",
+      "type": "DNg75"
+    },
+    {
+      "bodyId": "10216",
+      "class": null,
+      "group": 10216,
+      "index": 17,
+      "instance": "DNge037_R",
+      "population": 0,
+      "somaSide": "R",
+      "type": "DNge037"
+    },
+    {
+      "bodyId": "10218",
+      "class": null,
+      "group": 10218,
+      "index": 18,
+      "instance": "DNg35_R",
+      "population": 0,
+      "somaSide": "R",
+      "type": "DNg35"
+    },
+    {
+      "bodyId": "10221",
+      "class": null,
+      "group": 10216,
+      "index": 19,
+      "instance": "DNge037_L",
+      "population": 0,
+      "somaSide": "L",
+      "type": "DNge037"
+    },
+    {
+      "bodyId": "10228",
+      "class": null,
+      "group": 10228,
+      "index": 21,
+      "instance": "DNp06_L",
+      "population": 0,
+      "somaSide": "L",
+      "type": "DNp06"
+    },
+    {
+      "bodyId": "10234",
+      "class": null,
+      "group": 10234,
+      "index": 22,
+      "instance": "DNp35(PVLP136)_L",
+      "population": 1,
+      "somaSide": "L",
+      "type": "DNp35"
+    },
+    {
+      "bodyId": "10247",
+      "class": null,
+      "group": 10131,
+      "index": 24,
+      "instance": "DNg74_a_L",
+      "population": 1,
+      "somaSide": "L",
+      "type": "DNg74_a"
+    },
+    {
+      "bodyId": "10249",
+      "class": null,
+      "group": 10249,
+      "index": 25,
+      "instance": "DNp31_L",
+      "population": 1,
+      "somaSide": "L",
+      "type": "DNp31"
+    },
+    {
+      "bodyId": "10264",
+      "class": null,
+      "group": 10249,
+      "index": 27,
+      "instance": "DNp31_R",
+      "population": 1,
+      "somaSide": "R",
+      "type": "DNp31"
+    },
+    {
+      "bodyId": "10274",
+      "class": null,
+      "group": 10274,
+      "index": 28,
+      "instance": "DNg108_L",
+      "population": 1,
+      "somaSide": "L",
+      "type": "DNg108"
+    },
+    {
+      "bodyId": "10281",
+      "class": null,
+      "group": 10274,
+      "index": 29,
+      "instance": "DNg108_R",
+      "population": 1,
+      "somaSide": "R",
+      "type": "DNg108"
+    },
+    {
+      "bodyId": "10283",
+      "class": null,
+      "group": 10283,
+      "index": 30,
+      "instance": "DNp103(PVLP119)_R",
+      "population": 1,
+      "somaSide": "R",
+      "type": "DNp103"
+    },
+    {
+      "bodyId": "10286",
+      "class": null,
+      "group": 10286,
+      "index": 31,
+      "instance": "DNpe053(SMP454)_L",
+      "population": 1,
+      "somaSide": "L",
+      "type": "DNpe053"
+    },
+    {
+      "bodyId": "10301",
+      "class": null,
+      "group": 10301,
+      "index": 33,
+      "instance": "DNge050_L",
+      "population": 1,
+      "somaSide": "L",
+      "type": "DNge050"
+    },
+    {
+      "bodyId": "10360",
+      "class": null,
+      "group": 10360,
+      "index": 34,
+      "instance": "DNa02_R",
+      "population": 1,
+      "somaSide": "R",
+      "type": "DNa02"
+    },
+    {
+      "bodyId": "10388",
+      "class": null,
+      "group": 10388,
+      "index": 35,
+      "instance": "DNp13_R",
+      "population": 1,
+      "somaSide": "R",
+      "type": "DNp13"
+    },
+    {
+      "bodyId": "10394",
+      "class": null,
+      "group": 10394,
+      "index": 36,
+      "instance": "DNg98_L",
+      "population": 1,
+      "somaSide": "L",
+      "type": "DNg98"
+    },
+    {
+      "bodyId": "10417",
+      "class": null,
+      "group": 10283,
+      "index": 37,
+      "instance": "DNp103(PVLP119)_L",
+      "population": 1,
+      "somaSide": "L",
+      "type": "DNp103"
+    },
+    {
+      "bodyId": "10440",
+      "class": null,
+      "group": 10177,
+      "index": 39,
+      "instance": "DNg16_R",
+      "population": 1,
+      "somaSide": "R",
+      "type": "DNg16"
+    },
+    {
+      "bodyId": "10520",
+      "class": null,
+      "group": 10520,
+      "index": 43,
+      "instance": "DNg74_b_L",
+      "population": 1,
+      "somaSide": "L",
+      "type": "DNg74_b"
+    },
+    {
+      "bodyId": "10558",
+      "class": null,
+      "group": 10234,
+      "index": 47,
+      "instance": "DNp35(PVLP136)_R",
+      "population": 1,
+      "somaSide": "R",
+      "type": "DNp35"
+    },
+    {
+      "bodyId": "10584",
+      "class": null,
+      "group": 10228,
+      "index": 50,
+      "instance": "DNp06_R",
+      "population": 2,
+      "somaSide": "R",
+      "type": "DNp06"
+    },
+    {
+      "bodyId": "10959",
+      "class": null,
+      "group": 10394,
+      "index": 66,
+      "instance": "DNg98_R",
+      "population": 2,
+      "somaSide": "R",
+      "type": "DNg98"
+    },
+    {
+      "bodyId": "10975",
+      "class": null,
+      "group": 10975,
+      "index": 67,
+      "instance": "DNa03_R",
+      "population": 2,
+      "somaSide": "R",
+      "type": "DNa03"
+    },
+    {
+      "bodyId": "12601",
+      "class": null,
+      "group": 12601,
+      "index": 105,
+      "instance": "DNge122_R",
+      "population": 2,
+      "somaSide": "R",
+      "type": "DNge122"
+    },
+    {
+      "bodyId": "12628",
+      "class": null,
+      "group": 10091,
+      "index": 107,
+      "instance": "DNpe042(CL262)_R",
+      "population": 2,
+      "somaSide": "R",
+      "type": "DNpe042"
+    },
+    {
+      "bodyId": "13130",
+      "class": null,
+      "group": 10124,
+      "index": 115,
+      "instance": "DNg105_R",
+      "population": 2,
+      "somaSide": "R",
+      "type": "DNg105"
+    },
+    {
+      "bodyId": "13805",
+      "class": null,
+      "group": 13805,
+      "index": 133,
+      "instance": "DNg97_L",
+      "population": 2,
+      "somaSide": "L",
+      "type": "DNg97"
+    },
+    {
+      "bodyId": "20418",
+      "class": null,
+      "group": 10286,
+      "index": 213,
+      "instance": "DNpe053(SMP454)_R",
+      "population": 2,
+      "somaSide": "R",
+      "type": "DNpe053"
+    },
+    {
+      "bodyId": "230783",
+      "class": null,
+      "group": 13805,
+      "index": 354,
+      "instance": "DNg97_R",
+      "population": 2,
+      "somaSide": "R",
+      "type": "DNg97"
+    },
+    {
+      "bodyId": "256420",
+      "class": null,
+      "group": 10301,
+      "index": 355,
+      "instance": "DNge050_R",
+      "population": 2,
+      "somaSide": "R",
+      "type": "DNge050"
+    },
+    {
+      "bodyId": "519624",
+      "class": null,
+      "group": 10975,
+      "index": 381,
+      "instance": "DNa03_L",
+      "population": 2,
+      "somaSide": "L",
+      "type": "DNa03"
+    },
+    {
+      "bodyId": "520300",
+      "class": null,
+      "group": 10192,
+      "index": 387,
+      "instance": "DNg75(hb1874217622)_R",
+      "population": 2,
+      "somaSide": "R",
+      "type": "DNg75"
+    },
+    {
+      "bodyId": "523769",
+      "class": null,
+      "group": 10360,
+      "index": 395,
+      "instance": "DNa02_L",
+      "population": 2,
+      "somaSide": "L",
+      "type": "DNa02"
+    },
+    {
+      "bodyId": "524470",
+      "class": null,
+      "group": 10469,
+      "index": 398,
+      "instance": "DNbe001(PS103)_R",
+      "population": 2,
+      "somaSide": "R",
+      "type": "DNbe001"
+    },
+    {
+      "bodyId": "555457",
+      "class": null,
+      "group": 555457,
+      "index": 405,
+      "instance": "DNge079_R",
+      "population": 2,
+      "somaSide": "R",
+      "type": "DNge079"
+    },
+    {
+      "bodyId": "800099",
+      "class": null,
+      "group": 555457,
+      "index": 445,
+      "instance": "DNge079_L",
+      "population": 2,
+      "somaSide": "L",
+      "type": "DNge079"
+    }
+  ],
+  "sourceFile": "body-annotations-male-cns-v1.0-minconf-0.5.feather",
+  "sourceSha256": "2177e246113e4cfbf1e7772ec37c6da1955ff22e8063d0b1f833101f99a9a3b2",
+  "version": 1
+}

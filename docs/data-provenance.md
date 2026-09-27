@@ -415,12 +415,71 @@ is the same kind of non-compiler sidecar, for the same reason: it only calls
 directory, never to this compiler's own `.bin.gz`/manifest/ledger output.
 `scripts/data/fsutil.py` (the shared atomic-text-write helper both
 `positions.py` and `rewire_batch.py` use) is a third sidecar, for the same
-reason: it has no graph-compilation logic of its own.
+reason: it has no graph-compilation logic of its own. `scripts/data/
+descending_types.py` (see "Descending cell-type sidecar" below) is a fourth
+sidecar, the same kind as `positions.py`.
 
 ```console
 $ uv run python scripts/data/positions.py --help
 $ uv run python scripts/data/positions.py       # writes public/data/malecns-arena-v1.positions.json,
                                                  # updates manifest.json/ledger.json in place
+```
+
+## Descending cell-type sidecar
+
+`public/data/descending-types-v1.json` is produced offline by
+`scripts/data/descending_types.py` (WP1c of
+`.agents/plans/readout-attribution`) from the same pinned
+`body-annotations-male-cns-v1.0-minconf-0.5.feather` table `positions.py`
+reads -- no new source file is downloaded. It re-verifies that table's
+sha256 against `download.py`'s pin before joining anything, decodes the
+compiled graph artifact to find the graph's 48 descending (output-assigned)
+neurons in ascending index order -- the same order
+`src/lib/connectome/readout.ts`'s `outputNeuronIndices` produces, and the
+same order the trained readout's D = 48 inputs are indexed by -- and for
+each one emits its graph `index`, `bodyId`, `population`
+(`outputPopulationIndex`, 0/1/2, also read from the graph, never the
+annotations table), and the annotations table's own `type`, `class`,
+`instance`, `group`, and `somaSide` values, copied exactly as the source has
+them.
+
+**Honesty about missing annotations.** These fields are external metadata
+this project did not measure. A neuron with no value for a given field in
+the source table gets `null` for that field -- never inferred, imputed, or
+otherwise filled in. Real run against the pinned data: all 48 descending
+neurons have `type`, `instance`, `group`, and `somaSide`; **`class` is
+`null` for all 48** -- the source table genuinely has no `class` value for
+any descending neuron (not a join bug; `class` is populated for other
+neuron populations in the same table).
+
+**Provenance fields.** `descending-types-v1.json` carries its own
+`sourceFile`/`sourceSha256` (the verified annotations table) and
+`graphSha256` (sha256 of the exact `--graph` file bytes it was joined
+against -- the same value as the manifest's `gzipSha256` for a default run).
+Output is deterministic: sorted JSON keys, fixed separators, and a trailing
+newline, so re-running `descending_types.py` against unchanged inputs
+reproduces byte-identical output (verified directly, and by
+`tests_python/test_descending_types.py`).
+
+`descending_types.py` updates `malecns-arena-v1.manifest.json` in place with
+a `descendingTypes: {artifact, sha256, neuronCount}` entry, touching only
+that key -- the same in-place-update convention `positions.py` uses.
+Because it never touches `binarySha256`/`gzipSha256`/`compilerSourceSha256`,
+adding this key does not perturb any published artifact that pins the
+graph's `binarySha256` (e.g. `pathway-interventions-v1.json`'s
+`sources.biologicalSha`, `behavior-repertoire-null-v1.json`'s
+`sources.biologicalSha`) -- those pin the graph binary's own hash, never the
+manifest file's bytes. Before writing, it refuses to proceed (raising,
+writing nothing) if `--graph`'s sha256 doesn't match the manifest's own
+`gzipSha256`, mirroring `positions.py`'s same guard.
+
+`descending_types.py` is deliberately **not** part of "the compiler", for
+the same reason `positions.py` is not: see "Compiler provenance" below.
+
+```console
+$ uv run python scripts/data/descending_types.py --help
+$ uv run python scripts/data/descending_types.py  # writes public/data/descending-types-v1.json,
+                                                   # updates manifest.json in place
 ```
 
 ## Reproducing this artifact
@@ -431,7 +490,8 @@ $ uv run python scripts/data/download.py       # idempotent, hash-verified
 $ uv run python scripts/data/compile.py         # writes public/data/malecns-arena-v1.{bin.gz,manifest.json,ledger.json}
 $ uv run python scripts/data/rewire.py --seed 0 # writes the rewired control arm and updates the manifest
 $ uv run python scripts/data/positions.py       # writes the soma positions sidecar, see above
-$ uv run pytest tests_python                    # compiler + positions invariants, no raw data required
+$ uv run python scripts/data/descending_types.py # writes the descending cell-type sidecar, see above
+$ uv run pytest tests_python                    # compiler + sidecar invariants, no raw data required
 ```
 
 `compile.py` is deterministic: re-running it against the same pinned source
@@ -450,12 +510,21 @@ file contributing its filename (UTF-8) + a single NUL byte + its raw bytes
 into one hasher (see `compiler_source_sha256()` for the exact scheme).
 This is deliberately an explicit allowlist rather than a `scripts/data/*.py`
 directory glob (which an earlier version of this function used): the "Soma
-positions sidecar" section above adds `scripts/data/positions.py`,
-`scripts/data/rewire_batch.py`, and `scripts/data/fsutil.py`
+positions sidecar" and "Descending cell-type sidecar" sections above add
+`scripts/data/positions.py`, `scripts/data/rewire_batch.py`,
+`scripts/data/fsutil.py`, and `scripts/data/descending_types.py`
 (`NON_COMPILER_SIDECAR_FILENAMES` in `compile.py`) to this
 same directory, and none of them may change this hash -- none influences the
 compiled `.bin.gz` bytes, so folding any of them into "the compiler" would
-force an unrelated recompile/rehash every time one changed. A fail-closed
+force an unrelated recompile/rehash every time one changed. Adding
+`descending_types.py` to this allowlist did edit `compile.py` itself
+(`NON_COMPILER_SIDECAR_FILENAMES` lives there, and `compile.py` is itself
+one of the four `COMPILER_SOURCE_FILENAMES`), which is why
+`compilerSourceSha256` moved in this same change -- exactly the precedent
+set when `rewire_batch.py` was classified, and exactly what this
+self-consistent hash is for: it changed because the compiler's own source
+changed, while `binarySha256`/`gzipSha256` (the actual compiled graph bytes)
+did not. A fail-closed
 test (`test_every_scripts_data_module_is_classified` in
 `tests_python/test_compile.py`) asserts every `scripts/data/*.py` file is
 classified as either compiler or sidecar, so a new file dropped into the

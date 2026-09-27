@@ -206,6 +206,14 @@ COMPILER_SOURCE_DIR = Path(__file__).resolve().parent
 #: (the canonical atomic-text-write used by both `positions.py` and
 #: `rewire_batch.py`) with no graph-compilation logic of its own -- it is
 #: imported by sidecars, not by anything that produces `.bin.gz` bytes.
+#: `scripts/data/descending_types.py` is a fourth sidecar, the same kind as
+#: `positions.py`: it joins pinned MaleCNS annotation columns (this time
+#: `type`/`class`/`instance`/`group`/`somaSide`) onto the already-compiled
+#: graph's descending neurons after the fact, producing
+#: `public/data/descending-types-v1.json` and its own manifest key -- it
+#: never influences `compile_graph`'s aggregation/CSR logic or the emitted
+#: `.bin.gz` bytes, so it must not change this hash either (WP1c of
+#: `.agents/plans/readout-attribution`).
 COMPILER_SOURCE_FILENAMES: tuple[str, ...] = ("binfmt.py", "compile.py", "download.py", "rewire.py")
 
 #: Every `scripts/data/*.py` file that is *not* part of "the compiler" --
@@ -216,7 +224,12 @@ COMPILER_SOURCE_FILENAMES: tuple[str, ...] = ("binfmt.py", "compile.py", "downlo
 #: dropped into `scripts/data/` (compiler or sidecar) can never be silently
 #: left out of both -- unlike the old `*.py` glob, an allowlist fails open
 #: by default; this test is what makes it fail closed instead.
-NON_COMPILER_SIDECAR_FILENAMES: tuple[str, ...] = ("positions.py", "rewire_batch.py", "fsutil.py")
+NON_COMPILER_SIDECAR_FILENAMES: tuple[str, ...] = (
+    "positions.py",
+    "rewire_batch.py",
+    "fsutil.py",
+    "descending_types.py",
+)
 
 
 def compiler_source_sha256(source_dir: Path = COMPILER_SOURCE_DIR) -> str:
