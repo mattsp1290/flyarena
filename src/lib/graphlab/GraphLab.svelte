@@ -72,6 +72,13 @@
     }
   }
   function disconnect() {
+    // Drops the session's own `GraphLabApi` instance (and the token inside
+    // it) too -- clearing this component's `token` field alone leaves that
+    // instance, and the token, reachable through `session` indefinitely
+    // (a fix-verification review finding; see `session.ts`'s `release()`
+    // doc comment). Safe to call unconditionally, including when no job was
+    // ever submitted (`release()` is a no-op with nothing to drop).
+    session.release();
     token = '';
     health = null;
     connection = 'idle';
@@ -279,19 +286,25 @@
    * kept mounted, hidden and inert for the rest of the tab's lifetime (see
    * the `active` prop's own doc comment above), this is the *only* signal
    * this component ever gets that the user has left. Chose **cancel, then
-   * clear** over "keep polling until terminal, then clear": the token
-   * itself is cleared immediately either way (the running `GraphLabSession`
-   * already holds its own independent copy inside its own `GraphLabApi`
-   * instance, captured once at `session.start()` -- clearing this
-   * component's `token` field can never stop an already-in-flight request,
-   * including the cancel `DELETE` fired here), but an *uncancelled* job
-   * would keep that independent copy resident inside the session's own
-   * `GraphLabApi` for however much longer the job's own ceiling allows (up
-   * to 20 minutes -- `models.py`'s `CEILING_SECONDS`), even though nothing
-   * on screen shows it running any more. Cancelling first bounds that
-   * residency to the cancel round-trip instead. The cost is a job in
-   * progress when the user navigates away is lost rather than finishing in
-   * the background; reconnecting after returning always starts fresh.
+   * clear** over "keep polling until terminal, then clear": an *uncancelled*
+   * job would keep its `GraphLabSession`'s own `GraphLabApi` instance --
+   * and the token inside it -- resident for however much longer the job's
+   * own ceiling allows (up to 20 minutes -- `models.py`'s
+   * `CEILING_SECONDS`), even though nothing on screen shows it running any
+   * more. Cancelling first bounds that residency to the cancel round-trip
+   * instead. The cost is a job in progress when the user navigates away is
+   * lost rather than finishing in the background; reconnecting after
+   * returning always starts fresh.
+   *
+   * Clearing this component's own `token` field alone is not enough (a
+   * fix-verification review finding on an earlier version of this effect,
+   * which claimed it was): `GraphLabSession.start()` stores its own
+   * `GraphLabApi` instance -- and the token inside it -- in a private field
+   * that is never cleared by `cancel()` or `dispose()`. `disconnect()`
+   * below now also calls `session.release()`, which drops that reference so
+   * no token-holding object remains reachable through the session once the
+   * route has been left (see `session.ts`'s own doc comment on `release()`
+   * for why an in-flight cancel still completes despite this).
    *
    * `leftRouteHandled` (a plain variable, not `$state`) makes this fire
    * exactly once per "became inactive" transition rather than every time
@@ -316,6 +329,12 @@
     }
     if (leftRouteHandled) return;
     leftRouteHandled = true;
+    // `disconnect()` calls `session.release()` -- issued after `cancel()`
+    // (not before): `GraphLabSession.refresh()` captures its own local
+    // reference to the session's `GraphLabApi` instance synchronously,
+    // before its first `await`, so the cancel request already in flight is
+    // unaffected by `release()` clearing the session's own field right
+    // after (see `session.ts`'s `release()` doc comment).
     if (sessionActive(sessionState.status)) void session.cancel();
     disconnect();
   });
@@ -343,10 +362,24 @@
     }
   }
 
+  /**
+   * `"confirmed"`: both the submit-time and completion-time `/health`
+   * snapshots were obtained and agree. `"mismatch"`: both were obtained but
+   * disagree (the backend's identity changed mid-run). `"unconfirmed"`:
+   * either re-fetch itself failed (network error, non-2xx, bad JSON --
+   * `fetchHealthSnapshot` returns `null` for all of these), so there is
+   * nothing to compare -- a fix-verification review finding: a failed
+   * completion-time check previously left the mismatch flag at its default
+   * `false`, rendering a clean-looking label for a provenance claim that
+   * was never actually re-confirmed. `unconfirmedAt` distinguishes *which*
+   * check failed, purely for the rendered message's wording.
+   */
+  type ProvenanceStatus = 'confirmed' | 'mismatch' | 'unconfirmed';
+  let provenanceStatus = $state<ProvenanceStatus>('confirmed');
+  let unconfirmedAt = $state<'submit' | 'completion' | null>(null);
   let submittedGraphSha = $state<string | null>(null);
   let completionBundleSha = $state<string | null>(null);
   let completionGraphSha = $state<string | null>(null);
-  let provenanceMismatch = $state(false);
   let lastProvenanceCheckedJobId: string | null = null;
 
   async function submit() {
@@ -361,7 +394,8 @@
       selectedCellId = null;
       completionBundleSha = null;
       completionGraphSha = null;
-      provenanceMismatch = false;
+      provenanceStatus = 'confirmed';
+      unconfirmedAt = null;
       lastProvenanceCheckedJobId = null;
 
       let request: JobRequest;
@@ -399,9 +433,20 @@
       // Re-fetched right now, not read from whatever `health` a possibly
       // long-past "Connect" click cached -- this is the submit-time
       // provenance snapshot the completion check below compares against.
+      // Deliberately no fallback to the stale cached `health` on failure
+      // (a fix-verification review finding): silently substituting a
+      // possibly-long-stale value would make an unconfirmed submit-time
+      // snapshot look exactly like a fresh, confirmed one.
       const freshHealth = await fetchHealthSnapshot();
-      submittedBundleSha = freshHealth?.bundleSha256 ?? health?.bundleSha256 ?? null;
-      submittedGraphSha = freshHealth?.graphSha256 ?? health?.graphSha256 ?? null;
+      if (freshHealth === null) {
+        provenanceStatus = 'unconfirmed';
+        unconfirmedAt = 'submit';
+        submittedBundleSha = null;
+        submittedGraphSha = null;
+      } else {
+        submittedBundleSha = freshHealth.bundleSha256;
+        submittedGraphSha = freshHealth.graphSha256;
+      }
       void session.start(endpoint, token, request);
     } finally {
       submitting = false;
@@ -425,6 +470,10 @@
    * hardware) -- the label says so explicitly rather than silently
    * presenting the submit-time sha as if it still describes the process
    * that produced this result (a thermo-maintainability review finding).
+   * If either re-fetch itself failed outright, the label says the identity
+   * could not be confirmed at all, rather than rendering a clean-looking
+   * label for a claim that was never actually checked (a fix-verification
+   * review finding).
    */
   const provenance = $derived.by(() => {
     if (!result || !submittedKind) return '';
@@ -436,7 +485,13 @@
       `engine bundle sha ${short(submittedBundleSha)}`,
       `host ${result.host.arch}/${result.host.node}`
     ].join(' · ');
-    return provenanceMismatch ? `${base} — backend changed during this job; provenance uncertain` : base;
+    if (provenanceStatus === 'mismatch') return `${base} — backend changed during this job; provenance uncertain`;
+    if (provenanceStatus === 'unconfirmed') {
+      return unconfirmedAt === 'submit'
+        ? `${base} — backend identity could not be confirmed at submit time; provenance uncertain`
+        : `${base} — backend identity could not be re-confirmed at completion; provenance uncertain`;
+    }
+    return base;
   });
 
   /**
@@ -446,7 +501,11 @@
    * snapshot captured in `submit()`. A `graphSha256` comparison is only
    * meaningful when the submitted graph was `"biological"` (the one case
    * `/health`'s single value describes); a `rewired:<seed>` or
-   * `disconnected` job is never flagged on graph sha alone.
+   * `disconnected` job is never flagged on graph sha alone. If the submit-
+   * time check already failed (`unconfirmedAt === 'submit'`), there is no
+   * baseline to compare against, so this only records the completion
+   * snapshot for display and leaves the existing "unconfirmed" status in
+   * place rather than overwriting it with a spurious "confirmed"/"mismatch".
    */
   $effect(() => {
     const currentJob = job;
@@ -455,8 +514,16 @@
     void (async () => {
       const freshHealth = await fetchHealthSnapshot();
       if (currentJob.id !== sessionState.id) return; // a newer job started while this check was in flight
-      completionBundleSha = freshHealth?.bundleSha256 ?? null;
-      completionGraphSha = freshHealth?.graphSha256 ?? null;
+      if (freshHealth === null) {
+        if (unconfirmedAt !== 'submit') {
+          provenanceStatus = 'unconfirmed';
+          unconfirmedAt = 'completion';
+        }
+        return;
+      }
+      completionBundleSha = freshHealth.bundleSha256;
+      completionGraphSha = freshHealth.graphSha256;
+      if (unconfirmedAt === 'submit') return; // no submit-time baseline to compare against
       const bundleChanged =
         submittedBundleSha !== null && completionBundleSha !== null && submittedBundleSha !== completionBundleSha;
       const graphChanged =
@@ -464,7 +531,7 @@
         submittedGraphSha !== null &&
         completionGraphSha !== null &&
         submittedGraphSha !== completionGraphSha;
-      provenanceMismatch = bundleChanged || graphChanged;
+      provenanceStatus = bundleChanged || graphChanged ? 'mismatch' : 'confirmed';
     })();
   });
 

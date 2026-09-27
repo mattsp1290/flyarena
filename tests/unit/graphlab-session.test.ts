@@ -76,3 +76,70 @@ it('makes a best-effort cancel on dispose without waiting for it', async () => {
   const cancelCall = fetch.mock.calls.find(([, init]) => init?.method === 'DELETE');
   expect(cancelCall).toBeDefined();
 });
+
+// A fix-verification review finding on an earlier version of this module:
+// `start()` stores its own `GraphLabApi` instance (and the token inside it)
+// in `this.api`, and nothing ever cleared it -- not `cancel()`, not
+// `dispose()` -- so the last instance, and its token, stayed reachable
+// through the session object for as long as that object itself lived. The
+// tests below assert `release()` (and `dispose()`, which now calls it)
+// actually drop that reference, using both a direct field check and a
+// structural (`JSON.stringify`) inspection per the review's own suggestion:
+// `JSON.stringify` naturally omits a property whose value is `undefined`,
+// so this doubles as a token-reachability check without needing to know
+// every private field name on `GraphLabApi` itself.
+it('release() drops the session\'s GraphLabApi instance, so the token is no longer reachable on the session', async () => {
+  // A terminal ('completed') status, not 'running': `refresh()` only
+  // schedules its next-poll `setTimeout` while `sessionActive(...)` is
+  // true, and a scheduled Node `Timeout` is a circularly-linked object
+  // (`_idlePrev`/`_idleNext`) that `JSON.stringify` cannot serialize --
+  // unrelated to what this test checks, so a terminal status keeps
+  // `this.timer` unset and the structural inspection below meaningful.
+  const fetch = vi.fn().mockResolvedValueOnce(submitted()).mockResolvedValueOnce(response('completed'));
+  vi.stubGlobal('fetch', fetch);
+  const session = new GraphLabSession(() => {});
+  const secretToken = 'reachability-test-token-0123456789';
+  await session.start('http://localhost:8766', secretToken, job);
+
+  // Before release: the token really is reachable this way, proving the
+  // check below is meaningful rather than vacuously true.
+  expect(JSON.stringify(session)).toContain(secretToken);
+
+  session.release();
+
+  expect((session as unknown as { api?: unknown }).api).toBeUndefined();
+  expect(JSON.stringify(session)).not.toContain(secretToken);
+  session.dispose();
+});
+
+it('release() does not abort a cancel already in flight (matches GraphLab.svelte\'s cancel-then-release order)', async () => {
+  const fetch = vi.fn().mockResolvedValueOnce(submitted()).mockResolvedValueOnce(response('running')).mockResolvedValue(response('cancelled'));
+  vi.stubGlobal('fetch', fetch);
+  const session = new GraphLabSession(() => {});
+  await session.start('http://localhost:8766', 'token-0123456789ab', job);
+
+  // `refresh()` captures its own local `api` reference synchronously,
+  // before its first `await` -- so `release()` called immediately after
+  // `cancel()` (never awaited in between) must not prevent that already-
+  // dispatched DELETE from completing.
+  const cancelPromise = session.cancel();
+  session.release();
+  await cancelPromise;
+
+  const cancelCall = fetch.mock.calls.find(([, init]) => init?.method === 'DELETE');
+  expect(cancelCall).toBeDefined();
+  session.dispose();
+});
+
+it('dispose() also releases the api, leaving no token reachable', async () => {
+  const fetch = vi.fn().mockResolvedValueOnce(submitted()).mockResolvedValueOnce(response('running')).mockResolvedValue(response('cancelled'));
+  vi.stubGlobal('fetch', fetch);
+  const session = new GraphLabSession(() => {});
+  const secretToken = 'dispose-reachability-token-0123456789';
+  await session.start('http://localhost:8766', secretToken, job);
+
+  session.dispose();
+
+  expect((session as unknown as { api?: unknown }).api).toBeUndefined();
+  expect(JSON.stringify(session)).not.toContain(secretToken);
+});

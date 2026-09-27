@@ -304,8 +304,11 @@ describe('GraphLab route-change token lifetime (thermo-security I1)', () => {
     expect(screen.queryByText(/Bundle SHA-256/)).toBeNull();
 
     // Returning to the route must not resurrect the old token from
-    // anywhere (there is nowhere for it to have been kept: `disconnect()`
-    // clears the only `$state` field that ever held it).
+    // anywhere: `disconnect()` clears this component's own `token` field
+    // *and* calls `session.release()`, which drops the session's own
+    // `GraphLabApi` instance (the token's other, previously-uncleared,
+    // home -- see `session.ts`'s `release()` doc comment) -- covered
+    // directly by the `GraphLabSession` reachability test below.
     await rerender({ active: true });
     expect((container.querySelector('input[type="password"]') as HTMLInputElement).value).toBe('');
   });
@@ -447,5 +450,197 @@ describe('GraphLab provenance staleness (thermo-maintainability)', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Submit job' }));
     await waitFor(() => expect(screen.getByText('Computed on DGX (private, not published)')).toBeInTheDocument());
     await waitFor(() => expect(document.querySelector('.provenance')).not.toHaveTextContent(/backend changed/i));
+  });
+
+  // A fix-verification review finding: when the completion-time re-check
+  // itself failed (network error, non-2xx, bad JSON -- `fetchHealthSnapshot`
+  // returns `null`), the mismatch flag previously stayed at its default
+  // `false`, rendering a clean-looking label for a claim that was never
+  // actually re-confirmed. The two tests below cover both failure points
+  // (completion-time and submit-time) with their own distinct wording.
+  it('marks the label unconfirmed (not silently clean) when the completion-time /health re-check itself fails', async () => {
+    let healthCallCount = 0;
+    stubFetch((url) => {
+      if (url.includes('/api/graph/v1/health')) {
+        healthCallCount += 1;
+        return new Response(
+          JSON.stringify({ status: 'ok', modelVersion: 'v', bundleSha256: 'a'.repeat(64), graphSha256: 'b'.repeat(64), gpu: { available: false } })
+        );
+      }
+      return notFound();
+    });
+    const { container } = render(GraphLab);
+    await fireEvent.input(container.querySelector('input[type="password"]')!, { target: { value: 'a-valid-16-char-token' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Connect' }));
+    await waitFor(() => expect(screen.getByText(/Bundle SHA-256/)).toBeInTheDocument());
+    expect(healthCallCount).toBe(1);
+
+    const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/api/graph/v1/health')) {
+        healthCallCount += 1;
+        // Call 2 is the submit-time re-fetch (succeeds); call 3 is the
+        // completion-time re-check, which fails outright.
+        if (healthCallCount >= 3) return Promise.reject(new TypeError('Failed to fetch'));
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ status: 'ok', modelVersion: 'v', bundleSha256: 'a'.repeat(64), graphSha256: 'b'.repeat(64), gpu: { available: false } })
+          )
+        );
+      }
+      if (url.includes('/api/graph/v1/jobs') && init?.method === 'POST') {
+        return Promise.resolve(new Response(JSON.stringify({ id: 'job-1', status: 'queued' }), { status: 202 }));
+      }
+      if (url.includes('/api/graph/v1/jobs/')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              id: 'job-1',
+              kind: 'lesion',
+              status: 'completed',
+              progress: {},
+              error: null,
+              result: {
+                graph: 'biological',
+                graphSha256: 'b'.repeat(64),
+                host: { arch: 'arm64', node: 'v22.22.3' },
+                label: 'Computed on DGX (private, not published)',
+                baseline: { n: 4, mean: 1.5 },
+                sets: [{ indices: [7], bodyIds: ['10010'], effect: { n: 4, meanDifference: -0.4, ci95: [-0.6, -0.2] }, n: 4 }]
+              }
+            })
+          )
+        );
+      }
+      return Promise.resolve(notFound());
+    });
+    vi.stubGlobal('fetch', fetch);
+
+    await fireEvent.input(container.querySelector('textarea')!, { target: { value: '7' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Submit job' }));
+    await waitFor(() => expect(screen.getByText('Computed on DGX (private, not published)')).toBeInTheDocument());
+    await waitFor(() =>
+      expect(document.querySelector('.provenance')).toHaveTextContent(/could not be re-confirmed at completion/i)
+    );
+    // Never the silent, mismatch-only wording for this failure mode.
+    expect(document.querySelector('.provenance')).not.toHaveTextContent(/backend changed during this job/i);
+  });
+
+  it('marks the label unconfirmed when the submit-time /health re-fetch itself fails', async () => {
+    stubFetch((url) =>
+      url.includes('/api/graph/v1/health')
+        ? new Response(
+            JSON.stringify({ status: 'ok', modelVersion: 'v', bundleSha256: 'a'.repeat(64), graphSha256: 'b'.repeat(64), gpu: { available: false } })
+          )
+        : notFound()
+    );
+    const { container } = render(GraphLab);
+    await fireEvent.input(container.querySelector('input[type="password"]')!, { target: { value: 'a-valid-16-char-token' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Connect' }));
+    await waitFor(() => expect(screen.getByText(/Bundle SHA-256/)).toBeInTheDocument());
+
+    const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      // Every /health call from this point on fails -- including the
+      // submit-time re-fetch and the completion-time re-check.
+      if (url.includes('/api/graph/v1/health')) return Promise.reject(new TypeError('Failed to fetch'));
+      if (url.includes('/api/graph/v1/jobs') && init?.method === 'POST') {
+        return Promise.resolve(new Response(JSON.stringify({ id: 'job-1', status: 'queued' }), { status: 202 }));
+      }
+      if (url.includes('/api/graph/v1/jobs/')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              id: 'job-1',
+              kind: 'lesion',
+              status: 'completed',
+              progress: {},
+              error: null,
+              result: {
+                graph: 'biological',
+                graphSha256: 'b'.repeat(64),
+                host: { arch: 'arm64', node: 'v22.22.3' },
+                label: 'Computed on DGX (private, not published)',
+                baseline: { n: 4, mean: 1.5 },
+                sets: [{ indices: [7], bodyIds: ['10010'], effect: { n: 4, meanDifference: -0.4, ci95: [-0.6, -0.2] }, n: 4 }]
+              }
+            })
+          )
+        );
+      }
+      return Promise.resolve(notFound());
+    });
+    vi.stubGlobal('fetch', fetch);
+
+    await fireEvent.input(container.querySelector('textarea')!, { target: { value: '7' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Submit job' }));
+    await waitFor(() => expect(screen.getByText('Computed on DGX (private, not published)')).toBeInTheDocument());
+    await waitFor(() =>
+      expect(document.querySelector('.provenance')).toHaveTextContent(/could not be confirmed at submit time/i)
+    );
+    // A failed submit-time snapshot renders "unknown" shas, not a stale
+    // cached value from the earlier manual Connect click.
+    expect(document.querySelector('.provenance')?.textContent).toContain('unknown');
+  });
+});
+
+describe('GraphLab ARIA tabs: keyboard navigation and roving tabindex', () => {
+  it('supports ArrowRight/ArrowLeft/Home/End with a roving tabindex, and keeps the tabpanel in sync', async () => {
+    stubFetch((url) =>
+      url.includes('/api/graph/v1/health')
+        ? new Response(
+            JSON.stringify({ status: 'ok', modelVersion: 'v', bundleSha256: null, graphSha256: null, gpu: { available: false } })
+          )
+        : notFound()
+    );
+    const { container } = render(GraphLab);
+    await fireEvent.input(container.querySelector('input[type="password"]')!, { target: { value: 'a-valid-16-char-token' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Connect' }));
+    await waitFor(() => expect(screen.getByRole('tablist')).toBeInTheDocument());
+
+    const tablist = screen.getByRole('tablist');
+    const lesionTab = screen.getByRole('tab', { name: 'Lesion sweep' });
+    const atlasTab = screen.getByRole('tab', { name: 'Atlas search' });
+    const swapsetTab = screen.getByRole('tab', { name: 'Swap-set intervention' });
+    const tabpanel = document.getElementById('graphlab-tabpanel');
+
+    expect(lesionTab).toHaveAttribute('aria-selected', 'true');
+    expect(lesionTab).toHaveAttribute('tabindex', '0');
+    expect(atlasTab).toHaveAttribute('tabindex', '-1');
+    expect(swapsetTab).toHaveAttribute('tabindex', '-1');
+    expect(tabpanel).toHaveAttribute('aria-labelledby', 'graphlab-tab-lesion');
+    expect(lesionTab).toHaveAttribute('aria-controls', 'graphlab-tabpanel');
+
+    await fireEvent.keyDown(tablist, { key: 'ArrowRight' });
+    expect(atlasTab).toHaveAttribute('aria-selected', 'true');
+    expect(atlasTab).toHaveAttribute('tabindex', '0');
+    expect(lesionTab).toHaveAttribute('aria-selected', 'false');
+    expect(lesionTab).toHaveAttribute('tabindex', '-1');
+    expect(tabpanel).toHaveAttribute('aria-labelledby', 'graphlab-tab-atlas');
+
+    await fireEvent.keyDown(tablist, { key: 'ArrowRight' });
+    expect(swapsetTab).toHaveAttribute('aria-selected', 'true');
+    expect(swapsetTab).toHaveAttribute('tabindex', '0');
+
+    // Wraps from the last tab back to the first.
+    await fireEvent.keyDown(tablist, { key: 'ArrowRight' });
+    expect(lesionTab).toHaveAttribute('aria-selected', 'true');
+
+    // Wraps from the first tab back to the last.
+    await fireEvent.keyDown(tablist, { key: 'ArrowLeft' });
+    expect(swapsetTab).toHaveAttribute('aria-selected', 'true');
+
+    await fireEvent.keyDown(tablist, { key: 'Home' });
+    expect(lesionTab).toHaveAttribute('aria-selected', 'true');
+    expect(lesionTab).toHaveAttribute('tabindex', '0');
+
+    await fireEvent.keyDown(tablist, { key: 'End' });
+    expect(swapsetTab).toHaveAttribute('aria-selected', 'true');
+    expect(swapsetTab).toHaveAttribute('tabindex', '0');
+    expect(tabpanel).toHaveAttribute('aria-labelledby', 'graphlab-tab-swapset');
+
+    // A key this handler doesn't own must not change the selection.
+    await fireEvent.keyDown(tablist, { key: 'Tab' });
+    expect(swapsetTab).toHaveAttribute('aria-selected', 'true');
   });
 });

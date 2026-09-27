@@ -116,6 +116,35 @@ export class GraphLabSession {
   cancel() {
     return this.refresh('cancel');
   }
+  /**
+   * Drops this session's own `GraphLabApi` instance -- and the token
+   * inside it -- so nothing reachable through this session can hold the
+   * token in memory once the caller is done with it (a fix-verification
+   * review finding: `start()` stores `this.api`, and until this method
+   * existed, nothing ever cleared it -- not `dispose()`, not any caller --
+   * so the last `GraphLabApi` instance, and its token, stayed reachable for
+   * as long as the session object itself did, i.e. for the rest of the
+   * tab, contradicting `GraphLab.svelte`'s route-leave doc comment).
+   *
+   * Safe to call while a `cancel()` (or any `refresh()`) is still in
+   * flight: `refresh()` reads `const { api } = this` synchronously, before
+   * its first `await` -- calling an async method runs that synchronous
+   * prefix immediately, so by the time this method's caller gets control
+   * back, the in-flight call already holds its own local reference,
+   * independent of `this.api`. Setting `this.api = undefined` here can
+   * therefore never abort or corrupt a request already under way; it only
+   * prevents any *new* `refresh()` call from finding an `api` to use
+   * (`refresh()`'s own `!api` guard then makes it a no-op).
+   *
+   * A no-op if no job was ever started (`this.api` is already `undefined`).
+   * Does not touch `this.state`/polling/`this.disposed` -- callers that
+   * also want to stop an active job or tear down the session entirely
+   * still call `cancel()`/`dispose()` themselves; this method only ever
+   * detaches the API client.
+   */
+  release() {
+    this.api = undefined;
+  }
   dispose() {
     if (this.disposed) return;
     this.disposed = true;
@@ -124,6 +153,7 @@ export class GraphLabSession {
       // The API bounds this fresh request to 15 seconds; aborting polling cannot cancel it.
       void this.api.cancel(this.state.id, new AbortController().signal).catch(() => {});
     }
+    this.release();
   }
 }
 
