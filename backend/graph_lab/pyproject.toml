@@ -22,3 +22,16 @@ packages = ["graph_lab"]
 
 [tool.setuptools.package-dir]
 graph_lab = "."
+
+[tool.pytest.ini_options]
+# `spark`: reproduction checks that run real TS/GPU work on the Spark
+# (GB10) host itself -- `test_reproduction.py`'s lesion-vs-episode.ts,
+# atlas-vs-behavior-atlas-v1, and swapset-vs-M1000 checks
+# (`.agents/plans/graph-lab/02-job-engines.md`'s Tests section: "marked
+# `@pytest.mark.spark`"). CI has no GPU, no built JS bundle, and no
+# `training/`-venv `torch` (`.github/workflows/ci.yml`'s own `graph-lab`
+# job runs bare `uv run --locked python -I -m pytest -q`, CPU-only,
+# fixture-only), so it deselects this marker; on the Spark itself, run
+# `uv run --locked python -I -m pytest -m spark` explicitly, or drop the
+# `-m` filter to run everything.
+markers = ["spark: reproduction checks that run real TS/GPU work on the Spark host"]

@@ -31,14 +31,18 @@ WORKDIR /app
 # see this file's header -- the base image already provides every pinned
 # dependency at a compatible version.
 COPY backend/graph_lab/pyproject.toml ./graph_lab_src/pyproject.toml
-COPY backend/graph_lab/__init__.py backend/graph_lab/service.py backend/graph_lab/jobs.py backend/graph_lab/models.py ./graph_lab_src/
+COPY backend/graph_lab/__init__.py backend/graph_lab/service.py backend/graph_lab/jobs.py backend/graph_lab/models.py \
+     backend/graph_lab/py_scripts.py backend/graph_lab/engine_lesion.py backend/graph_lab/engine_atlas.py \
+     backend/graph_lab/engine_swapset.py ./graph_lab_src/
 RUN python -m pip install --no-cache-dir --no-deps ./graph_lab_src \
     && rm -rf ./graph_lab_src
 
-# --- Real-graph engine sources for WP2 (Python side). Not yet wired to any
-# job kind in WP1 (`service.py`'s `default_runner` 501s `atlas`/`swapset`
-# and `rewired:<seed>`) -- copied now so WP2 does not need to touch this
-# Dockerfile again. `scripts/analysis/graph_io.py` locates
+# --- Real-graph engine sources for WP2 (Python side): `rewired:<seed>`
+# regeneration (`engine_lesion.py`, also used by the atlas engine),
+# swap-set graph construction (`engine_swapset.py`), and the atlas
+# engine's own multi-step driver (`engine_atlas.py`, invoked as
+# `python -m graph_lab.engine_atlas`) all import these at runtime.
+# `scripts/analysis/graph_io.py` locates
 # `scripts/data/` relative to its own file location
 # (`Path(__file__).resolve().parents[1] / "data"`), so the two directories
 # must stay siblings under a common `scripts/` parent exactly as in the
@@ -47,14 +51,17 @@ RUN python -m pip install --no-cache-dir --no-deps ./graph_lab_src \
 # plan's own file list named only `swap_ops.py`/`graph_io.py`/
 # `transfer.py`/`rewire.py`/`binfmt.py`: both are real, unlisted transitive
 # dependencies (confirmed by reading their imports), and omitting them
-# would make this copy import-broken the moment WP2 exercises it.
+# would make this copy import-broken.
 COPY training/src/flyarena_training /opt/graph-lab/flyarena_training
 COPY scripts/data/binfmt.py scripts/data/fsutil.py scripts/data/rewire.py /opt/graph-lab/scripts/data/
 COPY scripts/analysis/env_guard.py scripts/analysis/swap_ops.py scripts/analysis/graph_io.py scripts/analysis/transfer.py /opt/graph-lab/scripts/analysis/
 
-# --- Graph artifacts, read-only. Used today by the GPU atlas smoke test
-# (`flyarena_training.atlas_cli`, run directly -- see the smoke-test note
-# in this WP's report) and, in WP2, by the job engines.
+# --- Graph artifacts, read-only. Used by the GPU atlas smoke test
+# (`flyarena_training.atlas_cli`, run directly) and by the job engines
+# themselves (`rewiring-null-v1.json` for `rewired:<seed>` regeneration,
+# `pathway-interventions-v1.json` is not read by any engine at runtime --
+# only by `test_reproduction.py`'s swap-set M1000 check, from the repo
+# checkout, not from this image).
 COPY public/data/malecns-arena-v1.bin.gz public/data/malecns-arena-v1.manifest.json public/data/rewiring-null-v1.json public/data/pathway-interventions-v1.json /opt/graph-lab/data/
 
 # --- esbuild-bundled JS entries/workers, produced locally by
@@ -100,6 +107,7 @@ ENV CUBLAS_WORKSPACE_CONFIG=:4096:8 \
     DD_IAST_ENABLED=false \
     GRAPH_LAB_DATA_DIR=/opt/graph-lab/data \
     GRAPH_LAB_BUNDLE_DIR=/opt/graph-lab/js \
+    GRAPH_LAB_SCRIPTS_DIR=/opt/graph-lab/scripts \
     PYTHONPATH=/opt/graph-lab \
     NODE_OPTIONS=
 

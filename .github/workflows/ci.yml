@@ -151,7 +151,15 @@ jobs:
         # own note on the same sandbox-runtime injection). Harmless and
         # a no-op here, kept for parity so this exact command also works
         # unchanged in that sandbox.
-        run: uv run --locked python -I -m pytest -q
+        # `-m "not spark"`: deselects `test_reproduction.py`'s reproduction
+        # checks (`@pytest.mark.spark` -- registered in this package's own
+        # `pyproject.toml`), which need a real GPU, a built JS bundle
+        # (`npm run graph-lab:bundle`), and `training/`'s own uv-managed
+        # `torch` venv -- none of which this CPU-only, fixture-only job
+        # has. Run on the Spark itself (`.agents/plans/graph-lab/
+        # 02-job-engines.md`'s gate 2: on WP2's own close, and again on
+        # every `scripts/graph-lab.sh --build`).
+        run: uv run --locked python -I -m pytest -q -m "not spark"
         working-directory: backend/graph_lab
 
   dependency-report:

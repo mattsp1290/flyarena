@@ -226,6 +226,21 @@ class Jobs:
                         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
                         "TORCHINDUCTOR_CACHE_DIR": "/tmp/torch-cache",
                         "TRITON_CACHE_DIR": "/tmp/triton-cache",
+                        # `graph_lab.engine_atlas`'s own nested
+                        # `python -m flyarena_training.atlas_cli` step
+                        # (WP2) needs `flyarena_training` importable --
+                        # the image copies it as a raw directory under
+                        # `/opt/graph-lab/`, relying on
+                        # `ENV PYTHONPATH=/opt/graph-lab` (`Dockerfile`),
+                        # never a real site-packages install. Without
+                        # forwarding this, every atlas job would fail in
+                        # the container with `ModuleNotFoundError`
+                        # (confirmed by code inspection: `_child_env`'s own
+                        # allow-list previously had no `PYTHONPATH` entry
+                        # at all). Passed through from this process's own
+                        # environment (never widened beyond it), matching
+                        # `GRAPH_LAB_DATA_DIR`'s own pattern just above.
+                        "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
                     }
                 ),
                 text=True,

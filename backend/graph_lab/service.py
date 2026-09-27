@@ -14,16 +14,30 @@ in-process engine call (`jobs.Jobs`).
 from __future__ import annotations
 
 import hmac
+import json
+import logging
 import os
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Callable
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
 
+from . import engine_lesion, engine_swapset
 from .jobs import Jobs, Runner, parse_graph_id
 from .models import AtlasJobRequest, JobRequest, LesionJobRequest, SwapsetJobRequest
+
+#: Refuse an atlas job (a real GPU search) if free GPU memory reported by
+#: `torch.cuda.mem_get_info()` is below this (`02-job-engines.md`'s atlas
+#: bound: "refuses to start... if free GPU memory is below 2 GiB"). Read
+#: with `torch.cuda.mem_get_info()` specifically (not `nvidia-smi`, which
+#: reports "Not Supported" for per-process/global memory on this host's
+#: GB10 unified-memory architecture -- confirmed empirically; `torch`'s own
+#: CUDA driver query works regardless).
+GPU_BUSY_THRESHOLD_BYTES = 2 * 1024**3
 
 MODEL_VERSION = "arena-graph-lab-v1"
 MAX_BODY_BYTES = 16 * 1024
@@ -73,44 +87,182 @@ def _parse_origins(raw: str) -> list[str]:
     return origins
 
 
-def default_runner(bundle_dir: Path, data_dir: Path, node_bin: str = "node") -> Runner:
+def default_runner(
+    bundle_dir: Path,
+    data_dir: Path,
+    node_bin: str = "node",
+    scripts_dir: "Path | None" = None,
+    python_bin: "str | None" = None,
+    atlas_python_bin: "str | None" = None,
+    atlas_device: str = "cuda",
+    gpu_free_bytes: "Callable[[], int | None] | None" = None,
+) -> Runner:
     """The real production runner: maps a validated job request to an argv
-    list that runs the matching esbuild-bundled entry script. WP1 wires only
-    `kind: "lesion"` end to end, and only for `graph` values that need no
-    Python-side graph preparation (`biological`/`disconnected`) -- `atlas`,
-    `swapset`, and `rewired:<seed>` need engine work
-    (`.agents/plans/graph-lab/02-job-engines.md`: GPU search + re-eval,
-    swap-op graph construction, and `rewire.py` regeneration respectively)
-    that is out of scope for this work package and ships in WP2. Those
-    kinds are still fully validated by `models.py` (including the
-    closed-set `graph` check) and rejected here with a clear, static 501 --
-    never silently accepted and never a 500 from an engine that doesn't
-    exist yet.
+    list that runs the matching esbuild-bundled entry script (or, for
+    `atlas`, `graph_lab.engine_atlas`'s own multi-step driver -- see
+    below). Wires all three job kinds
+    (`.agents/plans/graph-lab/02-job-engines.md`).
+
+    `scripts_dir`/`python_bin`/`atlas_python_bin`/`gpu_free_bytes` are
+    injectable the same way `bundle_dir`/`data_dir`/`node_bin` already are
+    (WP1's own convention), so tests can point them at fixtures/fakes
+    without a real container, GPU, or `training/`-venv path:
+    - `scripts_dir` (default `$GRAPH_LAB_SCRIPTS_DIR` or
+      `/opt/graph-lab/scripts`): where `scripts/data/rewire.py` and
+      `scripts/analysis/swap_ops.py` live (`py_scripts.py`'s own doc
+      comment) -- mirrors the repo's own `scripts/{data,analysis}` layout,
+      both in the container and locally.
+    - `python_bin` (default `sys.executable`): the interpreter that runs
+      `graph_lab.engine_atlas` itself -- always an interpreter with
+      `graph_lab` importable (the one running this very process, in the
+      container and in `uv run pytest` alike).
+    - `atlas_python_bin` (default `$GRAPH_LAB_ATLAS_PYTHON_BIN` or
+      `python_bin`): the interpreter `engine_atlas.py` shells out to for
+      `python -m flyarena_training.atlas_cli` -- the *same* interpreter in
+      the container (one merged environment; `Dockerfile`'s own header
+      comment), but a distinct `training/`-venv path locally/in tests
+      (`graph_lab`'s own venv deliberately has no `torch`; see
+      `pyproject.toml`'s header comment).
+    - `gpu_free_bytes` (default `_real_gpu_free_bytes`, `torch.cuda.
+      mem_get_info()`): read once per atlas submission, before any
+      subprocess starts.
     """
-    import json
+    resolved_scripts_dir = scripts_dir or Path(os.environ.get("GRAPH_LAB_SCRIPTS_DIR", "/opt/graph-lab/scripts"))
+    resolved_python_bin = python_bin or sys.executable
+    resolved_atlas_python_bin = atlas_python_bin or os.environ.get("GRAPH_LAB_ATLAS_PYTHON_BIN", resolved_python_bin)
+    check_gpu_free_bytes = gpu_free_bytes or _real_gpu_free_bytes
+
+    def _biological_manifest() -> dict:
+        return json.loads((data_dir / "malecns-arena-v1.manifest.json").read_text())
+
+    def _lesion_argv(request: LesionJobRequest, job_dir: Path) -> "list[str]":
+        mode, seed = parse_graph_id(request.graph)
+        manifest = _biological_manifest()
+        if mode == "rewired":
+            assert seed is not None  # parse_graph_id guarantees this for mode == "rewired"
+            try:
+                graph_path, expected_sha256 = engine_lesion.regenerate_rewired_graph(
+                    scripts_dir=resolved_scripts_dir, data_dir=data_dir, job_dir=job_dir, seed=seed
+                )
+            except Exception as error:  # noqa: BLE001 -- any regeneration/verification failure is a real 500, never left to bubble to jobs.py's generic handler with a less specific message.
+                raise HTTPException(500, f"Rewired graph regeneration failed: {_rewired_regeneration_error_detail(error)}") from error
+        else:
+            graph_path = data_dir / manifest["artifact"]
+            expected_sha256 = manifest["binarySha256"]
+        args = {
+            "dataDir": str(data_dir),
+            # `entry-lesion.ts`'s own `LesionArgs.mode` only ever accepts
+            # `'biological'`/`'disconnected'` -- a materialized `rewired`
+            # graph binary is loaded exactly like a biological one
+            # (`buildGraphBufferForMode`'s `'biological'`/`'rewired'`
+            # branches both just pass their own buffer through
+            # unmodified), so a regenerated `rewired:<seed>` graph is
+            # served here as `mode: "biological"` pointed at its own
+            # tmpfs path -- never `mode: "rewired"`, which this entry
+            # would reject.
+            "mode": "biological" if mode == "rewired" else mode,
+            "graphPath": str(graph_path),
+            "expectedSha256": expected_sha256,
+            "sets": request.sets,
+            "seedStart": request.seed_start,
+            "seedCount": request.seed_count,
+            "ticks": request.ticks,
+        }
+        args_path = job_dir / "args.json"
+        args_path.write_text(json.dumps(args))
+        return [node_bin, str(bundle_dir / "entry-lesion.mjs"), str(args_path)]
+
+    def _atlas_argv(request: AtlasJobRequest, job_dir: Path) -> "list[str]":
+        free_bytes = check_gpu_free_bytes()
+        if free_bytes is None or free_bytes < GPU_BUSY_THRESHOLD_BYTES:
+            raise HTTPException(503, "GPU busy")
+        mode, seed = parse_graph_id(request.graph)
+        manifest = _biological_manifest()
+        biological_path = data_dir / manifest["artifact"]
+        rewired_path = None
+        expected_sha256 = manifest["binarySha256"] if mode == "biological" else None
+        if mode == "rewired":
+            assert seed is not None
+            try:
+                rewired_path, expected_sha256 = engine_lesion.regenerate_rewired_graph(
+                    scripts_dir=resolved_scripts_dir, data_dir=data_dir, job_dir=job_dir, seed=seed
+                )
+            except Exception as error:  # noqa: BLE001 -- any regeneration/verification failure is a real 500, never left to bubble to jobs.py's generic handler with a less specific message.
+                raise HTTPException(500, f"Rewired graph regeneration failed: {_rewired_regeneration_error_detail(error)}") from error
+        args = {
+            "jobDir": str(job_dir),
+            "nodeBin": node_bin,
+            "bundleDir": str(bundle_dir),
+            "dataDir": str(data_dir),
+            "atlasPythonBin": resolved_atlas_python_bin,
+            "graphPath": str(biological_path),
+            "rewiredPath": str(rewired_path) if rewired_path else None,
+            "arm": mode,
+            "expectedSha256": expected_sha256,
+            "graphArtifactSha256": manifest["gzipSha256"],
+            "biologicalGraphPath": str(biological_path),
+            "biologicalExpectedSha256": manifest["binarySha256"],
+            "device": atlas_device,
+            "searchSeed": request.search_seed,
+            "population": request.population,
+            "generations": request.generations,
+            "ticks": request.ticks,
+        }
+        args_path = job_dir / "atlas-args.json"
+        args_path.write_text(json.dumps(args))
+        return [resolved_python_bin, "-m", "graph_lab.engine_atlas", str(args_path)]
+
+    def _swapset_argv(request: SwapsetJobRequest, job_dir: Path) -> "list[str]":
+        swaps = [(swap.a, swap.b, swap.c, swap.d) for swap in request.swaps]
+        # Only the fast half runs synchronously here, inside `Jobs.submit()`'s
+        # lock: `build_candidate` validates the swap list against the real
+        # graph (one swap application, one rebuild) and can still give a
+        # clean 422 before the job is accepted. Building the `controls`
+        # random controls (up to 100 `random_class_swaps` calls) is the
+        # expensive half -- measured at up to ~46s at this request kind's
+        # own upper bounds -- and would otherwise block `Jobs.get` (status
+        # polling) and cancellation for every other client for that whole
+        # window (a dual-review finding); it now runs inside
+        # `engine_swapset.run`, this job's own supervised async subprocess,
+        # where the existing wall-clock ceiling and cancellation already
+        # apply to it.
+        try:
+            built = engine_swapset.build_candidate(
+                scripts_dir=resolved_scripts_dir,
+                data_dir=data_dir,
+                job_dir=job_dir,
+                swaps=swaps,
+            )
+        except ValueError as error:
+            raise HTTPException(422, f"Invalid swap set: {error}") from error
+        args = {
+            "jobDir": str(job_dir),
+            "nodeBin": node_bin,
+            "entryPath": str(bundle_dir / "entry-swapset.mjs"),
+            "dataDir": str(data_dir),
+            "scriptsDir": str(resolved_scripts_dir),
+            "biologicalGraph": built["biologicalGraph"],
+            "candidateGraph": built["candidateGraph"],
+            "sourceIndices": built["sourceIndices"],
+            "targetIndices": built["targetIndices"],
+            "k": built["k"],
+            "controls": request.controls,
+            "seedStart": request.seed_start,
+            "seedCount": request.seed_count,
+            "ticks": request.ticks,
+            "publishedNullPath": str(data_dir / "rewiring-null-v1.json"),
+        }
+        args_path = job_dir / "swapset-args.json"
+        args_path.write_text(json.dumps(args))
+        return [resolved_python_bin, "-m", "graph_lab.engine_swapset", str(args_path)]
 
     def runner(request: JobRequest, job_dir: Path) -> list[str]:
         if isinstance(request, LesionJobRequest):
-            mode, seed = parse_graph_id(request.graph)
-            if mode == "rewired":
-                raise HTTPException(501, "rewired graph regeneration is not wired until WP2")
-            manifest_path = data_dir / "malecns-arena-v1.manifest.json"
-            manifest = json.loads(manifest_path.read_text())
-            args = {
-                "dataDir": str(data_dir),
-                "mode": mode,
-                "graphPath": str(data_dir / manifest["artifact"]),
-                "expectedSha256": manifest["binarySha256"],
-                "sets": request.sets,
-                "seedStart": request.seed_start,
-                "seedCount": request.seed_count,
-                "ticks": request.ticks,
-            }
-            args_path = job_dir / "args.json"
-            args_path.write_text(json.dumps(args))
-            return [node_bin, str(bundle_dir / "entry-lesion.mjs"), str(args_path)]
-        if isinstance(request, (AtlasJobRequest, SwapsetJobRequest)):
-            raise HTTPException(501, f"job kind {request.kind!r} engine is not wired until WP2")
+            return _lesion_argv(request, job_dir)
+        if isinstance(request, AtlasJobRequest):
+            return _atlas_argv(request, job_dir)
+        if isinstance(request, SwapsetJobRequest):
+            return _swapset_argv(request, job_dir)
         raise HTTPException(400, "Unrecognized job kind")
 
     return runner
@@ -151,17 +303,73 @@ def _gpu_available() -> bool:
         return False
 
 
+def _rewired_regeneration_error_detail(error: Exception) -> str:
+    """`engine_lesion.regenerate_rewired_graph` raises `ValueError` for
+    every check it does itself (sha mismatches, a missing published-null
+    entry) -- those messages only ever echo seeds and sha256 hex digests
+    (audited), safe to return verbatim. Anything else (`OSError`/
+    `FileNotFoundError` reading a missing/corrupt data file, a
+    `json.JSONDecodeError`, ...) can include an absolute server-side path
+    in its own `str()` (confirmed: a security review finding) -- those get
+    a fixed, generic message instead, with the real exception logged
+    server-side via `raise ... from error` (still visible in the server's
+    own logs/traceback, never in the HTTP response body)."""
+    if isinstance(error, ValueError):
+        return str(error)
+    logging.exception("graph-lab: rewired graph regeneration failed")
+    return "an internal error occurred while preparing the graph"
+
+
+def _real_gpu_free_bytes() -> "int | None":
+    """`None` means "unknown" (no `torch`, no CUDA device, or the query
+    itself raised) -- `default_runner`'s atlas branch treats that the same
+    as "known busy": refuse to start rather than silently proceeding
+    without ever having checked (`gpu_free_bytes` is injectable precisely
+    so `test_engines.py`/`test_security.py`, which run in `graph_lab`'s own
+    CPU-only venv with no `torch` at all, can exercise both the "GPU free"
+    and "GPU busy" branches without a real GPU)."""
+    try:
+        import torch  # optional: see `_gpu_available`'s own comment
+    except ImportError:
+        return None
+    try:
+        if not torch.cuda.is_available():
+            return None
+        free_bytes, _total_bytes = torch.cuda.mem_get_info()
+        return int(free_bytes)
+    except Exception:
+        return None
+
+
 def create_app(
     token: str | None = None,
     runner: Runner | None = None,
     data_dir: str | Path | None = None,
     bundle_dir: str | Path | None = None,
     node_bin: str = "node",
+    scripts_dir: "str | Path | None" = None,
+    python_bin: "str | None" = None,
+    atlas_python_bin: "str | None" = None,
+    atlas_device: str = "cuda",
+    gpu_free_bytes: "Callable[[], int | None] | None" = None,
 ) -> FastAPI:
     secret = token if token is not None else os.environ.get("GRAPH_LAB_TOKEN", "")
     resolved_data_dir = Path(data_dir or os.environ.get("GRAPH_LAB_DATA_DIR", "/opt/graph-lab/data"))
     resolved_bundle_dir = Path(bundle_dir or os.environ.get("GRAPH_LAB_BUNDLE_DIR", "/opt/graph-lab/js"))
-    active_runner = runner if runner is not None else default_runner(resolved_bundle_dir, resolved_data_dir, node_bin)
+    active_runner = (
+        runner
+        if runner is not None
+        else default_runner(
+            resolved_bundle_dir,
+            resolved_data_dir,
+            node_bin,
+            scripts_dir=Path(scripts_dir) if scripts_dir else None,
+            python_bin=python_bin,
+            atlas_python_bin=atlas_python_bin,
+            atlas_device=atlas_device,
+            gpu_free_bytes=gpu_free_bytes,
+        )
+    )
     jobs = Jobs(active_runner)
 
     @asynccontextmanager
