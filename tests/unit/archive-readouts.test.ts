@@ -328,7 +328,11 @@ describe('mergeReadouts', () => {
   it('sorts merged entries by id ascending, independent of insertion order', () => {
     const merged = mergeReadouts(
       [],
-      [makeEntry({ id: 'rewired-seed0-seed101' }), makeEntry({ id: 'biological-seed101' }), makeEntry({ id: 'C000-seed101' })]
+      [
+        makeEntry({ id: 'rewired-seed0-seed101', weightsSha256: 'w-rewired' }),
+        makeEntry({ id: 'biological-seed101', weightsSha256: 'w-biological' }),
+        makeEntry({ id: 'C000-seed101', weightsSha256: 'w-c000' })
+      ]
     );
     expect(merged.map((e) => e.id)).toEqual(['C000-seed101', 'biological-seed101', 'rewired-seed0-seed101']);
   });
@@ -362,9 +366,34 @@ describe('mergeReadouts', () => {
     expect(() => mergeReadouts(existing, [makeEntry({ graphId: 'rewired-seed0' })])).toThrow(/different graphId/);
   });
 
+  it('refuses a NEW id whose weightsSha256 duplicates an already-archived DIFFERENT id (the GPU-rerun-never-actually-run case)', () => {
+    const existing = [makeEntry({ id: 'biological-seed101', weightsSha256: 'shared-weights' })];
+    expect(() =>
+      mergeReadouts(existing, [makeEntry({ id: 'biological-seed101-gpurerun', weightsSha256: 'shared-weights' })])
+    ).toThrow(/same weightsSha256 as already-archived id "biological-seed101"/);
+  });
+
+  it('allows two different ids with different weightsSha256 (the real GPU-rerun case)', () => {
+    const existing = [makeEntry({ id: 'biological-seed101', weightsSha256: 'cpu-weights' })];
+    const merged = mergeReadouts(existing, [makeEntry({ id: 'biological-seed101-gpurerun', weightsSha256: 'gpu-weights' })]);
+    expect(merged.map((e) => e.id)).toEqual(['biological-seed101', 'biological-seed101-gpurerun']);
+  });
+
+  it('detects a weightsSha256 collision between two NEW additions in the same invocation, not just against existing entries', () => {
+    expect(() =>
+      mergeReadouts(
+        [],
+        [
+          makeEntry({ id: 'C000-seed101', graphId: 'C000', weightsSha256: 'dup-weights' }),
+          makeEntry({ id: 'C001-seed101', graphId: 'C001', weightsSha256: 'dup-weights' })
+        ]
+      )
+    ).toThrow(/same weightsSha256/);
+  });
+
   it('keeps existing entries not touched by this invocation', () => {
-    const existing = [makeEntry({ id: 'P-seed101' })];
-    const merged = mergeReadouts(existing, [makeEntry({ id: 'C000-seed101' })]);
+    const existing = [makeEntry({ id: 'P-seed101', weightsSha256: 'w-p' })];
+    const merged = mergeReadouts(existing, [makeEntry({ id: 'C000-seed101', weightsSha256: 'w-c000' })]);
     expect(merged.map((e) => e.id)).toEqual(['C000-seed101', 'P-seed101']);
   });
 });

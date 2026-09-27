@@ -86,7 +86,33 @@ describe('WP1 archive vs published sources (Gate 1, identity/score half)', () =>
     }
   });
 
-  it('P\'s per-seed archived weights reproduce the published pathway-interventions-v1.json perSeed scores', () => {
+  it('every archived entry\'s weightsSha256 is unique (no run archived twice under two different ids)', () => {
+    const byWeights = new Map<string, string>();
+    for (const entry of archive.readouts) {
+      const priorId = byWeights.get(entry.weightsSha256);
+      expect(priorId, `${entry.id} shares weightsSha256 with ${String(priorId)}`).toBeUndefined();
+      byWeights.set(entry.weightsSha256, entry.id);
+    }
+    expect(byWeights.size).toBe(archive.readouts.length);
+  });
+
+  it('every archived entry\'s theta decodes to bytes matching its own weightsSha256 (self-consistency, all 23 entries)', () => {
+    expect(archive.readouts.length).toBeGreaterThan(0);
+    for (const entry of archive.readouts) {
+      const decoded = Buffer.from(entry.theta, 'base64');
+      expect(sha256Hex(decoded), `${entry.id}'s theta does not hash to its own weightsSha256`).toBe(entry.weightsSha256);
+    }
+  });
+
+  it('the GPU-rerun entry\'s weights actually differ from the CPU run\'s (it is a real rerun, not a copy)', () => {
+    const cpu = archive.readouts.find((r) => r.id === 'biological-seed101');
+    const gpu = archive.readouts.find((r) => r.id === 'biological-seed101-gpurerun');
+    expect(cpu, 'no biological-seed101 entry').toBeDefined();
+    expect(gpu, 'no biological-seed101-gpurerun entry').toBeDefined();
+    expect(gpu?.weightsSha256).not.toBe(cpu?.weightsSha256);
+  });
+
+  it('P\'s per-seed raw scores reproduce the published pathway-interventions-v1.json perSeed scores', () => {
     const pRuns = rawScores.runs.filter((r) => r.id === 'P');
     expect(pRuns).toHaveLength(3);
     for (const run of pRuns) {
@@ -96,7 +122,7 @@ describe('WP1 archive vs published sources (Gate 1, identity/score half)', () =>
     }
   });
 
-  it('C000-C004\'s sorted means reproduce the published controls.C.scores array', () => {
+  it('C000-C004\'s raw sorted means reproduce the published controls.C.scores array', () => {
     const cMeans = rawScores.runs
       .filter((r) => /^C\d{3}$/.test(r.id))
       .map((r) => mean(r.movementScore))
@@ -105,7 +131,7 @@ describe('WP1 archive vs published sources (Gate 1, identity/score half)', () =>
     expect(cMeans).toEqual(pathwayInterventions.trained.controls.C.scores);
   });
 
-  it('M1000-M1004\'s sorted means reproduce the published controls.M.scores array', () => {
+  it('M1000-M1004\'s raw sorted means reproduce the published controls.M.scores array', () => {
     const mMeans = rawScores.runs
       .filter((r) => /^M1\d{3}$/.test(r.id))
       .map((r) => mean(r.movementScore))

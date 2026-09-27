@@ -454,6 +454,17 @@ const IDENTITY_FIELDS = [
  * overwriting it would make the archive's own committed bytes depend on
  * which checkout happened to re-run this CLI (undercutting the "output is
  * deterministic" requirement -- a dual-review finding).
+ *
+ * Separately, the SAME `weightsSha256` is never accepted under two DIFFERENT
+ * ids: `assertArmMatchesGraphId`/`assertArmBundlesMatchRawScores` catch a
+ * mislabeled `--source`, but neither catches the same run directory
+ * archived twice under two labels that were meant to be different runs (the
+ * GPU-rerun case's whole reason to exist: `--source biological:gpurerun=<dir>`
+ * pointed at the SAME run dir as `--source biological=<dir>` by operator
+ * error, e.g. the GPU rerun wasn't actually done yet). Unlike the
+ * `IDENTITY_FIELDS` check above (which only ever compares an entry against a
+ * PRIOR entry sharing its own id), this is a cross-id check -- a round-2
+ * dual-review finding.
  */
 export const mergeReadouts = (
   existing: readonly ArchivedReadout[],
@@ -461,6 +472,9 @@ export const mergeReadouts = (
 ): readonly ArchivedReadout[] => {
   const byId = new Map<string, ArchivedReadout>();
   for (const entry of existing) byId.set(entry.id, entry);
+  const idByWeightsSha256 = new Map<string, string>();
+  for (const entry of byId.values()) idByWeightsSha256.set(entry.weightsSha256, entry.id);
+
   for (const entry of additions) {
     const prior = byId.get(entry.id);
     if (prior) {
@@ -473,7 +487,16 @@ export const mergeReadouts = (
       }
       continue; // identical in every way that matters -- keep the prior entry (and its sourcePath) unchanged
     }
+    const existingIdForWeights = idByWeightsSha256.get(entry.weightsSha256);
+    if (existingIdForWeights !== undefined && existingIdForWeights !== entry.id) {
+      throw new Error(
+        `archive-readouts: id "${entry.id}" has the same weightsSha256 as already-archived id ` +
+          `"${existingIdForWeights}" -- the same theta_final.npy was archived under two different labels ` +
+          `(a copy-paste --source error, or a rerun that never actually happened)?`
+      );
+    }
     byId.set(entry.id, entry);
+    idByWeightsSha256.set(entry.weightsSha256, entry.id);
   }
   return [...byId.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 };
