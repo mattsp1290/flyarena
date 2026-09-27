@@ -99,15 +99,12 @@ BRIDGE_TARGET = 800
 #: connection-level (not synapse-level) threshold applied on top.
 SYNAPSE_THRESHOLD = 3
 
-#: Predeclared alternative subgraph selections
-#: (`.agents/plans/selection-robustness`, WP1); `"default"` is the unchanged
-#: policy above, used when `--selection` is omitted. `larger`/`smaller` only
-#: change `bridge_target`; `random-bridge` swaps `select_subgraph`'s
-#: `bridge_mode` for a seeded uniform sample; `alt-sensory-mapping` swaps
-#: `assign_channels`'s `channel_mode` for a seeded permutation of the
-#: sensory-to-channel assignment (descending assignment is always
-#: unchanged). Recorded verbatim in the emitted ledger/manifest `selection`
-#: key, same as the rest of the policy.
+#: Predeclared alternative subgraph selections (`.agents/plans/
+#: selection-robustness`, WP1); `"default"` is the unchanged policy above,
+#: used when `--selection` is omitted. `larger`/`smaller` change
+#: `bridge_target`; `random-bridge`/`alt-sensory-mapping` set
+#: `select_subgraph`'s `bridge_mode`/`assign_channels`'s `channel_mode` to a
+#: seeded sample/permutation. Recorded in the emitted `selection` key.
 SELECTIONS: Mapping[str, Mapping[str, object]] = {
     "default": {},
     "larger": {"bridge_target": 1600},
@@ -520,13 +517,10 @@ def select_subgraph(
     `bridge_ids`, `node_ids` (their union, deduplicated) and the before/
     after candidate counts the ledger records.
 
-    `selection` may override two bridge-only knobs (sensory/descending
-    selection is unaffected): `bridge_target` (default `BRIDGE_TARGET`), the
-    bridge population cap; and `bridge_mode`, `"degree-rank"` (default, the
-    existing `_rank_by_degree` top-N) or `"seeded-uniform"`, a
-    `numpy.random.default_rng(selection["seed"])` sample of `bridge_target`
-    candidates (or all, if fewer) drawn over the candidates sorted ascending
-    by body id, so the draw is deterministic and set-order-independent.
+    `selection` may override `bridge_target` (default `BRIDGE_TARGET`) and
+    `bridge_mode`: `"degree-rank"` (default, existing top-N) or
+    `"seeded-uniform"`, a `default_rng(selection["seed"])` sample over the
+    sorted-by-body-id candidate pool. Sensory/descending selection is unaffected.
     """
     selection = selection if selection is not None else SELECTIONS["default"]
     bridge_target = int(selection.get("bridge_target", BRIDGE_TARGET))
@@ -685,12 +679,9 @@ def assign_channels(
     partition slots for one body and skew the channel/population boundary
     math for every neuron after it).
 
-    `selection["channel_mode"]` (default `"contiguous-blocks"`) may switch
-    sensory-to-channel assignment only: `"seeded-permutation"` permutes the
-    sorted sensory ids with `numpy.random.default_rng(selection["seed"])`
-    before the same contiguous split. Descending-to-population assignment is
-    always the unchanged contiguous split -- `selection` never touches
-    `descending_ids`/`output_assignment`.
+    `selection["channel_mode"]` `"seeded-permutation"` permutes the sorted
+    sensory ids with `default_rng(selection["seed"])` before the same split;
+    default `"contiguous-blocks"` and descending/output are unaffected.
     """
     if len(sensory_ids) == 0:
         raise ValueError("assign_channels: sensory_ids must be non-empty")
@@ -772,11 +763,9 @@ def build_manifest_and_ledger(
     selection_id: str = "default",
     selection_params: Mapping[str, object] | None = None,
 ) -> "tuple[dict, dict]":
-    """`selection` is `select_subgraph`'s *return value*, not the
-    `SELECTIONS` policy entry -- that's `selection_id`/`selection_params`,
-    recorded verbatim as a `selection: {id, params}` key in both outputs.
-    `artifact_name` (default `ARTIFACT_NAME`) names every emitted `artifact`
-    field so a variant's manifest/ledger match its actual `.bin.gz` name.
+    """`selection` is `select_subgraph`'s return value, not the `SELECTIONS`
+    entry (`selection_id`/`selection_params`, recorded as a `selection`
+    key). `artifact_name` names every `artifact` field, matching the `.bin.gz`.
     """
     from download import SOURCE_FILES  # local import to avoid a hard dependency for fixture tests
 
@@ -881,16 +870,11 @@ def build_manifest_and_ledger(
 
 
 def _refuse_unsafe_variant_target(selection_id: str, artifact_name: str, out_dir: Path) -> str | None:
-    """Returns an error message (writes nothing) if `selection_id` is a
-    non-default selection that would (a) reuse the default artifact name,
-    (b) use an `artifact_name` that embeds `/`, `.`, or `..` -- rejected so
-    it can only ever contribute a filename, never directory structure, to
-    the real write path (`out_dir / f"{artifact_name}.bin.gz"` in `main()`;
-    without this, `--out-dir . --artifact-name public/data/malecns-arena-v1`
-    would resolve to the shipped path although `out_dir` alone is not
-    "inside public/data" -- a bypass a dual review found and this closes) --
-    or (c) resolve `--out-dir` inside `public/data`. `None` means safe.
-    Checked before any raw data is loaded or any file is written.
+    """Error message (writes nothing) if `selection_id` is non-default and
+    would reuse the default artifact name, use a non-plain-filename
+    `artifact_name` (`/`/`..` here could smuggle directory components past
+    an `out_dir`-only check -- a dual review finding), or resolve `--out-dir`
+    inside `public/data`. `None` means safe; checked before any data load/write.
     """
     if selection_id == "default":
         return None
