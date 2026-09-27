@@ -358,6 +358,83 @@ def test_refuse_helper_closes_the_path_separator_bypass_into_public_data():
     assert real_write_target == (compiler.PUBLIC_DATA_DIR / "malecns-arena-v1").resolve()  # confirms the exploit shape
 
 
+# ---------------------------------------------------------------------------
+# Regression tests for the thermo-methodology dual-review Critical finding:
+# `_refuse_unsafe_variant_target`'s prior `if selection_id == "default": return
+# None` short-circuit skipped the plain-filename and out-dir checks entirely
+# for the default selection -- which is also what `--selection`'s argparse
+# default gives when the flag is omitted. The reviewer confirmed
+# `--artifact-name /tmp/absolute-evil` and `--artifact-name ../escape` both
+# reached `load_annotations()` under `--selection default`. The only
+# permitted way to write into `public/data` is now the exact canonical
+# triple: selection "default" + `ARTIFACT_NAME` + `PUBLIC_DATA_DIR`.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "evil_artifact_name",
+    ["/tmp/absolute-evil", "../escape"],
+)
+def test_refuse_helper_rejects_absolute_or_traversal_artifact_name_for_default_selection(evil_artifact_name):
+    # Guard-level reproduction of the reviewer's two bypass argv lists,
+    # against the exact canonical (selection=default, out_dir=public/data)
+    # combination that used to short-circuit past all validation.
+    message = compiler._refuse_unsafe_variant_target("default", evil_artifact_name, compiler.PUBLIC_DATA_DIR)
+    assert message is not None
+
+
+def test_refuse_helper_rejects_default_selection_with_non_canonical_artifact_name_into_public_data():
+    # default selection + public/data out-dir is only safe with the exact
+    # default artifact name; any other name must still be refused.
+    message = compiler._refuse_unsafe_variant_target("default", "malecns-arena-v1-fake", compiler.PUBLIC_DATA_DIR)
+    assert message is not None
+
+
+def test_refuse_helper_rejects_non_default_selection_with_canonical_artifact_name_into_public_data():
+    # non-default selection + the exact default artifact name, still
+    # targeting public/data -- refused for two independent reasons at once
+    # (canonical-name reuse and public/data target); either is sufficient.
+    message = compiler._refuse_unsafe_variant_target("larger", compiler.ARTIFACT_NAME, compiler.PUBLIC_DATA_DIR)
+    assert message is not None
+
+
+def test_main_refuses_absolute_artifact_name_with_selection_default(tmp_path, monkeypatch):
+    """Regression test for the reviewer's first bypass argv list:
+    `--selection default --artifact-name /tmp/absolute-evil --out-dir ...`
+    used to reach `load_annotations()` -- past the point of no return --
+    because the guard's default-selection branch skipped the plain-filename
+    check. `pathlib`'s `/` makes an absolute right-hand operand replace the
+    left one entirely, so this would have written to `/tmp/absolute-evil*`
+    regardless of `--out-dir`."""
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("load_annotations must not be called when the refusal rule fires")
+
+    monkeypatch.setattr(compiler, "load_annotations", _fail_if_called)
+
+    exit_code = compiler.main(
+        ["--selection", "default", "--artifact-name", "/tmp/absolute-evil", "--out-dir", str(tmp_path)]
+    )
+    assert exit_code != 0
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_main_refuses_traversal_artifact_name_with_selection_omitted(tmp_path, monkeypatch):
+    """Regression test for the reviewer's second bypass argv list:
+    `--artifact-name ../escape --out-dir ...` with `--selection` omitted
+    entirely (argparse's `default="default"` making this identical to the
+    previous test's failure mode)."""
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("load_annotations must not be called when the refusal rule fires")
+
+    monkeypatch.setattr(compiler, "load_annotations", _fail_if_called)
+
+    exit_code = compiler.main(["--artifact-name", "../escape", "--out-dir", str(tmp_path)])
+    assert exit_code != 0
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_main_refuses_variant_before_loading_any_raw_data(tmp_path, monkeypatch):
     def _fail_if_called(*args, **kwargs):
         raise AssertionError("load_annotations must not be called when the refusal rule fires")

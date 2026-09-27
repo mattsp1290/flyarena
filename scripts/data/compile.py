@@ -35,6 +35,13 @@ import pyarrow.feather as feather
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import binfmt  # noqa: E402
+from selections import (  # noqa: E402
+    SELECTIONS,
+    default_if_none,
+    refuse_unsafe_variant_target,
+    resolve_bridge_ids,
+    resolve_sensory_order,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RAW_DATA_DIR = REPO_ROOT / "data" / "raw"
@@ -98,21 +105,6 @@ BRIDGE_TARGET = 800
 #: already synapse-confidence filtered at minconf 0.5, this is an additional
 #: connection-level (not synapse-level) threshold applied on top.
 SYNAPSE_THRESHOLD = 3
-
-#: Predeclared alternative subgraph selections (`.agents/plans/
-#: selection-robustness`, WP1); `"default"` is the unchanged policy above,
-#: used when `--selection` is omitted. `larger`/`smaller` change
-#: `bridge_target`; `random-bridge`/`alt-sensory-mapping` set
-#: `select_subgraph`'s `bridge_mode`/`assign_channels`'s `channel_mode` to a
-#: seeded sample/permutation. Recorded in the emitted `selection` key.
-SELECTIONS: Mapping[str, Mapping[str, object]] = {
-    "default": {},
-    "larger": {"bridge_target": 1600},
-    "smaller": {"bridge_target": 400},
-    "random-bridge": {"bridge_mode": "seeded-uniform", "seed": 20260927},
-    "alt-sensory-mapping": {"channel_mode": "seeded-permutation", "seed": 20260927},
-}
-
 
 #: Presynaptic sign policy (Dale's law: this format applies one +-1 sign per
 #: presynaptic neuron to every edge it emits). `consensus_nt` is the source
@@ -234,8 +226,20 @@ COMPILER_SOURCE_DIR = Path(__file__).resolve().parent
 #: thermo-maintainability-review extraction of what was previously ~130
 #: duplicated lines) -- like `fsutil.py`, it is imported by sidecars, not by
 #: anything that produces `.bin.gz` bytes, and has no graph-compilation
-#: logic of its own.
-COMPILER_SOURCE_FILENAMES: tuple[str, ...] = ("binfmt.py", "compile.py", "download.py", "rewire.py")
+#: logic of its own. `scripts/data/selections.py`, unlike every sidecar
+#: above, is **not** a sidecar: its `resolve_bridge_ids`/
+#: `resolve_sensory_order` directly determine which neurons/channels a
+#: `--selection` compiles, so it belongs in this tuple, not
+#: `NON_COMPILER_SIDECAR_FILENAMES` below (a thermo-maintainability-review
+#: extraction of the `SELECTIONS`/`bridge_mode`/`channel_mode`/refusal-guard
+#: code this WP added directly to `compile.py`).
+COMPILER_SOURCE_FILENAMES: tuple[str, ...] = (
+    "binfmt.py",
+    "compile.py",
+    "download.py",
+    "rewire.py",
+    "selections.py",
+)
 
 #: Every `scripts/data/*.py` file that is *not* part of "the compiler" --
 #: i.e. every file `compiler_source_sha256()` deliberately excludes.
@@ -517,12 +521,14 @@ def select_subgraph(
     `bridge_ids`, `node_ids` (their union, deduplicated) and the before/
     after candidate counts the ledger records.
 
-    `selection` may override `bridge_target` (default `BRIDGE_TARGET`) and
-    `bridge_mode`: `"degree-rank"` (default, existing top-N) or
-    `"seeded-uniform"`, a `default_rng(selection["seed"])` sample over the
-    sorted-by-body-id candidate pool. Sensory/descending selection is unaffected.
+    `selection` (one of `selections.SELECTIONS`' values, or `None` for the
+    unchanged default) may override two bridge-only knobs -- sensory and
+    descending selection are never affected by it: `bridge_target` (default
+    `BRIDGE_TARGET`), the bridge population size cap; and `bridge_mode`,
+    dispatched to `selections.resolve_bridge_ids` (see its docstring for
+    `"degree-rank"` vs. `"seeded-uniform"`).
     """
-    selection = selection if selection is not None else SELECTIONS["default"]
+    selection = default_if_none(selection)
     bridge_target = int(selection.get("bridge_target", BRIDGE_TARGET))
     bridge_mode = str(selection.get("bridge_mode", "degree-rank"))
     duplicate_body_ids = annotations.loc[annotations["bodyId"].duplicated(keep=False), "bodyId"].unique()
@@ -574,20 +580,9 @@ def select_subgraph(
         (forward_from_sensory & backward_from_descending) - set(sensory_ids) - set(descending_ids)
     )
 
-    if bridge_mode == "degree-rank":
-        bridge_frame = pd.DataFrame({"bodyId": sorted(bridge_candidates)})
-        bridge_ranked = _rank_by_degree(bridge_frame, degree)
-        bridge_ids = bridge_ranked["bodyId"].head(bridge_target).astype(np.int64).tolist()
-    elif bridge_mode == "seeded-uniform":
-        # Sort first so the array handed to the RNG -- and therefore which
-        # indices it draws -- does not depend on `set` iteration order.
-        sorted_candidates = np.array(sorted(bridge_candidates), dtype=np.int64)
-        rng = np.random.default_rng(int(selection["seed"]))
-        sample_size = min(bridge_target, len(sorted_candidates))
-        chosen_positions = rng.choice(len(sorted_candidates), size=sample_size, replace=False)
-        bridge_ids = sorted(int(body) for body in sorted_candidates[chosen_positions])
-    else:
-        raise ValueError(f"select_subgraph: unknown bridge_mode {bridge_mode!r}")
+    bridge_ids = resolve_bridge_ids(
+        bridge_candidates, degree, bridge_target, bridge_mode, selection.get("seed"), _rank_by_degree
+    )
 
     node_ids = sorted(set(sensory_ids) | set(descending_ids) | set(bridge_ids))
 
@@ -679,26 +674,21 @@ def assign_channels(
     partition slots for one body and skew the channel/population boundary
     math for every neuron after it).
 
-    `selection["channel_mode"]` `"seeded-permutation"` permutes the sorted
-    sensory ids with `default_rng(selection["seed"])` before the same split;
-    default `"contiguous-blocks"` and descending/output are unaffected.
+    `selection` (one of `selections.SELECTIONS`' values, or `None` for the
+    unchanged default) may override `channel_mode`, dispatched to
+    `selections.resolve_sensory_order` (see its docstring for
+    `"contiguous-blocks"` vs. `"seeded-permutation"`); descending/output
+    assignment is never affected by it.
     """
     if len(sensory_ids) == 0:
         raise ValueError("assign_channels: sensory_ids must be non-empty")
     if len(descending_ids) == 0:
         raise ValueError("assign_channels: descending_ids must be non-empty")
 
-    selection = selection if selection is not None else SELECTIONS["default"]
+    selection = default_if_none(selection)
     channel_mode = str(selection.get("channel_mode", "contiguous-blocks"))
     sensory_sorted = sorted(set(sensory_ids))
-    if channel_mode == "contiguous-blocks":
-        sensory_order = sensory_sorted
-    elif channel_mode == "seeded-permutation":
-        rng = np.random.default_rng(int(selection["seed"]))
-        permuted_positions = rng.permutation(len(sensory_sorted))
-        sensory_order = [sensory_sorted[i] for i in permuted_positions.tolist()]
-    else:
-        raise ValueError(f"assign_channels: unknown channel_mode {channel_mode!r}")
+    sensory_order = resolve_sensory_order(sensory_sorted, channel_mode, selection.get("seed"))
 
     input_assignment: dict[int, "tuple[int, float]"] = {}
     for position, body in enumerate(sensory_order):
@@ -769,7 +759,7 @@ def build_manifest_and_ledger(
     """
     from download import SOURCE_FILES  # local import to avoid a hard dependency for fixture tests
 
-    selection_params = selection_params if selection_params is not None else SELECTIONS["default"]
+    selection_params = default_if_none(selection_params)
     selection_record = {"id": selection_id, "params": dict(selection_params)}
 
     meta = graph.metadata
@@ -870,39 +860,23 @@ def build_manifest_and_ledger(
 
 
 def _refuse_unsafe_variant_target(selection_id: str, artifact_name: str, out_dir: Path) -> str | None:
-    """Error message (writes nothing) if `selection_id` is non-default and
-    would reuse the default artifact name, use a non-plain-filename
-    `artifact_name` (`/`/`..` here could smuggle directory components past
-    an `out_dir`-only check -- a dual review finding), or resolve `--out-dir`
-    inside `public/data`. `None` means safe; checked before any data load/write.
+    """`main()`-local binding of `selections.refuse_unsafe_variant_target`,
+    supplying this module's own `ARTIFACT_NAME`/`PUBLIC_DATA_DIR` (see that
+    function's docstring for the actual safety invariant and the Critical
+    finding -- an unconditional-vs.-`selection_id == "default"`-skipped
+    check asymmetry -- it fixes).
     """
-    if selection_id == "default":
-        return None
-    if artifact_name == ARTIFACT_NAME:
-        return (
-            f"--selection {selection_id!r} requires --artifact-name different from the "
-            f"default ({ARTIFACT_NAME!r}); refusing to compile a variant under the default name"
-        )
-    if not artifact_name or artifact_name in (".", "..") or Path(artifact_name).name != artifact_name:
-        return (
-            f"--artifact-name {artifact_name!r} must be a plain filename stem (no path "
-            "separators, '.', or '..'); refusing an ambiguous variant output path"
-        )
-    resolved_out_dir = out_dir.resolve()
-    resolved_public_data = PUBLIC_DATA_DIR.resolve()
-    if resolved_out_dir == resolved_public_data or resolved_public_data in resolved_out_dir.parents:
-        return (
-            f"--selection {selection_id!r} resolves --out-dir to {resolved_out_dir}, which is "
-            f"inside {resolved_public_data}; refusing to write a variant into public/data"
-        )
-    return None
+    return refuse_unsafe_variant_target(
+        selection_id, artifact_name, out_dir, default_artifact_name=ARTIFACT_NAME, public_data_dir=PUBLIC_DATA_DIR
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--raw-dir", type=Path, default=RAW_DATA_DIR)
     parser.add_argument("--out-dir", type=Path, default=PUBLIC_DATA_DIR)
-    parser.add_argument("--selection", choices=sorted(SELECTIONS), default="default", help="see SELECTIONS")
+    selection_help = f"predeclared subgraph-selection policy: {', '.join(sorted(SELECTIONS))} (see selections.py)"
+    parser.add_argument("--selection", choices=sorted(SELECTIONS), default="default", help=selection_help)
     parser.add_argument("--artifact-name", default=ARTIFACT_NAME, help="output filename stem")
     args = parser.parse_args(argv)
 
