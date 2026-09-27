@@ -293,6 +293,45 @@ def random_class_swaps(
     return rewired, stats
 
 
+def apply_explicit_swaps(
+    graph: "binfmt.GraphArrays", swaps: "list[tuple[int, int, int, int]]"
+) -> "tuple[binfmt.GraphArrays, list[dict]]":
+    """`backend/graph_lab`'s swap-set job engine: apply a *user-supplied*,
+    ordered list of `(a, b, c, d)` neuron-index swaps -- each meaning
+    `(a -> b, c -> d) -> (a -> d, c -> b)`
+    (`.agents/plans/graph-lab/02-job-engines.md`'s swap-set bounds) --
+    sequentially to `graph`, using this module's own `valid_swap`/
+    `apply_swap` primitives (never reimplemented): each swap is checked for
+    legality against the graph state *as of that step* (an edge a prior
+    swap in this same list retargeted is visible to a later one, matching
+    the plan's "applied in order"), then applied. Unlike
+    `random_swaps`/`random_class_swaps`, this never samples -- every edge
+    is caller-specified by its `(pre, post)` endpoints, resolved to the
+    current edge-index space fresh at each step (`edge_set_from_graph`),
+    since `apply_swap` mutates which edge index owns which `post`.
+
+    Raises `ValueError` (never a partial, silently-inconsistent graph) the
+    moment any swap in the list does not name two currently-existing edges
+    or fails `valid_swap` -- a request-supplied swap set is untrusted input
+    (`backend/graph_lab/models.py`'s `Swap` bounds only check each index is
+    in `[0, neuronCount)`, not that the graph actually has those edges)."""
+    stats: list[dict] = []
+    for step, (a, b, c, d) in enumerate(swaps):
+        edges = edge_set_from_graph(graph)
+        existing_pairs = set(zip(edges.pre.tolist(), edges.post.tolist()))
+        e1_matches = np.nonzero((edges.pre == a) & (edges.post == b))[0]
+        e2_matches = np.nonzero((edges.pre == c) & (edges.post == d))[0]
+        if len(e1_matches) == 0:
+            raise ValueError(f"apply_explicit_swaps: no edge {a}->{b} exists (swap {step})")
+        if len(e2_matches) == 0:
+            raise ValueError(f"apply_explicit_swaps: no edge {c}->{d} exists (swap {step})")
+        if not valid_swap(a, b, c, d, existing_pairs):
+            raise ValueError(f"apply_explicit_swaps: swap {step} ({a}->{b}, {c}->{d}) is not a legal swap")
+        graph = apply_swap(graph, int(e1_matches[0]), int(e2_matches[0]))
+        stats.append({"a": a, "b": b, "c": c, "d": d})
+    return graph, stats
+
+
 @dataclass(frozen=True)
 class SwapSensitivity:
     """The first-order sensitivity of the summed target transfer entries

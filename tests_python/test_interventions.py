@@ -190,6 +190,101 @@ def test_apply_swap_preserves_invariants_on_trace_fixture(trace_graph, trace_gra
     assert applied > 0, "no legal candidate found on the trace fixture -- test fixture assumption broken"
 
 
+def test_apply_explicit_swaps_matches_apply_swap_for_a_single_swap(trace_graph, trace_graph_masks):
+    """`backend/graph_lab`'s swap-set job engine applies a *user-supplied*
+    `(a, b, c, d)` neuron-index swap list via `swap_ops.apply_explicit_swaps`
+    (`.agents/plans/graph-lab/02-job-engines.md`); this is its only direct
+    test (the engine itself is exercised via `backend/graph_lab/tests/
+    test_engines.py`, which cannot import a `scripts/analysis` module
+    directly -- see that file). A single explicit swap must match calling
+    `apply_swap` directly at the resolved edge indices, byte for byte: this
+    function does not reimplement the swap primitive, only edge lookup."""
+    input_mask, thrust_mask, _bridge_mask, _clearance_mask = trace_graph_masks
+    candidates = swap_ops.candidate_targeted_swaps(trace_graph, input_mask, thrust_mask)
+    edges = swap_ops.edge_set_from_graph(trace_graph)
+    existing_pairs = set(zip(edges.pre.tolist(), edges.post.tolist()))
+
+    for e1 in candidates.in_edges.tolist():
+        for e2 in candidates.out_edges.tolist():
+            a, b = int(edges.pre[e1]), int(edges.post[e1])
+            c, d = int(edges.pre[e2]), int(edges.post[e2])
+            if not swap_ops.valid_swap(a, b, c, d, existing_pairs):
+                continue
+            via_explicit, stats = swap_ops.apply_explicit_swaps(trace_graph, [(a, b, c, d)])
+            via_direct = swap_ops.apply_swap(trace_graph, e1, e2)
+            assert binfmt.encode_graph_binary(via_explicit) == binfmt.encode_graph_binary(via_direct)
+            assert stats == [{"a": a, "b": b, "c": c, "d": d}]
+            _assert_swap_invariants(trace_graph, via_explicit)
+            return
+    pytest.fail("no legal candidate found on the trace fixture -- test fixture assumption broken")
+
+
+def test_apply_explicit_swaps_applies_sequentially_not_against_the_original_graph(trace_graph):
+    """A later swap in the list must see the *effect* of every earlier one
+    (`.agents/plans/graph-lab/02-job-engines.md`'s "applied in order"): find
+    a real edge `(a, b)`/`(c, d)` pair, apply the swap, then apply its own
+    exact inverse `(a, d, c, b)` -- illegal against the *original* graph
+    (edge `a->d` does not exist yet there) but legal, and required to be
+    legal, against the state *after* the first swap, since that swap is
+    exactly what creates edge `a->d`. Applying both in one
+    `apply_explicit_swaps` call round-trips back to the original graph
+    (a swap immediately followed by its own exact inverse is a no-op on
+    every invariant this module preserves), which only holds if the second
+    swap really executed against the first swap's output."""
+    edges = swap_ops.edge_set_from_graph(trace_graph)
+    existing_pairs = set(zip(edges.pre.tolist(), edges.post.tolist()))
+    n = len(edges.pre)
+    first_swap = None
+    for i in range(n):
+        for j in range(i + 1, n):
+            a, b = int(edges.pre[i]), int(edges.post[i])
+            c, d = int(edges.pre[j]), int(edges.post[j])
+            if swap_ops.valid_swap(a, b, c, d, existing_pairs):
+                first_swap = (a, b, c, d)
+                break
+        if first_swap:
+            break
+    assert first_swap is not None, "no legal candidate found on the trace fixture -- test fixture assumption broken"
+    a, b, c, d = first_swap
+    inverse_swap = (a, d, c, b)
+
+    # The inverse is illegal against the *unmodified* graph: edge a->d
+    # doesn't exist there yet, so this is a real precondition, not a
+    # tautology.
+    with pytest.raises(ValueError, match=r"no edge"):
+        swap_ops.apply_explicit_swaps(trace_graph, [inverse_swap])
+
+    round_tripped, stats = swap_ops.apply_explicit_swaps(trace_graph, [first_swap, inverse_swap])
+    assert binfmt.encode_graph_binary(round_tripped) == binfmt.encode_graph_binary(trace_graph)
+    assert stats == [
+        {"a": a, "b": b, "c": c, "d": d},
+        {"a": a, "b": d, "c": c, "d": b}
+    ]
+
+
+def test_apply_explicit_swaps_rejects_a_nonexistent_edge(trace_graph):
+    """A request-supplied swap set is untrusted input
+    (`backend/graph_lab/models.py`'s `Swap` bounds only check each index is
+    in `[0, neuronCount)`, never that the graph actually has that edge) --
+    naming an edge that does not exist must fail loudly, not silently no-op
+    or corrupt the graph."""
+    with pytest.raises(ValueError, match=r"no edge"):
+        swap_ops.apply_explicit_swaps(trace_graph, [(0, 0, 1, 2)])
+
+
+def test_apply_explicit_swaps_rejects_an_illegal_swap(trace_graph):
+    """A syntactically real `(a, b)`/`(c, d)` edge pair that fails
+    `valid_swap` (e.g. a self-loop or duplicate result) must also raise,
+    not silently apply an invalid swap."""
+    edges = swap_ops.edge_set_from_graph(trace_graph)
+    # A "swap" of an edge with itself: pre_i == pre_j and post_i == post_j,
+    # which `valid_swap` rejects as degenerate (same source AND same
+    # target on both edges).
+    a, b = int(edges.pre[0]), int(edges.post[0])
+    with pytest.raises(ValueError, match=r"not a legal swap"):
+        swap_ops.apply_explicit_swaps(trace_graph, [(a, b, a, b)])
+
+
 # ---------------------------------------------------------------------------
 # swap_ops: random_swaps / random_class_swaps
 # ---------------------------------------------------------------------------
