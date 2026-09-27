@@ -46,6 +46,22 @@ interface PathwayInterventionsArtifact {
 }
 const pathwayInterventions = readJson<PathwayInterventionsArtifact>('public/data/pathway-interventions-v1.json');
 
+interface MalecnsManifest {
+  readonly gzipSha256: string;
+  readonly binarySha256: string;
+  readonly rewiredArms: Readonly<Record<string, { readonly gzipSha256: string; readonly binarySha256: string }>>;
+}
+const manifest = readJson<MalecnsManifest>('public/data/malecns-arena-v1.manifest.json');
+
+interface InterventionIndexEntry {
+  readonly id: string;
+  readonly gzipSha256: string;
+  readonly binarySha256: string;
+}
+const interventionIndex = readJson<{ readonly entries: readonly InterventionIndexEntry[] }>(
+  'training/archive/intervention-index-v1.json'
+);
+
 interface TrainedReadoutReport {
   readonly arms: Readonly<
     Record<
@@ -155,6 +171,38 @@ describe('WP1 archive vs published sources (Gate 1, identity/score half)', () =>
       // weightsSha256 IS recomputable from the archive's own theta, unlike thetaSha256.
       const decoded = Buffer.from(entry.theta, 'base64');
       expect(sha256Hex(decoded)).toBe(entry.weightsSha256);
+    }
+  });
+
+  it('every bigq entry\'s graphGzipSha256/graphBinarySha256 match malecns-arena-v1.manifest.json (thermo-provenance: path-independent graph identity)', () => {
+    const bigqEntries = archive.readouts.filter((r) => r.kind === 'bigq');
+    expect(bigqEntries.length).toBeGreaterThan(0);
+    for (const entry of bigqEntries) {
+      if (entry.graphId === 'biological') {
+        expect(entry.graphGzipSha256).toBe(manifest.gzipSha256);
+        expect(entry.graphBinarySha256).toBe(manifest.binarySha256);
+      } else if (entry.graphId === 'rewired-seed0') {
+        expect(entry.graphGzipSha256).toBe(manifest.rewiredArms.seed0.gzipSha256);
+        expect(entry.graphBinarySha256).toBe(manifest.rewiredArms.seed0.binarySha256);
+      } else if (entry.graphId === 'disconnected') {
+        // No separate artifact -- derived at runtime from biological with edgeCount 0.
+        expect(entry.graphGzipSha256).toBeNull();
+        expect(entry.graphBinarySha256).toBeNull();
+      } else {
+        throw new Error(`unexpected bigq graphId "${entry.graphId}"`);
+      }
+    }
+  });
+
+  it('every intervention entry\'s graphGzipSha256/graphBinarySha256 match intervention-index-v1.json\'s entry for that graphId', () => {
+    const interventionEntries = archive.readouts.filter((r) => r.kind === 'intervention');
+    expect(interventionEntries.length).toBeGreaterThan(0);
+    const byId = new Map(interventionIndex.entries.map((e) => [e.id, e]));
+    for (const entry of interventionEntries) {
+      const indexEntry = byId.get(entry.graphId);
+      expect(indexEntry, `no intervention-index-v1.json entry for ${entry.graphId}`).toBeDefined();
+      expect(entry.graphGzipSha256).toBe(indexEntry?.gzipSha256);
+      expect(entry.graphBinarySha256).toBe(indexEntry?.binarySha256);
     }
   });
 

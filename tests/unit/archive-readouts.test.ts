@@ -1,21 +1,20 @@
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { gzipSync } from 'node:zlib';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { readoutFromFlat } from '../../src/lib/connectome/readout-serialization';
 import { readNpyFloat32Array } from '../../scripts/training/npy';
 import {
-  assertArmBundlesMatchRawScores,
   assertArmMatchesGraphId,
   buildArchivedReadout,
-  copyInterventionIndex,
-  copyRawInterventionScores,
-  extractInterventionSwaps,
+  DEFAULT_MANIFEST_PATH,
   kindForEntry,
   loadExistingArchive,
   mergeReadouts,
+  parseArgs,
   parseSourceArg,
   runArchiveReadouts,
   writeArchive,
@@ -30,6 +29,14 @@ import { writeTinyRunDir } from '../fixtures/trained-readout-run';
  * `writeTinyRunDir` (the existing tiny synthetic run-directory fixture --
  * `tests/fixtures/trained-readout-run.ts`), matching
  * `tests/unit/null-trained-evaluate.test.ts`'s own convention.
+ *
+ * `copyRawInterventionScores`/`assertArmBundlesMatchRawScores`,
+ * `copyInterventionIndex`, and `extractInterventionSwaps` moved to their own
+ * test files (`raw-intervention-scores.test.ts`, `intervention-index.test.ts`,
+ * `intervention-swaps.test.ts`) alongside the modules they now live in (a
+ * thermo-maintainability review finding: this file bundled four independent
+ * artifact-builders). `resolveBigqGraphIdentity`/`resolveInterventionGraphIdentity`
+ * are covered in `graph-identity.test.ts`.
  */
 
 let root: string;
@@ -82,6 +89,57 @@ describe('parseSourceArg', () => {
     // reject this real, plan-mandated graphId.
     const spec = parseSourceArg('--source', 'rewired-seed0=some/dir');
     expect(spec.graphId).toBe('rewired-seed0');
+  });
+});
+
+describe('parseArgs', () => {
+  it('rejects an unrecognized flag', () => {
+    expect(() => parseArgs(['--not-a-real-flag', 'value'])).toThrow(/Unknown argument: --not-a-real-flag/);
+  });
+
+  it('requires at least one of --source/--raw-intervention-scores/--intervention-index/--intervention-attribution', () => {
+    expect(() => parseArgs([])).toThrow(/at least one of --source/);
+  });
+
+  it('does not require all four -- one --source is enough', () => {
+    const args = parseArgs(['--source', 'biological=some/dir']);
+    expect(args.sources).toHaveLength(1);
+  });
+
+  it('does not require --source -- one copy-only flag is enough', () => {
+    const args = parseArgs(['--raw-intervention-scores', 'some/trained.json']);
+    expect(args.rawInterventionScoresPath?.endsWith('some/trained.json')).toBe(true);
+  });
+
+  for (const flag of ['--out', '--raw-intervention-scores-out', '--intervention-index-out', '--intervention-swaps-out']) {
+    it(`rejects ${flag} with a non-".json" path`, () => {
+      expect(() => parseArgs(['--source', 'biological=some/dir', flag, 'not-json.txt'])).toThrow(
+        new RegExp(`${flag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} must end with "\\.json"`)
+      );
+    });
+  }
+
+  it('accepts every output flag ending in ".json"', () => {
+    const args = parseArgs([
+      '--source',
+      'biological=some/dir',
+      '--out',
+      'a.json',
+      '--raw-intervention-scores-out',
+      'b.json',
+      '--intervention-index-out',
+      'c.json',
+      '--intervention-swaps-out',
+      'd.json'
+    ]);
+    expect(args.out.endsWith('a.json')).toBe(true);
+    expect(args.rawInterventionScoresOut.endsWith('b.json')).toBe(true);
+    expect(args.interventionIndexOut.endsWith('c.json')).toBe(true);
+    expect(args.interventionSwapsOut.endsWith('d.json')).toBe(true);
+  });
+
+  it('rejects a --source with a missing value', () => {
+    expect(() => parseArgs(['--source'])).toThrow();
   });
 });
 
@@ -166,6 +224,11 @@ describe('buildArchivedReadout', () => {
     expect(entry.arenaTask).toBe('default');
     expect(entry.graphArtifactSha256).toBe('graph-artifact-sha');
     expect(entry.armBundleSha256).toBe('bundle-sha-biological');
+    // buildArchivedReadout never has the cross-file context (the manifest or
+    // the intervention index) to resolve these -- that's runArchiveReadouts'
+    // attachGraphIdentity's job, done as a separate post-processing pass.
+    expect(entry.graphGzipSha256).toBeNull();
+    expect(entry.graphBinarySha256).toBeNull();
     expect(entry.D).toBe(D);
     expect(entry.H).toBe(H);
     expect(entry.parameterCount).toBe(H * D + H + 3 * H + 3);
@@ -296,6 +359,8 @@ const makeEntry = (overrides: Partial<ArchivedReadout> = {}): ArchivedReadout =>
   arenaTask: 'default',
   graphArtifactSha256: 'graph-sha',
   armBundleSha256: 'bundle-sha',
+  graphGzipSha256: 'graph-gzip-sha',
+  graphBinarySha256: 'graph-binary-sha',
   D: 6,
   H: 4,
   parameterCount: 43,
@@ -366,6 +431,13 @@ describe('mergeReadouts', () => {
     expect(() => mergeReadouts(existing, [makeEntry({ graphId: 'rewired-seed0' })])).toThrow(/different graphId/);
   });
 
+  it('refuses a duplicate id whose graphGzipSha256/graphBinarySha256 differ', () => {
+    const existing = [makeEntry({ graphGzipSha256: 'gz-a', graphBinarySha256: 'bin-a' })];
+    expect(() => mergeReadouts(existing, [makeEntry({ graphGzipSha256: 'gz-b', graphBinarySha256: 'bin-a' })])).toThrow(
+      /different graphGzipSha256/
+    );
+  });
+
   it('refuses a NEW id whose weightsSha256 duplicates an already-archived DIFFERENT id (the GPU-rerun-never-actually-run case)', () => {
     const existing = [makeEntry({ id: 'biological-seed101', weightsSha256: 'shared-weights' })];
     expect(() =>
@@ -398,221 +470,26 @@ describe('mergeReadouts', () => {
   });
 });
 
-describe('copyRawInterventionScores', () => {
-  it('copies a well-formed raw trained.json', () => {
-    const src = resolve(root, 'trained.json');
-    const out = resolve(root, 'archive', 'intervention-trained-raw-v1.json');
-    const payload = { version: 1, runs: [{ id: 'C000', trainerSeed: 101, movementScore: [1, 2, 3] }] };
-    writeFileSync(src, JSON.stringify(payload));
-
-    copyRawInterventionScores(src, out);
-    const written = JSON.parse(readFileSync(out, 'utf8'));
-    expect(written).toEqual(payload);
-  });
-
-  it('copies non-canonical (pretty-printed) input byte-for-byte, not re-encoded', () => {
-    const src = resolve(root, 'pretty-trained.json');
-    const out = resolve(root, 'archive', 'pretty-out.json');
-    const text = `${JSON.stringify({ version: 1, runs: [{ id: 'C000', trainerSeed: 101, movementScore: [1] }] }, null, 2)}\n`;
-    writeFileSync(src, text);
-
-    copyRawInterventionScores(src, out);
-    // Byte identity, not merely structural equality: a JSON.stringify(parsed)
-    // re-encode would silently collapse this back to compact form.
-    expect(readFileSync(out)).toEqual(readFileSync(src));
-  });
-
-  it('refuses a file with no "runs" array', () => {
-    const src = resolve(root, 'bad.json');
-    writeFileSync(src, JSON.stringify({ version: 1 }));
-    expect(() => copyRawInterventionScores(src, resolve(root, 'out.json'))).toThrow(/no "runs" array/);
-  });
-
-  it('refuses a malformed run entry', () => {
-    const src = resolve(root, 'bad-run.json');
-    writeFileSync(src, JSON.stringify({ runs: [{ id: 'C000' }] }));
-    expect(() => copyRawInterventionScores(src, resolve(root, 'out.json'))).toThrow(/malformed run entry/);
-  });
-});
-
-describe('copyInterventionIndex', () => {
-  const validPayload = {
-    sourceArtifact: 'public/data/malecns-arena-v1.bin.gz',
-    sourceSha256: 'a'.repeat(64),
-    entries: [{ id: 'P', path: 'graphs/P.bin.gz', gzipSha256: 'b'.repeat(64), binarySha256: 'c'.repeat(64) }]
-  };
-
-  it('copies a well-formed graph-list index.json', () => {
-    const src = resolve(root, 'index.json');
-    const out = resolve(root, 'archive', 'intervention-index-v1.json');
-    writeFileSync(src, JSON.stringify(validPayload));
-
-    copyInterventionIndex(src, out);
-    expect(JSON.parse(readFileSync(out, 'utf8'))).toEqual(validPayload);
-  });
-
-  it('copies non-canonical (pretty-printed) input byte-for-byte, not re-encoded', () => {
-    const src = resolve(root, 'pretty-index.json');
-    const out = resolve(root, 'archive', 'pretty-index-out.json');
-    const text = `${JSON.stringify(validPayload, null, 2)}\n`;
-    writeFileSync(src, text);
-
-    copyInterventionIndex(src, out);
-    expect(readFileSync(out)).toEqual(readFileSync(src));
-  });
-
-  it('refuses a file with no entries', () => {
-    const src = resolve(root, 'bad-index.json');
-    writeFileSync(src, JSON.stringify({ sourceSha256: 'a'.repeat(64), entries: [] }));
-    expect(() => copyInterventionIndex(src, resolve(root, 'out.json'))).toThrow(/not a valid graph-list index/);
-  });
-});
-
-const validAttributionPayload = {
-  P: {
-    kind: 'P',
-    swaps: 1,
-    steps: [
-      {
-        step: 0,
-        accepted: true,
-        addedEdge: { pre: 1, post: 2 },
-        addedEdge2: { pre: 3, post: 4 },
-        removedEdge: { pre: 5, post: 6 },
-        removedEdge2: { pre: 7, post: 8 }
-      },
-      {
-        step: 1,
-        accepted: false,
-        addedEdge: { pre: 100, post: 200 },
-        addedEdge2: { pre: 100, post: 200 },
-        removedEdge: { pre: 100, post: 200 },
-        removedEdge2: { pre: 100, post: 200 }
-      }
-    ]
-  },
-  Q: {
-    kind: 'Q',
-    swaps: 1,
-    steps: [
-      {
-        step: 0,
-        accepted: true,
-        addedEdge: { pre: 9, post: 10 },
-        addedEdge2: { pre: 11, post: 12 },
-        removedEdge: { pre: 13, post: 14 },
-        removedEdge2: { pre: 15, post: 16 }
-      }
-    ]
-  }
+/** Builds a real, `readGraphListIndex`-valid `index.json` (with a real gzip graph file alongside it) for one intervention id, for `runArchiveReadouts` tests that need `--intervention-index` to resolve graph identity. */
+const writeFakeInterventionIndex = (dir: string, id: string, graphBytes: Buffer): string => {
+  const graphsDir = resolve(dir, 'graphs');
+  mkdirSync(graphsDir, { recursive: true });
+  const gzipBytes = gzipSync(graphBytes);
+  const relPath = `graphs/${id}.bin.gz`;
+  writeFileSync(resolve(dir, relPath), gzipBytes);
+  const gzipSha256 = createHash('sha256').update(gzipBytes).digest('hex');
+  const binarySha256 = createHash('sha256').update(graphBytes).digest('hex');
+  const indexPath = resolve(dir, 'index.json');
+  writeFileSync(
+    indexPath,
+    JSON.stringify({
+      sourceArtifact: 'public/data/malecns-arena-v1.bin.gz',
+      sourceSha256: 'a'.repeat(64),
+      entries: [{ id, path: relPath, gzipSha256, binarySha256 }]
+    })
+  );
+  return indexPath;
 };
-
-describe('extractInterventionSwaps', () => {
-  it('extracts only accepted steps\' addedEdge/addedEdge2/removedEdge/removedEdge2 for P and Q', () => {
-    const src = resolve(root, 'attribution.json');
-    const out = resolve(root, 'archive', 'intervention-swaps-v1.json');
-    writeFileSync(src, JSON.stringify(validAttributionPayload));
-
-    extractInterventionSwaps(src, out);
-    const written = JSON.parse(readFileSync(out, 'utf8'));
-    expect(written.version).toBe(1);
-    expect(written.sourceSha256).toMatch(/^[0-9a-f]{64}$/);
-    expect(written.swaps).toEqual([
-      {
-        id: 'P',
-        addedEdges: [
-          { pre: 1, post: 2 },
-          { pre: 3, post: 4 }
-        ],
-        removedEdges: [
-          { pre: 5, post: 6 },
-          { pre: 7, post: 8 }
-        ]
-      },
-      {
-        id: 'Q',
-        addedEdges: [
-          { pre: 9, post: 10 },
-          { pre: 11, post: 12 }
-        ],
-        removedEdges: [
-          { pre: 13, post: 14 },
-          { pre: 15, post: 16 }
-        ]
-      }
-    ]);
-  });
-
-  it('refuses a file with no P entry', () => {
-    const src = resolve(root, 'no-p.json');
-    writeFileSync(src, JSON.stringify({ Q: { kind: 'Q', steps: [] } }));
-    expect(() => extractInterventionSwaps(src, resolve(root, 'out.json'))).toThrow(/no "P" entry/);
-  });
-
-  it('refuses a file with no Q entry', () => {
-    const src = resolve(root, 'no-q.json');
-    writeFileSync(src, JSON.stringify({ P: { kind: 'P', swaps: 0, steps: [] } }));
-    expect(() => extractInterventionSwaps(src, resolve(root, 'out.json'))).toThrow(/no "Q" entry/);
-  });
-
-  it('refuses when the accepted-step count disagrees with the entry\'s own "swaps" field', () => {
-    const src = resolve(root, 'bad-swaps-count.json');
-    const payload = {
-      ...validAttributionPayload,
-      P: { ...validAttributionPayload.P, swaps: 99 }
-    };
-    writeFileSync(src, JSON.stringify(payload));
-    expect(() => extractInterventionSwaps(src, resolve(root, 'out.json'))).toThrow(/accepted step\(s\) but swaps=99/);
-  });
-
-  it('refuses a malformed edge', () => {
-    const src = resolve(root, 'bad-edge.json');
-    const payload = {
-      ...validAttributionPayload,
-      P: {
-        kind: 'P',
-        swaps: 1,
-        steps: [
-          {
-            step: 0,
-            accepted: true,
-            addedEdge: { pre: 1 }, // missing "post"
-            addedEdge2: { pre: 3, post: 4 },
-            removedEdge: { pre: 5, post: 6 },
-            removedEdge2: { pre: 7, post: 8 }
-          }
-        ]
-      }
-    };
-    writeFileSync(src, JSON.stringify(payload));
-    expect(() => extractInterventionSwaps(src, resolve(root, 'out.json'))).toThrow(/malformed edge/);
-  });
-});
-
-describe('assertArmBundlesMatchRawScores', () => {
-  it('does not throw when armBundleSha256 values agree', () => {
-    const additions = [makeEntry({ kind: 'intervention', graphId: 'C000', trainerSeed: 101, armBundleSha256: 'shared-sha' })];
-    const rawRuns = [{ id: 'C000', trainerSeed: 101, armBundleSha256: 'shared-sha', movementScore: [] }];
-    expect(() => assertArmBundlesMatchRawScores(additions, rawRuns)).not.toThrow();
-  });
-
-  it('throws when an intervention addition\'s armBundleSha256 disagrees with the raw file (mislabeled --source)', () => {
-    const additions = [makeEntry({ kind: 'intervention', graphId: 'C000', trainerSeed: 101, armBundleSha256: 'wrong-sha' })];
-    const rawRuns = [{ id: 'C000', trainerSeed: 101, armBundleSha256: 'correct-sha', movementScore: [] }];
-    expect(() => assertArmBundlesMatchRawScores(additions, rawRuns)).toThrow(/mismatched --source label/);
-  });
-
-  it('ignores a bigq addition (never cross-checked against the intervention raw file)', () => {
-    const additions = [makeEntry({ kind: 'bigq', graphId: 'biological', trainerSeed: 101, armBundleSha256: 'anything' })];
-    const rawRuns = [{ id: 'biological', trainerSeed: 101, armBundleSha256: 'something-else', movementScore: [] }];
-    expect(() => assertArmBundlesMatchRawScores(additions, rawRuns)).not.toThrow();
-  });
-
-  it('ignores an addition with no matching raw entry', () => {
-    const additions = [makeEntry({ kind: 'intervention', graphId: 'C099', trainerSeed: 101 })];
-    expect(() => assertArmBundlesMatchRawScores(additions, [])).not.toThrow();
-  });
-});
 
 describe('runArchiveReadouts', () => {
   const baseArgs = (overrides: Partial<ArchiveReadoutsArgs> = {}): ArchiveReadoutsArgs => ({
@@ -627,7 +504,7 @@ describe('runArchiveReadouts', () => {
     ...overrides
   });
 
-  it('writes the readouts archive and reports the actual paths written', () => {
+  it('writes the readouts archive and reports the actual paths written, resolving bigq graph identity from the real committed manifest', () => {
     const dir = resolve(root, 'biological-101');
     writeTinyRunDir({ dir, arm: 'biological', trainerSeed: 101, D: 6, H: 4, substeps: 4, weightSeed: 1, armBundleSha256: 'sha' });
     const configPath = resolve(dir, 'config.json');
@@ -640,7 +517,45 @@ describe('runArchiveReadouts', () => {
 
     expect(result.readoutCount).toBe(1);
     expect(result.wrote).toEqual([args.out]);
-    expect(loadExistingArchive(args.out)?.readouts).toHaveLength(1);
+    const readouts = loadExistingArchive(args.out)?.readouts ?? [];
+    expect(readouts).toHaveLength(1);
+    // Resolved from DEFAULT_MANIFEST_PATH (the real, committed manifest) --
+    // no --intervention-index needed for a bigq graphId.
+    expect(readouts[0].graphGzipSha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(readouts[0].graphBinarySha256).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('throws when a non-bigq --source is given without --intervention-index', () => {
+    const dir = resolve(root, 'c000-run');
+    writeTinyRunDir({ dir, arm: 'rewired', trainerSeed: 101, D: 6, H: 4, substeps: 4, weightSeed: 1, armBundleSha256: 'sha' });
+    const configPath = resolve(dir, 'config.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8')) as Record<string, unknown>;
+    config.graphArtifactSha256 = 'graph-sha';
+    writeFileSync(configPath, JSON.stringify(config));
+
+    const args = baseArgs({ sources: [{ graphId: 'C000', idSuffix: null, runDir: dir }] });
+    expect(() => runArchiveReadouts(args)).toThrow(/needs --intervention-index/);
+    expect(loadExistingArchive(args.out)).toBeNull();
+  });
+
+  it('resolves an intervention --source\'s graph identity from --intervention-index when supplied', () => {
+    const dir = resolve(root, 'c000-run');
+    writeTinyRunDir({ dir, arm: 'rewired', trainerSeed: 101, D: 6, H: 4, substeps: 4, weightSeed: 1, armBundleSha256: 'sha' });
+    const configPath = resolve(dir, 'config.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8')) as Record<string, unknown>;
+    config.graphArtifactSha256 = 'graph-sha';
+    writeFileSync(configPath, JSON.stringify(config));
+
+    const indexPath = writeFakeInterventionIndex(root, 'C000', Buffer.from('c000-graph-bytes'));
+    const args = baseArgs({
+      sources: [{ graphId: 'C000', idSuffix: null, runDir: dir }],
+      interventionIndexPath: indexPath
+    });
+    const result = runArchiveReadouts(args);
+    const readouts = loadExistingArchive(args.out)?.readouts ?? [];
+    expect(result.wrote).toContain(args.interventionIndexOut);
+    expect(readouts[0].graphGzipSha256).toBe(createHash('sha256').update(gzipSync(Buffer.from('c000-graph-bytes'))).digest('hex'));
+    expect(readouts[0].graphBinarySha256).toBe(createHash('sha256').update(Buffer.from('c000-graph-bytes')).digest('hex'));
   });
 
   it('is deterministic: running twice produces byte-identical output', () => {
@@ -668,14 +583,14 @@ describe('runArchiveReadouts', () => {
     writeFileSync(configPath, JSON.stringify(config));
 
     const badIndexPath = resolve(root, 'bad-index.json');
-    writeFileSync(badIndexPath, JSON.stringify({ sourceSha256: 'a'.repeat(64), entries: [] }));
+    writeFileSync(badIndexPath, JSON.stringify({ sourceArtifact: 'x', sourceSha256: 'a'.repeat(64), entries: [] }));
 
     const args = baseArgs({
       sources: [{ graphId: 'biological', idSuffix: null, runDir: dir }],
       interventionIndexPath: badIndexPath
     });
 
-    expect(() => runArchiveReadouts(args)).toThrow(/not a valid graph-list index/);
+    expect(() => runArchiveReadouts(args)).toThrow(/has no entries/);
     // The readouts archive must not have been written either, even though
     // it would have succeeded on its own -- validate-before-write ordering.
     expect(loadExistingArchive(args.out)).toBeNull();
@@ -689,6 +604,7 @@ describe('runArchiveReadouts', () => {
     config.graphArtifactSha256 = 'graph-sha';
     writeFileSync(configPath, JSON.stringify(config));
 
+    const indexPath = writeFakeInterventionIndex(root, 'C000', Buffer.from('c000-graph-bytes'));
     const rawPath = resolve(root, 'raw.json');
     writeFileSync(
       rawPath,
@@ -699,10 +615,17 @@ describe('runArchiveReadouts', () => {
       // Mislabeled: this run's armBundleSha256 ("archived-sha") disagrees
       // with the raw file's recorded armBundleSha256 for id "C000".
       sources: [{ graphId: 'C000', idSuffix: null, runDir: dir }],
+      interventionIndexPath: indexPath,
       rawInterventionScoresPath: rawPath
     });
 
     expect(() => runArchiveReadouts(args)).toThrow(/mismatched --source label/);
     expect(loadExistingArchive(args.out)).toBeNull();
+  });
+});
+
+describe('DEFAULT_MANIFEST_PATH', () => {
+  it('points at the real, committed manifest', () => {
+    expect(DEFAULT_MANIFEST_PATH.endsWith('public/data/malecns-arena-v1.manifest.json')).toBe(true);
   });
 });

@@ -1,6 +1,5 @@
-import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
-import { basename, dirname, relative, resolve } from 'node:path';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { resolveArenaTask } from '../../src/lib/arena/tasks';
@@ -9,34 +8,16 @@ import { atomicWriteFileSync, sha256Hex } from '../training/fsio';
 import { readNpyFloat32Array } from '../training/npy';
 import { readRunDir, type LoadedRun } from '../training/run-dir';
 import type { ArmName } from '../training/arms';
-
-/**
- * Same atomic-write contract as `../training/fsio.ts`'s `atomicWriteFileSync`
- * (same-directory temp file + `renameSync`), but over a `Buffer` rather than
- * a `string` -- kept as a LOCAL copy, not a change to `fsio.ts`'s own
- * exported signature, because `fsio.ts` is a dependency (via
- * `collectRepoRelativeDependencies`) of several already-published artifacts'
- * own `producer.sourceSha256` (e.g. `repertoire-report.ts`'s
- * `repertoireNullProducer`); editing it -- even a purely additive signature
- * widening -- changes those artifacts' recomputed source identity and
- * spuriously fails `tests/unit/repertoire-report.test.ts`'s "the committed
- * artifact was produced by the producer at HEAD" check, which has nothing to
- * do with this WP (verified empirically while developing this diff).
- */
-const atomicWriteBufferSync = (path: string, contents: Buffer): void => {
-  const tmpPath = resolve(dirname(path), `.${basename(path)}.${randomBytes(6).toString('hex')}.tmp`);
-  try {
-    writeFileSync(tmpPath, contents);
-    renameSync(tmpPath, path);
-  } catch (error) {
-    try {
-      unlinkSync(tmpPath);
-    } catch {
-      // tmpPath was never created, or was already cleaned up -- nothing more to do.
-    }
-    throw error;
-  }
-};
+import type { GraphListIndex } from '../null/graph-list-index';
+import { resolveBigqGraphIdentity, resolveInterventionGraphIdentity, type GraphIdentity } from './graph-identity';
+import {
+  assertArmBundlesMatchRawScores,
+  copyRawInterventionScores,
+  readRawInterventionScores
+} from './raw-intervention-scores';
+import { copyInterventionIndex, readAndValidateInterventionIndex } from './intervention-index';
+import { buildInterventionSwapsArchive, extractInterventionSwaps } from './intervention-swaps';
+import { copyVerbatim } from './copy-verbatim';
 
 /**
  * `.agents/plans/readout-attribution/01-archive-and-types.md`'s WP1: archive
@@ -73,18 +54,37 @@ const atomicWriteBufferSync = (path: string, contents: Buffer): void => {
  * an entry whose `armBundleSha256` is missing.
  *
  * Caveat for WP2 (a dual-review finding, verified against
- * `export-arms.ts`'s `computeArmBundleSha256`): `armBundleSha256` hashes the
- * *entire* serialized arm bundle, including `provenance.artifactPath` -- the
- * literal, worktree-specific filesystem path `export-arms.ts --rewired` was
- * invoked with. So `armBundleSha256` is not reproducible from a graph
- * regenerated at a different path (e.g. after the source worktree is pruned
- * and `interventions.py` is rerun elsewhere) even when the regenerated
- * graph's bytes are identical. The path-INDEPENDENT identity is each
- * intervention graph's `gzipSha256`/`binarySha256`
- * (`training/archive/intervention-index-v1.json`, keyed by `graphId`) --
- * WP2 should verify a regenerated graph against those, not against
- * `armBundleSha256`, and treat `armBundleSha256` as this specific archived
- * run's own training-time provenance rather than a durable graph identity.
+ * `export-arms.ts`'s `computeArmBundleSha256`, and confirmed empirically by
+ * a later thermo-provenance review): `armBundleSha256` hashes the *entire*
+ * serialized arm bundle, including `provenance.artifactPath` -- the literal
+ * CLI argument string `export-arms.ts --rewired`/`--graph` was invoked with,
+ * not a canonicalized path. Whether it reproduces from a fresh checkout
+ * therefore depends entirely on what string was passed at export time, NOT
+ * on anything this script controls:
+ *
+ * - **bigq** (`biological`/`rewired-seed0`/`disconnected`): reproducible.
+ *   The original export used the repo-relative
+ *   `public/data/malecns-arena-v1*.bin.gz` paths, confirmed by re-running
+ *   `export-arms-cli.ts` against those same relative paths from this
+ *   worktree and getting byte-identical `armBundleSha256` values.
+ * - **interventions** (`P`/`C000`-`C004`/`M1000`-`M1004`): NOT reproducible.
+ *   `train-sample.sh`/`lookup-intervention-graph.ts`'s
+ *   `resolveVerifiedInterventionGraphPath` always resolves an ABSOLUTE,
+ *   checkout-specific path before calling `export-arms.ts --rewired` with
+ *   it (`node:path`'s `resolve` never returns a relative path) -- so a
+ *   graph regenerated from ANY checkout other than the exact one that
+ *   trained the original run will have byte-identical CSR arrays but a
+ *   DIFFERENT `armBundleSha256`.
+ *
+ * So `armBundleSha256` is kept as this specific archived run's own
+ * training-time provenance (and the field WP2 must still record if it ever
+ * needs to reason about which exact bundle a run trained against), but it is
+ * NOT usable as WP2's graph-REGENERATION check. `graphGzipSha256`/
+ * `graphBinarySha256` (below) are the path-independent identity WP2 should
+ * check a regenerated graph against instead: the graph artifact's own
+ * content hashes, verified here against the actual artifact bytes (not
+ * merely copied from `intervention-index-v1.json`/the manifest) --
+ * `graph-identity.ts`'s `resolveBigqGraphIdentity`/`resolveInterventionGraphIdentity`.
  */
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -121,7 +121,37 @@ export interface ArchivedReadout {
   /** `run.config.arenaTask`, or `'default'` when the run directory predates arena tasks. */
   readonly arenaTask: string;
   readonly graphArtifactSha256: string;
+  /**
+   * This run's arm bundle's own self-certifying hash. Training-time
+   * provenance only -- NOT a durable, path-independent graph identity: it
+   * hashes `provenance.artifactPath` (a literal export-time CLI argument
+   * string) along with the graph bytes, so it reproduces from a fresh
+   * checkout only when that original export used a repo-relative path
+   * (true for bigq, false for every intervention entry -- see the module
+   * doc comment's "Caveat for WP2" section for the empirical check). Use
+   * `graphGzipSha256`/`graphBinarySha256` below for graph-regeneration
+   * verification instead (a thermo-provenance review finding).
+   */
   readonly armBundleSha256: string;
+  /**
+   * Path-independent graph identity, thermo-provenance review: the graph
+   * artifact's own content hashes (gzip bytes / decompressed CSR binary
+   * bytes), recomputed and verified against the actual artifact -- for bigq
+   * entries against `public/data/malecns-arena-v1.manifest.json` (and the
+   * committed `public/data/malecns-arena-v1*.bin.gz` files themselves); for
+   * intervention entries against `training/archive/intervention-index-v1.json`'s
+   * entry for this `graphId` (and the graph binary that index entry's `path`
+   * names, at archive-build time). `null` only for `graphId: "disconnected"`,
+   * which has no separate artifact at all (derived at runtime from
+   * `biological` with `edgeCount: 0` -- see `export-arms.ts`'s
+   * `toDisconnectedGraph`/`disconnected-runtime-zero-edge` provenance kind).
+   * Unlike `armBundleSha256`, these ARE expected to reproduce from a graph
+   * regenerated in any checkout -- this is what WP2's `resolve-graph.ts`
+   * should check a regenerated graph against.
+   */
+  readonly graphGzipSha256: string | null;
+  /** The decompressed CSR binary's sha256 -- see `graphGzipSha256`'s doc comment. */
+  readonly graphBinarySha256: string | null;
   readonly D: number;
   readonly H: number;
   readonly parameterCount: number;
@@ -399,6 +429,11 @@ export const buildArchivedReadout = (spec: Readonly<SourceSpec>): ArchivedReadou
     arenaTask: arenaTaskId,
     graphArtifactSha256,
     armBundleSha256: config.armBundleSha256,
+    // Filled in by `attachGraphIdentity` in `runArchiveReadouts` (needs
+    // cross-file context -- the manifest or the intervention index --
+    // `buildArchivedReadout` only ever sees one run directory at a time).
+    graphGzipSha256: null,
+    graphBinarySha256: null,
     D: config.D,
     H: config.H,
     parameterCount: config.parameterCount,
@@ -432,6 +467,8 @@ const IDENTITY_FIELDS = [
   'arenaTask',
   'armBundleSha256',
   'graphArtifactSha256',
+  'graphGzipSha256',
+  'graphBinarySha256',
   'D',
   'H',
   'parameterCount'
@@ -508,226 +545,57 @@ export const writeArchive = (path: string, readouts: readonly ArchivedReadout[])
 };
 
 // ---------------------------------------------------------------------------
-// training/archive/intervention-trained-raw-v1.json
-// ---------------------------------------------------------------------------
-
-/**
- * `null-trained-evaluate-graph-list.ts`'s `NullTrainedInterventionEvaluationRaw`
- * (id-keyed `runs`), the exact raw output of the hbru worktree's
- * `--graph-list`/`--runs` rescore -- the only place the published
- * `pathway-interventions-v1.json` artifact's sorted, unlabeled C/M score
- * arrays can be traced back to a specific `(id, trainerSeed)` pair. Copied
- * (not re-derived) so that id mapping survives the hbru worktree being
- * pruned. Only lightly validated here (has a non-empty `runs` array of
- * well-shaped entries) -- this is a copy of an already-produced, already
- * cross-checked artifact, not a second independent computation.
- */
-interface RawInterventionRun {
-  readonly id: string;
-  readonly trainerSeed: number;
-  readonly armBundleSha256?: string;
-  readonly movementScore: readonly number[];
-}
-
-/**
- * Write `bytes` to `outPath` unmodified, then re-read and re-hash the
- * written file to confirm the write itself didn't alter anything -- a
- * byte-for-byte copy of an externally-produced artifact (this file's whole
- * purpose is preserving its exact bytes against worktree pruning, so a
- * `string` decode/re-encode round trip, or any other silent reformatting,
- * would defeat it -- a dual-review finding).
- */
-const copyVerbatim = (sourcePath: string, outPath: string, bytes: Buffer): void => {
-  mkdirSync(dirname(outPath), { recursive: true });
-  atomicWriteBufferSync(outPath, bytes);
-  const expected = sha256Hex(bytes);
-  const actual = sha256Hex(readFileSync(outPath));
-  if (actual !== expected) {
-    throw new Error(`archive-readouts: ${outPath} sha256 ${actual} does not match ${sourcePath}'s ${expected} after copying`);
-  }
-};
-
-/** Read+validate (not copy) -- split out from `copyRawInterventionScores` so `runArchiveReadouts` can cross-check `--source` additions against this file's `(id, trainerSeed) -> armBundleSha256` map in the same invocation, before either is written. */
-const readRawInterventionScores = (
-  sourcePath: string
-): { readonly rawBytes: Buffer; readonly runs: readonly RawInterventionRun[] } => {
-  const rawBytes = readFileSync(sourcePath);
-  const parsed = JSON.parse(rawBytes.toString('utf8')) as { readonly runs?: readonly RawInterventionRun[] };
-  if (!Array.isArray(parsed.runs) || parsed.runs.length === 0) {
-    throw new Error(`archive-readouts: ${sourcePath} has no "runs" array`);
-  }
-  for (const run of parsed.runs) {
-    if (
-      typeof run.id !== 'string' ||
-      run.id.length === 0 ||
-      typeof run.trainerSeed !== 'number' ||
-      !Array.isArray(run.movementScore)
-    ) {
-      throw new Error(`archive-readouts: ${sourcePath} has a malformed run entry: ${JSON.stringify(run)}`);
-    }
-  }
-  return { rawBytes, runs: parsed.runs };
-};
-
-export const copyRawInterventionScores = (sourcePath: string, outPath: string): void => {
-  const { rawBytes } = readRawInterventionScores(sourcePath);
-  copyVerbatim(sourcePath, outPath, rawBytes);
-};
-
-/**
- * Cross-check every `kind: "intervention"` addition's `armBundleSha256`
- * against the raw scores file's own `(graphId, trainerSeed) -> armBundleSha256`
- * mapping -- a stronger check than `assertArmMatchesGraphId` alone (which
- * cannot distinguish e.g. a `C000` label from a `C001` run, since both are
- * `arm: "rewired"`), available whenever `--source` and
- * `--raw-intervention-scores` are supplied together in one invocation (a
- * dual-review finding). Silently skips an addition with no matching raw
- * entry (e.g. a bigq addition, or an intervention id the raw file doesn't
- * cover) rather than requiring full coverage in either direction.
- */
-export const assertArmBundlesMatchRawScores = (
-  additions: readonly ArchivedReadout[],
-  rawRuns: readonly RawInterventionRun[]
-): void => {
-  const rawByKey = new Map(rawRuns.map((run) => [`${run.id}\u0000${run.trainerSeed}`, run]));
-  for (const entry of additions) {
-    if (entry.kind !== 'intervention') continue;
-    const match = rawByKey.get(`${entry.graphId}\u0000${entry.trainerSeed}`);
-    if (match && typeof match.armBundleSha256 === 'string' && match.armBundleSha256 !== entry.armBundleSha256) {
-      throw new Error(
-        `archive-readouts: --source ${entry.graphId} (trainerSeed ${entry.trainerSeed}) has armBundleSha256 ` +
-          `${entry.armBundleSha256}, but the raw intervention scores file records ${match.armBundleSha256} for ` +
-          `id "${entry.graphId}" -- mismatched --source label, or wrong run directory?`
-      );
-    }
-  }
-};
-
-// ---------------------------------------------------------------------------
-// training/archive/intervention-index-v1.json
-// ---------------------------------------------------------------------------
-
-/**
- * `graph-list-index.ts`'s `GraphListIndex` (`scripts/analysis/interventions.py`'s
- * `index.json`): copied byte-for-byte (never re-serialized) so this file's
- * own sha256 stays equal to `pathway-interventions-v1.json`'s recorded
- * `sources.indexSha` -- the one independent, already-published check this
- * archive's copy can be verified against -- and so WP2's regenerated
- * intervention graphs can be sha-checked against this repository's own
- * committed record, without depending on any worktree.
- */
-interface RawGraphListIndex {
-  readonly sourceArtifact?: unknown;
-  readonly sourceSha256?: unknown;
-  readonly entries?: readonly unknown[];
-}
-
-/** Read+validate (not copy) -- split out so `runArchiveReadouts` can validate this input before writing anything, matching `readRawInterventionScores`'s split. */
-const readGraphListIndexBytes = (sourcePath: string): Buffer => {
-  const rawBytes = readFileSync(sourcePath);
-  const parsed = JSON.parse(rawBytes.toString('utf8')) as RawGraphListIndex;
-  if (typeof parsed.sourceSha256 !== 'string' || !Array.isArray(parsed.entries) || parsed.entries.length === 0) {
-    throw new Error(`archive-readouts: ${sourcePath} is not a valid graph-list index.json`);
-  }
-  return rawBytes;
-};
-
-export const copyInterventionIndex = (sourcePath: string, outPath: string): void => {
-  copyVerbatim(sourcePath, outPath, readGraphListIndexBytes(sourcePath));
-};
-
-// ---------------------------------------------------------------------------
-// training/archive/intervention-swaps-v1.json
-// ---------------------------------------------------------------------------
-
-export interface SwapEdge {
-  readonly pre: number;
-  readonly post: number;
-}
-
-interface AttributionStep {
-  readonly step: number;
-  readonly accepted: boolean;
-  readonly addedEdge: SwapEdge;
-  readonly addedEdge2: SwapEdge;
-  readonly removedEdge: SwapEdge;
-  readonly removedEdge2: SwapEdge;
-}
-
-interface AttributionEntry {
-  readonly kind: string;
-  readonly steps: readonly AttributionStep[];
-  /** `interventions.py`'s own count of accepted swap steps -- cross-checked against `steps.filter(accepted).length` below, a free integrity check on the parse. */
-  readonly swaps?: number;
-}
-
-export interface InterventionSwapEntry {
-  readonly id: string;
-  /** Every accepted step's `addedEdge`/`addedEdge2`, in step order -- H3 uses these edges' thrust endpoints as "newly connected thrust neurons" (`00-overview.md`). */
-  readonly addedEdges: readonly SwapEdge[];
-  /** Every accepted step's `removedEdge`/`removedEdge2`, in step order. */
-  readonly removedEdges: readonly SwapEdge[];
-}
-
-export interface InterventionSwapsArchive {
-  readonly version: 1;
-  /** sha256 of the source `attribution.json`'s raw bytes -- provenance, not a value with a separately-published record to check it against (unlike `intervention-index-v1.json`'s `sourceSha256`, which `pathway-interventions-v1.json`'s `sources.indexSha` does independently confirm). */
-  readonly sourceSha256: string;
-  /** `P` then `Q`, in that order -- `00-overview.md`'s H3 only ever needs `P`; `Q` is archived alongside it since `interventions.py` produces both from one run and a future analysis may need it. */
-  readonly swaps: readonly InterventionSwapEntry[];
-}
-
-const isSwapEdge = (value: unknown): value is SwapEdge =>
-  typeof value === 'object' &&
-  value !== null &&
-  Number.isInteger((value as Partial<SwapEdge>).pre) &&
-  Number.isInteger((value as Partial<SwapEdge>).post);
-
-const extractSwapsFor = (id: string, entry: AttributionEntry | undefined): InterventionSwapEntry => {
-  if (!entry || !Array.isArray(entry.steps)) {
-    throw new Error(`archive-readouts: attribution.json has no "${id}" entry with a "steps" array`);
-  }
-  const accepted = entry.steps.filter((step) => step.accepted === true);
-  if (typeof entry.swaps === 'number' && accepted.length !== entry.swaps) {
-    throw new Error(
-      `archive-readouts: attribution.json's "${id}" entry has ${accepted.length} accepted step(s) but ` +
-        `swaps=${entry.swaps}`
-    );
-  }
-  const addedEdges: SwapEdge[] = [];
-  const removedEdges: SwapEdge[] = [];
-  for (const step of accepted) {
-    for (const edge of [step.addedEdge, step.addedEdge2, step.removedEdge, step.removedEdge2]) {
-      if (!isSwapEdge(edge)) {
-        throw new Error(`archive-readouts: attribution.json's "${id}" step ${step.step} has a malformed edge`);
-      }
-    }
-    addedEdges.push({ pre: step.addedEdge.pre, post: step.addedEdge.post }, { pre: step.addedEdge2.pre, post: step.addedEdge2.post });
-    removedEdges.push(
-      { pre: step.removedEdge.pre, post: step.removedEdge.post },
-      { pre: step.removedEdge2.pre, post: step.removedEdge2.post }
-    );
-  }
-  return { id, addedEdges, removedEdges };
-};
-
-/** Read+validate+build (not write) -- split out so `runArchiveReadouts` can validate this input before writing anything, matching `readRawInterventionScores`'s split. */
-const buildInterventionSwapsArchive = (sourcePath: string): InterventionSwapsArchive => {
-  const raw = readFileSync(sourcePath);
-  const parsed = JSON.parse(raw.toString('utf8')) as { readonly P?: AttributionEntry; readonly Q?: AttributionEntry };
-  const swaps = [extractSwapsFor('P', parsed.P), extractSwapsFor('Q', parsed.Q)];
-  return { version: 1, sourceSha256: sha256Hex(raw), swaps };
-};
-
-export const extractInterventionSwaps = (sourcePath: string, outPath: string): void => {
-  const archive = buildInterventionSwapsArchive(sourcePath);
-  mkdirSync(dirname(outPath), { recursive: true });
-  atomicWriteFileSync(outPath, JSON.stringify(archive));
-};
-
-// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
+
+/**
+ * `public/data/malecns-arena-v1.manifest.json` -- a fixed, already-committed
+ * repo file (never an agent-worktree path), so bigq graph identity is always
+ * resolvable with no extra CLI flag, unlike the intervention index (which
+ * only exists in gitignored worktrees until `--intervention-index` copies
+ * it in).
+ */
+export const DEFAULT_MANIFEST_PATH = resolve(repoRoot, 'public/data/malecns-arena-v1.manifest.json');
+
+/**
+ * Resolve every addition's path-independent `graphGzipSha256`/
+ * `graphBinarySha256` (thermo-provenance review finding -- see the module
+ * doc comment's "Caveat for WP2"), returning a NEW array (additions are
+ * immutable `readonly` records) rather than mutating in place.
+ *
+ * bigq additions are always resolved, from the fixed `manifestPath` -- no
+ * `--intervention-index` needed. Intervention/task-intervention additions
+ * REQUIRE `interventionIndex` (throws if any such addition is present but
+ * `--intervention-index` was not supplied in this invocation): unlike bigq,
+ * there is no fixed, always-available repo file to resolve them from.
+ */
+export const attachGraphIdentity = (
+  additions: readonly ArchivedReadout[],
+  ctx: {
+    readonly manifestPath: string;
+    readonly interventionIndex: { readonly index: GraphListIndex; readonly indexDir: string } | null;
+  }
+): readonly ArchivedReadout[] =>
+  additions.map((entry) => {
+    if (entry.kind === 'bigq') {
+      const identity = resolveBigqGraphIdentity(entry.graphId, ctx.manifestPath);
+      return applyGraphIdentity(entry, identity);
+    }
+    if (!ctx.interventionIndex) {
+      throw new Error(
+        `archive-readouts: --source ${entry.graphId} (kind "${entry.kind}") needs --intervention-index to resolve ` +
+          'a path-independent graph identity, but none was supplied in this invocation'
+      );
+    }
+    const identity = resolveInterventionGraphIdentity(entry.graphId, ctx.interventionIndex.index, ctx.interventionIndex.indexDir);
+    return applyGraphIdentity(entry, identity);
+  });
+
+const applyGraphIdentity = (entry: ArchivedReadout, identity: GraphIdentity | null): ArchivedReadout => ({
+  ...entry,
+  graphGzipSha256: identity?.graphGzipSha256 ?? null,
+  graphBinarySha256: identity?.graphBinarySha256 ?? null
+});
 
 export interface RunArchiveReadoutsResult {
   readonly out: string;
@@ -748,17 +616,25 @@ export interface RunArchiveReadoutsResult {
  */
 export const runArchiveReadouts = (args: Readonly<ArchiveReadoutsArgs>): RunArchiveReadoutsResult => {
   // -- Phase 1: read, parse, and validate every input; write nothing yet. --
-  const additions = args.sources.map(buildArchivedReadout);
-  const existing = args.sources.length > 0 ? loadExistingArchive(args.out) : null;
-  const mergedReadouts = args.sources.length > 0 ? mergeReadouts(existing?.readouts ?? [], additions) : null;
-
   const rawScores = args.rawInterventionScoresPath ? readRawInterventionScores(args.rawInterventionScoresPath) : null;
-  if (rawScores) assertArmBundlesMatchRawScores(additions, rawScores.runs);
-
-  const indexBytes = args.interventionIndexPath ? readGraphListIndexBytes(args.interventionIndexPath) : null;
+  const interventionIndexResult = args.interventionIndexPath
+    ? readAndValidateInterventionIndex(args.interventionIndexPath)
+    : null;
   const swapsArchive = args.interventionAttributionPath
     ? buildInterventionSwapsArchive(args.interventionAttributionPath)
     : null;
+
+  let additions: readonly ArchivedReadout[] = args.sources.map(buildArchivedReadout);
+  additions = attachGraphIdentity(additions, {
+    manifestPath: DEFAULT_MANIFEST_PATH,
+    interventionIndex: interventionIndexResult
+      ? { index: interventionIndexResult.index, indexDir: interventionIndexResult.indexDir }
+      : null
+  });
+  if (rawScores) assertArmBundlesMatchRawScores(additions, rawScores.runs);
+
+  const existing = args.sources.length > 0 ? loadExistingArchive(args.out) : null;
+  const mergedReadouts = args.sources.length > 0 ? mergeReadouts(existing?.readouts ?? [], additions) : null;
 
   // -- Phase 2: every input validated -- now write. --
   const wrote: string[] = [];
@@ -770,8 +646,8 @@ export const runArchiveReadouts = (args: Readonly<ArchiveReadoutsArgs>): RunArch
     copyVerbatim(args.rawInterventionScoresPath, args.rawInterventionScoresOut, rawScores.rawBytes);
     wrote.push(args.rawInterventionScoresOut);
   }
-  if (indexBytes && args.interventionIndexPath) {
-    copyVerbatim(args.interventionIndexPath, args.interventionIndexOut, indexBytes);
+  if (interventionIndexResult && args.interventionIndexPath) {
+    copyVerbatim(args.interventionIndexPath, args.interventionIndexOut, interventionIndexResult.rawBytes);
     wrote.push(args.interventionIndexOut);
   }
   if (swapsArchive) {
