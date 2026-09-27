@@ -12,37 +12,32 @@ import { verifyAndEvaluateSearchGraph, type ExpectedGraphIdentity } from '../atl
  * unmodified, just called with an explicit `dataDir`-derived graph path
  * instead of any `import.meta.url`/cwd-relative default.
  *
- * **Not in `bundle.mjs`'s entry list yet -- confirmed unsafe to
- * single-file-bundle with today's sources; report this instead of editing
- * around it (this WP's scope note: "if bundling requires a source change,
- * report it").** `verifyAndEvaluateSearchGraph` imports
+ * **Now included in `bundle.mjs`'s entry list (WP2).** WP1 originally
+ * excluded this file: `verifyAndEvaluateSearchGraph` imports
  * `scripts/atlas/publish.ts`, which unconditionally imports
  * `scripts/training/export-arms.ts` (for `computeArmBundleSha256`/
  * `deserializeArmBundle`), which unconditionally imports
  * `scripts/training/export-traces.ts`. Both `export-arms.ts` and
- * `export-traces.ts` end with a top-level
+ * `export-traces.ts` used to end with a top-level
  * `if (process.argv[1] === fileURLToPath(import.meta.url)) main();` guard
- * that invokes *their own* CLI parser. Verified empirically: once esbuild
- * bundles this file with `--bundle` into one output, every inlined
- * module's `import.meta.url` collapses to that single output file's own
- * URL (there is only one real ES module left at runtime), so both guards'
- * comparisons against `process.argv[1]` (this entry's own invocation)
- * evaluate `true`, and the bundle crashes on startup trying to parse
- * `entry-atlas-reeval`'s own args as `export-arms`'s or `export-traces`'s
- * CLI flags (reproduced: `export-traces failed: Unknown argument:
- * <args-file-path>`). Because the guard is a bare top-level statement (a
- * side effect, not a declaration), esbuild's tree-shaking cannot remove it
- * merely because none of `export-arms.ts`'s *exports* are used -- the
- * import itself forces the whole module body to run. `publish.ts` is
- * therefore not currently safe to import into any single-file esbuild
- * bundle, regardless of which of its exports a caller actually needs.
+ * that invoked *their own* CLI parser. Verified empirically at the time:
+ * once esbuild bundled this file with `--bundle` into one output, every
+ * inlined module's `import.meta.url` collapsed to that single output
+ * file's own URL (there is only one real ES module left at runtime), so
+ * both guards' comparisons against `process.argv[1]` (this entry's own
+ * invocation) evaluated `true`, and the bundle crashed on startup trying
+ * to parse `entry-atlas-reeval`'s own args as `export-arms`'s or
+ * `export-traces`'s CLI flags (reproduced: `export-traces failed: Unknown
+ * argument: <args-file-path>`).
  *
- * This file's logic is otherwise real and correct (type-checked, and
- * calling exactly the function WP2's plan names) -- it is simply not
- * wired into `bundle.mjs` until WP2 either resolves the guard hazard
- * upstream or changes how this entry composes with `publish.ts`. `jobs.py`
- * does not dispatch `kind: "atlas"` to it either (501, see
- * `service.py`'s `default_runner`).
+ * WP2 resolved this at the source rather than editing around it: both
+ * guards moved into their own thin `export-arms-cli.ts`/
+ * `export-traces-cli.ts` files (`package.json`'s `training:export-arms`/
+ * `training:traces` scripts repointed at them), so `export-arms.ts`/
+ * `export-traces.ts` themselves have no top-level side effect and are
+ * safe to bundle. `service.py`'s `default_runner` dispatches `kind:
+ * "atlas"` to `graph_lab.engine_atlas`, which runs this entry (bundled as
+ * `entry-atlas-reeval.mjs`) as its final step.
  */
 interface AtlasReevalArgs {
   readonly dataDir: string;

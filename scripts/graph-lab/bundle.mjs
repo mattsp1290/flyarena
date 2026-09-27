@@ -21,26 +21,34 @@ const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, '../..');
 const outdir = resolve(repoRoot, 'backend/graph_lab/js');
 
-// `entry-atlas-reeval` is deliberately excluded: it transitively imports
-// `scripts/training/export-arms.ts` and `scripts/training/export-traces.ts`,
-// both of which end with a top-level
-// `if (process.argv[1] === fileURLToPath(import.meta.url)) main();` guard.
-// Bundling collapses every inlined module's `import.meta.url` to this
-// output file's own URL, so those guards misfire and invoke the wrong CLI
-// parser against this entry's own argv (confirmed empirically -- see
-// `entry-atlas-reeval.ts`'s own doc comment for the full analysis and the
-// reproduced error). Reported as a plan deviation rather than bundling it
-// anyway or editing the guarded files (out of this WP's change surface).
+// `entry-atlas-reeval` was previously excluded here: it transitively
+// imported `scripts/training/export-arms.ts` and
+// `scripts/training/export-traces.ts`, both of which used to end with a
+// top-level `if (process.argv[1] === fileURLToPath(import.meta.url))
+// main();` guard. Bundling collapsed every inlined module's
+// `import.meta.url` to this output file's own URL, so those guards
+// misfired and invoked the wrong CLI parser against this entry's own argv
+// (confirmed empirically -- see `entry-atlas-reeval.ts`'s own doc comment
+// for the original analysis and reproduced error). WP2
+// (`.agents/plans/graph-lab/02-job-engines.md`'s atlas engine) resolved
+// this at the source: both guards moved into their own thin
+// `export-arms-cli.ts`/`export-traces-cli.ts` files, so `export-arms.ts`/
+// `export-traces.ts` themselves now have no top-level side effect and are
+// safe to bundle. `entry-atlas-reeval` is included below.
 //
 // Each entry is paired explicitly with the worker(s) it `fork()`s at
 // runtime (a thermo-review suggestion: a flat list of entry/worker names
 // in a row makes it easy to add one without the other, with no error
 // until a job silently fails trying to `fork()` a `.mjs` that was never
-// built). An entry with no worker of its own -- none exist yet -- would
-// list an empty `workers` array, still visible here rather than omitted.
+// built). An entry with no worker of its own lists an empty `workers`
+// array, still visible here rather than omitted: `entry-atlas-reeval` and
+// `entry-export-arms` do their own work in-process (no `fork()`), so both
+// list `workers: []`.
 const ENTRY_WORKER_PAIRS = [
   { entry: 'entry-lesion', workers: ['worker-lesion'] },
-  { entry: 'entry-swapset', workers: ['worker-score'] }
+  { entry: 'entry-swapset', workers: ['worker-score'] },
+  { entry: 'entry-export-arms', workers: [] },
+  { entry: 'entry-atlas-reeval', workers: [] }
 ];
 
 const ENTRY_NAMES = ENTRY_WORKER_PAIRS.flatMap(({ entry, workers }) => [entry, ...workers]);

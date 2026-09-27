@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { gzipSync } from 'node:zlib';
@@ -247,10 +247,67 @@ describe('graph-lab entry-swapset.mjs (built bundle, unrelated cwd, temp-directo
   });
 });
 
-// `entry-atlas-reeval.mjs` has no bundle to test here: it is deliberately
-// excluded from `bundle.mjs`'s entry list (see its own doc comment and
-// `bundle.mjs`'s) because its transitive dependency on
-// `scripts/training/export-arms.ts`/`export-traces.ts` is not safe to
-// single-file-bundle with today's sources (confirmed empirically -- both
-// files end with a top-level CLI-invocation guard keyed on
-// `import.meta.url`, which misfires once bundled).
+describe('graph-lab entry-export-arms.mjs (built bundle, unrelated cwd, temp-directory data)', () => {
+  it('exports biological and disconnected arm bundles from a fixture graph binary', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'graph-lab-data-'));
+    const { path } = writeFixtureGraph(dataDir);
+    const outDir = join(dataDir, 'arms');
+
+    const args = { graphPath: path, outDir };
+    const argsPath = join(dataDir, 'args.json');
+    writeFileSync(argsPath, JSON.stringify(args));
+
+    const result = runEntry('entry-export-arms.mjs', argsPath) as {
+      outDir: string;
+      written: string[];
+      d: number;
+    };
+    expect(result.written.sort()).toEqual(['biological', 'disconnected']);
+    expect(result.d).toBeGreaterThan(0);
+
+    const biologicalBundle = JSON.parse(readFileSync(join(result.outDir, 'biological.json'), 'utf8'));
+    expect(biologicalBundle.formatVersion).toBe(1);
+    expect(biologicalBundle.arm).toBe('biological');
+  });
+});
+
+// `entry-atlas-reeval.mjs`: WP2 (`.agents/plans/graph-lab/02-job-engines.md`)
+// resolved the CLI-guard bundling hazard at the source (moving
+// `export-arms.ts`'s/`export-traces.ts`'s own CLI guards into
+// `export-arms-cli.ts`/`export-traces-cli.ts` -- see `bundle.mjs`'s own doc
+// comment) and now includes this entry in the bundle. A full atlas search
+// is real GPU/Python work, exercised for real by
+// `backend/graph_lab/tests/test_engines.py`/`test_reproduction.py`, not
+// here -- this test only proves the built bundle's protocol wiring: a
+// well-formed but identity-mismatched search file reports a clean
+// `{"type":"error",...}` line rather than crashing or hanging.
+describe('graph-lab entry-atlas-reeval.mjs (built bundle, unrelated cwd, temp-directory data)', () => {
+  it('reports a clean error for a search file whose declared identity does not match the graph', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'graph-lab-data-'));
+    const { path, sha256 } = writeFixtureGraph(dataDir);
+
+    const searchPath = join(dataDir, 'search.json');
+    writeFileSync(
+      searchPath,
+      JSON.stringify({
+        schemaVersion: 1,
+        modelVersion: 'behavior-atlas-v1',
+        bundle: { formatVersion: 1, arm: 'biological', sha256: 'deadbeef' }
+      })
+    );
+
+    const argsPath = join(dataDir, 'args.json');
+    writeFileSync(
+      argsPath,
+      JSON.stringify({
+        dataDir,
+        searchPath,
+        expected: { arm: 'biological', binarySha256: sha256, parentGzipSha256: 'deadbeef' },
+        biologicalGraphPath: path,
+        biologicalExpectedSha256: sha256
+      })
+    );
+
+    expect(() => runEntry('entry-atlas-reeval.mjs', argsPath)).toThrow();
+  });
+});
