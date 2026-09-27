@@ -30,7 +30,7 @@ const sha256Hex = (data: Uint8Array): string => createHash('sha256').update(data
  * compiled graph's own biologicalIds but never influences the compiled
  * .bin.gz bytes) must not change this hash.
  */
-const COMPILER_SOURCE_FILENAMES = ['binfmt.py', 'compile.py', 'download.py', 'rewire.py'] as const;
+const COMPILER_SOURCE_FILENAMES = ['binfmt.py', 'compile.py', 'download.py', 'rewire.py', 'selections.py'] as const;
 
 /**
  * Recomputes `compilerSourceSha256` from the working tree: must exactly
