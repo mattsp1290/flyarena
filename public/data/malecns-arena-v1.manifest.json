@@ -6,7 +6,7 @@
   },
   "binaryBytes": 399792,
   "binarySha256": "f1a0f982ffdfba12ecb2206d064c3dc1ceaae7cffa06a22049093d69a79098f7",
-  "compilerSourceSha256": "dc26aeda0763bf8878ce0334c412dbf7537144bd02c514dc9e2794bc65385c83",
+  "compilerSourceSha256": "56b3b7c6b077d1e9efa224ec084ab6fe837e083a737f2a073e9187504de00f6e",
   "descendingTypes": {
     "artifact": "descending-types-v1.json",
     "neuronCount": 48,
