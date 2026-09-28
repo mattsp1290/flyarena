@@ -56,7 +56,24 @@ export interface TaskGeneralityOverall {
 
 export interface TaskGeneralityArtifact {
   readonly version: 1;
-  readonly sources: { readonly biologicalSha: string; readonly rewiringNullSha: string; readonly pathwayInterventionsSha: string };
+  readonly sources: {
+    readonly biologicalSha: string;
+    readonly rewiringNullSha: string;
+    readonly pathwayInterventionsSha: string;
+    /**
+     * Per task, the sha256 of that task's own `clearance.json`
+     * (`scripts/null/task-clearance.ts`) -- carried through for provenance
+     * parity with the producer's own `TaskGeneralitySources.clearanceShas`,
+     * even though this browser subset does not render the measured
+     * clearance data itself (that lives only in `docs/task-generality-report.md`;
+     * see this file's own top doc comment for why the browser subset omits
+     * fields no rendered content needs). Validated for shape and for
+     * agreeing with `tasks[]`'s own ids, the same "don't just check shape,
+     * cross-check it against the data it describes" discipline this file's
+     * other `sources.*` fields already follow.
+     */
+    readonly clearanceShas: Readonly<Record<string, string>>;
+  };
   readonly tasks: readonly TaskGeneralityTask[];
   readonly overall: { readonly authored: TaskGeneralityOverall; readonly trained: TaskGeneralityOverall };
   /**
@@ -145,6 +162,9 @@ const taskReason = (value: unknown): string | undefined => {
 
 const isTask = (value: unknown): value is TaskGeneralityTask => taskReason(value) === undefined;
 
+/** Mirrors `scripts/null/task-generality-report.ts`'s `MIN_NON_DEGENERATE_TASKS` -- this Node-only producer constant can't be imported into the browser bundle, so it is kept in sync manually here, the same "reimplemented, not imported" discipline this file's own top doc comment already documents for the rest of the artifact shape (thermo review, Suggestion: name the threshold on both sides of the boundary so a future change to one is at least `grep`-discoverable against the other). */
+const MIN_NON_DEGENERATE_TASKS = 3;
+
 /** `00-overview.md`'s overall-verdict rule, recomputed from the per-task data it is supposed to summarize (mirrors `pathwayInterventions.ts`'s/`repertoireNull.ts`'s own "a hash-valid artifact could still ship a summary that disagrees with its own per-item data" cross-checks). */
 const recomputeOverall = (
   tasks: readonly TaskGeneralityTask[],
@@ -152,7 +172,8 @@ const recomputeOverall = (
   generalizes: (task: Readonly<TaskGeneralityTask>) => boolean
 ): TaskGeneralityOverall => {
   const eligible = tasks.filter(nonDegenerate);
-  const verdict: 'general' | 'task-dependent' = eligible.length >= 3 && eligible.every(generalizes) ? 'general' : 'task-dependent';
+  const verdict: 'general' | 'task-dependent' =
+    eligible.length >= MIN_NON_DEGENERATE_TASKS && eligible.every(generalizes) ? 'general' : 'task-dependent';
   return { verdict, nonDegenerateCount: eligible.length, totalCount: tasks.length };
 };
 
@@ -175,6 +196,10 @@ const validateShape = (value: unknown): { ok: true; data: TaskGeneralityArtifact
   ) {
     return { ok: false, reason: 'task-generality artifact is missing sources.biologicalSha/sources.rewiringNullSha/sources.pathwayInterventionsSha' };
   }
+  const clearanceShasRaw = sources.clearanceShas as Record<string, unknown> | undefined;
+  if (!clearanceShasRaw || typeof clearanceShasRaw !== 'object') {
+    return { ok: false, reason: 'task-generality artifact is missing sources.clearanceShas' };
+  }
 
   if (!Array.isArray(v.tasks) || v.tasks.length === 0) {
     return { ok: false, reason: 'task-generality artifact has a malformed "tasks" array' };
@@ -184,6 +209,18 @@ const validateShape = (value: unknown): { ok: true; data: TaskGeneralityArtifact
     if (reason) return { ok: false, reason: `task-generality artifact tasks[]: ${reason}` };
   }
   const tasks = v.tasks as TaskGeneralityTask[];
+
+  // `sources.clearanceShas` must carry a real sha256 string for every task
+  // this artifact actually describes -- shape alone (an object) would also
+  // accept an artifact whose clearance provenance silently omits a task
+  // (thermo-methodology review, Critical fix pass: "have the loader
+  // cross-check the new fields too").
+  for (const task of tasks) {
+    if (typeof clearanceShasRaw[task.id] !== 'string') {
+      return { ok: false, reason: `task-generality artifact sources.clearanceShas is missing a string entry for task "${task.id}"` };
+    }
+  }
+  const clearanceShas = clearanceShasRaw as Readonly<Record<string, string>>;
 
   const overall = v.overall as Record<string, unknown> | undefined;
   if (!overall || !isOverall(overall.authored) || !isOverall(overall.trained)) {
@@ -219,6 +256,7 @@ const validateShape = (value: unknown): { ok: true; data: TaskGeneralityArtifact
       version: 1,
       sources: {
         biologicalSha: sources.biologicalSha,
+        clearanceShas,
         rewiringNullSha: sources.rewiringNullSha,
         pathwayInterventionsSha: sources.pathwayInterventionsSha
       },

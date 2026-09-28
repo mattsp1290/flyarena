@@ -23,6 +23,7 @@ import {
 } from './intervention-report-trained';
 import type { NullTrainedInterventionEvaluationRaw } from './null-trained-evaluate-graph-list';
 import type { PathwayInterventionsArtifact } from './intervention-artifact';
+import { CLEARANCE_CHANNELS, type ChannelPercentiles, type ClearanceChannel, type TaskClearanceReport } from './task-clearance';
 
 /**
  * WP4 of `.agents/plans/task-generality` (`04-artifact-and-findings.md`):
@@ -117,6 +118,16 @@ export interface TaskGeneralityInputPaths {
   readonly nullSummary: string;
   readonly interventionStats: string;
   readonly trained: string;
+  /**
+   * `02-authored-runs.md`'s WP2 step 3 output (`scripts/null/task-clearance.ts`):
+   * 10 seeds x 1800 ticks of measured clearance/`foodDistance` percentiles,
+   * "feed[ing] the report's limitations" per that step's own wording --
+   * thermo-methodology review (Critical): the report used to state a
+   * clearance/`foodDistance` claim as an a-priori formula prediction
+   * instead of this measured file, and the `foodDistance` half of that
+   * prediction was empirically wrong (see `buildResultDependentLimitations`).
+   */
+  readonly clearance: string;
 }
 
 export const taskInputPaths = (
@@ -126,7 +137,8 @@ export const taskInputPaths = (
 ): TaskGeneralityInputPaths => ({
   nullSummary: resolve(authoredDir, id, 'null-summary.json'),
   interventionStats: resolve(authoredDir, id, 'intervention-stats.json'),
-  trained: resolve(trainedDir, id, 'trained.json')
+  trained: resolve(trainedDir, id, 'trained.json'),
+  clearance: resolve(authoredDir, id, 'clearance.json')
 });
 
 // ---------------------------------------------------------------------------
@@ -139,6 +151,17 @@ export interface TaskGeneralitySources {
   readonly pathwayInterventionsSha: string;
   readonly graphIndexSha: string;
   readonly interventionIndexSha: string;
+  /**
+   * Per task, the sha256 of that task's own `clearance.json`
+   * (`scripts/null/task-clearance.ts`) -- unlike the other sources above,
+   * this is genuinely one file per task, not one shared file, so it is
+   * recorded as a map rather than a single scalar. Thermo-methodology
+   * review (Critical): this provenance, and the measured data it points at
+   * (`TaskGeneralityTask.clearance`), did not exist before this fix -- the
+   * report previously stated a clearance/`foodDistance` claim with no
+   * underlying measurement recorded anywhere in the artifact.
+   */
+  readonly clearanceShas: Readonly<Record<Exclude<ArenaTaskId, 'default'>, string>>;
   readonly producer: TaskGeneralityProducer;
 }
 
@@ -203,6 +226,15 @@ export interface TaskGeneralityTask {
   /** `pathway.category !== 'degenerate'`. */
   readonly categorized: boolean;
   readonly trained: TaskGeneralityTrainedResult;
+  /**
+   * `scripts/null/task-clearance.ts`'s measured per-channel percentiles/
+   * `fractionSaturated`, for this task's own 10-seed/1800-tick trace export
+   * (`00-overview.md:52`: "WP2 measures each variant's actual clearance
+   * distribution from traces, and the report quotes the measured values,
+   * not a formula"). `renderTaskGeneralityReportMarkdown`'s Limitations
+   * section is derived from this field, never hardcoded prose.
+   */
+  readonly clearance: Readonly<Record<ClearanceChannel, ChannelPercentiles>>;
 }
 
 export interface TaskGeneralityOverall {
@@ -247,16 +279,25 @@ export interface BuildTaskInputs {
   readonly interventionStatsLabel: string;
   readonly trainedText: string;
   readonly trainedLabel: string;
+  readonly clearanceText: string;
+  readonly clearanceLabel: string;
 }
 
 const NULL_HOLDS_PERCENTILE = 0.25;
+
+/** `buildTask`'s own return, plus the clearance file's sha256 -- surfaced separately (not folded into `TaskGeneralityTask` itself) so `buildTaskGeneralityArtifact` can assemble `sources.clearanceShas` without re-hashing each task's clearance bytes a second time. */
+interface BuiltTask {
+  readonly task: TaskGeneralityTask;
+  readonly clearanceSha: string;
+}
 
 const buildTask = (
   inputs: Readonly<BuildTaskInputs>,
   interventionIndexSha: string,
   interventionIndexInfo: Readonly<GraphListIndexInfo>,
-  manifestBiologicalSha: string
-): TaskGeneralityTask => {
+  manifestBiologicalSha: string,
+  manifestGzipSha: string
+): BuiltTask => {
   const resolved = resolveArenaTask(inputs.id);
   const nullSummary = JSON.parse(inputs.nullSummaryText) as RewiringNullArtifact;
   if (nullSummary.arenaTask?.id !== inputs.id || nullSummary.arenaTask.fingerprint !== resolved.fingerprint) {
@@ -342,14 +383,48 @@ const buildTask = (
   }
   const trained = buildTrainedTaskResult(trainedRaw, interventionIndexInfo);
 
+  // `02-authored-runs.md`'s WP2 step 3: 10 seeds x 1800 ticks of measured
+  // clearance/`foodDistance` percentiles, so the report's Limitations
+  // section can quote real data instead of the plan's own a-priori
+  // "Consequences" prediction (thermo-methodology review, Critical --
+  // that prediction turned out to be wrong for `foodDistance`: measured
+  // `fractionSaturated` is 0 in every task, including `sparse-food`).
+  const clearanceBytes = Buffer.from(inputs.clearanceText, 'utf8');
+  const clearance = JSON.parse(inputs.clearanceText) as TaskClearanceReport;
+  if (clearance.arenaTask?.id !== inputs.id || clearance.arenaTask.fingerprint !== resolved.fingerprint) {
+    throw new Error(`task-generality-report: ${inputs.clearanceLabel} is not recorded under arena task "${inputs.id}"`);
+  }
+  // `clearance.json`'s own `graph.sha256` is `task-clearance.ts`'s hash of
+  // the *gzip* artifact bytes it read (`sha256Hex(readFileSync(args.graph))`,
+  // default `public/data/malecns-arena-v1.bin.gz`) -- the manifest's
+  // `gzipSha256`, not `binarySha256` (the decompressed binary
+  // `null-summary.json`'s own `sourceGraphSha256` uses). Checked against
+  // the right manifest field so this cross-check cannot silently pass by
+  // comparing two hashes of different byte representations that happen to
+  // both be 64 hex characters.
+  if (clearance.graph.sha256 !== manifestGzipSha) {
+    throw new Error(
+      `task-generality-report: ${inputs.clearanceLabel}'s graph.sha256 (${clearance.graph.sha256}) does not match the manifest's gzipSha256 (${manifestGzipSha})`
+    );
+  }
+  for (const channel of CLEARANCE_CHANNELS) {
+    if (!clearance.channels[channel]) {
+      throw new Error(`task-generality-report: ${inputs.clearanceLabel} is missing channel "${channel}"`);
+    }
+  }
+
   return {
-    id: inputs.id,
-    fingerprint: resolved.fingerprint,
-    changes: diffArenaConfig(resolved.config),
-    null: nullResult,
-    pathway: pathwayResult,
-    categorized: pathwayCategory !== 'degenerate',
-    trained
+    task: {
+      id: inputs.id,
+      fingerprint: resolved.fingerprint,
+      changes: diffArenaConfig(resolved.config),
+      null: nullResult,
+      pathway: pathwayResult,
+      categorized: pathwayCategory !== 'degenerate',
+      trained,
+      clearance: clearance.channels
+    },
+    clearanceSha: sha256Hex(clearanceBytes)
   };
 };
 
@@ -389,10 +464,12 @@ export interface BuildArtifactInputs {
   readonly pathwayInterventionsBytes: Buffer;
   readonly pathwayInterventionsParsed: Readonly<PathwayInterventionsArtifact>;
   readonly manifestBiologicalSha: string;
+  readonly manifestGzipSha: string;
   readonly manifestRewiringNullSha: string;
   readonly manifestPathwayInterventionsSha: string;
 }
 
+/** `00-overview.md:67`'s "Overall" bullet, quoted in `PREDECLARED_OUTCOME_RULES` below -- the one predeclared threshold value both `computeOverall` call sites share. */
 const MIN_NON_DEGENERATE_TASKS = 3;
 
 const computeOverall = (
@@ -453,13 +530,35 @@ export const buildTaskGeneralityArtifact = (inputs: Readonly<BuildArtifactInputs
     );
   }
 
-  const tasks = inputs.tasks.map((task) => buildTask(task, interventionIndexSha, interventionIndexInfo, inputs.manifestBiologicalSha));
+  const built = inputs.tasks.map((task) =>
+    buildTask(task, interventionIndexSha, interventionIndexInfo, inputs.manifestBiologicalSha, inputs.manifestGzipSha)
+  );
+  const tasks = built.map((b) => b.task);
+  const clearanceShas = Object.fromEntries(built.map((b) => [b.task.id, b.clearanceSha])) as Readonly<
+    Record<Exclude<ArenaTaskId, 'default'>, string>
+  >;
 
   const authoredOverall = computeOverall(
     tasks,
     (t) => t.categorized,
     (t) => t.null.nullHolds && t.pathway.generalizes
   );
+  // `00-overview.md:67`'s "Overall" bullet only defines "null holds" and
+  // "pathway generalizes," both authored-side concepts -- it never states a
+  // trained-side predicate in those terms (thermo-methodology review,
+  // Important). This study's own operational reading, applied here and
+  // stated in the report's own words (`PREDECLARED_OUTCOME_RULES` quotes
+  // the plan verbatim and does not include this sentence, since the plan
+  // itself doesn't): a non-degenerate task "generalizes" on the trained
+  // side only if it is `trainedRobust` (all 3 P trainer seeds agree) AND
+  // that agreed category is `pathway-supported` -- the same
+  // 3-of-4-non-degenerate threshold as the authored side, but requiring a
+  // *robust* result rather than a single seed's hit. This is the most
+  // conservative reading consistent with the authored-side rule's own
+  // shape (it never lets one seed alone produce "general"); it has not
+  // been ratified in `00-overview.md` itself, and a future re-run's
+  // trained verdict rests on this operational rule, not a predeclared one,
+  // until the plan is amended.
   const trainedOverall = computeOverall(
     tasks,
     (t) => !t.trained.degenerate,
@@ -477,6 +576,7 @@ export const buildTaskGeneralityArtifact = (inputs: Readonly<BuildArtifactInputs
       pathwayInterventionsSha,
       graphIndexSha: sha256Hex(inputs.graphIndexBytes),
       interventionIndexSha,
+      clearanceShas,
       producer: taskGeneralityProducer()
     },
     tasks,
@@ -496,7 +596,10 @@ export const buildTaskGeneralityArtifact = (inputs: Readonly<BuildArtifactInputs
 // ---------------------------------------------------------------------------
 
 const pct = (value: number): string => `${(value * 100).toFixed(1)}%`;
+/** Two decimal places -- `fractionSaturated` values measured here are small (well under 2%); `pct`'s one decimal would round e.g. 0.65% and 1.16% to distinguishable but coarser 0.7%/1.2%. */
+const pct2 = (value: number): string => `${(value * 100).toFixed(2)}%`;
 const fmt = (value: number): string => value.toFixed(2);
+const fmt3 = (value: number): string => value.toFixed(3);
 
 const TASK_TABLE = `| id | Changes | Intent |
 | --- | --- | --- |
@@ -570,6 +673,66 @@ const renderTaskRow = (task: Readonly<TaskGeneralityTask>): string => {
 };
 
 /**
+ * `02-authored-runs.md`'s WP2 step 3 measurement, rendered verbatim as a
+ * table (`00-overview.md:52`: "the report quotes the measured values, not
+ * a formula") -- thermo-methodology review (Critical): the report
+ * previously stated an a-priori clearance/`foodDistance` prediction with no
+ * underlying measurement quoted anywhere, and the `foodDistance` half of
+ * that prediction was empirically wrong (measured `fractionSaturated` is 0
+ * in every task, including `sparse-food`). This table is the actual
+ * measurement; `buildClearanceLimitations` below derives its own prose
+ * summary from these same numbers, never a second, independently-typed copy.
+ */
+const renderClearanceSection = (tasks: readonly TaskGeneralityTask[]): string => {
+  const header = '| task | channel | p5 | p50 | p95 | max | fraction saturated |';
+  const divider = '| --- | --- | --- | --- | --- | --- | --- |';
+  const rows = tasks.flatMap((t) =>
+    CLEARANCE_CHANNELS.map((channel) => {
+      const c = t.clearance[channel];
+      return `| \`${t.id}\` | ${channel} | ${fmt3(c.p5)} | ${fmt3(c.p50)} | ${fmt3(c.p95)} | ${fmt3(c.max)} | ${pct2(c.fractionSaturated)} |`;
+    })
+  );
+  return [header, divider, ...rows].join('\n');
+};
+
+const WALL_CLEARANCE_CHANNELS = CLEARANCE_CHANNELS.filter((c): c is Exclude<ClearanceChannel, 'foodDistance'> => c !== 'foodDistance');
+
+/**
+ * The Limitations section's clearance/`foodDistance` bullets, mechanically
+ * derived from `renderClearanceSection`'s own data -- replaces the fixed
+ * a-priori prediction a thermo-methodology review (Critical) found was
+ * never checked against WP2's actual measurement, and was wrong for
+ * `foodDistance` (predicted "saturates far more often in `sparse-food`";
+ * measured `fractionSaturated` is 0 in every task). If a future re-run's
+ * data changes which task(s) saturate, this text changes with it -- see
+ * `tests/unit/task-generality-report.test.ts`'s perturbation test.
+ */
+const buildClearanceLimitations = (tasks: readonly TaskGeneralityTask[]): readonly string[] => {
+  const foodDistanceMax = Math.max(...tasks.map((t) => t.clearance.foodDistance.max));
+  const foodDistanceMaxTask = tasks.find((t) => t.clearance.foodDistance.max === foodDistanceMax);
+  const foodSaturatingTasks = tasks.filter((t) => t.clearance.foodDistance.fractionSaturated > 0);
+  const foodDistanceBullet =
+    foodSaturatingTasks.length === 0
+      ? `- Measured \`foodDistance\` never saturates in any task (fractionSaturated 0 in all ${tasks.length} tasks; the largest measured value is ${fmt3(foodDistanceMax)} in \`${foodDistanceMaxTask?.id}\`, still well under the sensor's 1.0 ceiling).`
+      : `- Measured \`foodDistance\` saturates (fractionSaturated > 0) in: ${foodSaturatingTasks.map((t) => `\`${t.id}\` (${pct2(t.clearance.foodDistance.fractionSaturated)})`).join(', ')}; every other task shows 0% \`foodDistance\` saturation.`;
+
+  const wallSaturatingTasks = tasks.filter((t) => WALL_CLEARANCE_CHANNELS.some((ch) => t.clearance[ch].fractionSaturated > 0));
+  const wallClearanceBullet =
+    wallSaturatingTasks.length === 0
+      ? '- No task shows any measured wall-clearance saturation on `forwardClearance`/`leftClearance`/`rightClearance` (fractionSaturated 0 on every channel in every task).'
+      : `- Measured wall clearance saturates only in: ${wallSaturatingTasks
+          .map((t) => {
+            const parts = WALL_CLEARANCE_CHANNELS.filter((ch) => t.clearance[ch].fractionSaturated > 0).map(
+              (ch) => `${ch} ${pct2(t.clearance[ch].fractionSaturated)}`
+            );
+            return `\`${t.id}\` (${parts.join(', ')})`;
+          })
+          .join('; ')}; every other task shows 0% wall-clearance saturation on every channel.`;
+
+  return [foodDistanceBullet, wallClearanceBullet];
+};
+
+/**
  * Data-derived limitation bullets that depend on this run's own results --
  * kept out of the fixed `STATIC_LIMITATIONS` list below so a re-run whose
  * degenerate tasks differ (or whose trained side never uses
@@ -579,7 +742,7 @@ const renderTaskRow = (task: Readonly<TaskGeneralityTask>): string => {
  * actually checked).
  */
 const buildResultDependentLimitations = (artifact: Readonly<TaskGeneralityArtifact>): readonly string[] => {
-  const bullets: string[] = [];
+  const bullets: string[] = [...buildClearanceLimitations(artifact.tasks)];
   const degenerateTasks = artifact.tasks.filter((t) => !t.categorized);
   if (degenerateTasks.length > 0) {
     const clauses = degenerateTasks.map((t) => {
@@ -604,7 +767,7 @@ const buildResultDependentLimitations = (artifact: Readonly<TaskGeneralityArtifa
 };
 
 const STATIC_LIMITATIONS = `- This experiment covers this model only: config variants of the existing arena, no new physics, sensors, or reward code, and no claim about fly behavior.
-- \`sensorRange\` is unchanged (24) in every task, so observation scaling is unchanged, but the measured clearance and \`foodDistance\` distributions differ per task -- reported values, not a formula. Wall clearance saturates near its reachable maximum in \`sparse-food\` and is compressed in \`crowded\`; \`foodDistance\` saturates at 1 (uninformative) far more often in \`sparse-food\`'s enlarged arena.
+- \`sensorRange\` is unchanged (24) in every task, so observation scaling is unchanged; the measured clearance and \`foodDistance\` distributions still differ per task -- see "Measured sensor saturation" above for the quoted per-channel percentiles and \`fractionSaturated\` values, not a formula.
 - \`no-movement\` severs the direct channel through which thrust earned score (distance x \`movementScorePerUnit\`, set to 0); any pathway result there reflects only thrust's indirect effect on food and hazard outcomes.
 - P/C/M/Q/MQ graphs were selected once on the default task's task-independent transfer matrix and reused unchanged across all four tasks (checked against the default study's own \`sources.indexSha\` above) -- this study never re-selects them per task.
 - Degenerate tasks (authored or trained) are not categorized at all, and are excluded from the "at least 3 of 4 non-degenerate" overall verdict's eligible set.
@@ -634,9 +797,28 @@ Each variant changes only the listed \`ArenaConfig\` fields; every other field (
 unchanged from \`ARENA_CONFIG\`, and each passes \`retainArenaConfig\`'s validation, including the disk-packing
 capacity check.
 
+## Measured sensor saturation
+
+\`00-overview.md\`'s own "Consequences" paragraph predicted, from the \`sensorRange\`/arena-size formula alone
+(before WP2 measured anything), that wall clearance would saturate near its reachable maximum in \`sparse-food\`
+and be compressed in \`crowded\`, and that \`foodDistance\` would saturate "far more often" in \`sparse-food\`'s
+enlarged arena. WP2 (\`scripts/null/task-clearance.ts\`, 10 seeds x 1800 ticks per task) measured the real
+distributions instead of relying on that formula. The table below is that measurement, quoted directly
+(\`00-overview.md:52\`: "the report quotes the measured values, not a formula"):
+
+${renderClearanceSection(tasks)}
+
 ## Predeclared outcome rules
 
 ${PREDECLARED_OUTCOME_RULES}
+
+**Trained-side "generalizes" (this study's own operational rule, not verbatim from \`00-overview.md\`):** the
+"Overall" bullet above only defines "null holds" and "pathway generalizes," both authored-side concepts, and never
+states a trained-side predicate in those terms. This report applies the same 3-of-4-non-degenerate threshold to
+the trained side, reading a non-degenerate task as "generalizing" only if it is \`trainedRobust\` (all 3 P trainer
+seeds agree) **and** that agreed category is \`pathway-supported\` -- never a single seed's hit alone. This rule
+has not been ratified in \`00-overview.md\` itself; see \`scripts/null/task-generality-report.ts\`'s own comment on
+\`computeOverall\`'s trained call site for the identical disclosure in code.
 
 ## Per-task results
 
@@ -754,10 +936,12 @@ export const runTaskGeneralityReport = (args: Readonly<TaskGeneralityReportArgs>
 
   const manifest = JSON.parse(readFileSync(args.manifest, 'utf8')) as {
     readonly binarySha256?: string;
+    readonly gzipSha256?: string;
     readonly rewiringNull?: { readonly sha256?: string };
     readonly pathwayInterventions?: { readonly sha256?: string };
   };
   if (!manifest.binarySha256) throw new Error(`task-generality-report: ${args.manifest} is missing binarySha256`);
+  if (!manifest.gzipSha256) throw new Error(`task-generality-report: ${args.manifest} is missing gzipSha256`);
   if (!manifest.rewiringNull?.sha256) throw new Error(`task-generality-report: ${args.manifest} is missing rewiringNull.sha256`);
   if (!manifest.pathwayInterventions?.sha256) {
     throw new Error(`task-generality-report: ${args.manifest} is missing pathwayInterventions.sha256 (publish the pathway-interventions artifact first)`);
@@ -772,7 +956,9 @@ export const runTaskGeneralityReport = (args: Readonly<TaskGeneralityReportArgs>
       interventionStatsText: readFileSync(paths.interventionStats, 'utf8'),
       interventionStatsLabel: paths.interventionStats,
       trainedText: readFileSync(paths.trained, 'utf8'),
-      trainedLabel: paths.trained
+      trainedLabel: paths.trained,
+      clearanceText: readFileSync(paths.clearance, 'utf8'),
+      clearanceLabel: paths.clearance
     };
   });
 
@@ -786,6 +972,7 @@ export const runTaskGeneralityReport = (args: Readonly<TaskGeneralityReportArgs>
     pathwayInterventionsBytes,
     pathwayInterventionsParsed,
     manifestBiologicalSha: manifest.binarySha256,
+    manifestGzipSha: manifest.gzipSha256,
     manifestRewiringNullSha: manifest.rewiringNull.sha256,
     manifestPathwayInterventionsSha: manifest.pathwayInterventions.sha256
   });

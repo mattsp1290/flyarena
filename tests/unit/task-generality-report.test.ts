@@ -61,6 +61,7 @@ const graphIndexBytes = Buffer.from('graph-index-fixture', 'utf8');
 const rewiringNullBytes = Buffer.from('rewiring-null-fixture', 'utf8');
 const pathwayInterventionsBytes = Buffer.from('pathway-interventions-fixture', 'utf8');
 const manifestBiologicalSha = SHA('biological-graph');
+const manifestGzipSha = SHA('gzip-graph');
 const manifestRewiringNullSha = sha256Hex(rewiringNullBytes);
 const manifestPathwayInterventionsSha = sha256Hex(pathwayInterventionsBytes);
 
@@ -91,7 +92,23 @@ interface TaskFixtureOptions {
   readonly pTrainedScores: Readonly<Record<(typeof P_TRAINER_SEEDS)[number], number>>;
   readonly cTrainedScores: readonly number[];
   readonly mTrainedScores: readonly number[];
+  /** `foodDistance`'s own `fractionSaturated`, default 0 (never saturates) -- overridden by the perturbation test below to prove the rendered limitation text tracks this value. */
+  readonly foodDistanceFractionSaturated?: number;
+  /** `forwardClearance`'s own `fractionSaturated`, default 0. */
+  readonly forwardClearanceFractionSaturated?: number;
 }
+
+const CLEARANCE_CHANNEL_NAMES = ['foodDistance', 'forwardClearance', 'leftClearance', 'rightClearance'] as const;
+
+/** One channel's `ChannelPercentiles`-shaped fixture -- `fractionSaturated` is the only field any test perturbs; the rest are plausible fixed values. */
+const channelFixture = (fractionSaturated: number) => ({
+  p5: 0.1,
+  p50: 0.2,
+  p95: 0.3,
+  max: fractionSaturated > 0 ? 1 : 0.35,
+  n: 18000,
+  fractionSaturated
+});
 
 /** Builds one task's `BuildTaskInputs`, with every cross-referenced field consistent by construction. */
 const taskFixture = (options: TaskFixtureOptions): BuildTaskInputs => {
@@ -145,6 +162,29 @@ const taskFixture = (options: TaskFixtureOptions): BuildTaskInputs => {
   };
   const trainedText = JSON.stringify(trained);
 
+  const clearance = {
+    version: 1,
+    arenaTask: { id: options.id, fingerprint },
+    sensorRange: 24,
+    graph: { path: 'public/data/malecns-arena-v1.bin.gz', sha256: manifestGzipSha },
+    seeds: { start: 1, count: 10 },
+    ticks: 1800,
+    substeps: 4,
+    channels: Object.fromEntries(
+      CLEARANCE_CHANNEL_NAMES.map((channel) => [
+        channel,
+        channelFixture(
+          channel === 'foodDistance'
+            ? (options.foodDistanceFractionSaturated ?? 0)
+            : channel === 'forwardClearance'
+              ? (options.forwardClearanceFractionSaturated ?? 0)
+              : 0
+        )
+      ])
+    )
+  };
+  const clearanceText = JSON.stringify(clearance);
+
   return {
     id: options.id,
     nullSummaryText,
@@ -152,7 +192,9 @@ const taskFixture = (options: TaskFixtureOptions): BuildTaskInputs => {
     interventionStatsText,
     interventionStatsLabel: `${options.id}/intervention-stats.json`,
     trainedText,
-    trainedLabel: `${options.id}/trained.json`
+    trainedLabel: `${options.id}/trained.json`,
+    clearanceText,
+    clearanceLabel: `${options.id}/clearance.json`
   };
 };
 
@@ -181,6 +223,7 @@ const buildArtifact = (tasks: readonly BuildTaskInputs[]): TaskGeneralityArtifac
     pathwayInterventionsBytes,
     pathwayInterventionsParsed,
     manifestBiologicalSha,
+    manifestGzipSha,
     manifestRewiringNullSha,
     manifestPathwayInterventionsSha
   } satisfies BuildArtifactInputs);
@@ -336,6 +379,38 @@ describe('buildTaskGeneralityArtifact: cross-checks', () => {
     expect(() => buildArtifact(tasks)).toThrow(/does not match the shared intervention index sha/);
   });
 
+  it('throws when clearance.json is not recorded under the requested arena task', () => {
+    const bad = taskFixture(generalTaskOptions('hazard-heavy'));
+    const clearance = JSON.parse(bad.clearanceText) as { arenaTask: { id: string; fingerprint: string } };
+    clearance.arenaTask.id = 'crowded';
+    const tasks = STUDY_TASK_IDS.map((id) => (id === 'hazard-heavy' ? { ...bad, clearanceText: JSON.stringify(clearance) } : taskFixture(generalTaskOptions(id))));
+    expect(() => buildArtifact(tasks)).toThrow(/clearance\.json is not recorded under arena task/);
+  });
+
+  it('throws when clearance.json\'s graph.sha256 does not match the manifest\'s gzipSha256', () => {
+    const bad = taskFixture(generalTaskOptions('hazard-heavy'));
+    const clearance = JSON.parse(bad.clearanceText) as { graph: { sha256: string } };
+    clearance.graph.sha256 = SHA('a-different-gzip');
+    const tasks = STUDY_TASK_IDS.map((id) => (id === 'hazard-heavy' ? { ...bad, clearanceText: JSON.stringify(clearance) } : taskFixture(generalTaskOptions(id))));
+    expect(() => buildArtifact(tasks)).toThrow(/does not match the manifest's gzipSha256/);
+  });
+
+  it('throws when clearance.json is missing a required channel', () => {
+    const bad = taskFixture(generalTaskOptions('hazard-heavy'));
+    const clearance = JSON.parse(bad.clearanceText) as { channels: Record<string, unknown> };
+    delete clearance.channels.foodDistance;
+    const tasks = STUDY_TASK_IDS.map((id) => (id === 'hazard-heavy' ? { ...bad, clearanceText: JSON.stringify(clearance) } : taskFixture(generalTaskOptions(id))));
+    expect(() => buildArtifact(tasks)).toThrow(/is missing channel "foodDistance"/);
+  });
+
+  it('records each task\'s clearance.json sha256 in sources.clearanceShas', () => {
+    const tasks = STUDY_TASK_IDS.map((id) => taskFixture(generalTaskOptions(id)));
+    const artifact = buildArtifact(tasks);
+    for (const task of tasks) {
+      expect(artifact.sources.clearanceShas[task.id]).toBe(sha256Hex(Buffer.from(task.clearanceText, 'utf8')));
+    }
+  });
+
   it('throws when intervention-stats is diagnosticOnly', () => {
     const bad = taskFixture(generalTaskOptions('hazard-heavy'));
     const stats = JSON.parse(bad.interventionStatsText) as Record<string, unknown>;
@@ -407,6 +482,7 @@ describe('buildTaskGeneralityArtifact: cross-checks', () => {
         pathwayInterventionsBytes,
         pathwayInterventionsParsed,
         manifestBiologicalSha,
+        manifestGzipSha,
         manifestRewiringNullSha: SHA('stale-manifest-pin'),
         manifestPathwayInterventionsSha
       })
@@ -426,6 +502,7 @@ describe('buildTaskGeneralityArtifact: cross-checks', () => {
         pathwayInterventionsBytes,
         pathwayInterventionsParsed,
         manifestBiologicalSha,
+        manifestGzipSha,
         manifestRewiringNullSha,
         manifestPathwayInterventionsSha: SHA('stale-manifest-pin')
       })
@@ -449,6 +526,7 @@ describe('buildTaskGeneralityArtifact: cross-checks', () => {
         pathwayInterventionsBytes,
         pathwayInterventionsParsed: staleIndexPi,
         manifestBiologicalSha,
+        manifestGzipSha,
         manifestRewiringNullSha,
         manifestPathwayInterventionsSha
       })
@@ -533,7 +611,7 @@ describe('renderTaskGeneralityReportMarkdown', () => {
   it('TASK_TABLE lists exactly the diffArenaConfig changes for every study task (never lets the two silently disagree)', () => {
     const tasks = STUDY_TASK_IDS.map((id) => taskFixture(generalTaskOptions(id)));
     const markdown = renderTaskGeneralityReportMarkdown(buildArtifact(tasks));
-    const taskTableSection = markdown.split('## Predeclared outcome rules')[0];
+    const taskTableSection = markdown.split('## Measured sensor saturation')[0];
     for (const id of STUDY_TASK_IDS) {
       const row = taskTableSection.split('\n').find((line) => line.startsWith(`| \`${id}\``));
       expect(row, `no TASK_TABLE row for "${id}"`).toBeDefined();
@@ -541,6 +619,66 @@ describe('renderTaskGeneralityReportMarkdown', () => {
         expect(row, `${id}: ${key}`).toContain(`\`${key} ${value}\``);
       }
     }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Thermo-methodology review (Critical): the Limitations section's
+  // clearance/foodDistance claim must be derived from WP2's own
+  // clearance.json measurement, not a hardcoded a-priori prediction -- and
+  // must change when the underlying measured data changes.
+  // ---------------------------------------------------------------------------
+
+  it('quotes the real measured clearance/foodDistance percentiles in a "Measured sensor saturation" table', () => {
+    const tasks = STUDY_TASK_IDS.map((id) => taskFixture(generalTaskOptions(id)));
+    const markdown = renderTaskGeneralityReportMarkdown(buildArtifact(tasks));
+    expect(markdown).toContain('## Measured sensor saturation');
+    expect(markdown).toContain('| task | channel | p5 | p50 | p95 | max | fraction saturated |');
+    for (const id of STUDY_TASK_IDS) {
+      expect(markdown).toContain(`| \`${id}\` | foodDistance | 0.100 | 0.200 | 0.300 | 0.350 | 0.00% |`);
+    }
+  });
+
+  it('says foodDistance never saturates when every task\'s measured fractionSaturated is 0 (the real shipped case)', () => {
+    const tasks = STUDY_TASK_IDS.map((id) => taskFixture(generalTaskOptions(id)));
+    const markdown = renderTaskGeneralityReportMarkdown(buildArtifact(tasks));
+    expect(markdown).toMatch(/Measured `foodDistance` never saturates in any task \(fractionSaturated 0 in all 4 tasks/);
+    expect(markdown).not.toMatch(/Measured `foodDistance` saturates/);
+  });
+
+  it('changes the foodDistance limitation text to name the saturating task when its measured fractionSaturated becomes nonzero (proves the text tracks the data, not a fixed prediction)', () => {
+    const [firstId, ...restIds] = STUDY_TASK_IDS;
+    const saturating = taskFixture({ ...generalTaskOptions(firstId), foodDistanceFractionSaturated: 0.05 });
+    const tasks = [saturating, ...restIds.map((id) => taskFixture(generalTaskOptions(id)))];
+    const markdown = renderTaskGeneralityReportMarkdown(buildArtifact(tasks));
+    expect(markdown).toMatch(new RegExp(`Measured \`foodDistance\` saturates \\(fractionSaturated > 0\\) in: \`${firstId}\` \\(5\\.00%\\)`));
+    expect(markdown).toContain('every other task shows 0% `foodDistance` saturation');
+    expect(markdown).not.toMatch(/Measured `foodDistance` never saturates in any task/);
+  });
+
+  it('says no task shows wall-clearance saturation when every measured fractionSaturated is 0', () => {
+    const tasks = STUDY_TASK_IDS.map((id) => taskFixture(generalTaskOptions(id)));
+    const markdown = renderTaskGeneralityReportMarkdown(buildArtifact(tasks));
+    expect(markdown).toContain(
+      'No task shows any measured wall-clearance saturation on `forwardClearance`/`leftClearance`/`rightClearance` (fractionSaturated 0 on every channel in every task).'
+    );
+  });
+
+  it('names the specific task and channel when measured wall-clearance saturation is nonzero', () => {
+    const [firstId, ...restIds] = STUDY_TASK_IDS;
+    const saturating = taskFixture({ ...generalTaskOptions(firstId), forwardClearanceFractionSaturated: 0.0116 });
+    const tasks = [saturating, ...restIds.map((id) => taskFixture(generalTaskOptions(id)))];
+    const markdown = renderTaskGeneralityReportMarkdown(buildArtifact(tasks));
+    expect(markdown).toMatch(new RegExp(`Measured wall clearance saturates only in: \\\`${firstId}\\\` \\(forwardClearance 1\\.16%\\)`));
+    expect(markdown).toContain('every other task shows 0% wall-clearance saturation on every channel');
+    expect(markdown).not.toContain('No task shows any measured wall-clearance saturation');
+  });
+
+  it('states the trained-side "generalizes" rule explicitly, disclosing that 00-overview.md does not define it', () => {
+    const tasks = STUDY_TASK_IDS.map((id) => taskFixture(generalTaskOptions(id)));
+    const markdown = renderTaskGeneralityReportMarkdown(buildArtifact(tasks));
+    expect(markdown).toContain('**Trained-side "generalizes" (this study\'s own operational rule, not verbatim from `00-overview.md`):**');
+    expect(markdown).toMatch(/never\s+states a trained-side predicate in those terms/);
+    expect(markdown).toMatch(/has not been ratified in `00-overview\.md` itself/);
   });
 });
 
@@ -576,6 +714,7 @@ describe('runTaskGeneralityReport (CLI layer)', () => {
     // exactly the format `updateManifestWithTaskGenerality` itself writes back.
     const manifestObject = {
       binarySha256: manifestBiologicalSha,
+      gzipSha256: manifestGzipSha,
       rewiringNull: { sha256: manifestRewiringNullSha },
       pathwayInterventions: { sha256: cliManifestPathwayInterventionsSha }
     };
@@ -587,6 +726,7 @@ describe('runTaskGeneralityReport (CLI layer)', () => {
       writeFileSync(paths.nullSummary, fixture.nullSummaryText, { flag: 'wx' });
       writeFileSync(paths.interventionStats, fixture.interventionStatsText, { flag: 'wx' });
       writeFileSync(paths.trained, fixture.trainedText, { flag: 'wx' });
+      writeFileSync(paths.clearance, fixture.clearanceText, { flag: 'wx' });
     }
   };
 

@@ -82,14 +82,17 @@ describe('loadTaskGenerality (shape validation, with a synthetic manifest sha256
     }
   });
 
+  const TASK_IDS = ['hazard-heavy', 'sparse-food', 'no-movement', 'crowded'];
+
   const validArtifact = {
     version: 1,
     sources: {
       biologicalSha: manifest.binarySha256,
       rewiringNullSha: manifest.rewiringNull?.sha256 ?? 'a'.repeat(64),
-      pathwayInterventionsSha: manifest.pathwayInterventions?.sha256 ?? 'b'.repeat(64)
+      pathwayInterventionsSha: manifest.pathwayInterventions?.sha256 ?? 'b'.repeat(64),
+      clearanceShas: Object.fromEntries(TASK_IDS.map((id) => [id, sha256Hex(`clearance-${id}`)]))
     },
-    tasks: ['hazard-heavy', 'sparse-food', 'no-movement', 'crowded'].map(generalizingTask),
+    tasks: TASK_IDS.map(generalizingTask),
     overall: {
       authored: { verdict: 'general', nonDegenerateCount: 4, totalCount: 4 },
       trained: { verdict: 'general', nonDegenerateCount: 4, totalCount: 4 }
@@ -194,6 +197,25 @@ describe('loadTaskGenerality (shape validation, with a synthetic manifest sha256
     const result = await loadTaskGenerality(manifestForBody, '/data');
     expect(result.status).toBe('invalid');
     if (result.status === 'invalid') expect(result.reason).toMatch(/category disagrees with perSeed/);
+  });
+
+  it('is "invalid" when sources.clearanceShas is missing entirely', async () => {
+    const { clearanceShas: _omit, ...sourcesWithoutClearanceShas } = validArtifact.sources;
+    const { manifest: manifestForBody } = manifestServing({ ...validArtifact, sources: sourcesWithoutClearanceShas });
+    const result = await loadTaskGenerality(manifestForBody, '/data');
+    expect(result.status).toBe('invalid');
+    if (result.status === 'invalid') expect(result.reason).toMatch(/missing sources\.clearanceShas/);
+  });
+
+  it('is "invalid" when sources.clearanceShas is missing the entry for one of the tasks the artifact actually describes', async () => {
+    const { 'no-movement': _omit, ...clearanceShasWithoutOneTask } = validArtifact.sources.clearanceShas;
+    const { manifest: manifestForBody } = manifestServing({
+      ...validArtifact,
+      sources: { ...validArtifact.sources, clearanceShas: clearanceShasWithoutOneTask }
+    });
+    const result = await loadTaskGenerality(manifestForBody, '/data');
+    expect(result.status).toBe('invalid');
+    if (result.status === 'invalid') expect(result.reason).toMatch(/clearanceShas is missing a string entry for task "no-movement"/);
   });
 
   it('is "invalid" when sources.biologicalSha does not match the manifest\'s compiled biological graph (a stale/re-pinned artifact)', async () => {
