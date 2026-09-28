@@ -15,6 +15,7 @@ import {
   classifyRuns,
   trainedArmDistribution,
   trainedTaskResult,
+  TRAINED_CATEGORY_NOTE,
   P_TRAINER_SEEDS,
   type PTrainerSeed,
   type TrainedOutcomeCategory,
@@ -133,6 +134,7 @@ export const taskInputPaths = (
 // ---------------------------------------------------------------------------
 
 export interface TaskGeneralitySources {
+  readonly biologicalSha: string;
   readonly rewiringNullSha: string;
   readonly pathwayInterventionsSha: string;
   readonly graphIndexSha: string;
@@ -157,9 +159,19 @@ export interface TaskGeneralityPathwayResult {
   readonly mP95: number;
   readonly cDegenerate: boolean;
   readonly mDegenerate: boolean;
+  readonly nullDegenerate: boolean;
   /** The raw authored category (`'degenerate'` when the null/C/M-arm degenerate guard fired) -- `generalizes` below is `category === 'pathway-supported'`, restated as a plain boolean for the overall-verdict computation. */
   readonly category: OutcomeCategory;
   readonly generalizes: boolean;
+  /**
+   * `00-overview.md`'s channel-specific (Q-vs-MQ) modifier, reported here
+   * regardless of `category`/`categorized` so a degenerate task's report
+   * line can state whether its own Q-vs-MQ result is independently valid,
+   * derived from data rather than hardcoded to a specific task's name (a
+   * dual-review finding: an earlier version's Limitations section hardcoded
+   * this claim as literal prose naming `no-movement` specifically).
+   */
+  readonly q: { readonly score: number; readonly channelSpecific: boolean | 'degenerate' };
 }
 
 export type TaskGeneralityTrainedResult =
@@ -204,6 +216,16 @@ export interface TaskGeneralityArtifact {
   readonly sources: TaskGeneralitySources;
   readonly tasks: readonly TaskGeneralityTask[];
   readonly overall: { readonly authored: TaskGeneralityOverall; readonly trained: TaskGeneralityOverall };
+  /**
+   * `intervention-report-trained.ts`'s own `TRAINED_CATEGORY_NOTE`, carried
+   * through unchanged -- `'no-specific-effect'` is a reporting convention
+   * this study's coordinator adopted after the trained scores were known,
+   * not a predeclared category (see that constant's own doc comment). Never
+   * hand-duplicated here; both the report and the Findings step gate their
+   * own caveat clause on this field being present, matching
+   * `pathwayInterventions.ts`'s identical `trained.note` convention.
+   */
+  readonly trainedCategoryNote: string;
   /** The default (shipped) task's own authored/trained results, quoted for the report's context/disclosure section only -- never a member of `tasks`/`overall` above (`00-overview.md`'s "default-task context" is background, not a fifth study task). */
   readonly defaultContext: {
     readonly authoredCategory: Exclude<OutcomeCategory, 'degenerate'>;
@@ -232,12 +254,23 @@ const NULL_HOLDS_PERCENTILE = 0.25;
 const buildTask = (
   inputs: Readonly<BuildTaskInputs>,
   interventionIndexSha: string,
-  interventionIndexInfo: Readonly<GraphListIndexInfo>
+  interventionIndexInfo: Readonly<GraphListIndexInfo>,
+  manifestBiologicalSha: string
 ): TaskGeneralityTask => {
   const resolved = resolveArenaTask(inputs.id);
   const nullSummary = JSON.parse(inputs.nullSummaryText) as RewiringNullArtifact;
   if (nullSummary.arenaTask?.id !== inputs.id || nullSummary.arenaTask.fingerprint !== resolved.fingerprint) {
     throw new Error(`task-generality-report: ${inputs.nullSummaryLabel} is not recorded under arena task "${inputs.id}"`);
+  }
+  // A per-task null scored against a different biological graph than the
+  // one this manifest ships would otherwise silently mix results across
+  // graph revisions (a dual-review finding: `intervention-artifact.ts`'s
+  // own precedent checks this for the default study; this module read the
+  // task fingerprint but never the graph identity).
+  if (nullSummary.sourceGraphSha256 !== manifestBiologicalSha) {
+    throw new Error(
+      `task-generality-report: ${inputs.nullSummaryLabel}'s sourceGraphSha256 (${nullSummary.sourceGraphSha256}) does not match the manifest's biological graph (${manifestBiologicalSha})`
+    );
   }
   const nullSummaryBytes = Buffer.from(inputs.nullSummaryText, 'utf8');
 
@@ -292,8 +325,10 @@ const buildTask = (
     mP95: stats.controls.M.p95,
     cDegenerate: stats.armDegeneracy.cArm.degenerate,
     mDegenerate: stats.armDegeneracy.mArm.degenerate,
+    nullDegenerate: stats.armDegeneracy.nullArm.degenerate,
     category: pathwayCategory,
-    generalizes: pathwayCategory === 'pathway-supported'
+    generalizes: pathwayCategory === 'pathway-supported',
+    q: { score: stats.q.score, channelSpecific: stats.q.channelSpecific }
   };
 
   const trainedRaw = JSON.parse(inputs.trainedText) as NullTrainedInterventionEvaluationRaw;
@@ -353,6 +388,9 @@ export interface BuildArtifactInputs {
   readonly rewiringNullBytes: Buffer;
   readonly pathwayInterventionsBytes: Buffer;
   readonly pathwayInterventionsParsed: Readonly<PathwayInterventionsArtifact>;
+  readonly manifestBiologicalSha: string;
+  readonly manifestRewiringNullSha: string;
+  readonly manifestPathwayInterventionsSha: string;
 }
 
 const MIN_NON_DEGENERATE_TASKS = 3;
@@ -371,7 +409,51 @@ const computeOverall = (
 export const buildTaskGeneralityArtifact = (inputs: Readonly<BuildArtifactInputs>): TaskGeneralityArtifact => {
   const interventionIndexSha = sha256Hex(inputs.interventionIndexBytes);
   const interventionIndexInfo = parseGraphListIndexInfo(inputs.interventionIndexText, inputs.interventionIndexLabel);
-  const tasks = inputs.tasks.map((task) => buildTask(task, interventionIndexSha, interventionIndexInfo));
+
+  // `intervention-artifact.ts`'s own precedent: cross-check every input
+  // against the manifest and against every other input before building
+  // anything, so a wrong `--rewiring-null`/`--pathway-interventions` path
+  // fails loudly here rather than publishing an artifact the browser loader
+  // then silently rejects as stale in production (a dual-review finding).
+  const rewiringNullSha = sha256Hex(inputs.rewiringNullBytes);
+  if (rewiringNullSha !== inputs.manifestRewiringNullSha) {
+    throw new Error(
+      `task-generality-report: the rewiring-null sha256 ${rewiringNullSha} does not match the manifest's rewiringNull.sha256 (${inputs.manifestRewiringNullSha}) -- stale manifest or wrong --rewiring-null path?`
+    );
+  }
+  const pathwayInterventionsSha = sha256Hex(inputs.pathwayInterventionsBytes);
+  if (pathwayInterventionsSha !== inputs.manifestPathwayInterventionsSha) {
+    throw new Error(
+      `task-generality-report: the pathway-interventions sha256 ${pathwayInterventionsSha} does not match the manifest's pathwayInterventions.sha256 (${inputs.manifestPathwayInterventionsSha}) -- stale manifest or wrong --pathway-interventions path?`
+    );
+  }
+  const pi = inputs.pathwayInterventionsParsed;
+  if (pi.version !== 1) {
+    throw new Error(`task-generality-report: pathway-interventions artifact has unsupported version ${String(pi.version)}, expected 1`);
+  }
+  if (pi.sources.rewiringNullSha !== rewiringNullSha) {
+    throw new Error(
+      `task-generality-report: the pathway-interventions artifact's sources.rewiringNullSha (${pi.sources.rewiringNullSha}) does not match the rewiring-null bytes just hashed (${rewiringNullSha})`
+    );
+  }
+  if (pi.sources.biologicalSha !== inputs.manifestBiologicalSha) {
+    throw new Error(
+      `task-generality-report: the pathway-interventions artifact's sources.biologicalSha (${pi.sources.biologicalSha}) does not match the manifest's biological graph (${inputs.manifestBiologicalSha})`
+    );
+  }
+  // "P/C/M/Q/MQ graphs were selected once on the default task's
+  // task-independent transfer matrix and reused unchanged across all four
+  // tasks" (this module's own report text) is a claim this producer must
+  // actually check, not merely narrate -- the default study's own
+  // `sources.indexSha` is the one canonical record of which graph list that
+  // selection produced.
+  if (pi.sources.indexSha !== interventionIndexSha) {
+    throw new Error(
+      `task-generality-report: the per-task intervention index (${interventionIndexSha}) does not match the default-task pathway-interventions artifact's sources.indexSha (${pi.sources.indexSha}) -- the P/C/M graphs were not reused unchanged`
+    );
+  }
+
+  const tasks = inputs.tasks.map((task) => buildTask(task, interventionIndexSha, interventionIndexInfo, inputs.manifestBiologicalSha));
 
   const authoredOverall = computeOverall(
     tasks,
@@ -384,21 +466,22 @@ export const buildTaskGeneralityArtifact = (inputs: Readonly<BuildArtifactInputs
     (t) => !t.trained.degenerate && t.trained.trainedRobust && t.trained.category === 'pathway-supported'
   );
 
-  const pi = inputs.pathwayInterventionsParsed;
   const defaultAuthoredCategory = pi.authored.category;
   const defaultTrainedRepresentative = pi.trained.perSeed[P_TRAINER_SEEDS[0]];
 
   return {
     version: 1,
     sources: {
-      rewiringNullSha: sha256Hex(inputs.rewiringNullBytes),
-      pathwayInterventionsSha: sha256Hex(inputs.pathwayInterventionsBytes),
+      biologicalSha: inputs.manifestBiologicalSha,
+      rewiringNullSha,
+      pathwayInterventionsSha,
       graphIndexSha: sha256Hex(inputs.graphIndexBytes),
       interventionIndexSha,
       producer: taskGeneralityProducer()
     },
     tasks,
     overall: { authored: authoredOverall, trained: trainedOverall },
+    trainedCategoryNote: TRAINED_CATEGORY_NOTE,
     defaultContext: {
       authoredCategory: defaultAuthoredCategory,
       trainedCategory: defaultTrainedRepresentative.category,
@@ -434,11 +517,29 @@ const renderTaskRow = (task: Readonly<TaskGeneralityTask>): string => {
     .join(', ');
   const nullLine = `Null: biological ${fmt(task.null.bioScore)} (${pct(task.null.bioPercentile)}) vs 25th percentile ${fmt(task.null.p25)} (median ${fmt(task.null.nullMedian)}) -- ${task.null.nullHolds ? 'holds' : 'does not hold'}${task.null.degenerate ? ' (null distribution degenerate)' : ''}.`;
 
+  // The channel-specific (Q-vs-MQ) modifier is reported for every task,
+  // never merged into the P/C/M category above -- this is the mechanical
+  // form of "a degenerate P/C/M category and an independently valid
+  // Q-vs-MQ result must not be conflated" (a dual-review finding: an
+  // earlier version stated this only as hardcoded prose naming one task).
+  const channelSpecificText =
+    task.pathway.q.channelSpecific === 'degenerate'
+      ? 'degenerate (not independently evaluable)'
+      : task.pathway.q.channelSpecific
+        ? 'holds'
+        : 'does not hold';
+  const qLine = `Q-vs-MQ channel-specific (Q=${fmt(task.pathway.q.score)}): ${channelSpecificText}.`;
+
   let pathwayLine: string;
   if (!task.categorized) {
-    pathwayLine = `Pathway: **degenerate** (C arm degenerate: ${task.pathway.cDegenerate}, M arm degenerate: ${task.pathway.mDegenerate}) -- not categorized. P=${fmt(task.pathway.pScore)}, C p95=${fmt(task.pathway.cP95)}, M p95=${fmt(task.pathway.mP95)}.`;
+    const degenerateArms = [
+      task.pathway.nullDegenerate && 'null',
+      task.pathway.cDegenerate && 'C',
+      task.pathway.mDegenerate && 'M'
+    ].filter((arm): arm is string => Boolean(arm));
+    pathwayLine = `Pathway: **degenerate** (${degenerateArms.join('/')} arm IQR below threshold) -- not categorized. P=${fmt(task.pathway.pScore)}, C p95=${fmt(task.pathway.cP95)}, M p95=${fmt(task.pathway.mP95)}. ${qLine}`;
   } else {
-    pathwayLine = `Pathway: **${task.pathway.category}** (${task.pathway.generalizes ? 'generalizes' : 'does not generalize'}). P=${fmt(task.pathway.pScore)}, C p95=${fmt(task.pathway.cP95)}, M p95=${fmt(task.pathway.mP95)}.`;
+    pathwayLine = `Pathway: **${task.pathway.category}** (${task.pathway.generalizes ? 'generalizes' : 'does not generalize'}). P=${fmt(task.pathway.pScore)}, C p95=${fmt(task.pathway.cP95)}, M p95=${fmt(task.pathway.mP95)}. ${qLine}`;
   }
 
   let trainedLine: string;
@@ -452,9 +553,15 @@ const renderTaskRow = (task: Readonly<TaskGeneralityTask>): string => {
     const perSeedText = P_TRAINER_SEEDS.map((seed) => `seed ${seed}: ${trained.perSeed[seed]}`).join(', ');
     const robustText = trained.trainedRobust ? 'robust' : 'not robust';
     const supportedSeeds = P_TRAINER_SEEDS.filter((seed) => trained.perSeed[seed] === 'pathway-supported');
+    // "single-seed hit" only when the split is genuinely 1 of 3 -- a 2-of-3
+    // split is a different (stronger) shape and must say so, not reuse the
+    // same fixed phrase regardless of the actual count (a dual-review
+    // finding: the phrase and the interpolated count could disagree).
+    const splitText =
+      supportedSeeds.length === 1 ? 'a single-seed hit' : `a ${supportedSeeds.length}-of-${P_TRAINER_SEEDS.length}-seed split`;
     const marginNote =
       !trained.trainedRobust && supportedSeeds.length > 0
-        ? ` (${supportedSeeds.length} of ${P_TRAINER_SEEDS.length} seeds reach pathway-supported -- this is a single-seed hit, not a robust finding)`
+        ? ` (${supportedSeeds.length} of ${P_TRAINER_SEEDS.length} seeds reach pathway-supported -- ${splitText}, not a robust finding)`
         : '';
     trainedLine = `Trained: **${trained.category}** (${robustText}${marginNote}). Per seed: ${perSeedText}.`;
   }
@@ -462,19 +569,53 @@ const renderTaskRow = (task: Readonly<TaskGeneralityTask>): string => {
   return `### \`${task.id}\` (${changesText})\n\n- ${nullLine}\n- ${pathwayLine}\n- ${trainedLine}`;
 };
 
-const LIMITATIONS = `- This experiment covers this model only: config variants of the existing arena, no new physics, sensors, or reward code, and no claim about fly behavior.
+/**
+ * Data-derived limitation bullets that depend on this run's own results --
+ * kept out of the fixed `STATIC_LIMITATIONS` list below so a re-run whose
+ * degenerate tasks differ (or whose trained side never uses
+ * `no-specific-effect`) cannot leave a stale claim in the rendered report (a
+ * dual-review finding: an earlier version hardcoded "no-movement ... is
+ * degenerate (C arm IQR 0)" as literal prose, which the producer never
+ * actually checked).
+ */
+const buildResultDependentLimitations = (artifact: Readonly<TaskGeneralityArtifact>): readonly string[] => {
+  const bullets: string[] = [];
+  const degenerateTasks = artifact.tasks.filter((t) => !t.categorized);
+  if (degenerateTasks.length > 0) {
+    const clauses = degenerateTasks.map((t) => {
+      const arms = [t.pathway.nullDegenerate && 'null', t.pathway.cDegenerate && 'C', t.pathway.mDegenerate && 'M'].filter(
+        (arm): arm is string => Boolean(arm)
+      );
+      const qClause =
+        t.pathway.q.channelSpecific === 'degenerate'
+          ? 'its Q-vs-MQ result is also degenerate'
+          : `its Q-vs-MQ channel-specific result (${t.pathway.q.channelSpecific ? 'holds' : 'does not hold'}) is independently valid and is not conflated with the degenerate P/C/M category`;
+      return `\`${t.id}\`'s authored pathway category is \`degenerate\` (${arms.join('/')} arm IQR below the predeclared threshold), while ${qClause}`;
+    });
+    bullets.push(`- ${clauses.join('; ')}.`);
+  }
+  const anyNoSpecificEffect = artifact.tasks.some(
+    (t) => !t.trained.degenerate && Object.values(t.trained.perSeed).includes('no-specific-effect')
+  );
+  if (anyNoSpecificEffect) {
+    bullets.push(`- ${artifact.trainedCategoryNote}`);
+  }
+  return bullets;
+};
+
+const STATIC_LIMITATIONS = `- This experiment covers this model only: config variants of the existing arena, no new physics, sensors, or reward code, and no claim about fly behavior.
 - \`sensorRange\` is unchanged (24) in every task, so observation scaling is unchanged, but the measured clearance and \`foodDistance\` distributions differ per task -- reported values, not a formula. Wall clearance saturates near its reachable maximum in \`sparse-food\` and is compressed in \`crowded\`; \`foodDistance\` saturates at 1 (uninformative) far more often in \`sparse-food\`'s enlarged arena.
-- \`no-movement\` severs the direct channel through which thrust earned score (distance x \`movementScorePerUnit\`, set to 0); any pathway result there reflects only thrust's indirect effect on food and hazard outcomes. Its authored pathway category is \`degenerate\` (the C control arm's IQR is 0, the predeclared guard), while its Q-vs-MQ channel-specific result is independently valid and is not conflated with the degenerate P/C/M category above.
-- P/C/M/Q/MQ graphs were selected once on the default task's task-independent transfer matrix and reused unchanged across all four tasks -- this study never re-selects them per task.
+- \`no-movement\` severs the direct channel through which thrust earned score (distance x \`movementScorePerUnit\`, set to 0); any pathway result there reflects only thrust's indirect effect on food and hazard outcomes.
+- P/C/M/Q/MQ graphs were selected once on the default task's task-independent transfer matrix and reused unchanged across all four tasks (checked against the default study's own \`sources.indexSha\` above) -- this study never re-selects them per task.
 - Degenerate tasks (authored or trained) are not categorized at all, and are excluded from the "at least 3 of 4 non-degenerate" overall verdict's eligible set.
-- Trained results use only 5 freshly-trained controls per arm (a coarse resolution) and are reported robust only when all 3 P trainer seeds agree; a category reached at only 1 of 3 seeds is disclosed as a single-seed hit next to that category, never presented as if it were the robust finding, and is never treated as generalizing the default task's own separately-published trained result.
-- \`no-specific-effect\` (trained side) is a reporting convention adopted after the trained scores were known, not a predeclared category (see \`docs/pathway-interventions-report.md\`).
+- Trained results use only 5 freshly-trained controls per arm (a coarse resolution) and are reported robust only when all 3 P trainer seeds agree; a category reached at fewer than all 3 seeds is disclosed as a split next to that category, never presented as if it were the robust finding, and is never treated as generalizing the default task's own separately-published trained result.
 - The null and pathway comparisons are repeated across 4 tasks x 2 decoders (8 combinations) without correction for multiple comparisons; each is reported and read on its own predeclared terms.
 - Everything here is descriptive and bound to this model only; no causal claim is made about the real fly.`;
 
 export const renderTaskGeneralityReportMarkdown = (artifact: Readonly<TaskGeneralityArtifact>): string => {
   const { tasks, overall, defaultContext } = artifact;
   const taskSections = tasks.map(renderTaskRow).join('\n\n');
+  const limitations = [...buildResultDependentLimitations(artifact), STATIC_LIMITATIONS].join('\n');
 
   return `# Task generality of the null and pathway findings
 
@@ -507,11 +648,11 @@ ${taskSections}
 - **Trained:** **${overall.trained.verdict}** (${overall.trained.nonDegenerateCount} of ${overall.trained.totalCount} tasks non-degenerate).
 
 The default task's own separately-published results are context only, not a fifth study task: authored category
-**${defaultContext.authoredCategory}**; trained category **${defaultContext.trainedCategory}** (${defaultContext.trainedRobust ? 'robust' : 'not robust'} across trainer seeds). A single-seed pathway-supported hit on a task variant above is never framed as generalizing this default-task result.
+**${defaultContext.authoredCategory}**; trained category **${defaultContext.trainedCategory}** (${defaultContext.trainedRobust ? 'robust' : 'not robust'} across trainer seeds). A non-robust trained hit on a task variant above is never framed as generalizing this default-task result.
 
 ## Limitations
 
-${LIMITATIONS}
+${limitations}
 `;
 };
 
@@ -611,6 +752,17 @@ export const runTaskGeneralityReport = (args: Readonly<TaskGeneralityReportArgs>
   const pathwayInterventionsBytes = readFileSync(args.pathwayInterventions);
   const pathwayInterventionsParsed = JSON.parse(pathwayInterventionsBytes.toString('utf8')) as PathwayInterventionsArtifact;
 
+  const manifest = JSON.parse(readFileSync(args.manifest, 'utf8')) as {
+    readonly binarySha256?: string;
+    readonly rewiringNull?: { readonly sha256?: string };
+    readonly pathwayInterventions?: { readonly sha256?: string };
+  };
+  if (!manifest.binarySha256) throw new Error(`task-generality-report: ${args.manifest} is missing binarySha256`);
+  if (!manifest.rewiringNull?.sha256) throw new Error(`task-generality-report: ${args.manifest} is missing rewiringNull.sha256`);
+  if (!manifest.pathwayInterventions?.sha256) {
+    throw new Error(`task-generality-report: ${args.manifest} is missing pathwayInterventions.sha256 (publish the pathway-interventions artifact first)`);
+  }
+
   const tasks: BuildTaskInputs[] = STUDY_TASK_IDS.map((id) => {
     const paths = taskInputPaths(args.authoredDir, args.trainedDir, id);
     return {
@@ -632,7 +784,10 @@ export const runTaskGeneralityReport = (args: Readonly<TaskGeneralityReportArgs>
     graphIndexBytes,
     rewiringNullBytes,
     pathwayInterventionsBytes,
-    pathwayInterventionsParsed
+    pathwayInterventionsParsed,
+    manifestBiologicalSha: manifest.binarySha256,
+    manifestRewiringNullSha: manifest.rewiringNull.sha256,
+    manifestPathwayInterventionsSha: manifest.pathwayInterventions.sha256
   });
 
   verifyManifestRoundTrips(args.manifest);
