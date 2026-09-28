@@ -5,6 +5,7 @@ import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import { runEpisode } from '../training/episode';
 import { sha256Hex } from '../training/fsio';
 import { graphFromTaskMode, loadVerifiedGraphBinary } from './null-worker-shared';
+import { createRegimeAccumulator } from './regime-metrics';
 
 /**
  * Side-effect-free implementation of the WP2 regime-check task
@@ -124,9 +125,6 @@ export interface RegimeWorkerErrorMessage {
 
 export type RegimeWorkerMessage = RegimeWorkerResultMessage | RegimeWorkerErrorMessage;
 
-const clamp = (value: number, minimum: number, maximum: number): number =>
-  value < minimum ? minimum : value > maximum ? maximum : value;
-
 /**
  * Load a `transfer.py`-written steady-state sidecar as a `Float64Array`,
  * verifying its sha256 against `expectedSha256` first (the sidecar's own
@@ -183,49 +181,23 @@ export const runTask = (task: RegimeWorkerTask): readonly RegimeSeedResult[] => 
   }
 
   const substeps = NEURAL_SUBSTEPS_PER_TICK;
-  const uClamped = new Float64Array(inputChannelCount);
 
   return task.heldOutSeeds.map((seed) => {
-    let clampedNeuronSubsteps = 0;
-    let totalNeuronSubsteps = 0;
-    let substepIndex = 0;
-    let tickCount = 0;
-    let distanceSum = 0;
-
-    const onSubstep = (rate: Float32Array, channelValues: ArrayLike<number>): void => {
-      for (let neuron = 0; neuron < neuronCount; neuron += 1) {
-        totalNeuronSubsteps += 1;
-        const value = rate[neuron];
-        if (value === rateMin || value === rateMax) clampedNeuronSubsteps += 1;
-      }
-
-      substepIndex += 1;
-      if (substepIndex < substeps) return;
-      substepIndex = 0;
-      tickCount += 1;
-
-      for (let channel = 0; channel < inputChannelCount; channel += 1) {
-        uClamped[channel] = clamp(channelValues[channel] ?? 0, inputClampMin, inputClampMax);
-      }
-
-      let diffSquaredSum = 0;
-      let normSquaredSum = 0;
-      for (let neuron = 0; neuron < neuronCount; neuron += 1) {
-        let predicted = 0;
-        const rowBase = neuron * inputChannelCount;
-        for (let channel = 0; channel < inputChannelCount; channel += 1) {
-          predicted += steadyStateMap[rowBase + channel] * uClamped[channel];
-        }
-        const diff = rate[neuron] - predicted;
-        diffSquaredSum += diff * diff;
-        normSquaredSum += predicted * predicted;
-      }
-
-      const norm = Math.sqrt(normSquaredSum);
-      // See this file's module doc comment for the zero-norm convention.
-      const tickDistance = norm > 0 ? Math.sqrt(diffSquaredSum) / norm : diffSquaredSum === 0 ? 0 : 1;
-      distanceSum += tickDistance;
-    };
+    // `regime-metrics.ts`'s `createRegimeAccumulator` (WP2 extraction, a
+    // pure re-implementation of this file's pre-extraction inline
+    // accumulator in the same operation order -- see that module's doc
+    // comment). A fresh accumulator per seed, matching the pre-extraction
+    // per-seed `let` locals this replaces.
+    const accumulator = createRegimeAccumulator({
+      neuronCount,
+      inputChannelCount,
+      rateMin,
+      rateMax,
+      inputClampMin,
+      inputClampMax,
+      steadyStateMap,
+      substeps
+    });
 
     // The episode's own score (movementScore/foodPickups/hazardContacts) is
     // not this metric's concern -- only the per-substep observations
@@ -244,18 +216,11 @@ export const runTask = (task: RegimeWorkerTask): readonly RegimeSeedResult[] => 
       seed,
       ticks: task.ticks,
       substeps,
-      left: { decoder: 'authored', graph, onSubstep },
+      left: { decoder: 'authored', graph, onSubstep: accumulator.onSubstep },
       right: { decoder: 'parked' }
     });
 
-    const clampFraction = totalNeuronSubsteps > 0 ? clampedNeuronSubsteps / totalNeuronSubsteps : 0;
-    const steadyStateDistance = tickCount > 0 ? distanceSum / tickCount : 0;
-    if (!Number.isFinite(clampFraction) || !Number.isFinite(steadyStateDistance)) {
-      throw new Error(
-        `regime-worker: ${task.graphId} seed ${seed} produced a non-finite regime metric ` +
-          `(clampFraction=${clampFraction}, steadyStateDistance=${steadyStateDistance})`
-      );
-    }
+    const { clampFraction, steadyStateDistance } = accumulator.result(`${task.graphId} seed ${seed}`);
     return { seed, clampFraction, steadyStateDistance };
   });
 };

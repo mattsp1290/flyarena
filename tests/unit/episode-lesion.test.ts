@@ -313,15 +313,15 @@ describe('runEpisode lesion: decoder gating', () => {
 });
 
 describe('runEpisode onSubstep: decoder gating', () => {
-  // Structural twin of the "runEpisode lesion: decoder gating" block above:
-  // `onSubstep` is guarded the same way `lesion` is
-  // (`scripts/training/episode.ts`'s `createAgentRunner`, immediately below
-  // the `lesion` guard), and that guard runs before any decoder-specific
-  // "requires a graph/weights" check, so these throw without needing to
-  // supply a graph or weights either -- see the lesion version of this block
-  // for why that's true of the guard's position, not an oversight here.
+  // `.agents/plans/readout-attribution/02-analyses.md`'s WP2 widened this
+  // guard: `onSubstep` is now valid for every decoder that actually steps a
+  // network (the authored family, unchanged, plus `trained`/`silenced` --
+  // `episode.ts`'s `createAgentRunner`). Only `parked` (no network stepped
+  // at all) still rejects it; see `tests/unit/episode-readout-mask.test.ts`
+  // for `onSubstep`'s new trained/silenced-branch behavior (accepted, and
+  // does not change the outcome).
 
-  it('throws when combined with trained', () => {
+  it('no longer throws for trained merely for lacking a graph/weights match to onSubstep -- it falls through to the ordinary "requires a graph" check', () => {
     expect(() =>
       runEpisode({
         seed: 1,
@@ -329,10 +329,10 @@ describe('runEpisode onSubstep: decoder gating', () => {
         left: { decoder: 'trained', onSubstep: () => {} },
         right: { decoder: 'parked' }
       })
-    ).toThrow(/does not support onSubstep/);
+    ).toThrow(/requires a graph/);
   });
 
-  it('throws when combined with silenced', () => {
+  it('no longer throws for silenced merely for lacking a graph/weights match to onSubstep -- it falls through to the ordinary "requires a graph" check', () => {
     expect(() =>
       runEpisode({
         seed: 1,
@@ -340,7 +340,7 @@ describe('runEpisode onSubstep: decoder gating', () => {
         left: { decoder: 'silenced', onSubstep: () => {} },
         right: { decoder: 'parked' }
       })
-    ).toThrow(/does not support onSubstep/);
+    ).toThrow(/requires a graph/);
   });
 
   it('throws when combined with parked', () => {

@@ -153,6 +153,35 @@ export interface AgentEpisodeConfig {
    * test do not need to change to cover this addition.
    */
   readonly onSubstep?: SubstepObserver;
+  /**
+   * `.agents/plans/readout-attribution/02-analyses.md`'s WP2 readout-input
+   * mask: indices into the readout's own `D`-length input space
+   * (`outputNeuronIndices(graph)` order, i.e. `0 <= d < weights.inputSize`
+   * -- NOT raw neuron ids the way `lesion` is), zeroed in the readout's
+   * input only, leaving the network's real dynamics (`state.rate`)
+   * untouched. Valid only for decoder `trained`; `runEpisode` throws for
+   * any other decoder, including `silenced` (whose whole input is already
+   * always zero -- masking it is meaningless). Must be sorted ascending,
+   * unique, and in `[0, weights.inputSize)`; `runEpisode` throws on the
+   * first violation, mirroring `lesion`'s own contract. An unset or
+   * zero-length mask is bit-identical to no mask; a mask covering every
+   * `[0, D)` index is bit-identical to `silenced` -- `readoutForward` only
+   * ever reads the `D` gathered positions (`indices[input]`), so it cannot
+   * observe whether the rest of the copied buffer still holds the
+   * network's real per-neuron rates (unmasked positions) or is all-zero
+   * (`silenced`'s buffer): see `createNeuralRunner`'s masked-copy below.
+   */
+  readonly readoutMask?: Int32Array;
+  /**
+   * Read-only, allocation-free, off-by-default per-tick observer for the
+   * `trained`/`silenced` decoders: called once per tick, immediately before
+   * `readoutForward`, with the exact `Float32Array` the readout is about to
+   * read (post-mask for `trained`, the shared all-zero buffer for
+   * `silenced`) and the 0-based tick index. `runEpisode` throws if this is
+   * set for any other decoder. `scripts/attribution/saliency.ts` uses this
+   * to record the readout-input trajectories saliency is computed from.
+   */
+  readonly onReadoutInput?: (rate: Float32Array, tick: number) => void;
 }
 
 export interface EpisodeConfig {
@@ -249,6 +278,24 @@ const validateLesionIndices = (agentId: AgentId, lesion: Int32Array, neuronCount
   }
 };
 
+/** Same sorted/unique/in-range contract as `validateLesionIndices`, but against the readout's own `D`-length input space (`readoutMask`'s doc comment), not the graph's raw neuron count. */
+const validateReadoutMaskIndices = (agentId: AgentId, mask: Int32Array, inputSize: number): void => {
+  for (let i = 0; i < mask.length; i += 1) {
+    const index = mask[i];
+    if (index < 0 || index >= inputSize) {
+      throw new Error(
+        `episode: agent "${agentId}" readoutMask index ${index} is out of range [0, ${inputSize})`
+      );
+    }
+    if (i > 0 && index <= mask[i - 1]) {
+      throw new Error(
+        `episode: agent "${agentId}" readoutMask indices must be sorted ascending and unique, ` +
+          `got ${mask[i - 1]} then ${index} at position ${i}`
+      );
+    }
+  }
+};
+
 /**
  * Builds the per-tick action producer for a non-parked agent. Neural state
  * (`createModelState`) starts at zero, matching WP3's "Neural state reset
@@ -313,11 +360,44 @@ const createNeuralRunner = (
     const zeroRate =
       config.decoder === 'silenced' ? new Float32Array(graph.metadata.neuronCount) : null;
 
+    // `readoutMask` support (`trained` only -- checked in `createAgentRunner`
+    // before this branch is ever reached). Preallocated once, shaped like
+    // `state.rate` (not `readoutScratch`, the H-length hidden buffer): every
+    // tick, the network's real rate is copied in full, then the masked `D`
+    // positions (via `indices`, `readoutMask`'s own D-space contract) are
+    // zeroed -- dynamics (`state.rate` itself) are never touched. See
+    // `AgentEpisodeConfig.readoutMask`'s doc comment for the two identities
+    // (empty mask == no mask, full mask == `silenced`) this preserves.
+    // `config.decoder === 'trained'` is already guaranteed here --
+    // `createAgentRunner` rejects `readoutMask` on any other decoder
+    // (including `silenced`) before this function is ever called.
+    let mask: Int32Array | null = null;
+    let maskedRate: Float32Array | null = null;
+    if (config.readoutMask) {
+      if (!(config.readoutMask instanceof Int32Array)) {
+        throw new Error(`episode: agent "${agentId}" readoutMask must be an Int32Array`);
+      }
+      mask = Int32Array.from(config.readoutMask);
+      validateReadoutMaskIndices(agentId, mask, weights.inputSize);
+      maskedRate = new Float32Array(graph.metadata.neuronCount);
+    }
+
+    const onReadoutInput = config.onReadoutInput;
+    const onSubstep = config.onSubstep;
+    let tick = 0;
+
     return {
       step: (world) => {
         const observation = observeAgent(world, agentId);
-        runSubsteps(graph, state, scratch, observation, substeps, outputs);
-        const readoutInput = zeroRate ?? state.rate;
+        runSubsteps(graph, state, scratch, observation, substeps, outputs, onSubstep);
+        let readoutInput = zeroRate ?? state.rate;
+        if (mask && maskedRate) {
+          maskedRate.set(readoutInput);
+          for (let i = 0; i < mask.length; i += 1) maskedRate[indices[mask[i]]] = 0;
+          readoutInput = maskedRate;
+        }
+        onReadoutInput?.(readoutInput, tick);
+        tick += 1;
         readoutForward(weights, readoutInput, indices, readoutScratch, readoutOut);
         const decoded = decodeAction(Array.from(readoutOut));
         return [decoded.thrust, decoded.yaw, decoded.brake];
@@ -344,10 +424,25 @@ const createAgentRunner = (
         '(the authored decoder family only)'
     );
   }
-  if (config.onSubstep && !isAuthoredFamily(config.decoder)) {
+  // `onSubstep` is now valid for every decoder that actually steps a
+  // network -- the authored family (unchanged) plus `trained`/`silenced`
+  // (`.agents/plans/readout-attribution/02-analyses.md`'s WP2, threaded
+  // through to `runSubsteps`' own `onSubstep` parameter in
+  // `createNeuralRunner`'s trained/silenced branch). Only `parked` (no
+  // network stepped at all) rejects it.
+  if (config.onSubstep && config.decoder === 'parked') {
+    throw new Error(`episode: agent "${agentId}" decoder "parked" does not support onSubstep (no network is stepped)`);
+  }
+  if (config.readoutMask && config.decoder !== 'trained') {
     throw new Error(
-      `episode: agent "${agentId}" decoder "${config.decoder}" does not support onSubstep ` +
-        '(the authored decoder family only)'
+      `episode: agent "${agentId}" decoder "${config.decoder}" does not support readoutMask ` +
+        '(the "trained" decoder only)'
+    );
+  }
+  if (config.onReadoutInput && config.decoder !== 'trained' && config.decoder !== 'silenced') {
+    throw new Error(
+      `episode: agent "${agentId}" decoder "${config.decoder}" does not support onReadoutInput ` +
+        '(the "trained"/"silenced" decoders only)'
     );
   }
   return config.decoder === 'parked' ? createParkedRunner() : createNeuralRunner(agentId, config, substeps);
