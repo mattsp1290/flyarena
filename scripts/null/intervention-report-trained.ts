@@ -62,8 +62,16 @@ export interface TrainedArmDistribution {
   readonly max: number;
 }
 
-/** `values` need not be sorted; the arm's own descriptive stats are computed independently of the sort `scores` above carries. */
-const trainedArmDistribution = (values: readonly number[]): TrainedArmDistribution => {
+/**
+ * `values` need not be sorted; the arm's own descriptive stats are computed
+ * independently of the sort `scores` above carries. Exported (task-generality
+ * WP4, `scripts/null/task-generality-report.ts`): that module builds its own
+ * per-task `TrainedArmDistribution` for C/M from a task's `trained.json`
+ * before calling `trainedTaskResult` below, and must not hand-roll a second
+ * copy of this sort/max convention (the same "reuse, don't reimplement"
+ * discipline `armDistribution` in `intervention-report.ts` already follows).
+ */
+export const trainedArmDistribution = (values: readonly number[]): TrainedArmDistribution => {
   if (values.length === 0) throw new Error('intervention-report-trained: trainedArmDistribution requires at least one score');
   const scores = [...values].sort((a, b) => a - b);
   return { n: scores.length, scores, max: scores[scores.length - 1] };
@@ -222,7 +230,16 @@ const assertFiniteMovementScore = (label: string, movementScore: readonly number
   }
 };
 
-const classifyRuns = (
+/**
+ * Exported (task-generality WP4): `task-generality-report.ts` needs the
+ * exact same id -> kind/trainerSeed classification and validation (P-by-seed
+ * completeness, C/M arm size and trainer-seed checks, stale-graph gzipSha256
+ * cross-check) for each task's own `trained.json` before it can build that
+ * task's `TrainedArmDistribution`s and call `trainedTaskResult` below --
+ * reusing this rather than a second hand-rolled classifier keeps the two
+ * studies' validation rules from silently drifting apart.
+ */
+export const classifyRuns = (
   raw: Readonly<NullTrainedInterventionEvaluationRaw>,
   info: Readonly<GraphListIndexInfo>
 ): {
