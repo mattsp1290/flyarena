@@ -105,6 +105,14 @@ fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
+# The analysis steps (transfer.py, features.py, explain.py) refuse to run
+# unless BLAS is single-threaded (scripts/analysis/env_guard.py). Set that
+# here rather than relying on the caller's shell: the first real run died at
+# transfer.py because the launching shell lacked MKL_NUM_THREADS.
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+export DD_IAST_ENABLED=false
+unset PYTHONPATH
+
 command -v jq >/dev/null 2>&1 || { echo "run-chain.sh: jq is required (sha cross-checks between steps)" >&2; exit 1; }
 
 B="training/runs/selections/${SELECTION}"
