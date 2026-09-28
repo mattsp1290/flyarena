@@ -421,6 +421,51 @@ export class ExperimentController {
   }
 
   /**
+   * Table-driven sidecar registration (thermo-maintainability review,
+   * Important, both reviewers): `initialize()` used to hand-write the same
+   * ~12-line `runSidecarLoad<X>(...)` call once per sidecar artifact -- 5
+   * near-identical blocks (rewiring-null, null-explanation,
+   * pathway-interventions, repertoire-null, task-generality), differing
+   * only in the type parameter, the loader function, the
+   * `unexpected error while loading ...` label, and the dispatch callback.
+   * This method collapses each call site to one line; `runSidecarLoad`
+   * itself (the actual execution mechanics: catch, dispatch, the
+   * `destroyed` guard, error routing) is unchanged.
+   *
+   * `ExperimentControllerCallbacks`/`ExperimentControllerOptions` keep
+   * their own named per-sidecar fields (`onRewiringNull`,
+   * `loadRewiringNull`, etc.) rather than moving to a generic
+   * `Record<string, ...>` map -- that public surface is what every existing
+   * controller test (5+ files, including `experiment-controller-test-helpers.ts`'s
+   * shared `createCallbacks()`) already injects by name, and collapsing it
+   * too would touch every one of them for no behavioral gain. This is the
+   * deliberately minimal, low-risk slice of the reviewer's own suggested
+   * `SidecarSpec<T>[]` registry: it removes the boilerplate that was
+   * actually duplicating (the call-site wiring, which is what drifted when
+   * this file's doc comments went stale in an earlier fix pass) without
+   * changing any public or test-facing shape.
+   *
+   * The `as T` cast is the one place this generalization gives up the
+   * call-site-local type-checking each hand-written call previously had:
+   * every `SidecarLoadResult<X>` union in this codebase includes an
+   * `{status: 'unavailable', reason: string}` member (the shared shape
+   * `sidecarResult.ts`'s `SidecarLoadResult<T>` and every sibling loader's
+   * own result type both follow), so this literal is always a valid `T` in
+   * practice -- TypeScript just cannot prove that for an unconstrained
+   * generic `T` the way it could prove it against each call site's own
+   * concrete type argument before.
+   */
+  private registerSidecar<T>(label: string, load: () => Promise<T>, dispatch: (result: T) => void): void {
+    void runSidecarLoad<T>(
+      load,
+      (reason) => ({ status: 'unavailable', reason: `unexpected error while loading ${label}: ${reason}` }) as T,
+      () => this.destroyed,
+      dispatch,
+      (message) => this.options.callbacks.onError(message)
+    );
+  }
+
+  /**
    * WP6 item 2: fetch both graph artifacts, gunzip, and sha256-verify them
    * before anything is allowed to start. WP6 item 3: one dedicated Worker
    * per arm, initialized with the default biological (left) vs rewired
@@ -470,79 +515,47 @@ export class ExperimentController {
     // their fetch latencies). Fire-and-forget, deliberately not awaited
     // here (unlike the trained-readout load just below) — "loading must not
     // block Start" means none of these may sit in this method's own `await`
-    // chain ahead of Worker construction. `runSidecarLoad` (module-level
-    // helper above) owns the leading-`.catch`/trailing-`.catch` wrapping
-    // every fork needs: the leading one enforces each loader's own "never
-    // throws" contract at this call site too (dual review, Important —
-    // mirrors `App.svelte`'s own `onManifest` handler, which added the
-    // equivalent `.catch` around `loadPositions` for the same reason), so
-    // an unexpected throw anywhere in a loader's chain can never leave its
-    // status `undefined` forever (a ledger/panel row stuck on "Loading…")
-    // or become an unhandled rejection; the trailing one guards the
-    // *callback* instead — each `onX` is host code (`App.svelte`), and a
-    // throw there is routed to `onError` rather than becoming an unhandled
-    // rejection. Each fork's own `onUnexpectedError` maps a genuine
-    // runtime/JS error to `'unavailable'`, never `'invalid'` (thermo review,
+    // chain ahead of Worker construction. `registerSidecar` (this class's
+    // own method, defined above) owns the leading-`.catch`/trailing-`.catch`
+    // wrapping every fork needs via `runSidecarLoad`: the leading one
+    // enforces each loader's own "never throws" contract at this call site
+    // too (dual review, Important — mirrors `App.svelte`'s own `onManifest`
+    // handler, which added the equivalent `.catch` around `loadPositions`
+    // for the same reason), so an unexpected throw anywhere in a loader's
+    // chain can never leave its status `undefined` forever (a ledger/panel
+    // row stuck on "Loading…") or become an unhandled rejection; the
+    // trailing one guards the *callback* instead — each `onX` is host code
+    // (`App.svelte`), and a throw there is routed to `onError` rather than
+    // becoming an unhandled rejection. Each fork's own unexpected-error
+    // mapping goes to `'unavailable'`, never `'invalid'` (thermo review,
     // Suggestion): that status is reserved for an actual hash/shape/
     // cross-check failure, which each panel renders as "failed
-    // verification" — a plain thrown error is not that claim.
-    void runSidecarLoad<RewiringNullLoadResult>(
-      () => loadNull(artifacts.manifest, dataBaseUrl),
-      (reason) => ({ status: 'unavailable', reason: `unexpected error while loading the rewiring null: ${reason}` }),
-      () => this.destroyed,
-      (result) => this.options.callbacks.onRewiringNull(result),
-      (message) => this.options.callbacks.onError(message)
+    // verification" — a plain thrown error is not that claim. None of these
+    // five is "sequenced after" any other; each fires the instant
+    // `artifacts.manifest` is available, independent of whether any sibling
+    // fork has started, run, or settled yet.
+    this.registerSidecar<RewiringNullLoadResult>('the rewiring null', () => loadNull(artifacts.manifest, dataBaseUrl), (result) =>
+      this.options.callbacks.onRewiringNull(result)
     );
-
-    // WP4 of `.agents/plans/null-explanation`: only needs `manifest`/
-    // `dataBaseUrl` (its own cross-check re-reads `manifest.rewiringNull.sha256`
-    // directly, never a resolved `RewiringNullLoadResult`), so it fires
-    // independently of the rewiring-null fork above, not after it.
-    void runSidecarLoad<NullExplanationLoadResult>(
+    this.registerSidecar<NullExplanationLoadResult>(
+      'the null explanation',
       () => loadExplanation(artifacts.manifest, dataBaseUrl),
-      (reason) => ({ status: 'unavailable', reason: `unexpected error while loading the null explanation: ${reason}` }),
-      () => this.destroyed,
-      (result) => this.options.callbacks.onNullExplanation(result),
-      (message) => this.options.callbacks.onError(message)
+      (result) => this.options.callbacks.onNullExplanation(result)
     );
-
-    // WP4 of `.agents/plans/pathway-interventions`: only needs `manifest`/
-    // `dataBaseUrl` (its own cross-check re-reads
-    // `manifest.rewiringNull.sha256`/`manifest.nullExplanation.sha256`
-    // directly), so it fires independently of the two forks above too.
-    void runSidecarLoad<PathwayInterventionsLoadResult>(
+    this.registerSidecar<PathwayInterventionsLoadResult>(
+      'the pathway-interventions study',
       () => loadInterventions(artifacts.manifest, dataBaseUrl),
-      (reason) => ({ status: 'unavailable', reason: `unexpected error while loading the pathway-interventions study: ${reason}` }),
-      () => this.destroyed,
-      (result) => this.options.callbacks.onPathwayInterventions(result),
-      (message) => this.options.callbacks.onError(message)
+      (result) => this.options.callbacks.onPathwayInterventions(result)
     );
-
-    // WP3 of `.agents/plans/repertoire-null`, wired per `findings-tour`'s
-    // `01-findings-panel.md` ("Add a repertoire load behind the `destroyed`
-    // guard, with an injectable seam, following `loadPathwayInterventions`.
-    // Otherwise pass `missing`"). `loadRepertoire` only needs
-    // `manifest`/`dataBaseUrl` (its own cross-check re-reads
-    // `manifest.binarySha256`/`manifest.rewiringNull.sha256` directly), so
-    // it fires independently of the three forks above, not after them.
-    void runSidecarLoad<RepertoireNullLoadResult>(
+    this.registerSidecar<RepertoireNullLoadResult>(
+      'the repertoire-null comparison',
       () => loadRepertoire(artifacts.manifest, dataBaseUrl),
-      (reason) => ({ status: 'unavailable', reason: `unexpected error while loading the repertoire-null comparison: ${reason}` }),
-      () => this.destroyed,
-      (result) => this.options.callbacks.onRepertoireNull(result),
-      (message) => this.options.callbacks.onError(message)
+      (result) => this.options.callbacks.onRepertoireNull(result)
     );
-
-    // WP4 of `.agents/plans/task-generality`: only needs `manifest`/
-    // `dataBaseUrl` (its own cross-check re-reads
-    // `manifest.rewiringNull.sha256`/`manifest.pathwayInterventions.sha256`
-    // directly), so it fires independently of the four forks above too.
-    void runSidecarLoad<TaskGeneralityLoadResult>(
+    this.registerSidecar<TaskGeneralityLoadResult>(
+      'the task-generality study',
       () => loadTaskGeneralityFn(artifacts.manifest, dataBaseUrl),
-      (reason) => ({ status: 'unavailable', reason: `unexpected error while loading the task-generality study: ${reason}` }),
-      () => this.destroyed,
-      (result) => this.options.callbacks.onTaskGenerality(result),
-      (message) => this.options.callbacks.onError(message)
+      (result) => this.options.callbacks.onTaskGenerality(result)
     );
 
     // Trained-readout artifact: optional relative to the required arena
