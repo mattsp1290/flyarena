@@ -227,6 +227,19 @@ export interface ArenaManifest {
    * omits its one-line strip rather than pretending it exists.
    */
   behaviorRepertoireNull?: SidecarManifestEntry;
+  /**
+   * WP4 of `.agents/plans/task-generality`: whether the rewiring-null and
+   * pathway-intervention findings hold beyond the default foraging task,
+   * across four predeclared `ArenaConfig` variants.
+   * `scripts/null/task-generality-report.ts` writes this once
+   * `task-generality-v1.json` exists — see `./taskGenerality.ts#loadTaskGenerality`.
+   * Optional: a manifest produced before that WP (or a hand-built test
+   * fixture) simply has no task-generality study to show —
+   * `loadTaskGenerality` reports that as `status: 'missing'` rather than
+   * throwing, and the Findings panel's task-generality step simply omits its
+   * sentence rather than pretending it exists.
+   */
+  taskGenerality?: SidecarManifestEntry;
   sourceDataset: string;
   rewiredArms: Record<
     string,

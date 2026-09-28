@@ -13,6 +13,7 @@
   import type { NullExplanationLoadResult } from './lib/experiment/nullExplanation';
   import type { PathwayInterventionsLoadResult } from './lib/experiment/pathwayInterventions';
   import type { RepertoireNullLoadResult } from './lib/experiment/repertoireNull';
+  import type { TaskGeneralityLoadResult } from './lib/experiment/taskGenerality';
   import { ExperimentController } from './lib/experiment/controller';
   import type { ExperimentRunner, ExperimentTelemetry } from './lib/experiment/runner';
   import type { ExperimentStatus } from './lib/experiment/state';
@@ -92,6 +93,8 @@
   let pathwayInterventionsStatus = $state<PathwayInterventionsLoadResult | undefined>(undefined);
   /** `undefined` until `initialize()`'s repertoire-null load resolves (WP3 of `.agents/plans/repertoire-null`); feeds the Findings panel's step 7 ("Behavior repertoire") sentence. Loading it never blocks Start, and never blocks reaching a settled `pathwayInterventionsStatus` either — see `ExperimentController#initialize`'s doc comment. */
   let repertoireNullStatus = $state<RepertoireNullLoadResult | undefined>(undefined);
+  /** `undefined` until `initialize()`'s task-generality load resolves (WP4 of `.agents/plans/task-generality`); feeds the Findings panel's task-generality step, placed before the "Behavior repertoire" step. Loading it never blocks Start, and never blocks reaching a settled `repertoireNullStatus` either — see `ExperimentController#initialize`'s doc comment. */
+  let taskGeneralityStatus = $state<TaskGeneralityLoadResult | undefined>(undefined);
   /** True for the duration of an in-flight `controller.setDecoder()` call — set/cleared locally around that call (there is only ever one decoder shared by both arms, unlike per-arm topology switches, so a single flag suffices). */
   let decoderSwitchPending = $state(false);
 
@@ -345,6 +348,9 @@
         onRepertoireNull: (result) => {
           if (!destroyed) repertoireNullStatus = result;
         },
+        onTaskGenerality: (result) => {
+          if (!destroyed) taskGeneralityStatus = result;
+        },
         onDecoderApplied: (next) => {
           if (!destroyed) decoder = next;
         }
@@ -511,6 +517,7 @@
       nullExplanation={nullExplanationStatus}
       pathwayInterventions={pathwayInterventionsStatus}
       repertoireNull={repertoireNullStatus}
+      taskGenerality={taskGeneralityStatus}
     />
 
     <LedgerPanel

@@ -26,6 +26,7 @@
     "intervention:report": "tsx scripts/null/intervention-report.ts",
     "intervention:artifact": "tsx scripts/null/intervention-artifact.ts",
     "null:task-clearance": "tsx scripts/null/task-clearance.ts",
+    "task-generality:report": "tsx scripts/null/task-generality-report.ts",
     "analysis:fixture": "tsx scripts/analysis/export-trace-graph-fixture.ts",
     "lesion:evaluate": "tsx scripts/lesion/atlas-evaluate.ts",
     "lesion:report": "tsx scripts/lesion/atlas-report.ts",

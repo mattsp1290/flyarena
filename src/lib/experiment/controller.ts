@@ -14,6 +14,7 @@ import { loadRewiringNull, type RewiringNullLoadResult } from './rewiringNull';
 import { loadNullExplanation, type NullExplanationLoadResult } from './nullExplanation';
 import { loadPathwayInterventions, type PathwayInterventionsLoadResult } from './pathwayInterventions';
 import { loadRepertoireNull, type RepertoireNullLoadResult } from './repertoireNull';
+import { loadTaskGenerality, type TaskGeneralityLoadResult } from './taskGenerality';
 import { buildGraphBufferForMode, createWorkerAgentBinding } from './bindings';
 import { ExperimentRunner, isNotInitializedRejection, type ExperimentTelemetry } from './runner';
 import { transition, type ExperimentStatus } from './state';
@@ -129,6 +130,18 @@ export interface ExperimentControllerCallbacks {
    */
   onRepertoireNull: (result: RepertoireNullLoadResult) => void;
   /**
+   * Fired once `loadTaskGenerality` resolves (WP4 of
+   * `.agents/plans/task-generality`) — sequenced after the repertoire-null
+   * load settles, for the same reason every fork above is sequenced after
+   * the one before it (never races ahead of `initialize()`'s own load
+   * order; this artifact's own cross-check needs `manifest`, not any other
+   * resolved load result), but fired independently of `onRepertoireNull`
+   * itself. Never blocks reaching `ready`. The host's hook for the Findings
+   * panel's task-generality step, placed before the "Behavior repertoire"
+   * step.
+   */
+  onTaskGenerality: (result: TaskGeneralityLoadResult) => void;
+  /**
    * Fired once per agent right after `setDecoder()` has successfully applied
    * a decoder switch to both arms' Workers and reset the run to tick 0 —
    * mirrors `onTopologyApplied`'s "never speculatively before a switch is
@@ -173,6 +186,11 @@ export interface ExperimentControllerOptions {
    * Same seam-for-testability reasoning as `loadPathwayInterventions` above.
    */
   loadRepertoireNull?: typeof loadRepertoireNull;
+  /**
+   * Injectable for tests; defaults to `./taskGenerality.ts#loadTaskGenerality`.
+   * Same seam-for-testability reasoning as `loadRepertoireNull` above.
+   */
+  loadTaskGenerality?: typeof loadTaskGenerality;
   /** Passed straight through to the constructed `ExperimentRunner` (see `ExperimentRunnerOptions.targetTickIntervalMs`); `0` disables real-time pacing entirely, which unit tests use to run a many-tick determinism check without waiting out real seconds. Omitted in production, matching the runner's own real-time default. */
   targetTickIntervalMs?: number;
 }
@@ -432,6 +450,7 @@ export class ExperimentController {
     const loadExplanation = this.options.loadNullExplanation ?? loadNullExplanation;
     const loadInterventions = this.options.loadPathwayInterventions ?? loadPathwayInterventions;
     const loadRepertoire = this.options.loadRepertoireNull ?? loadRepertoireNull;
+    const loadTaskGeneralityFn = this.options.loadTaskGenerality ?? loadTaskGenerality;
     const dataBaseUrl = `${import.meta.env.BASE_URL}data`;
     let artifacts: LoadedArenaArtifacts;
     try {
@@ -518,6 +537,18 @@ export class ExperimentController {
       (reason) => ({ status: 'unavailable', reason: `unexpected error while loading the repertoire-null comparison: ${reason}` }),
       () => this.destroyed,
       (result) => this.options.callbacks.onRepertoireNull(result),
+      (message) => this.options.callbacks.onError(message)
+    );
+
+    // WP4 of `.agents/plans/task-generality`: only needs `manifest`/
+    // `dataBaseUrl` (its own cross-check re-reads
+    // `manifest.rewiringNull.sha256`/`manifest.pathwayInterventions.sha256`
+    // directly), so it fires independently of the four forks above too.
+    void runSidecarLoad<TaskGeneralityLoadResult>(
+      () => loadTaskGeneralityFn(artifacts.manifest, dataBaseUrl),
+      (reason) => ({ status: 'unavailable', reason: `unexpected error while loading the task-generality study: ${reason}` }),
+      () => this.destroyed,
+      (result) => this.options.callbacks.onTaskGenerality(result),
       (message) => this.options.callbacks.onError(message)
     );
 

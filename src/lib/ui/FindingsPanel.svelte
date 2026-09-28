@@ -5,18 +5,19 @@
   import type { NullExplanationLoadResult } from '../experiment/nullExplanation';
   import type { PathwayInterventionsLoadResult } from '../experiment/pathwayInterventions';
   import type { RepertoireNullLoadResult } from '../experiment/repertoireNull';
+  import type { TaskGeneralityLoadResult } from '../experiment/taskGenerality';
   import { buildFindingSteps, findingStepStatusLabel, type FindingStep } from '../findings/steps';
 
   /**
    * WP1 of `.agents/plans/findings-tour` (`01-findings-panel.md`): a
-   * collapsible ARIA stepper that walks a visitor through the seven-step
-   * evidence chain, in order, each step templated from an already
-   * fetched/sha256-verified/shape-validated artifact
-   * (`src/lib/findings/steps.ts#buildFindingSteps`) — never a hard-coded
-   * number. Framing (user constraint, no biological claims): the header
-   * reads "Findings under this model — not claims about the real fly," and
-   * every templated sentence names its decoder condition and ends with
-   * "under this model."
+   * collapsible ARIA stepper that walks a visitor through the (now
+   * eight-step, since task-generality WP4) evidence chain, in order, each
+   * step templated from an already fetched/sha256-verified/shape-validated
+   * artifact (`src/lib/findings/steps.ts#buildFindingSteps`) — never a
+   * hard-coded number. Framing (user constraint, no biological claims): the
+   * header reads "Findings under this model — not claims about the real
+   * fly," and every templated sentence names its decoder condition and ends
+   * with "under this model."
    *
    * Collapsed by default, like `ActivityPanel.svelte`'s own "expand to see
    * more" convention — it never blocks the arena or Start. Placed directly
@@ -26,8 +27,8 @@
    * the panel" discipline `LedgerPanel`/`NullExplanationNote` already
    * follow.
    *
-   * Every one of the seven `<li>` steps is always rendered with its own
-   * full content (sentence, provenance) — nothing is hidden behind a
+   * Every one of the `<li>` steps is always rendered with its own full
+   * content (sentence, provenance) — nothing is hidden behind a
    * wizard-style single-step view, so the tampering/degradation coverage in
    * `tests/e2e/findings.spec.ts` can assert every step's state at once, and
    * a screen-reader user is never forced through Next clicks to reach a
@@ -35,9 +36,10 @@
    * `<ol>`'s own concept per `01-findings-panel.md`) is a keyboard-walking
    * cursor only: Previous/Next move which step has it and move DOM focus to
    * that step's own heading, and a polite live region announces "Step N of
-   * 7" on every move — the accessible way to walk the chain in order
-   * without requiring a screen-reader user to tab through six steps' worth
-   * of links first.
+   * M" (`steps.length`, never a hard-coded literal) on every move — the
+   * accessible way to walk the chain in order without requiring a
+   * screen-reader user to tab through every earlier step's worth of links
+   * first.
    */
 
   interface Props {
@@ -47,9 +49,11 @@
     pathwayInterventions: PathwayInterventionsLoadResult | undefined;
     /** WP3 of `.agents/plans/repertoire-null`, wired per `findings-tour`'s own `01-findings-panel.md` ("optional `repertoireNull`" input). `undefined` while `App.svelte`'s repertoire-null load has not yet resolved. */
     repertoireNull: RepertoireNullLoadResult | undefined;
+    /** WP4 of `.agents/plans/task-generality`. `undefined` while `App.svelte`'s task-generality load has not yet resolved. */
+    taskGenerality: TaskGeneralityLoadResult | undefined;
   }
 
-  let { manifest, rewiringNull, nullExplanation, pathwayInterventions, repertoireNull }: Props = $props();
+  let { manifest, rewiringNull, nullExplanation, pathwayInterventions, repertoireNull, taskGenerality }: Props = $props();
 
   let expanded = $state(false);
   let currentIndex = $state(0);
@@ -63,7 +67,7 @@
   const dataBaseUrl = `${import.meta.env.BASE_URL}data`;
 
   const steps = $derived<readonly FindingStep[]>(
-    buildFindingSteps({ manifest, dataBaseUrl, rewiringNull, nullExplanation, pathwayInterventions, repertoireNull })
+    buildFindingSteps({ manifest, dataBaseUrl, rewiringNull, nullExplanation, pathwayInterventions, repertoireNull, taskGenerality })
   );
 
   const toggle = (): void => {
@@ -100,7 +104,7 @@
   </div>
 
   {#if !expanded}
-    <p class="reason">Expand to walk the evidence chain: seven steps, each templated from a verified artifact.</p>
+    <p class="reason">Expand to walk the evidence chain: {steps.length} steps, each templated from a verified artifact.</p>
   {/if}
 
   <!-- (thermo review, maintainability Suggestion) Mounted unconditionally
@@ -108,7 +112,7 @@
        some screen readers do not reliably announce a live region's
        *initial* content when the region and its first text arrive in the
        same DOM update; they announce only a later mutation of an
-       already-present node. The first "Step 1 of 7" text on expand is then
+       already-present node. The first "Step 1 of N" text on expand is then
        a real mutation of an existing node, not a simultaneous insertion. -->
   <div aria-live="polite" class="sr-only">{expanded ? `Step ${currentIndex + 1} of ${steps.length}` : ''}</div>
 

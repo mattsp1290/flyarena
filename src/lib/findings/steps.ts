@@ -1,6 +1,7 @@
 /**
  * WP1 of `.agents/plans/findings-tour` (`01-findings-panel.md`): pure
- * builder for the Findings panel's seven-step evidence chain
+ * builder for the Findings panel's (now eight-step, since task-generality
+ * WP4) evidence chain
  * (`src/lib/ui/FindingsPanel.svelte`). Every sentence is templated
  * exclusively from fields on the already fetched, sha256-verified,
  * shape-validated artifacts `ExperimentController#initialize()` already
@@ -19,8 +20,8 @@
  *
  * A step whose backing artifact has not yet resolved, was never shipped, or
  * failed verification degrades only that one step (`FindingStepStatus`):
- * the panel still renders all seven steps (`aria-current="step"`/"Step N of
- * 7" stay honest and stable), swapping the templated sentence for a short,
+ * the panel still renders every step (`aria-current="step"`/"Step N of M"
+ * stay honest and stable, derived from the array length), swapping the templated sentence for a short,
  * honestly-worded status line instead of hiding the step outright.
  */
 
@@ -37,6 +38,7 @@ import {
   type PathwayInterventionsTrainedCategory
 } from '../experiment/pathwayInterventions';
 import type { RepertoireNullLoadResult } from '../experiment/repertoireNull';
+import type { TaskGeneralityLoadResult, TaskGeneralityTask } from '../experiment/taskGenerality';
 import { metricVerdictLabel } from '../atlas/repertoireStrip';
 import { CELL_COUNT } from '../atlas/types';
 import { githubDocUrl } from '../ui/links';
@@ -69,7 +71,7 @@ export interface FindingStep {
   /** Present only when `status === 'ok'`. */
   readonly sentence?: string;
   readonly condition: 'authored' | 'trained' | 'both';
-  /** One entry per source artifact this step's sentence is templated from; empty when the step has never had a real source to cite (e.g. step 7 before `repertoire-null` lands). */
+  /** One entry per source artifact this step's sentence is templated from; empty when the step has never had a real source to cite. */
   readonly provenance: readonly FindingStepProvenance[];
   /** The underlying loader's own honest reason string, present only when `status` is `'unavailable'` or `'invalid'`. */
   readonly reason?: string;
@@ -83,6 +85,8 @@ export interface BuildFindingStepsInputs {
   readonly pathwayInterventions: PathwayInterventionsLoadResult | undefined;
   /** WP3 of `.agents/plans/repertoire-null`, following `findings-tour`'s own `01-findings-panel.md` ("optional `repertoireNull`" input). `undefined` while the repertoire-null load has not yet resolved -- `buildBehaviorRepertoireStep` below reports that as `'loading'`, the same convention every other step's `undefined` input already uses. */
   readonly repertoireNull: RepertoireNullLoadResult | undefined;
+  /** WP4 of `.agents/plans/task-generality`. `undefined` while the task-generality load has not yet resolved -- the same `'loading'` convention every other step's `undefined` input already uses. */
+  readonly taskGenerality: TaskGeneralityLoadResult | undefined;
 }
 
 const STATUS_LABEL: Record<Exclude<FindingStepStatus, 'ok'>, string> = {
@@ -123,7 +127,7 @@ const rewiringNullStepStatus = (result: RewiringNullLoadResult | undefined): Exc
 };
 
 const sidecarStepStatus = (
-  result: NullExplanationLoadResult | PathwayInterventionsLoadResult | RepertoireNullLoadResult | undefined
+  result: NullExplanationLoadResult | PathwayInterventionsLoadResult | RepertoireNullLoadResult | TaskGeneralityLoadResult | undefined
 ): Exclude<FindingStepStatus, 'ok'> | 'ok' => {
   if (result === undefined) return 'loading';
   return result.status;
@@ -469,7 +473,79 @@ const buildTrainedInterventionsStep = (inputs: BuildFindingStepsInputs): Finding
 };
 
 // ---------------------------------------------------------------------------
-// Step 7: Behavior repertoire
+// Step 7: Task generality
+// ---------------------------------------------------------------------------
+
+/**
+ * WP4 of `.agents/plans/task-generality`: whether the rewiring-null and
+ * pathway-intervention findings above hold beyond the default foraging
+ * task, across four predeclared `ArenaConfig` variants. Inserted after
+ * "Trained interventions" and before "Behavior repertoire" (`04-artifact-and-findings.md`'s
+ * own placement), which becomes step 8. `condition: 'both'`: the sentence
+ * states both the authored and trained overall verdicts together, mirroring
+ * step 6's own "both decoders in one sentence" shape. Reuses the same
+ * `P_TRAINER_SEEDS` (already imported above for step 6) -- the trained
+ * decoder's fixed trainer-seed set is study-wide, not per-artifact.
+ */
+
+/** One task's authored clause, e.g. `"hazard-heavy: pathway-supported"` or `"no-movement: degenerate"`. Null-holds is called out only when it does *not* hold (the common case needs no extra clause). */
+const authoredTaskClause = (task: Readonly<TaskGeneralityTask>): string => {
+  if (!task.categorized) return `${task.id}: degenerate`;
+  const holdsSuffix = task.null.nullHolds ? '' : ', null does not hold';
+  return `${task.id}: ${task.pathway.category}${holdsSuffix}`;
+};
+
+/** One task's trained clause -- "not robust" is always stated alongside the category (never a footnote), with the per-seed breakdown so a single-seed hit is never mistaken for a robust finding. */
+const trainedTaskClause = (task: Readonly<TaskGeneralityTask>): string => {
+  // Narrowed into a local first (rather than repeatedly re-narrowing
+  // `task.trained.degenerate` at each use), since TypeScript does not carry
+  // a nested-property discriminant narrowing across a function-closure
+  // boundary (the `.map()` callback below) -- a plain local `const`
+  // narrows fine there.
+  const trained = task.trained;
+  if (trained.degenerate) return `${task.id}: degenerate`;
+  const category = describeTrainedCategory(trained.category);
+  if (trained.trainedRobust) return `${task.id}: ${category} (robust)`;
+  const perSeedText = P_TRAINER_SEEDS.map((seed) => `seed ${seed} ${describeTrainedCategory(trained.perSeed[seed])}`).join(', ');
+  return `${task.id}: ${category} (not robust -- ${perSeedText})`;
+};
+
+const buildTaskGeneralityStep = (inputs: BuildFindingStepsInputs): FindingStep => {
+  const provenance = provenanceFor(
+    inputs.manifest,
+    inputs.manifest?.taskGenerality,
+    'Task-generality result (task-generality-v1.json)',
+    'task-generality-report.md',
+    inputs.dataBaseUrl
+  );
+  const status = sidecarStepStatus(inputs.taskGenerality);
+  const base = {
+    id: 'task-generality',
+    title: 'Task generality',
+    condition: 'both' as const,
+    provenance: provenance ? [provenance] : []
+  };
+  if (status !== 'ok' || inputs.taskGenerality?.status !== 'ok') {
+    return { ...base, status, reason: reasonFor(status, inputs.taskGenerality) };
+  }
+  const { tasks, overall } = inputs.taskGenerality.data;
+
+  const authoredClause =
+    overall.authored.verdict === 'general'
+      ? `general (${overall.authored.nonDegenerateCount} of ${overall.authored.totalCount} tasks non-degenerate, null holds and the pathway generalizes in every one)`
+      : `task-dependent (${tasks.map(authoredTaskClause).join('; ')})`;
+  const trainedClause =
+    overall.trained.verdict === 'general'
+      ? `general (${overall.trained.nonDegenerateCount} of ${overall.trained.totalCount} tasks non-degenerate)`
+      : `task-dependent (${tasks.map(trainedTaskClause).join('; ')})`;
+
+  const sentence =
+    `Across ${tasks.length} task variants, authored: ${authoredClause}; trained: ${trainedClause}, under this model.`;
+  return { ...base, status: 'ok', sentence };
+};
+
+// ---------------------------------------------------------------------------
+// Step 8: Behavior repertoire
 // ---------------------------------------------------------------------------
 
 /**
@@ -551,10 +627,11 @@ const buildBehaviorRepertoireStep = (inputs: BuildFindingStepsInputs): FindingSt
 };
 
 /**
- * Builds all seven Findings-panel steps, in evidence-chain order
- * (`01-findings-panel.md`'s step list). Pure and synchronous: every input
- * is a value the caller already has in scope (controller callback mirrors),
- * never a fetch performed here.
+ * Builds all eight Findings-panel steps, in evidence-chain order
+ * (`01-findings-panel.md`'s step list, extended by task-generality WP4's
+ * "before Behavior repertoire" placement). Pure and synchronous: every
+ * input is a value the caller already has in scope (controller callback
+ * mirrors), never a fetch performed here.
  */
 export const buildFindingSteps = (inputs: BuildFindingStepsInputs): readonly FindingStep[] => [
   buildRewiringNullStep(inputs),
@@ -563,5 +640,6 @@ export const buildFindingSteps = (inputs: BuildFindingStepsInputs): readonly Fin
   buildInterventionStep(inputs),
   buildTrainedNullStep(inputs),
   buildTrainedInterventionsStep(inputs),
+  buildTaskGeneralityStep(inputs),
   buildBehaviorRepertoireStep(inputs)
 ];
