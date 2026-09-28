@@ -9,6 +9,7 @@ import { readoutFromFlat } from '../../src/lib/connectome/readout-serialization'
 import { readNpyFloat32Array } from '../../scripts/training/npy';
 import {
   assertArmMatchesGraphId,
+  assertTaskGraphMatchesDefaultGraph,
   buildArchivedReadout,
   DEFAULT_MANIFEST_PATH,
   kindForEntry,
@@ -16,7 +17,9 @@ import {
   mergeReadouts,
   parseArgs,
   parseSourceArg,
+  parseTaskInterventionRawScoresArg,
   runArchiveReadouts,
+  taskInterventionRawScoresOutPath,
   writeArchive,
   type ArchivedReadout,
   type ArchiveReadoutsArgs
@@ -92,6 +95,37 @@ describe('parseSourceArg', () => {
   });
 });
 
+describe('parseTaskInterventionRawScoresArg', () => {
+  it('parses "<arenaTaskId>=<path>"', () => {
+    const spec = parseTaskInterventionRawScoresArg('--task-intervention-raw-scores', 'hazard-heavy=training/runs/tasks/hazard-heavy/trained.json');
+    expect(spec.arenaTask).toBe('hazard-heavy');
+    expect(spec.path.endsWith('training/runs/tasks/hazard-heavy/trained.json')).toBe(true);
+  });
+
+  it('rejects a spec with no "="', () => {
+    expect(() => parseTaskInterventionRawScoresArg('--task-intervention-raw-scores', 'hazard-heavy')).toThrow(/must be/);
+  });
+
+  it('rejects a spec with an empty path', () => {
+    expect(() => parseTaskInterventionRawScoresArg('--task-intervention-raw-scores', 'hazard-heavy=')).toThrow(/must be/);
+  });
+
+  it('rejects an unrecognized arena-task id', () => {
+    expect(() => parseTaskInterventionRawScoresArg('--task-intervention-raw-scores', 'not-a-real-task=some/path.json')).toThrow();
+  });
+});
+
+describe('taskInterventionRawScoresOutPath', () => {
+  it('points at "<dir>/task-intervention-trained-raw-<task>-v1.json"', () => {
+    const path = taskInterventionRawScoresOutPath(resolve(root, 'archive'), 'crowded');
+    expect(path).toBe(resolve(root, 'archive', 'task-intervention-trained-raw-crowded-v1.json'));
+  });
+
+  it('throws for an unrecognized arena-task id', () => {
+    expect(() => taskInterventionRawScoresOutPath(root, 'not-a-real-task')).toThrow();
+  });
+});
+
 describe('parseArgs', () => {
   it('rejects an unrecognized flag', () => {
     expect(() => parseArgs(['--not-a-real-flag', 'value'])).toThrow(/Unknown argument: --not-a-real-flag/);
@@ -140,6 +174,39 @@ describe('parseArgs', () => {
 
   it('rejects a --source with a missing value', () => {
     expect(() => parseArgs(['--source'])).toThrow();
+  });
+
+  it('does not require --source -- --task-intervention-raw-scores alone is enough', () => {
+    const args = parseArgs(['--task-intervention-raw-scores', 'hazard-heavy=some/trained.json']);
+    expect(args.taskInterventionRawScores).toEqual([
+      { arenaTask: 'hazard-heavy', path: expect.stringContaining('some/trained.json') }
+    ]);
+  });
+
+  it('accepts --task-intervention-raw-scores-out-dir', () => {
+    const args = parseArgs(['--source', 'biological=some/dir', '--task-intervention-raw-scores-out-dir', 'some/out-dir']);
+    expect(args.taskInterventionRawScoresOutDir.endsWith('some/out-dir')).toBe(true);
+  });
+
+  it('rejects --task-intervention-raw-scores given more than once for the same arena task (a dual-review finding: two would silently last-write-wins the same output file)', () => {
+    expect(() =>
+      parseArgs([
+        '--task-intervention-raw-scores',
+        'hazard-heavy=some/a.json',
+        '--task-intervention-raw-scores',
+        'hazard-heavy=some/b.json'
+      ])
+    ).toThrow(/"hazard-heavy" was given more than once/);
+  });
+
+  it('allows --task-intervention-raw-scores for two DIFFERENT arena tasks', () => {
+    const args = parseArgs([
+      '--task-intervention-raw-scores',
+      'hazard-heavy=some/a.json',
+      '--task-intervention-raw-scores',
+      'sparse-food=some/b.json'
+    ]);
+    expect(args.taskInterventionRawScores).toHaveLength(2);
   });
 });
 
@@ -326,6 +393,43 @@ describe('buildArchivedReadout', () => {
     const entry = buildArchivedReadout({ graphId: 'P', idSuffix: null, runDir: dir });
     expect(entry.arenaTask).toBe('hazard-heavy');
     expect(entry.kind).toBe('task-intervention');
+    // WP1b: a non-default arenaTask entry carries its resolved fingerprint.
+    expect(entry.arenaTaskFingerprint).toMatch(/^arena-config-v1\|/);
+    // WP1b dual-review finding: the arena-task suffix is baked into the id
+    // AUTOMATICALLY, with no --source idSuffix supplied -- so id-uniqueness
+    // across tasks for the same (graphId, trainerSeed) never depends on the
+    // caller remembering to pass one.
+    expect(entry.id).toBe('P-seed101-hazard-heavy');
+  });
+
+  it('stacks an explicit idSuffix with the automatic arena-task suffix, rather than replacing it', () => {
+    const dir = resolve(root, 'hazard-heavy-gpurerun-run');
+    writeTinyRunDir({
+      dir,
+      arm: 'rewired',
+      trainerSeed: 101,
+      D,
+      H,
+      substeps: 4,
+      weightSeed: 6,
+      armBundleSha256: 'bundle-sha-hazard-2',
+      arenaTask: 'hazard-heavy'
+    });
+    const configPath = resolve(dir, 'config.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8')) as Record<string, unknown>;
+    config.graphArtifactSha256 = 'graph-artifact-sha';
+    writeFileSync(configPath, JSON.stringify(config));
+
+    const entry = buildArchivedReadout({ graphId: 'P', idSuffix: 'gpurerun', runDir: dir });
+    expect(entry.id).toBe('P-seed101-gpurerun-hazard-heavy');
+  });
+
+  it('leaves arenaTaskFingerprint undefined for the default task', () => {
+    const dir = resolve(root, 'default-task-run');
+    writeRunDir(dir, { weightSeed: 9 });
+    const entry = buildArchivedReadout({ graphId: 'biological', idSuffix: null, runDir: dir });
+    expect(entry.arenaTask).toBe('default');
+    expect(entry.arenaTaskFingerprint).toBeUndefined();
   });
 
   it('throws on an unrecognized arenaTask id', () => {
@@ -470,6 +574,70 @@ describe('mergeReadouts', () => {
   });
 });
 
+describe('assertTaskGraphMatchesDefaultGraph', () => {
+  it('is a no-op for a non-task-intervention entry', () => {
+    const addition = makeEntry({ kind: 'bigq' });
+    expect(() => assertTaskGraphMatchesDefaultGraph(addition, [])).not.toThrow();
+  });
+
+  it('is a no-op when there is no existing archive at all', () => {
+    const addition = makeEntry({ kind: 'bigq', graphId: 'P' });
+    expect(() => assertTaskGraphMatchesDefaultGraph(addition, [])).not.toThrow();
+  });
+
+  it('throws when no default-task "intervention" entry exists for this graphId', () => {
+    const addition = makeEntry({
+      id: 'P-seed101-hazard-heavy',
+      kind: 'task-intervention',
+      graphId: 'P',
+      arenaTask: 'hazard-heavy',
+      graphGzipSha256: 'gz-p',
+      graphBinarySha256: 'bin-p'
+    });
+    expect(() => assertTaskGraphMatchesDefaultGraph(addition, [])).toThrow(/has no already-\s*archived default-task/);
+  });
+
+  it('throws when the resolved graph disagrees with the default-task entry\'s graph', () => {
+    const defaultEntry = makeEntry({
+      id: 'P-seed101',
+      kind: 'intervention',
+      graphId: 'P',
+      graphGzipSha256: 'gz-p-default',
+      graphBinarySha256: 'bin-p-default'
+    });
+    const addition = makeEntry({
+      id: 'P-seed101-hazard-heavy',
+      kind: 'task-intervention',
+      graphId: 'P',
+      arenaTask: 'hazard-heavy',
+      graphGzipSha256: 'gz-p-DIFFERENT',
+      graphBinarySha256: 'bin-p-default'
+    });
+    expect(() => assertTaskGraphMatchesDefaultGraph(addition, [defaultEntry])).toThrow(
+      /per-task readouts must use the same intervention graphs as the default task/
+    );
+  });
+
+  it('does not throw when the resolved graph agrees with the default-task entry\'s graph', () => {
+    const defaultEntry = makeEntry({
+      id: 'P-seed101',
+      kind: 'intervention',
+      graphId: 'P',
+      graphGzipSha256: 'gz-p-default',
+      graphBinarySha256: 'bin-p-default'
+    });
+    const addition = makeEntry({
+      id: 'P-seed101-hazard-heavy',
+      kind: 'task-intervention',
+      graphId: 'P',
+      arenaTask: 'hazard-heavy',
+      graphGzipSha256: 'gz-p-default',
+      graphBinarySha256: 'bin-p-default'
+    });
+    expect(() => assertTaskGraphMatchesDefaultGraph(addition, [defaultEntry])).not.toThrow();
+  });
+});
+
 /** Builds a real, `readGraphListIndex`-valid `index.json` (with a real gzip graph file alongside it) for one intervention id, for `runArchiveReadouts` tests that need `--intervention-index` to resolve graph identity. */
 const writeFakeInterventionIndex = (dir: string, id: string, graphBytes: Buffer): string => {
   const graphsDir = resolve(dir, 'graphs');
@@ -501,6 +669,8 @@ describe('runArchiveReadouts', () => {
     interventionIndexOut: resolve(root, 'intervention-index-v1.json'),
     interventionAttributionPath: null,
     interventionSwapsOut: resolve(root, 'intervention-swaps-v1.json'),
+    taskInterventionRawScores: [],
+    taskInterventionRawScoresOutDir: root,
     ...overrides
   });
 
@@ -621,6 +791,150 @@ describe('runArchiveReadouts', () => {
 
     expect(() => runArchiveReadouts(args)).toThrow(/mismatched --source label/);
     expect(loadExistingArchive(args.out)).toBeNull();
+  });
+
+  describe('WP1b: --task-intervention-raw-scores / task-intervention --source', () => {
+    const writeTaskRunDir = (dir: string, overrides: Partial<Parameters<typeof writeTinyRunDir>[0]> = {}): void => {
+      writeTinyRunDir({
+        dir,
+        arm: 'rewired',
+        trainerSeed: 101,
+        D: 6,
+        H: 4,
+        substeps: 4,
+        weightSeed: 5,
+        armBundleSha256: 'archived-task-sha',
+        arenaTask: 'hazard-heavy',
+        ...overrides
+      });
+      const configPath = resolve(dir, 'config.json');
+      const config = JSON.parse(readFileSync(configPath, 'utf8')) as Record<string, unknown>;
+      config.graphArtifactSha256 = 'graph-artifact-sha';
+      writeFileSync(configPath, JSON.stringify(config));
+    };
+
+    it('archives a task-intervention entry, verifying its graph against the already-archived default-task entry', () => {
+      // Seed an existing archive with the default-task "intervention" entry
+      // for graphId "C000" -- the task-intervention addition's graph is
+      // verified against THIS entry (assertTaskGraphMatchesDefaultGraph).
+      const graphBytes = Buffer.from('c000-graph-bytes');
+      const gzipSha256 = createHash('sha256').update(gzipSync(graphBytes)).digest('hex');
+      const binarySha256 = createHash('sha256').update(graphBytes).digest('hex');
+      const existingDefaultEntry = makeEntry({
+        id: 'C000-seed101',
+        kind: 'intervention',
+        graphId: 'C000',
+        graphGzipSha256: gzipSha256,
+        graphBinarySha256: binarySha256,
+        weightsSha256: 'default-c000-weights'
+      });
+      const outPath = resolve(root, 'trained-readouts-v1.json');
+      writeArchive(outPath, [existingDefaultEntry]);
+
+      const dir = resolve(root, 'c000-hazard-heavy-run');
+      writeTaskRunDir(dir);
+
+      const indexPath = writeFakeInterventionIndex(root, 'C000', graphBytes);
+      const indexBytes = readFileSync(indexPath);
+      const graphListSha256 = createHash('sha256').update(indexBytes).digest('hex');
+
+      const rawPath = resolve(root, 'hazard-heavy-trained.json');
+      writeFileSync(
+        rawPath,
+        JSON.stringify({
+          arenaTask: 'hazard-heavy',
+          arenaTaskFingerprint: 'fingerprint',
+          graphListSha256,
+          runs: [{ id: 'C000', trainerSeed: 101, armBundleSha256: 'archived-task-sha', movementScore: [1, 2, 3] }]
+        })
+      );
+
+      const args = baseArgs({
+        out: outPath,
+        // No idSuffix: WP1b auto-derives the id's task suffix from the run's
+        // own arenaTask -- an explicit --source idSuffix is no longer needed
+        // for task-uniqueness (a dual-review finding).
+        sources: [{ graphId: 'C000', idSuffix: null, runDir: dir }],
+        interventionIndexPath: indexPath,
+        taskInterventionRawScores: [{ arenaTask: 'hazard-heavy', path: rawPath }]
+      });
+
+      const result = runArchiveReadouts(args);
+      expect(result.readoutCount).toBe(2);
+      expect(result.wrote).toContain(taskInterventionRawScoresOutPath(root, 'hazard-heavy'));
+
+      const readouts = loadExistingArchive(outPath)?.readouts ?? [];
+      const taskEntry = readouts.find((r) => r.id === 'C000-seed101-hazard-heavy');
+      expect(taskEntry).toBeDefined();
+      expect(taskEntry?.kind).toBe('task-intervention');
+      expect(taskEntry?.arenaTask).toBe('hazard-heavy');
+      expect(taskEntry?.graphGzipSha256).toBe(gzipSha256);
+      expect(taskEntry?.graphBinarySha256).toBe(binarySha256);
+
+      // The default-task entry itself is untouched.
+      expect(readouts.find((r) => r.id === 'C000-seed101')).toEqual(existingDefaultEntry);
+    });
+
+    it('throws when --task-intervention-raw-scores is given without --intervention-index', () => {
+      const rawPath = resolve(root, 'hazard-heavy-trained.json');
+      writeFileSync(
+        rawPath,
+        JSON.stringify({
+          arenaTask: 'hazard-heavy',
+          graphListSha256: 'a'.repeat(64),
+          runs: [{ id: 'C000', trainerSeed: 101, armBundleSha256: 'x', movementScore: [1] }]
+        })
+      );
+      const args = baseArgs({ taskInterventionRawScores: [{ arenaTask: 'hazard-heavy', path: rawPath }] });
+      expect(() => runArchiveReadouts(args)).toThrow(/needs --intervention-index/);
+    });
+
+    it('throws when a task raw-scores file\'s graphListSha256 does not match this invocation\'s --intervention-index', () => {
+      const graphBytes = Buffer.from('c000-graph-bytes');
+      const indexPath = writeFakeInterventionIndex(root, 'C000', graphBytes);
+      const rawPath = resolve(root, 'hazard-heavy-trained.json');
+      writeFileSync(
+        rawPath,
+        JSON.stringify({
+          arenaTask: 'hazard-heavy',
+          graphListSha256: 'f'.repeat(64), // wrong -- does not match indexPath's own sha256
+          runs: [{ id: 'C000', trainerSeed: 101, armBundleSha256: 'x', movementScore: [1] }]
+        })
+      );
+      const args = baseArgs({
+        interventionIndexPath: indexPath,
+        taskInterventionRawScores: [{ arenaTask: 'hazard-heavy', path: rawPath }]
+      });
+      expect(() => runArchiveReadouts(args)).toThrow(/does not match this invocation's --intervention-index sha256/);
+    });
+
+    it('throws when a task-intervention --source disagrees with the already-archived default-task graph', () => {
+      const existingDefaultEntry = makeEntry({
+        id: 'C000-seed101',
+        kind: 'intervention',
+        graphId: 'C000',
+        graphGzipSha256: 'gz-DIFFERENT-from-index',
+        graphBinarySha256: 'bin-DIFFERENT-from-index',
+        weightsSha256: 'default-c000-weights'
+      });
+      const outPath = resolve(root, 'trained-readouts-v1.json');
+      writeArchive(outPath, [existingDefaultEntry]);
+
+      const dir = resolve(root, 'c000-hazard-heavy-run-2');
+      writeTaskRunDir(dir, { armBundleSha256: 'sha-2' });
+
+      const indexPath = writeFakeInterventionIndex(root, 'C000', Buffer.from('c000-graph-bytes'));
+
+      const args = baseArgs({
+        out: outPath,
+        sources: [{ graphId: 'C000', idSuffix: null, runDir: dir }],
+        interventionIndexPath: indexPath
+      });
+
+      expect(() => runArchiveReadouts(args)).toThrow(/per-task readouts must use the same intervention graphs as the default task/);
+      // The archive must not have been overwritten with a partial/invalid write.
+      expect(loadExistingArchive(outPath)?.readouts).toEqual([existingDefaultEntry]);
+    });
   });
 });
 

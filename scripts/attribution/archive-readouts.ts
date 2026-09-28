@@ -18,6 +18,11 @@ import {
 import { copyInterventionIndex, readAndValidateInterventionIndex } from './intervention-index';
 import { buildInterventionSwapsArchive, extractInterventionSwaps } from './intervention-swaps';
 import { copyVerbatim } from './copy-verbatim';
+import {
+  assertTaskArmBundlesMatchRawScores,
+  readTaskInterventionRawScores,
+  type TaskArmBundleCheckable
+} from './task-intervention-raw-scores';
 
 /**
  * `.agents/plans/readout-attribution/01-archive-and-types.md`'s WP1: archive
@@ -95,6 +100,27 @@ export const DEFAULT_RAW_INTERVENTION_SCORES_OUT = resolve(repoRoot, 'training/a
 export const DEFAULT_INTERVENTION_INDEX_OUT = resolve(repoRoot, 'training/archive/intervention-index-v1.json');
 export const DEFAULT_INTERVENTION_SWAPS_OUT = resolve(repoRoot, 'training/archive/intervention-swaps-v1.json');
 
+/**
+ * WP1b: `<dir>/task-intervention-trained-raw-<arenaTask>-v1.json` -- one file
+ * per arena task (never merged into one file -- see
+ * `task-intervention-raw-scores.ts`'s doc comment), so each stays a
+ * byte-for-byte copy of that task's own `flyarena-s8z8` `trained.json`, each
+ * independently checkable against its own recorded sha256. `resolveArenaTask`
+ * validates `arenaTask` (throws on an unrecognized id) before it is
+ * interpolated into a filesystem path. `dir` is a parameter (like every
+ * other output's `*Out`/`*OutDir` field on `ArchiveReadoutsArgs`, overridable
+ * via `--task-intervention-raw-scores-out-dir`), never a `repoRoot`-rooted
+ * constant baked directly into this function: `runArchiveReadouts` is
+ * exercised directly (bypassing CLI parsing entirely) by its own unit tests,
+ * and a hard-coded `repoRoot` path here would make those tests write into
+ * this actual checkout's committed archive instead of an isolated tmpdir (a
+ * real bug caught while adding this module's own test coverage).
+ */
+export const DEFAULT_TASK_INTERVENTION_RAW_SCORES_OUT_DIR = resolve(repoRoot, 'training/archive');
+
+export const taskInterventionRawScoresOutPath = (dir: string, arenaTask: string): string =>
+  resolve(dir, `task-intervention-trained-raw-${resolveArenaTask(arenaTask).id}-v1.json`);
+
 // ---------------------------------------------------------------------------
 // Archive schema
 // ---------------------------------------------------------------------------
@@ -102,7 +128,7 @@ export const DEFAULT_INTERVENTION_SWAPS_OUT = resolve(repoRoot, 'training/archiv
 export type ArchivedReadoutKind = 'bigq' | 'intervention' | 'task-intervention';
 
 export interface ArchivedReadout {
-  /** `"<graphId>-seed<trainerSeed>[-<idSuffix>]"` -- unique within the archive (see `mergeReadouts`). Not guaranteed injective against an adversarially-chosen `graphId`/`idSuffix` containing `"-seed<digits>"` itself (string concatenation, not a structured key) -- not a live risk for this archive's own fixed `graphId` vocabulary (which does include the literal `"rewired-seed0"`, so a naive "reject `-seed\d` in labels" guard would incorrectly reject real data), but `mergeReadouts`' identity check is the actual safety net against a collision, not this format. */
+  /** `"<graphId>-seed<trainerSeed>[-<idSuffix>][-<arenaTask>]"` (the `arenaTask` suffix is automatic -- WP1b -- and omitted for `arenaTask: "default"`) -- unique within the archive (see `mergeReadouts`). Not guaranteed injective against an adversarially-chosen `graphId`/`idSuffix`/`arenaTask` containing `"-seed<digits>"` itself (string concatenation, not a structured key) -- not a live risk for this archive's own fixed `graphId`/`arenaTask` vocabularies (which do include the literal `"rewired-seed0"`, so a naive "reject `-seed\d` in labels" guard would incorrectly reject real data), but `mergeReadouts`' identity check is the actual safety net against a collision, not this format. */
   readonly id: string;
   readonly arm: ArmName;
   readonly kind: ArchivedReadoutKind;
@@ -120,6 +146,19 @@ export interface ArchivedReadout {
   readonly trainerSeed: number;
   /** `run.config.arenaTask`, or `'default'` when the run directory predates arena tasks. */
   readonly arenaTask: string;
+  /**
+   * WP1b: `resolveArenaTask(arenaTask).fingerprint` (`src/lib/arena/tasks.ts`)
+   * -- `undefined` for `arenaTask: "default"` (every WP1 bigq/intervention
+   * entry; the default task's fingerprint is a fixed, always-reproducible
+   * constant, and leaving it `undefined` here keeps those 23 already-committed
+   * entries' bytes reproducible bit-for-bit on a hypothetical future re-run
+   * of their own `--source` args -- see `IDENTITY_FIELDS`), always present
+   * for a `kind: "task-intervention"` entry. Recorded directly on the entry
+   * (not merely re-derivable by re-resolving `arenaTask`) so a reader/test
+   * can check it against `tests/fixtures/golden/tasks.json` without importing
+   * `resolveArenaTask` itself.
+   */
+  readonly arenaTaskFingerprint?: string;
   readonly graphArtifactSha256: string;
   /**
    * This run's arm bundle's own self-certifying hash. Training-time
@@ -240,6 +279,31 @@ export const parseSourceArg = (flag: string, value: string): SourceSpec => {
   return { graphId, idSuffix: idSuffixRaw.length > 0 ? idSuffixRaw : null, runDir: resolve(process.cwd(), runDir) };
 };
 
+export interface TaskInterventionRawScoreSpec {
+  readonly arenaTask: string;
+  readonly path: string;
+}
+
+/**
+ * `--task-intervention-raw-scores <arenaTaskId>=<path>` (WP1b, repeatable --
+ * one per task): `<path>` is a task's own `flyarena-s8z8`
+ * `null-trained-evaluate.ts --graph-list` rescore output (`trained.json`),
+ * copied verbatim into `taskInterventionRawScoresOutPath(outDir, arenaTaskId)`
+ * (`outDir` defaults to `DEFAULT_TASK_INTERVENTION_RAW_SCORES_OUT_DIR`,
+ * overridable with `--task-intervention-raw-scores-out-dir`). No `idSuffix`
+ * (unlike `--source`): one raw-scores file per arena task is the whole shape
+ * (`task-intervention-raw-scores.ts`'s doc comment).
+ */
+export const parseTaskInterventionRawScoresArg = (flag: string, value: string): TaskInterventionRawScoreSpec => {
+  const eq = value.indexOf('=');
+  if (eq <= 0) throw new Error(`${flag} must be "<arenaTaskId>=<path>", got "${value}"`);
+  const arenaTask = value.slice(0, eq);
+  const path = value.slice(eq + 1);
+  if (!path) throw new Error(`${flag} must be "<arenaTaskId>=<path>", got "${value}"`);
+  resolveArenaTask(arenaTask); // throws on an unrecognized arena-task id
+  return { arenaTask, path: resolve(process.cwd(), path) };
+};
+
 export interface ArchiveReadoutsArgs {
   readonly sources: readonly SourceSpec[];
   readonly out: string;
@@ -249,6 +313,8 @@ export interface ArchiveReadoutsArgs {
   readonly interventionIndexOut: string;
   readonly interventionAttributionPath: string | null;
   readonly interventionSwapsOut: string;
+  readonly taskInterventionRawScores: readonly TaskInterventionRawScoreSpec[];
+  readonly taskInterventionRawScoresOutDir: string;
 }
 
 export const parseArgs = (argv: readonly string[]): ArchiveReadoutsArgs => {
@@ -260,6 +326,8 @@ export const parseArgs = (argv: readonly string[]): ArchiveReadoutsArgs => {
   let interventionIndexOut = DEFAULT_INTERVENTION_INDEX_OUT;
   let interventionAttributionPath: string | null = null;
   let interventionSwapsOut = DEFAULT_INTERVENTION_SWAPS_OUT;
+  const taskInterventionRawScores: TaskInterventionRawScoreSpec[] = [];
+  let taskInterventionRawScoresOutDir = DEFAULT_TASK_INTERVENTION_RAW_SCORES_OUT_DIR;
 
   let index = 0;
   while (index < argv.length) {
@@ -288,6 +356,12 @@ export const parseArgs = (argv: readonly string[]): ArchiveReadoutsArgs => {
     } else if (flag === '--intervention-swaps-out') {
       interventionSwapsOut = resolve(process.cwd(), requireValue(flag, argv[index + 1]));
       index += 2;
+    } else if (flag === '--task-intervention-raw-scores') {
+      taskInterventionRawScores.push(parseTaskInterventionRawScoresArg(flag, requireValue(flag, argv[index + 1])));
+      index += 2;
+    } else if (flag === '--task-intervention-raw-scores-out-dir') {
+      taskInterventionRawScoresOutDir = resolve(process.cwd(), requireValue(flag, argv[index + 1]));
+      index += 2;
     } else {
       throw new Error(`Unknown argument: ${flag}`);
     }
@@ -297,12 +371,31 @@ export const parseArgs = (argv: readonly string[]): ArchiveReadoutsArgs => {
     sources.length === 0 &&
     rawInterventionScoresPath === null &&
     interventionIndexPath === null &&
-    interventionAttributionPath === null
+    interventionAttributionPath === null &&
+    taskInterventionRawScores.length === 0
   ) {
     throw new Error(
       'archive-readouts: at least one of --source/--raw-intervention-scores/--intervention-index/' +
-        '--intervention-attribution is required'
+        '--intervention-attribution/--task-intervention-raw-scores is required'
     );
+  }
+  // A dual-review finding: without this, two `--task-intervention-raw-scores`
+  // for the SAME arena task would both validate independently and the
+  // second would silently overwrite the first's output file (both resolve
+  // to the same `taskInterventionRawScoresOutPath`) -- unlike `mergeReadouts`,
+  // which always refuses to silently overwrite a conflicting entry. Checked
+  // here (all of `argv` parsed, one pass) rather than in `runArchiveReadouts`,
+  // so a CLI-level operator mistake is caught before any file is even read.
+  {
+    const seenArenaTasks = new Set<string>();
+    for (const spec of taskInterventionRawScores) {
+      if (seenArenaTasks.has(spec.arenaTask)) {
+        throw new Error(
+          `archive-readouts: --task-intervention-raw-scores "${spec.arenaTask}" was given more than once`
+        );
+      }
+      seenArenaTasks.add(spec.arenaTask);
+    }
   }
   for (const [flagName, path] of [
     ['--out', out],
@@ -321,7 +414,9 @@ export const parseArgs = (argv: readonly string[]): ArchiveReadoutsArgs => {
     interventionIndexPath,
     interventionIndexOut,
     interventionAttributionPath,
-    interventionSwapsOut
+    interventionSwapsOut,
+    taskInterventionRawScores,
+    taskInterventionRawScoresOutDir
   };
 };
 
@@ -393,7 +488,8 @@ export const buildArchivedReadout = (spec: Readonly<SourceSpec>): ArchivedReadou
   // Throws on an unrecognized arena-task id (`resolveArenaTask`'s own
   // contract) -- a run directory recording a bogus `arenaTask` is not
   // silently archived under a fabricated identity.
-  const arenaTaskId = resolveArenaTask(config.arenaTask).id;
+  const resolvedArenaTask = resolveArenaTask(config.arenaTask);
+  const arenaTaskId = resolvedArenaTask.id;
 
   assertArmMatchesGraphId(spec.graphId, config.arm);
 
@@ -418,7 +514,22 @@ export const buildArchivedReadout = (spec: Readonly<SourceSpec>): ArchivedReadou
     throw new Error(`archive-readouts: ${thetaPath} changed while archiving (weightsSha256 mismatch)`);
   }
 
-  const id = `${spec.graphId}-seed${config.trainerSeed}${spec.idSuffix ? `-${spec.idSuffix}` : ''}`;
+  // WP1b (dual-review finding): a non-default `arenaTaskId` is baked into
+  // the id AUTOMATICALLY -- never left to depend on the caller also
+  // remembering to pass a matching `--source graphId:<task>=...` idSuffix.
+  // Before this, id-uniqueness across arena tasks for the same
+  // `(graphId, trainerSeed)` pair (e.g. "P" at trainer seed 101 under both
+  // "hazard-heavy" and "sparse-food") relied entirely on operator
+  // convention; a missed idSuffix would not have corrupted data (`mergeReadouts`'s
+  // `IDENTITY_FIELDS` -- which includes `arenaTask` -- still throws on a
+  // resulting id collision, since the two entries disagree on `arenaTask`),
+  // but it would have failed loudly and late rather than being structurally
+  // impossible. `idSuffix` remains available for the orthogonal
+  // disambiguation case (default-task GPU rerun) and stacks with the
+  // task suffix, but is never REQUIRED for task uniqueness.
+  const id = `${spec.graphId}-seed${config.trainerSeed}${spec.idSuffix ? `-${spec.idSuffix}` : ''}${
+    arenaTaskId === 'default' ? '' : `-${arenaTaskId}`
+  }`;
 
   return {
     id,
@@ -427,6 +538,7 @@ export const buildArchivedReadout = (spec: Readonly<SourceSpec>): ArchivedReadou
     graphId: spec.graphId,
     trainerSeed: config.trainerSeed,
     arenaTask: arenaTaskId,
+    arenaTaskFingerprint: arenaTaskId === 'default' ? undefined : resolvedArenaTask.fingerprint,
     graphArtifactSha256,
     armBundleSha256: config.armBundleSha256,
     // Filled in by `attachGraphIdentity` in `runArchiveReadouts` (needs
@@ -465,6 +577,7 @@ const IDENTITY_FIELDS = [
   'graphId',
   'trainerSeed',
   'arenaTask',
+  'arenaTaskFingerprint',
   'armBundleSha256',
   'graphArtifactSha256',
   'graphGzipSha256',
@@ -597,6 +710,49 @@ const applyGraphIdentity = (entry: ArchivedReadout, identity: GraphIdentity | nu
   graphBinarySha256: identity?.graphBinarySha256 ?? null
 });
 
+/**
+ * WP1b (`01-archive-and-types.md`): "The per-task runs use the same
+ * intervention graphs as the default task, and archive-readouts must verify
+ * this rather than assume it." `attachGraphIdentity` above already RESOLVES
+ * each `task-intervention` addition's `graphGzipSha256`/`graphBinarySha256`
+ * independently -- re-verified against the actual graph bytes on disk for
+ * *this* invocation's `--intervention-index` (`graph-identity.ts`). This is
+ * the separate cross-check that the resolved identity actually lands on the
+ * SAME graph the already-archived default-task `"intervention"` entry for
+ * this `graphId` has on file -- not merely that both happened to be resolved
+ * from an `--intervention-index` file that claims the same id (a caller
+ * could point `--intervention-index` at a different, stale copy of the graph
+ * list for a per-task invocation; this catches that rather than silently
+ * trusting it, because it compares against the archive's own already-verified
+ * record, not against the input the current invocation is trying to verify).
+ * A no-op for any other `kind`.
+ */
+export const assertTaskGraphMatchesDefaultGraph = (
+  addition: Readonly<ArchivedReadout>,
+  existingReadouts: readonly ArchivedReadout[]
+): void => {
+  if (addition.kind !== 'task-intervention') return;
+  const defaultEntry = existingReadouts.find((entry) => entry.kind === 'intervention' && entry.graphId === addition.graphId);
+  if (!defaultEntry) {
+    throw new Error(
+      `archive-readouts: task-intervention entry "${addition.id}" (graphId "${addition.graphId}") has no already-` +
+        'archived default-task "intervention" entry for that graphId to verify its graph against -- archive the ' +
+        'default-task WP1 entries first'
+    );
+  }
+  if (
+    addition.graphGzipSha256 !== defaultEntry.graphGzipSha256 ||
+    addition.graphBinarySha256 !== defaultEntry.graphBinarySha256
+  ) {
+    throw new Error(
+      `archive-readouts: task-intervention entry "${addition.id}"'s graph (gzip ${addition.graphGzipSha256}, ` +
+        `binary ${addition.graphBinarySha256}) does not match the default-task "${defaultEntry.id}" entry's graph ` +
+        `(gzip ${defaultEntry.graphGzipSha256}, binary ${defaultEntry.graphBinarySha256}) for graphId ` +
+        `"${addition.graphId}" -- per-task readouts must use the same intervention graphs as the default task`
+    );
+  }
+};
+
 export interface RunArchiveReadoutsResult {
   readonly out: string;
   readonly readoutCount: number;
@@ -624,6 +780,36 @@ export const runArchiveReadouts = (args: Readonly<ArchiveReadoutsArgs>): RunArch
     ? buildInterventionSwapsArchive(args.interventionAttributionPath)
     : null;
 
+  // WP1b: `--task-intervention-raw-scores` requires `--intervention-index` in
+  // the SAME invocation -- there is no fixed, always-available repo file to
+  // check `graphListSha256` against (mirrors `attachGraphIdentity`'s own
+  // requirement for `task-intervention` `--source` additions).
+  if (args.taskInterventionRawScores.length > 0 && !interventionIndexResult) {
+    throw new Error(
+      'archive-readouts: --task-intervention-raw-scores needs --intervention-index in the same invocation, to ' +
+        "verify each task's graphListSha256 against the same intervention graph list the per-task readouts resolve against"
+    );
+  }
+  const taskRawFiles = args.taskInterventionRawScores.map((spec) => {
+    const read = readTaskInterventionRawScores(spec.path, spec.arenaTask);
+    // "The per-task runs use the same intervention graphs as the default
+    // task, and archive-readouts must verify this rather than assume it"
+    // (01-archive-and-types.md) -- checked here at the raw-scores level too,
+    // not only per readout (`assertTaskGraphMatchesDefaultGraph` below):
+    // this task's own rescore was run against the exact byte-verified
+    // `--intervention-index` this invocation is using, not merely a
+    // same-shaped file.
+    const indexSha256 = sha256Hex(interventionIndexResult!.rawBytes);
+    if (read.parsed.graphListSha256 !== indexSha256) {
+      throw new Error(
+        `archive-readouts: ${spec.path}'s graphListSha256 ${read.parsed.graphListSha256} does not match this ` +
+          `invocation's --intervention-index sha256 ${indexSha256} -- the per-task rescore was not run against ` +
+          'the same intervention graph list the default task uses'
+      );
+    }
+    return { arenaTask: spec.arenaTask, path: spec.path, ...read };
+  });
+
   let additions: readonly ArchivedReadout[] = args.sources.map(buildArchivedReadout);
   additions = attachGraphIdentity(additions, {
     manifestPath: DEFAULT_MANIFEST_PATH,
@@ -632,9 +818,14 @@ export const runArchiveReadouts = (args: Readonly<ArchiveReadoutsArgs>): RunArch
       : null
   });
   if (rawScores) assertArmBundlesMatchRawScores(additions, rawScores.runs);
+  for (const taskRawFile of taskRawFiles) {
+    assertTaskArmBundlesMatchRawScores(additions as readonly TaskArmBundleCheckable[], taskRawFile.arenaTask, taskRawFile.parsed.runs);
+  }
 
   const existing = args.sources.length > 0 ? loadExistingArchive(args.out) : null;
-  const mergedReadouts = args.sources.length > 0 ? mergeReadouts(existing?.readouts ?? [], additions) : null;
+  const existingReadouts = existing?.readouts ?? [];
+  for (const addition of additions) assertTaskGraphMatchesDefaultGraph(addition, existingReadouts);
+  const mergedReadouts = args.sources.length > 0 ? mergeReadouts(existingReadouts, additions) : null;
 
   // -- Phase 2: every input validated -- now write. --
   const wrote: string[] = [];
@@ -654,6 +845,11 @@ export const runArchiveReadouts = (args: Readonly<ArchiveReadoutsArgs>): RunArch
     mkdirSync(dirname(args.interventionSwapsOut), { recursive: true });
     atomicWriteFileSync(args.interventionSwapsOut, JSON.stringify(swapsArchive));
     wrote.push(args.interventionSwapsOut);
+  }
+  for (const taskRawFile of taskRawFiles) {
+    const outPath = taskInterventionRawScoresOutPath(args.taskInterventionRawScoresOutDir, taskRawFile.arenaTask);
+    copyVerbatim(taskRawFile.path, outPath, taskRawFile.rawBytes);
+    wrote.push(outPath);
   }
 
   const readoutCount = mergedReadouts?.length ?? loadExistingArchive(args.out)?.readouts.length ?? 0;
