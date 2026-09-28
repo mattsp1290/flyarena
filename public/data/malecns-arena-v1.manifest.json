@@ -2,7 +2,7 @@
   "artifact": "malecns-arena-v1.bin.gz",
   "behaviorRepertoireNull": {
     "artifact": "behavior-repertoire-null-v1.json",
-    "sha256": "1a923656beed7b6ecd494f542cd38bdcafc86775289209477665e83111a54bf2"
+    "sha256": "8b95ac509a58e03d410c25c1058b8b037ed6d8f76aea688f26505f856601d6ac"
   },
   "binaryBytes": 399792,
   "binarySha256": "f1a0f982ffdfba12ecb2206d064c3dc1ceaae7cffa06a22049093d69a79098f7",
