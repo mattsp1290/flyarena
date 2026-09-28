@@ -12,6 +12,7 @@ import {
   type PathwayInterventionsLoadResult
 } from '../../src/lib/experiment/pathwayInterventions';
 import { loadRepertoireNull, type RepertoireNullArtifact, type RepertoireNullLoadResult } from '../../src/lib/experiment/repertoireNull';
+import { loadTaskGenerality, type TaskGeneralityArtifact, type TaskGeneralityLoadResult } from '../../src/lib/experiment/taskGenerality';
 import { createPublicDataFetch } from '../helpers/fake-worker';
 
 /**
@@ -41,6 +42,7 @@ let realRewiringNull: RewiringNullArtifact;
 let realNullExplanation: NullExplanationArtifact;
 let realPathwayInterventions: PathwayInterventionsArtifact;
 let realRepertoireNull: RepertoireNullArtifact;
+let realTaskGenerality: TaskGeneralityArtifact;
 
 beforeAll(async () => {
   vi.stubGlobal('fetch', createPublicDataFetch());
@@ -48,16 +50,19 @@ beforeAll(async () => {
   const nullExplanationResult = await loadNullExplanation(manifest, '/data');
   const pathwayInterventionsResult = await loadPathwayInterventions(manifest, '/data');
   const repertoireNullResult = await loadRepertoireNull(manifest, '/data');
+  const taskGeneralityResult = await loadTaskGenerality(manifest, '/data');
   if (rewiringNullResult.status !== 'ok') throw new Error(`Fixture setup: rewiringNull is "${rewiringNullResult.status}"`);
   if (nullExplanationResult.status !== 'ok') throw new Error(`Fixture setup: nullExplanation is "${nullExplanationResult.status}"`);
   if (pathwayInterventionsResult.status !== 'ok') {
     throw new Error(`Fixture setup: pathwayInterventions is "${pathwayInterventionsResult.status}"`);
   }
   if (repertoireNullResult.status !== 'ok') throw new Error(`Fixture setup: repertoireNull is "${repertoireNullResult.status}"`);
+  if (taskGeneralityResult.status !== 'ok') throw new Error(`Fixture setup: taskGenerality is "${taskGeneralityResult.status}"`);
   realRewiringNull = rewiringNullResult.data;
   realNullExplanation = nullExplanationResult.data;
   realPathwayInterventions = pathwayInterventionsResult.data;
   realRepertoireNull = repertoireNullResult.data;
+  realTaskGenerality = taskGeneralityResult.data;
   vi.unstubAllGlobals();
 });
 
@@ -76,6 +81,10 @@ const repertoireNullOk = (data: RepertoireNullArtifact = realRepertoireNull): Re
   status: 'ok',
   data
 });
+const taskGeneralityOk = (data: TaskGeneralityArtifact = realTaskGenerality): TaskGeneralityLoadResult => ({
+  status: 'ok',
+  data
+});
 
 const baseInputs = (): BuildFindingStepsInputs => ({
   manifest,
@@ -83,7 +92,8 @@ const baseInputs = (): BuildFindingStepsInputs => ({
   rewiringNull: rewiringNullOk(),
   nullExplanation: nullExplanationOk(),
   pathwayInterventions: pathwayInterventionsOk(),
-  repertoireNull: repertoireNullOk()
+  repertoireNull: repertoireNullOk(),
+  taskGenerality: taskGeneralityOk()
 });
 
 const findStep = (steps: readonly FindingStep[], id: string): FindingStep => {
@@ -93,7 +103,7 @@ const findStep = (steps: readonly FindingStep[], id: string): FindingStep => {
 };
 
 describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
-  it('builds exactly seven steps, in evidence-chain order', () => {
+  it('builds exactly eight steps, in evidence-chain order', () => {
     const steps = buildFindingSteps(baseInputs());
     expect(steps.map((step) => step.id)).toEqual([
       'rewiring-null',
@@ -102,6 +112,7 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
       'intervention',
       'trained-null',
       'trained-interventions',
+      'task-generality',
       'behavior-repertoire'
     ]);
   });
@@ -321,7 +332,117 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     expect(step.sentence).not.toContain('reporting convention');
   });
 
-  it('step 7 (behavior repertoire) states the real primary category, occupied count, rewired median, and search-seed robustness', () => {
+  it('step 7 (task generality) states the real authored/trained overall verdicts, under this model', () => {
+    const steps = buildFindingSteps(baseInputs());
+    const step = findStep(steps, 'task-generality');
+    expect(step.status).toBe('ok');
+    expect(step.condition).toBe('both');
+    // Real shipped data: authored is general (3 of 4 non-degenerate tasks
+    // hold and generalize), trained is task-dependent (no task reaches a
+    // robust pathway-supported result).
+    expect(realTaskGenerality.overall.authored.verdict).toBe('general');
+    expect(realTaskGenerality.overall.trained.verdict).toBe('task-dependent');
+    expect(step.sentence).toContain(`${realTaskGenerality.tasks.length} task variants`);
+    expect(step.sentence).toContain('authored: general');
+    expect(step.sentence).toContain('trained: task-dependent');
+    // A single-seed pathway-supported hit is disclosed as "not robust"
+    // alongside its category, never only in a footnote.
+    expect(step.sentence).toMatch(/not robust/);
+    expect(step.sentence).toMatch(/under this model\.$/);
+    expect(step.provenance).toHaveLength(1);
+    expect(step.provenance[0].sha256Prefix).toBe(manifest.taskGenerality?.sha256.slice(0, 12));
+  });
+
+  it('step 7 states "general" for both authored and trained when every non-degenerate task generalizes/reaches a robust pathway-supported category', () => {
+    const general: TaskGeneralityArtifact = {
+      version: 1,
+      sources: realTaskGenerality.sources,
+      tasks: (['hazard-heavy', 'sparse-food', 'no-movement', 'crowded'] as const).map((id) => ({
+        id,
+        categorized: true,
+        null: { nullHolds: true, degenerate: false },
+        pathway: { category: 'pathway-supported', generalizes: true },
+        trained: {
+          degenerate: false,
+          trainedRobust: true,
+          category: 'pathway-supported',
+          perSeed: { '101': 'pathway-supported', '202': 'pathway-supported', '303': 'pathway-supported' }
+        }
+      })),
+      overall: {
+        authored: { verdict: 'general', nonDegenerateCount: 4, totalCount: 4 },
+        trained: { verdict: 'general', nonDegenerateCount: 4, totalCount: 4 }
+      }
+    };
+    const step = findStep(buildFindingSteps({ ...baseInputs(), taskGenerality: taskGeneralityOk(general) }), 'task-generality');
+    expect(step.sentence).toContain('authored: general');
+    expect(step.sentence).toContain('trained: general');
+    expect(step.sentence).not.toContain('not robust');
+    // "non-degenerate" is expected static text even in the general branch
+    // (the parenthetical count) -- only a per-task "<id>: degenerate" clause
+    // (the task-dependent listing) would be wrong here.
+    expect(step.sentence).not.toMatch(/: degenerate/);
+  });
+
+  it('step 7 lists per-task detail, including a degenerate task, when the authored side is task-dependent', () => {
+    const taskDependent: TaskGeneralityArtifact = {
+      ...realTaskGenerality,
+      tasks: [
+        {
+          id: 'no-movement',
+          categorized: false,
+          null: { nullHolds: true, degenerate: false },
+          pathway: { category: 'degenerate', generalizes: false },
+          trained: { degenerate: true }
+        },
+        {
+          id: 'hazard-heavy',
+          categorized: true,
+          null: { nullHolds: true, degenerate: false },
+          pathway: { category: 'not-supported', generalizes: false },
+          trained: {
+            degenerate: false,
+            trainedRobust: true,
+            category: 'no-specific-effect',
+            perSeed: { '101': 'no-specific-effect', '202': 'no-specific-effect', '303': 'no-specific-effect' }
+          }
+        }
+      ],
+      overall: {
+        authored: { verdict: 'task-dependent', nonDegenerateCount: 1, totalCount: 2 },
+        trained: { verdict: 'task-dependent', nonDegenerateCount: 1, totalCount: 2 }
+      }
+    };
+    const step = findStep(buildFindingSteps({ ...baseInputs(), taskGenerality: taskGeneralityOk(taskDependent) }), 'task-generality');
+    expect(step.sentence).toContain('authored: task-dependent');
+    expect(step.sentence).toContain('no-movement: degenerate');
+    expect(step.sentence).toContain('hazard-heavy: not-supported');
+    expect(step.sentence).toContain('trained: task-dependent');
+  });
+
+  it('step 7 is "missing" with no sentence when the task-generality artifact has not been published', () => {
+    const steps = buildFindingSteps({
+      ...baseInputs(),
+      taskGenerality: { status: 'missing', reason: 'The manifest has no taskGenerality artifact entry.' }
+    });
+    const step = findStep(steps, 'task-generality');
+    expect(step.status).toBe('missing');
+    expect(step.sentence).toBeUndefined();
+  });
+
+  it('step 7 is "invalid" with the honest reason when the task-generality artifact fails verification, without affecting other steps', () => {
+    const steps = buildFindingSteps({
+      ...baseInputs(),
+      taskGenerality: { status: 'invalid', reason: 'sha256 mismatch' }
+    });
+    const step = findStep(steps, 'task-generality');
+    expect(step.status).toBe('invalid');
+    expect(step.reason).toBe('sha256 mismatch');
+    expect(findStep(steps, 'rewiring-null').status).toBe('ok');
+    expect(findStep(steps, 'behavior-repertoire').status).toBe('ok');
+  });
+
+  it('step 8 (behavior repertoire) states the real primary category, occupied count, rewired median, and search-seed robustness', () => {
     const steps = buildFindingSteps(baseInputs());
     const step = findStep(steps, 'behavior-repertoire');
     expect(step.status).toBe('ok');
@@ -339,7 +460,7 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     expect(step.provenance[0].sha256Prefix).toBe(manifest.behaviorRepertoireNull?.sha256.slice(0, 12));
   });
 
-  it('step 7 states "robust across all 5 search seeds" when every seed agrees', () => {
+  it('step 8 states "robust across all 5 search seeds" when every seed agrees', () => {
     const robust: RepertoireNullArtifact = {
       ...realRepertoireNull,
       robustness: {
@@ -353,7 +474,7 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     expect(step.sentence).not.toContain('not robust');
   });
 
-  it('step 7 is "missing" with no sentence when the repertoire-null artifact has not been published', () => {
+  it('step 8 is "missing" with no sentence when the repertoire-null artifact has not been published', () => {
     const steps = buildFindingSteps({
       ...baseInputs(),
       repertoireNull: { status: 'missing', reason: 'The manifest has no behaviorRepertoireNull artifact entry.' }
@@ -370,7 +491,8 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
       rewiringNull: undefined,
       nullExplanation: undefined,
       pathwayInterventions: undefined,
-      repertoireNull: undefined
+      repertoireNull: undefined,
+      taskGenerality: undefined
     });
     expect(findStep(steps, 'rewiring-null').status).toBe('loading');
     expect(findStep(steps, 'mirrored-decoder').status).toBe('loading');
@@ -378,6 +500,7 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     expect(findStep(steps, 'intervention').status).toBe('loading');
     expect(findStep(steps, 'trained-null').status).toBe('loading');
     expect(findStep(steps, 'trained-interventions').status).toBe('loading');
+    expect(findStep(steps, 'task-generality').status).toBe('loading');
     expect(findStep(steps, 'behavior-repertoire').status).toBe('loading');
   });
 

@@ -7,6 +7,7 @@ import type { RewiringNullLoadResult } from '../../src/lib/experiment/rewiringNu
 import type { NullExplanationLoadResult } from '../../src/lib/experiment/nullExplanation';
 import type { PathwayInterventionsLoadResult } from '../../src/lib/experiment/pathwayInterventions';
 import type { RepertoireNullLoadResult } from '../../src/lib/experiment/repertoireNull';
+import type { TaskGeneralityLoadResult } from '../../src/lib/experiment/taskGenerality';
 import type { ExperimentStatus } from '../../src/lib/experiment/state';
 import type { DecoderKind } from '../../src/lib/worker/protocol';
 import { createPublicDataFetch, FakeNeuralWorker } from '../helpers/fake-worker';
@@ -34,6 +35,7 @@ export type TestControllerCallbacks = ExperimentControllerCallbacks & {
   nullExplanationResults: NullExplanationLoadResult[];
   pathwayInterventionsResults: PathwayInterventionsLoadResult[];
   repertoireNullResults: RepertoireNullLoadResult[];
+  taskGeneralityResults: TaskGeneralityLoadResult[];
   decodersApplied: DecoderKind[];
 };
 
@@ -47,6 +49,7 @@ export const createCallbacks = (): TestControllerCallbacks => {
   const nullExplanationResults: NullExplanationLoadResult[] = [];
   const pathwayInterventionsResults: PathwayInterventionsLoadResult[] = [];
   const repertoireNullResults: RepertoireNullLoadResult[] = [];
+  const taskGeneralityResults: TaskGeneralityLoadResult[] = [];
   const decodersApplied: DecoderKind[] = [];
   return {
     statuses,
@@ -58,6 +61,7 @@ export const createCallbacks = (): TestControllerCallbacks => {
     nullExplanationResults,
     pathwayInterventionsResults,
     repertoireNullResults,
+    taskGeneralityResults,
     decodersApplied,
     onStatusChange: (status) => statuses.push(status),
     onTelemetry: vi.fn(),
@@ -70,6 +74,7 @@ export const createCallbacks = (): TestControllerCallbacks => {
     onNullExplanation: (result) => nullExplanationResults.push(result),
     onPathwayInterventions: (result) => pathwayInterventionsResults.push(result),
     onRepertoireNull: (result) => repertoireNullResults.push(result),
+    onTaskGenerality: (result) => taskGeneralityResults.push(result),
     onDecoderApplied: (decoder) => decodersApplied.push(decoder)
   };
 };

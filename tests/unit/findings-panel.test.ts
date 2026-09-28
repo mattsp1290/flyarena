@@ -13,6 +13,7 @@ import {
   type PathwayInterventionsLoadResult
 } from '../../src/lib/experiment/pathwayInterventions';
 import { loadRepertoireNull, type RepertoireNullArtifact, type RepertoireNullLoadResult } from '../../src/lib/experiment/repertoireNull';
+import { loadTaskGenerality, type TaskGeneralityArtifact, type TaskGeneralityLoadResult } from '../../src/lib/experiment/taskGenerality';
 import { createPublicDataFetch } from '../helpers/fake-worker';
 
 /**
@@ -41,6 +42,7 @@ let realRewiringNull: RewiringNullArtifact;
 let realNullExplanation: NullExplanationArtifact;
 let realPathwayInterventions: PathwayInterventionsArtifact;
 let realRepertoireNull: RepertoireNullArtifact;
+let realTaskGenerality: TaskGeneralityArtifact;
 
 beforeAll(async () => {
   vi.stubGlobal('fetch', createPublicDataFetch());
@@ -48,16 +50,19 @@ beforeAll(async () => {
   const nullExplanationResult = await loadNullExplanation(manifest, '/data');
   const pathwayInterventionsResult = await loadPathwayInterventions(manifest, '/data');
   const repertoireNullResult = await loadRepertoireNull(manifest, '/data');
+  const taskGeneralityResult = await loadTaskGenerality(manifest, '/data');
   if (rewiringNullResult.status !== 'ok') throw new Error(`Fixture setup: rewiringNull is "${rewiringNullResult.status}"`);
   if (nullExplanationResult.status !== 'ok') throw new Error(`Fixture setup: nullExplanation is "${nullExplanationResult.status}"`);
   if (pathwayInterventionsResult.status !== 'ok') {
     throw new Error(`Fixture setup: pathwayInterventions is "${pathwayInterventionsResult.status}"`);
   }
   if (repertoireNullResult.status !== 'ok') throw new Error(`Fixture setup: repertoireNull is "${repertoireNullResult.status}"`);
+  if (taskGeneralityResult.status !== 'ok') throw new Error(`Fixture setup: taskGenerality is "${taskGeneralityResult.status}"`);
   realRewiringNull = rewiringNullResult.data;
   realNullExplanation = nullExplanationResult.data;
   realPathwayInterventions = pathwayInterventionsResult.data;
   realRepertoireNull = repertoireNullResult.data;
+  realTaskGenerality = taskGeneralityResult.data;
   vi.unstubAllGlobals();
 });
 
@@ -66,7 +71,8 @@ const okProps = () => ({
   rewiringNull: { status: 'ok', data: realRewiringNull } as RewiringNullLoadResult,
   nullExplanation: { status: 'ok', data: realNullExplanation } as NullExplanationLoadResult,
   pathwayInterventions: { status: 'ok', data: realPathwayInterventions } as PathwayInterventionsLoadResult,
-  repertoireNull: { status: 'ok', data: realRepertoireNull } as RepertoireNullLoadResult
+  repertoireNull: { status: 'ok', data: realRepertoireNull } as RepertoireNullLoadResult,
+  taskGenerality: { status: 'ok', data: realTaskGenerality } as TaskGeneralityLoadResult
 });
 
 describe('FindingsPanel', () => {
@@ -77,7 +83,7 @@ describe('FindingsPanel', () => {
     expect(screen.queryByRole('list')).not.toBeInTheDocument();
   });
 
-  it('expanding shows the seven-step list and flips aria-expanded', async () => {
+  it('expanding shows the eight-step list and flips aria-expanded', async () => {
     const { container } = render(FindingsPanel, okProps());
     const toggle = screen.getByRole('button', { name: /^expand$/i });
     await fireEvent.click(toggle);
@@ -85,7 +91,7 @@ describe('FindingsPanel', () => {
     // Scoped to the top-level step `<li>`s specifically -- `getAllByRole('listitem')`
     // would also pick up each step's own nested `<ul class="provenance">` items.
     const items = container.querySelectorAll('ol.steps > li.step');
-    expect(items).toHaveLength(7);
+    expect(items).toHaveLength(8);
   });
 
   it('the header names the model framing constraint verbatim', async () => {
@@ -95,13 +101,13 @@ describe('FindingsPanel', () => {
     ).toBeInTheDocument();
   });
 
-  it('step 1 has aria-current="step" by default once expanded, and the live region announces "Step 1 of 7"', async () => {
+  it('step 1 has aria-current="step" by default once expanded, and the live region announces "Step 1 of 8"', async () => {
     const { container } = render(FindingsPanel, okProps());
     await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
     const items = container.querySelectorAll('ol.steps > li.step');
     expect(items[0]).toHaveAttribute('aria-current', 'step');
     for (const item of Array.from(items).slice(1)) expect(item).not.toHaveAttribute('aria-current');
-    expect(screen.getByText('Step 1 of 7')).toBeInTheDocument();
+    expect(screen.getByText('Step 1 of 8')).toBeInTheDocument();
   });
 
   it('Next moves aria-current to step 2, moves focus to its heading, and updates the live region', async () => {
@@ -111,19 +117,19 @@ describe('FindingsPanel', () => {
     const items = container.querySelectorAll('ol.steps > li.step');
     expect(items[0]).not.toHaveAttribute('aria-current');
     expect(items[1]).toHaveAttribute('aria-current', 'step');
-    expect(screen.getByText('Step 2 of 7')).toBeInTheDocument();
+    expect(screen.getByText('Step 2 of 8')).toBeInTheDocument();
     const heading = screen.getByRole('heading', { name: /2\. mirrored decoder/i });
     expect(heading).toHaveFocus();
   });
 
-  it('Previous is disabled on step 1 and Next is disabled on step 7', async () => {
+  it('Previous is disabled on step 1 and Next is disabled on step 8', async () => {
     render(FindingsPanel, okProps());
     await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
     expect(screen.getByRole('button', { name: /^previous$/i })).toBeDisabled();
-    for (let i = 0; i < 6; i += 1) {
+    for (let i = 0; i < 7; i += 1) {
       await fireEvent.click(screen.getByRole('button', { name: /^next$/i }));
     }
-    expect(screen.getByText('Step 7 of 7')).toBeInTheDocument();
+    expect(screen.getByText('Step 8 of 8')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /^next$/i })).toBeDisabled();
   });
 
@@ -134,17 +140,36 @@ describe('FindingsPanel', () => {
     await fireEvent.click(screen.getByRole('button', { name: /^previous$/i }));
     const heading = screen.getByRole('heading', { name: /1\. rewiring null/i });
     expect(heading).toHaveFocus();
-    expect(screen.getByText('Step 1 of 7')).toBeInTheDocument();
+    expect(screen.getByText('Step 1 of 8')).toBeInTheDocument();
   });
 
-  it('step 7 (behavior repertoire) states the real category and links to the atlas', async () => {
+  it('step 7 (task generality) states the real overall verdicts and links to the report', async () => {
+    render(FindingsPanel, okProps());
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    const step7 = document.querySelectorAll('ol.steps > li.step')[6] as HTMLElement;
+    const sentence = step7.querySelector('p.sentence') as HTMLElement;
+    expect(sentence.textContent).toMatch(new RegExp(`authored: ${realTaskGenerality.overall.authored.verdict}`));
+    expect(sentence.textContent).toMatch(new RegExp(`trained: ${realTaskGenerality.overall.trained.verdict}`));
+    expect(sentence.textContent).toMatch(/under this model\.$/);
+  });
+
+  it('step 7 shows "Not yet published" when the task-generality artifact is missing', async () => {
+    render(FindingsPanel, {
+      ...okProps(),
+      taskGenerality: { status: 'missing', reason: 'The manifest has no taskGenerality artifact entry.' } as TaskGeneralityLoadResult
+    });
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    expect(screen.getByText('Not yet published')).toBeInTheDocument();
+  });
+
+  it('step 8 (behavior repertoire) states the real category and links to the atlas', async () => {
     render(FindingsPanel, okProps());
     await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
     expect(screen.getByText(new RegExp(`biological occupies ${realRepertoireNull.primary.bio.occupied} of 36`))).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /behavior atlas/i })).toHaveAttribute('href', '#atlas');
   });
 
-  it('step 7 shows "Not yet published" when the repertoire-null artifact is missing', async () => {
+  it('step 8 shows "Not yet published" when the repertoire-null artifact is missing', async () => {
     render(FindingsPanel, {
       ...okProps(),
       repertoireNull: {

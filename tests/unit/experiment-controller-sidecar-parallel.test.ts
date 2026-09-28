@@ -4,12 +4,13 @@ import { createCallbacks, createWorker, SEED, TOTAL_TICKS, useControllerTestLife
 
 /**
  * Thermo-maintainability review (Important, I1): `ExperimentController#initialize()`
- * used to chain its four sidecar loads (rewiring-null, null-explanation,
- * pathway-interventions, repertoire-null) in sequence, each waiting on the
- * previous one's settled promise, even though every one of them only needs
+ * used to chain its sidecar loads (rewiring-null, null-explanation,
+ * pathway-interventions, repertoire-null, and — since task-generality WP4 —
+ * task-generality) in sequence, each waiting on the previous one's settled
+ * promise, even though every one of them only needs
  * `artifacts.manifest`/`dataBaseUrl` -- already available the instant the
  * arena artifacts load, not the *result* of any other sidecar load. Fixed
- * by firing all four directly off the manifest in parallel (see
+ * by firing all five directly off the manifest in parallel (see
  * `controller.ts`'s `runSidecarLoad` doc comment and each fork's own
  * comment). The per-sidecar test files
  * (`experiment-controller-null-explanation.test.ts`,
@@ -18,14 +19,14 @@ import { createCallbacks, createWorker, SEED, TOTAL_TICKS, useControllerTestLife
  * one loader still fires when the *specific* loader immediately before it
  * in the old chain fails" -- this file adds the one thing none of those
  * pairwise tests covers: that a single loader failing (throwing) does not
- * block *any* of the other three from firing, all four wired up in the
- * same `initialize()` call at once.
+ * block *any* of the other four from firing, all five wired up in the same
+ * `initialize()` call at once.
  */
 
 const { trackController } = useControllerTestLifecycle();
 
-describe('ExperimentController: one sidecar loader failing does not block the other three', () => {
-  it('still dispatches onRewiringNull/onNullExplanation/onRepertoireNull as "ok" (or their real committed-artifact result) when loadPathwayInterventions throws synchronously', async () => {
+describe('ExperimentController: one sidecar loader failing does not block the other four', () => {
+  it('still dispatches onRewiringNull/onNullExplanation/onRepertoireNull/onTaskGenerality as "ok" (or their real committed-artifact result) when loadPathwayInterventions throws synchronously', async () => {
     const callbacks = createCallbacks();
     const controller = new ExperimentController({
       seed: SEED,
@@ -46,17 +47,22 @@ describe('ExperimentController: one sidecar loader failing does not block the ot
     await vi.waitFor(() => expect(callbacks.pathwayInterventionsResults).toHaveLength(1));
     expect(callbacks.pathwayInterventionsResults[0].status).toBe('unavailable');
 
-    // The other three loaders -- fired in parallel, off the same manifest,
+    // The other four loaders -- fired in parallel, off the same manifest,
     // never chained through the failing one -- all still resolve.
+    // `taskGenerality` itself cross-checks against the (now unavailable, not
+    // merely absent) `pathwayInterventions` artifact only via the manifest's
+    // *pinned* sha, never the failed load result, so it still resolves `ok`.
     await vi.waitFor(() => expect(callbacks.rewiringNullResults).toHaveLength(1));
     await vi.waitFor(() => expect(callbacks.nullExplanationResults).toHaveLength(1));
     await vi.waitFor(() => expect(callbacks.repertoireNullResults).toHaveLength(1));
+    await vi.waitFor(() => expect(callbacks.taskGeneralityResults).toHaveLength(1));
     expect(callbacks.rewiringNullResults[0].status).toBe('ok');
     expect(callbacks.nullExplanationResults[0].status).toBe('ok');
     expect(callbacks.repertoireNullResults[0].status).toBe('ok');
+    expect(callbacks.taskGeneralityResults[0].status).toBe('ok');
   });
 
-  it('all four sidecar loaders are invoked in the same microtask turn (no fork waits on another to even start)', async () => {
+  it('all five sidecar loaders are invoked in the same microtask turn (no fork waits on another to even start)', async () => {
     const started: string[] = [];
     const callbacks = createCallbacks();
     const controller = new ExperimentController({
@@ -84,18 +90,23 @@ describe('ExperimentController: one sidecar loader failing does not block the ot
         started.push('repertoireNull');
         const { loadRepertoireNull } = await import('../../src/lib/experiment/repertoireNull');
         return loadRepertoireNull(manifest, dataBaseUrl);
+      },
+      loadTaskGenerality: async (manifest, dataBaseUrl) => {
+        started.push('taskGenerality');
+        const { loadTaskGenerality } = await import('../../src/lib/experiment/taskGenerality');
+        return loadTaskGenerality(manifest, dataBaseUrl);
       }
     });
     trackController(controller);
 
     await controller.initialize();
 
-    // All four were already invoked by the time `initialize()`'s own
+    // All five were already invoked by the time `initialize()`'s own
     // returned promise resolves -- if any fork were still chained behind
     // another (the old sequential shape), the later ones would not have
     // started yet at this point (they only would have after that earlier
     // fork's own fetch/verify round trip settled, well after `initialize()`
     // itself returns).
-    expect(started.sort()).toEqual(['nullExplanation', 'pathwayInterventions', 'repertoireNull', 'rewiringNull']);
+    expect(started.sort()).toEqual(['nullExplanation', 'pathwayInterventions', 'repertoireNull', 'rewiringNull', 'taskGenerality']);
   });
 });

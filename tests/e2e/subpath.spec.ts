@@ -31,6 +31,15 @@ test('all views work beneath /fly/ with root asset routes deliberately unavailab
   const findingsJsonLink=page.locator('section.findings ol.steps li.step').first().getByRole('link',{name:'Pinned JSON'});
   await expect(findingsJsonLink).toHaveAttribute('href','/fly/data/rewiring-null-v1.json');
   expect((await request.get(await findingsJsonLink.getAttribute('href')as string)).status()).toBe(200);
+  // WP4 of `.agents/plans/task-generality`: `loadTaskGenerality` (fired
+  // independently, same /fly/-prefixed `dataBaseUrl`) must resolve to its
+  // real "ok" step-7 sentence here too, not silently 404 against the
+  // deliberately-unavailable root /data/ path.
+  const step7=page.locator('section.findings ol.steps li.step').nth(6);
+  await expect(step7).toContainText(/authored: general/,{timeout:20000});
+  const taskGeneralityJsonLink=step7.getByRole('link',{name:'Pinned JSON'});
+  await expect(taskGeneralityJsonLink).toHaveAttribute('href','/fly/data/task-generality-v1.json');
+  expect((await request.get(await taskGeneralityJsonLink.getAttribute('href')as string)).status()).toBe(200);
   // Collapsed again so the rest of this test's unscoped `getByRole('button',
   // {name:/^collapse$/i})` (the activity panel's own toggle, below) keeps
   // resolving to exactly one match.
@@ -139,4 +148,18 @@ test('a tampered behavior-repertoire-null-v1.json under /fly/ shows an honest ve
   await expect(page.getByRole('group',{name:'Select a discovered behavior'})).toBeVisible();
   await expect(page.locator('.repertoire-strip.error-message')).toHaveText('Repertoire comparison failed verification',{timeout:20000});
   await expect(page.locator('body')).not.toContainText(/Repertoire vs \d+ rewirings/i);
+});
+
+test('a tampered task-generality-v1.json under /fly/ shows an honest verification-failure line on step 7, while the rest of the Findings panel and the app keep working', async ({page}) => {
+  await page.route('**/data/task-generality-v1.json', async route => {
+    const bytes = await readFile('public/data/task-generality-v1.json');
+    bytes[10] ^= 0xff;
+    await route.fulfill({status:200, contentType:'application/json', body:bytes});
+  });
+  await page.goto('/fly/');
+  await expect(page.getByRole('status')).toHaveText('ready');
+  await page.locator('section.findings button').first().click();
+  const step7=page.locator('section.findings ol.steps li.step').nth(6);
+  await expect(step7).toContainText(/failed verification/i,{timeout:20000});
+  await expect(page.locator('body')).not.toContainText(/authored: general/);
 });
