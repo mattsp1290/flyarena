@@ -495,8 +495,23 @@ const authoredTaskClause = (task: Readonly<TaskGeneralityTask>): string => {
   return `${task.id}: ${task.pathway.category}${holdsSuffix}`;
 };
 
-/** One task's trained clause -- "not robust" is always stated alongside the category (never a footnote), with the per-seed breakdown so a single-seed hit is never mistaken for a robust finding. */
-const trainedTaskClause = (task: Readonly<TaskGeneralityTask>): string => {
+/**
+ * One task's trained clause -- "not robust" is always stated alongside the
+ * category (never a footnote), with the per-seed breakdown so a
+ * single-seed hit is never mistaken for a robust finding.
+ *
+ * `hasNote` (thermo-review-style finding, task-generality WP4 fix pass):
+ * `'no-specific-effect'` reads as "no effect" to an unprimed reader, when it
+ * actually means the trained side's predeclared rules cannot decide between
+ * `edge-class-effect`/`not-supported` -- see `describeTrainedCategory`'s own
+ * doc comment. Passed through only when the artifact's own
+ * `trainedCategoryNote` field is present (never unconditionally), and only
+ * on the headline (robust-branch) category, matching step 6's own
+ * `buildTrainedInterventionsStep` precedent exactly -- the per-seed
+ * disagreement listing omits it so a dissenting seed doesn't repeat the same
+ * caveat once per seed.
+ */
+const trainedTaskClause = (task: Readonly<TaskGeneralityTask>, hasNote: boolean): string => {
   // Narrowed into a local first (rather than repeatedly re-narrowing
   // `task.trained.degenerate` at each use), since TypeScript does not carry
   // a nested-property discriminant narrowing across a function-closure
@@ -504,8 +519,10 @@ const trainedTaskClause = (task: Readonly<TaskGeneralityTask>): string => {
   // narrows fine there.
   const trained = task.trained;
   if (trained.degenerate) return `${task.id}: degenerate`;
+  if (trained.trainedRobust) {
+    return `${task.id}: ${describeTrainedCategory(trained.category, { withCaveat: hasNote })} (robust)`;
+  }
   const category = describeTrainedCategory(trained.category);
-  if (trained.trainedRobust) return `${task.id}: ${category} (robust)`;
   const perSeedText = P_TRAINER_SEEDS.map((seed) => `seed ${seed} ${describeTrainedCategory(trained.perSeed[seed])}`).join(', ');
   return `${task.id}: ${category} (not robust -- ${perSeedText})`;
 };
@@ -528,7 +545,7 @@ const buildTaskGeneralityStep = (inputs: BuildFindingStepsInputs): FindingStep =
   if (status !== 'ok' || inputs.taskGenerality?.status !== 'ok') {
     return { ...base, status, reason: reasonFor(status, inputs.taskGenerality) };
   }
-  const { tasks, overall } = inputs.taskGenerality.data;
+  const { tasks, overall, trainedCategoryNote } = inputs.taskGenerality.data;
 
   const authoredClause =
     overall.authored.verdict === 'general'
@@ -537,7 +554,7 @@ const buildTaskGeneralityStep = (inputs: BuildFindingStepsInputs): FindingStep =
   const trainedClause =
     overall.trained.verdict === 'general'
       ? `general (${overall.trained.nonDegenerateCount} of ${overall.trained.totalCount} tasks non-degenerate)`
-      : `task-dependent (${tasks.map(trainedTaskClause).join('; ')})`;
+      : `task-dependent (${tasks.map((task) => trainedTaskClause(task, Boolean(trainedCategoryNote))).join('; ')})`;
 
   const sentence =
     `Across ${tasks.length} task variants, authored: ${authoredClause}; trained: ${trainedClause}, under this model.`;

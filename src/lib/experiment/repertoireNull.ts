@@ -8,7 +8,7 @@
  * type is `scripts/atlas/repertoire-report.ts`'s `RepertoireNullArtifact` —
  * that module is a Node-only pipeline (not part of the browser bundle), so
  * this file independently authors and validates just the subset the atlas
- * strip and the Findings panel's step 7 actually render, the same
+ * strip and the Findings panel's step 8 actually render, the same
  * "reimplemented, not imported" discipline `./nullExplanation.ts`/
  * `./rewiringNull.ts`/`./pathwayInterventions.ts` already document for their
  * own artifacts.
@@ -24,7 +24,7 @@
  * manifest and this artifact on its own, independently of
  * `ExperimentController#initialize()` -- `03-artifact-and-atlas-strip.md`:
  * "Its state never delays or fails the atlas load") and
- * `ExperimentController` (Findings step 7, `src/lib/findings/steps.ts`).
+ * `ExperimentController` (Findings step 8, `src/lib/findings/steps.ts`).
  * Living beside `rewiringNull.ts`/`pathwayInterventions.ts` also means
  * `ExperimentController` importing this module is an ordinary same-directory
  * dependency, not a new `experiment/ -> atlas/` edge.
@@ -184,7 +184,7 @@ const validateShape = (value: unknown): { ok: true; data: RepertoireNullArtifact
   }
   // A maintainability review (Suggestion) noted these two distributions'
   // own `n` must equal the primary search seed's actual rewired sample
-  // size -- both the strip and Findings step 7 print `search.rewiredCount`
+  // size -- both the strip and Findings step 8 print `search.rewiredCount`
   // next to this distribution's `p50` as if it were that distribution's own
   // sample size.
   const primaryOccupied = primaryDist.occupied as RepertoireRewiredDistribution;
@@ -276,7 +276,7 @@ const validateShape = (value: unknown): { ok: true; data: RepertoireNullArtifact
  * never throws, matching `loadNullExplanation`/`loadRewiringNull`/
  * `loadPathwayInterventions`'s own "never throws, always return a reasoned
  * status" contract, so a missing/tampered/malformed artifact only ever
- * hides or degrades the atlas strip / Findings step 7, never the rest of
+ * hides or degrades the atlas strip / Findings step 8, never the rest of
  * either surface (`03-artifact-and-atlas-strip.md`: "Its state never
  * delays or fails the atlas load").
  *
@@ -289,7 +289,7 @@ const validateShape = (value: unknown): { ok: true; data: RepertoireNullArtifact
  * resolved -- a maintainability review, Important: the artifact's own
  * premise is "reuses the shipped atlas search exactly", and this field
  * exists specifically so that premise is checkable, not merely recorded.
- * `ExperimentController` (Findings step 7) never loads the atlas at all, so
+ * `ExperimentController` (Findings step 8) never loads the atlas at all, so
  * it has nothing to cross-check `atlasSha256` against either; that step
  * links out to `#atlas` rather than rendering beside the live grid.
  *

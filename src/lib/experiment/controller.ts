@@ -91,12 +91,11 @@ export interface ExperimentControllerCallbacks {
   onRewiringNull: (result: RewiringNullLoadResult) => void;
   /**
    * Fired once `loadNullExplanation` resolves (WP4 of
-   * `.agents/plans/null-explanation`) — sequenced after the rewiring-null
-   * load settles (`initialize()`'s own `nullLoad` doc comment explains why:
-   * never races ahead of the histogram's own load, and this note's
-   * cross-check needs `manifest`, not the resolved rewiring-null data), but
-   * fired independently of `onRewiringNull` itself (a throwing
-   * `onRewiringNull` host callback must never also skip this one). Like
+   * `.agents/plans/null-explanation`) — fired in parallel with
+   * `onRewiringNull` (this note's own cross-check needs `manifest`, not the
+   * resolved rewiring-null data, so it never has to wait for that load), and
+   * independently of it (a throwing `onRewiringNull` host callback must
+   * never also skip this one). Like
    * `onRewiringNull`, this never blocks reaching `ready`. The host's hook
    * for the ledger panel's finding note, rendered next to
    * `NullHistogram.svelte` inside the "Topology null distribution" section.
@@ -104,13 +103,11 @@ export interface ExperimentControllerCallbacks {
   onNullExplanation: (result: NullExplanationLoadResult) => void;
   /**
    * Fired once `loadPathwayInterventions` resolves (WP4 of
-   * `.agents/plans/pathway-interventions`) — sequenced after the
-   * null-explanation load settles, for the same reason `onNullExplanation`
-   * is sequenced after `onRewiringNull`'s own load (never races ahead of
-   * the note this sentence is appended to; this artifact's own cross-check
-   * needs `manifest`, not the resolved `NullExplanationLoadResult`), but
-   * fired independently of `onNullExplanation` itself (a throwing
-   * `onNullExplanation` host callback must never also skip this one). Never
+   * `.agents/plans/pathway-interventions`) — fired in parallel with every
+   * fork above (this artifact's own cross-check needs `manifest`, not the
+   * resolved `NullExplanationLoadResult`), and independently of
+   * `onNullExplanation` itself (a throwing `onNullExplanation` host callback
+   * must never also skip this one). Never
    * blocks reaching `ready`. The host's hook for the ledger panel's
    * tested-outcome sentence, rendered under the null-explanation note.
    */
@@ -120,24 +117,20 @@ export interface ExperimentControllerCallbacks {
    * `.agents/plans/repertoire-null`, following `findings-tour`'s
    * `01-findings-panel.md`: "Add a repertoire load behind the `destroyed`
    * guard, with an injectable seam, following `loadPathwayInterventions`")
-   * — sequenced after the pathway-interventions load settles, for the same
-   * reason every fork above is sequenced after the one before it (never
-   * races ahead of `initialize()`'s own load order; this artifact's own
-   * cross-check needs `manifest`, not any other resolved load result), but
-   * fired independently of `onPathwayInterventions` itself. Never blocks
-   * reaching `ready`. The host's hook for the Findings panel's step 7
+   * — fired in parallel with every fork above (this artifact's own
+   * cross-check needs `manifest`, not any other resolved load result), and
+   * independently of `onPathwayInterventions` itself. Never blocks
+   * reaching `ready`. The host's hook for the Findings panel's step 8
    * ("Behavior repertoire") sentence.
    */
   onRepertoireNull: (result: RepertoireNullLoadResult) => void;
   /**
    * Fired once `loadTaskGenerality` resolves (WP4 of
-   * `.agents/plans/task-generality`) — sequenced after the repertoire-null
-   * load settles, for the same reason every fork above is sequenced after
-   * the one before it (never races ahead of `initialize()`'s own load
-   * order; this artifact's own cross-check needs `manifest`, not any other
-   * resolved load result), but fired independently of `onRepertoireNull`
-   * itself. Never blocks reaching `ready`. The host's hook for the Findings
-   * panel's task-generality step, placed before the "Behavior repertoire"
+   * `.agents/plans/task-generality`) — fired in parallel with every fork
+   * above (this artifact's own cross-check needs `manifest`, not any other
+   * resolved load result), and independently of `onRepertoireNull` itself.
+   * Never blocks reaching `ready`. The host's hook for the Findings panel's
+   * step 7 ("Task generality"), placed before the "Behavior repertoire"
    * step.
    */
   onTaskGenerality: (result: TaskGeneralityLoadResult) => void;
@@ -244,7 +237,7 @@ const graphBinarySha256ForMode = (manifest: ArenaManifest, mode: GraphMode): str
  *
  * Returns the settled result promise (never rejects), which a caller
  * *could* use as a sequencing gate for a second, dependent sidecar load —
- * but as of the four `initialize()` forks below, none of them actually
+ * but as of the five `initialize()` forks below, none of them actually
  * needs to (a thermo-maintainability review, Important: an earlier version
  * chained all four onto one another in sequence purely as an authorial
  * habit copied from the first fork onto every fork added since, even
@@ -468,7 +461,7 @@ export class ExperimentController {
     this.rewiredGraphBuffer = artifacts.rewired;
     this.options.callbacks.onManifest(artifacts.manifest, artifacts.parsedBiological);
 
-    // Four independent sidecar loads, fired in parallel directly off
+    // Five independent sidecar loads, fired in parallel directly off
     // `artifacts.manifest`/`dataBaseUrl` — none needs another's *result*,
     // only the manifest already in scope here (thermo-maintainability
     // review, Important: see `runSidecarLoad`'s own doc comment for why an

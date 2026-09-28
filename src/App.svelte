@@ -91,7 +91,7 @@
   let nullExplanationStatus = $state<NullExplanationLoadResult | undefined>(undefined);
   /** `undefined` until `initialize()`'s pathway-interventions load resolves (WP4 of `.agents/plans/pathway-interventions`); feeds the ledger's tested-outcome sentence under the null-explanation note. Loading it never blocks Start, and never blocks reaching a settled `nullExplanationStatus` either — see `ExperimentController#initialize`'s doc comment. */
   let pathwayInterventionsStatus = $state<PathwayInterventionsLoadResult | undefined>(undefined);
-  /** `undefined` until `initialize()`'s repertoire-null load resolves (WP3 of `.agents/plans/repertoire-null`); feeds the Findings panel's step 7 ("Behavior repertoire") sentence. Loading it never blocks Start, and never blocks reaching a settled `pathwayInterventionsStatus` either — see `ExperimentController#initialize`'s doc comment. */
+  /** `undefined` until `initialize()`'s repertoire-null load resolves (WP3 of `.agents/plans/repertoire-null`); feeds the Findings panel's step 8 ("Behavior repertoire") sentence. Loading it never blocks Start, and never blocks reaching a settled `pathwayInterventionsStatus` either — see `ExperimentController#initialize`'s doc comment. */
   let repertoireNullStatus = $state<RepertoireNullLoadResult | undefined>(undefined);
   /** `undefined` until `initialize()`'s task-generality load resolves (WP4 of `.agents/plans/task-generality`); feeds the Findings panel's task-generality step, placed before the "Behavior repertoire" step. Loading it never blocks Start, and never blocks reaching a settled `repertoireNullStatus` either — see `ExperimentController#initialize`'s doc comment. */
   let taskGeneralityStatus = $state<TaskGeneralityLoadResult | undefined>(undefined);
