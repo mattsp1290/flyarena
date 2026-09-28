@@ -56,9 +56,18 @@ export interface TaskGeneralityOverall {
 
 export interface TaskGeneralityArtifact {
   readonly version: 1;
-  readonly sources: { readonly rewiringNullSha: string; readonly pathwayInterventionsSha: string };
+  readonly sources: { readonly biologicalSha: string; readonly rewiringNullSha: string; readonly pathwayInterventionsSha: string };
   readonly tasks: readonly TaskGeneralityTask[];
   readonly overall: { readonly authored: TaskGeneralityOverall; readonly trained: TaskGeneralityOverall };
+  /**
+   * `intervention-report-trained.ts`'s `TRAINED_CATEGORY_NOTE`, carried
+   * through unchanged. Optional — an older/hand-built fixture may simply
+   * not carry it; the Findings step only shows the "reporting convention"
+   * caveat when this field is actually present, never unconditionally,
+   * matching `pathwayInterventions.ts`'s identical `trained.note` doc
+   * comment convention.
+   */
+  readonly trainedCategoryNote?: string;
 }
 
 export type TaskGeneralityLoadResult = SidecarLoadResult<TaskGeneralityArtifact>;
@@ -73,33 +82,68 @@ const isOverall = (value: unknown): value is TaskGeneralityOverall => {
   );
 };
 
-const isTrained = (value: unknown): value is TaskGeneralityTrained => {
-  if (typeof value !== 'object' || value === null) return false;
+/**
+ * Shape AND internal consistency, in one pass -- a hash-valid artifact
+ * could otherwise ship a `trainedRobust`/`category` that disagrees with its
+ * own `perSeed` data (the exact `robustness.robust disagrees with its own
+ * per-seed categories` class of check `repertoireNull.ts`/`pathwayInterventions.ts`
+ * already apply to their own summary fields; a dual-review finding: this
+ * loader originally recomputed `overall.*` from these per-task booleans
+ * without ever checking the booleans themselves against the category data
+ * sitting right next to them, so a task claiming `trainedRobust: true` with
+ * disagreeing `perSeed` entries would render "(robust)" in the Findings
+ * step for what is actually a single-seed hit).
+ */
+const trainedReason = (value: unknown): string | undefined => {
+  if (typeof value !== 'object' || value === null) return 'is not an object';
   const v = value as Record<string, unknown>;
-  if (typeof v.degenerate !== 'boolean') return false;
-  if (v.degenerate) return true;
-  if (typeof v.trainedRobust !== 'boolean' || !isTrainedCategory(v.category)) return false;
+  if (typeof v.degenerate !== 'boolean') return 'is missing a boolean "degenerate"';
+  if (v.degenerate) return undefined;
+  if (typeof v.trainedRobust !== 'boolean') return 'is missing a boolean "trainedRobust"';
+  if (!isTrainedCategory(v.category)) return 'has an invalid "category"';
   const perSeed = v.perSeed as Record<string, unknown> | undefined;
-  return Boolean(perSeed) && P_TRAINER_SEEDS.every((seed) => isTrainedCategory((perSeed as Record<string, unknown>)[seed]));
+  if (!perSeed || !P_TRAINER_SEEDS.every((seed) => isTrainedCategory(perSeed[seed]))) {
+    return 'is missing a valid category for every trainer seed in "perSeed"';
+  }
+  const categories = P_TRAINER_SEEDS.map((seed) => perSeed[seed] as TaskGeneralityTrainedCategory);
+  const recomputedRobust = categories.every((category) => category === categories[0]);
+  if (recomputedRobust !== v.trainedRobust) return 'trainedRobust disagrees with its own perSeed categories';
+  if (v.category !== categories[0]) return `category disagrees with perSeed["${P_TRAINER_SEEDS[0]}"]`;
+  return undefined;
 };
 
-const isTask = (value: unknown): value is TaskGeneralityTask => {
-  if (typeof value !== 'object' || value === null) return false;
+const isTrained = (value: unknown): value is TaskGeneralityTrained => trainedReason(value) === undefined;
+
+const taskReason = (value: unknown): string | undefined => {
+  if (typeof value !== 'object' || value === null) return 'is not an object';
   const v = value as Record<string, unknown>;
+  if (typeof v.id !== 'string') return 'is missing a string "id"';
+  if (typeof v.categorized !== 'boolean') return 'is missing a boolean "categorized"';
   const nullField = v.null as Record<string, unknown> | undefined;
+  if (!nullField || typeof nullField.nullHolds !== 'boolean' || typeof nullField.degenerate !== 'boolean') {
+    return 'has a malformed "null" field';
+  }
   const pathway = v.pathway as Record<string, unknown> | undefined;
-  return (
-    typeof v.id === 'string' &&
-    typeof v.categorized === 'boolean' &&
-    Boolean(nullField) &&
-    typeof (nullField as Record<string, unknown>).nullHolds === 'boolean' &&
-    typeof (nullField as Record<string, unknown>).degenerate === 'boolean' &&
-    Boolean(pathway) &&
-    isPathwayCategory((pathway as Record<string, unknown>).category) &&
-    typeof (pathway as Record<string, unknown>).generalizes === 'boolean' &&
-    isTrained(v.trained)
-  );
+  if (!pathway || !isPathwayCategory(pathway.category) || typeof pathway.generalizes !== 'boolean') {
+    return 'has a malformed "pathway" field';
+  }
+  // Cross-field consistency: `categorized` and `generalizes` are each
+  // supposed to be a plain restatement of `pathway.category` -- a
+  // hash-valid artifact could otherwise ship `categorized: true` alongside
+  // `pathway.category: 'degenerate'` (wrongly entering the eligible set),
+  // or `generalizes: true` alongside a non-`'pathway-supported'` category.
+  if (v.categorized !== (pathway.category !== 'degenerate')) {
+    return `id "${String(v.id)}": categorized disagrees with pathway.category`;
+  }
+  if (pathway.generalizes !== (pathway.category === 'pathway-supported')) {
+    return `id "${String(v.id)}": pathway.generalizes disagrees with pathway.category`;
+  }
+  const trainedIssue = trainedReason(v.trained);
+  if (trainedIssue) return `id "${String(v.id)}": trained ${trainedIssue}`;
+  return undefined;
 };
+
+const isTask = (value: unknown): value is TaskGeneralityTask => taskReason(value) === undefined;
 
 /** `00-overview.md`'s overall-verdict rule, recomputed from the per-task data it is supposed to summarize (mirrors `pathwayInterventions.ts`'s/`repertoireNull.ts`'s own "a hash-valid artifact could still ship a summary that disagrees with its own per-item data" cross-checks). */
 const recomputeOverall = (
@@ -123,12 +167,21 @@ const validateShape = (value: unknown): { ok: true; data: TaskGeneralityArtifact
   if (v.version !== 1) return { ok: false, reason: `task-generality artifact has unsupported version ${String(v.version)}` };
 
   const sources = v.sources as Record<string, unknown> | undefined;
-  if (!sources || typeof sources.rewiringNullSha !== 'string' || typeof sources.pathwayInterventionsSha !== 'string') {
-    return { ok: false, reason: 'task-generality artifact is missing sources.rewiringNullSha/sources.pathwayInterventionsSha' };
+  if (
+    !sources ||
+    typeof sources.biologicalSha !== 'string' ||
+    typeof sources.rewiringNullSha !== 'string' ||
+    typeof sources.pathwayInterventionsSha !== 'string'
+  ) {
+    return { ok: false, reason: 'task-generality artifact is missing sources.biologicalSha/sources.rewiringNullSha/sources.pathwayInterventionsSha' };
   }
 
-  if (!Array.isArray(v.tasks) || v.tasks.length === 0 || !v.tasks.every(isTask)) {
+  if (!Array.isArray(v.tasks) || v.tasks.length === 0) {
     return { ok: false, reason: 'task-generality artifact has a malformed "tasks" array' };
+  }
+  for (const task of v.tasks) {
+    const reason = taskReason(task);
+    if (reason) return { ok: false, reason: `task-generality artifact tasks[]: ${reason}` };
   }
   const tasks = v.tasks as TaskGeneralityTask[];
 
@@ -156,13 +209,22 @@ const validateShape = (value: unknown): { ok: true; data: TaskGeneralityArtifact
     return { ok: false, reason: 'task-generality artifact overall.trained disagrees with its own per-task data' };
   }
 
+  if (v.trainedCategoryNote !== undefined && typeof v.trainedCategoryNote !== 'string') {
+    return { ok: false, reason: 'task-generality artifact has a non-string "trainedCategoryNote"' };
+  }
+
   return {
     ok: true,
     data: {
       version: 1,
-      sources: { rewiringNullSha: sources.rewiringNullSha, pathwayInterventionsSha: sources.pathwayInterventionsSha },
+      sources: {
+        biologicalSha: sources.biologicalSha,
+        rewiringNullSha: sources.rewiringNullSha,
+        pathwayInterventionsSha: sources.pathwayInterventionsSha
+      },
       tasks,
-      overall: { authored: authoredOverall, trained: trainedOverall }
+      overall: { authored: authoredOverall, trained: trainedOverall },
+      ...(typeof v.trainedCategoryNote === 'string' ? { trainedCategoryNote: v.trainedCategoryNote } : {})
     }
   };
 };
@@ -199,6 +261,12 @@ export const loadTaskGenerality = async (
   if (!validated.ok) return { status: 'invalid', reason: validated.reason };
   const data = validated.data;
 
+  if (data.sources.biologicalSha !== manifest.binarySha256) {
+    return {
+      status: 'invalid',
+      reason: `task-generality sources.biologicalSha does not match the manifest's compiled biological graph (${manifest.binarySha256}) — stale artifact`
+    };
+  }
   const shippedRewiringNullSha = manifest.rewiringNull?.sha256;
   if (!shippedRewiringNullSha) {
     return { status: 'invalid', reason: 'manifest is missing rewiringNull.sha256, needed to cross-check the task-generality artifact' };
