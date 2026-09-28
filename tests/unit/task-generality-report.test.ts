@@ -1,16 +1,23 @@
 // @vitest-environment node
-import { describe, expect, it } from 'vitest';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   buildTaskGeneralityArtifact,
   diffArenaConfig,
+  parseTaskGeneralityReportArgs,
   renderTaskGeneralityReportMarkdown,
+  runTaskGeneralityReport,
+  taskInputPaths,
   STUDY_TASK_IDS,
   type BuildArtifactInputs,
   type BuildTaskInputs,
   type TaskGeneralityArtifact
 } from '../../scripts/null/task-generality-report';
 import { P_TRAINER_SEEDS, TRAINED_ARM_SIZE, CONTROL_TRAINER_SEED } from '../../scripts/null/intervention-report-trained';
+import { sortKeysDeep } from '../../scripts/null/null-report';
 import { sha256Hex } from '../../scripts/training/fsio';
 import { resolveArenaTask } from '../../src/lib/arena/tasks';
 import type { PathwayInterventionsArtifact } from '../../scripts/null/intervention-artifact';
@@ -53,8 +60,13 @@ const interventionIndexSha = sha256Hex(interventionIndexBytes);
 const graphIndexBytes = Buffer.from('graph-index-fixture', 'utf8');
 const rewiringNullBytes = Buffer.from('rewiring-null-fixture', 'utf8');
 const pathwayInterventionsBytes = Buffer.from('pathway-interventions-fixture', 'utf8');
+const manifestBiologicalSha = SHA('biological-graph');
+const manifestRewiringNullSha = sha256Hex(rewiringNullBytes);
+const manifestPathwayInterventionsSha = sha256Hex(pathwayInterventionsBytes);
 
 const pathwayInterventionsParsed = {
+  version: 1,
+  sources: { biologicalSha: manifestBiologicalSha, rewiringNullSha: manifestRewiringNullSha, indexSha: interventionIndexSha },
   authored: { category: 'pathway-supported' },
   trained: {
     trainedRobust: true,
@@ -73,6 +85,8 @@ interface TaskFixtureOptions {
   readonly pScoreAuthored: number;
   readonly cP95: number;
   readonly mP95: number;
+  readonly qScore?: number;
+  readonly qChannelSpecific?: boolean | 'degenerate';
   /** Mean `movementScore` per P trainer seed. */
   readonly pTrainedScores: Readonly<Record<(typeof P_TRAINER_SEEDS)[number], number>>;
   readonly cTrainedScores: readonly number[];
@@ -85,6 +99,7 @@ const taskFixture = (options: TaskFixtureOptions): BuildTaskInputs => {
 
   const nullSummary = {
     arenaTask: { id: options.id, fingerprint },
+    sourceGraphSha256: manifestBiologicalSha,
     biological: { score: options.bioScore },
     null: { median: (options.rewiredScores[Math.floor(options.rewiredScores.length / 2)] as number) ?? 0, degenerate: options.nullDegenerate ?? false },
     bioPercentile: 0.01,
@@ -99,14 +114,15 @@ const taskFixture = (options: TaskFixtureOptions): BuildTaskInputs => {
     biologicalReproduction: { computedScore: options.bioScore, publishedScore: options.bioScore, matches: true },
     inputs: { indexSha256: interventionIndexSha, publishedNullSha256: publishedNullSha },
     armDegeneracy: {
-      nullArm: { iqr: 1, degenerate: false },
+      nullArm: { iqr: options.nullDegenerate ? 0 : 1, degenerate: options.nullDegenerate ?? false },
       cArm: { iqr: options.cArmDegenerate ? 0 : 1, degenerate: options.cArmDegenerate ?? false },
       mArm: { iqr: options.mArmDegenerate ? 0 : 1, degenerate: options.mArmDegenerate ?? false },
       mqArm: { iqr: 1, degenerate: false },
-      categoryDegenerate: (options.cArmDegenerate ?? false) || (options.mArmDegenerate ?? false),
+      categoryDegenerate: (options.nullDegenerate ?? false) || (options.cArmDegenerate ?? false) || (options.mArmDegenerate ?? false),
       channelSpecificDegenerate: false
     },
     p: { score: options.pScoreAuthored, category: options.pathwayCategory },
+    q: { score: options.qScore ?? 1, channelSpecific: options.qChannelSpecific ?? true },
     controls: { C: { p95: options.cP95 }, M: { p95: options.mP95 } }
   };
   const interventionStatsText = JSON.stringify(interventionStats);
@@ -163,7 +179,10 @@ const buildArtifact = (tasks: readonly BuildTaskInputs[]): TaskGeneralityArtifac
     graphIndexBytes,
     rewiringNullBytes,
     pathwayInterventionsBytes,
-    pathwayInterventionsParsed
+    pathwayInterventionsParsed,
+    manifestBiologicalSha,
+    manifestRewiringNullSha,
+    manifestPathwayInterventionsSha
   } satisfies BuildArtifactInputs);
 
 describe('diffArenaConfig', () => {
@@ -264,6 +283,30 @@ describe('buildTaskGeneralityArtifact: overall verdicts', () => {
     expect(artifact.tasks[0].trained).toEqual({ degenerate: true });
     expect(artifact.overall.trained).toEqual({ verdict: 'general', nonDegenerateCount: 3, totalCount: 4 });
   });
+
+  it('is "task-dependent" (authored) when one task\'s null does not hold, even though its pathway generalizes', () => {
+    const [firstId, ...restIds] = STUDY_TASK_IDS;
+    // bioScore above every rewired score (well above p25) -- "does not hold".
+    const failing = taskFixture({ ...generalTaskOptions(firstId), bioScore: 100 });
+    const tasks = [failing, ...restIds.map((id) => taskFixture(generalTaskOptions(id)))];
+    const artifact = buildArtifact(tasks);
+    const failingTask = artifact.tasks.find((t) => t.id === firstId);
+    expect(failingTask?.null.nullHolds).toBe(false);
+    expect(failingTask?.pathway.generalizes).toBe(true);
+    expect(artifact.overall.authored).toEqual({ verdict: 'task-dependent', nonDegenerateCount: 4, totalCount: 4 });
+  });
+
+  it('nullHolds is false exactly at the p25 boundary (the rule is strict "<", not "<=")', () => {
+    const options = generalTaskOptions(STUDY_TASK_IDS[0]);
+    // p25 of the fixture's rewiredScores (20 values, i-5 for i in 0..19) is
+    // the 5th sorted value (quantileIndex(20, 0.25) = 5): value 0.
+    const bioScore = 0;
+    const boundary = taskFixture({ ...options, bioScore });
+    const artifact = buildArtifact([boundary, ...STUDY_TASK_IDS.slice(1).map((id) => taskFixture(generalTaskOptions(id)))]);
+    const task = artifact.tasks[0];
+    expect(task.null.p25).toBe(bioScore);
+    expect(task.null.nullHolds).toBe(false);
+  });
 });
 
 describe('buildTaskGeneralityArtifact: cross-checks', () => {
@@ -291,6 +334,125 @@ describe('buildTaskGeneralityArtifact: cross-checks', () => {
     trained.graphListSha256 = SHA('stale-index');
     const tasks = STUDY_TASK_IDS.map((id) => (id === 'hazard-heavy' ? { ...bad, trainedText: JSON.stringify(trained) } : taskFixture(generalTaskOptions(id))));
     expect(() => buildArtifact(tasks)).toThrow(/does not match the shared intervention index sha/);
+  });
+
+  it('throws when intervention-stats is diagnosticOnly', () => {
+    const bad = taskFixture(generalTaskOptions('hazard-heavy'));
+    const stats = JSON.parse(bad.interventionStatsText) as Record<string, unknown>;
+    stats.diagnosticOnly = true;
+    const tasks = STUDY_TASK_IDS.map((id) => (id === 'hazard-heavy' ? { ...bad, interventionStatsText: JSON.stringify(stats) } : taskFixture(generalTaskOptions(id))));
+    expect(() => buildArtifact(tasks)).toThrow(/diagnosticOnly, or its biologicalReproduction\.matches is not true/);
+  });
+
+  it('throws when intervention-stats biologicalReproduction.matches is false', () => {
+    const bad = taskFixture(generalTaskOptions('hazard-heavy'));
+    const stats = JSON.parse(bad.interventionStatsText) as { biologicalReproduction: { matches: boolean } };
+    stats.biologicalReproduction.matches = false;
+    const tasks = STUDY_TASK_IDS.map((id) => (id === 'hazard-heavy' ? { ...bad, interventionStatsText: JSON.stringify(stats) } : taskFixture(generalTaskOptions(id))));
+    expect(() => buildArtifact(tasks)).toThrow(/diagnosticOnly, or its biologicalReproduction\.matches is not true/);
+  });
+
+  it('throws when intervention-stats is not a --stats-only result', () => {
+    const bad = taskFixture(generalTaskOptions('hazard-heavy'));
+    const stats = JSON.parse(bad.interventionStatsText) as Record<string, unknown>;
+    delete stats.statsOnly;
+    const tasks = STUDY_TASK_IDS.map((id) => (id === 'hazard-heavy' ? { ...bad, interventionStatsText: JSON.stringify(stats) } : taskFixture(generalTaskOptions(id))));
+    expect(() => buildArtifact(tasks)).toThrow(/is not a --stats-only result/);
+  });
+
+  it('throws when intervention-stats inputs.indexSha256 is stale', () => {
+    const bad = taskFixture(generalTaskOptions('hazard-heavy'));
+    const stats = JSON.parse(bad.interventionStatsText) as { inputs: { indexSha256: string } };
+    stats.inputs.indexSha256 = SHA('stale');
+    const tasks = STUDY_TASK_IDS.map((id) => (id === 'hazard-heavy' ? { ...bad, interventionStatsText: JSON.stringify(stats) } : taskFixture(generalTaskOptions(id))));
+    expect(() => buildArtifact(tasks)).toThrow(/does not match the shared intervention index sha/);
+  });
+
+  it('throws when trained.json is recorded under a different arena task', () => {
+    const bad = taskFixture(generalTaskOptions('hazard-heavy'));
+    const trained = JSON.parse(bad.trainedText) as { arenaTask: string };
+    trained.arenaTask = 'crowded';
+    const tasks = STUDY_TASK_IDS.map((id) => (id === 'hazard-heavy' ? { ...bad, trainedText: JSON.stringify(trained) } : taskFixture(generalTaskOptions(id))));
+    expect(() => buildArtifact(tasks)).toThrow(/is not recorded under arena task/);
+  });
+
+  it('throws when trained.json is missing a P run at one of the three trainer seeds', () => {
+    const bad = taskFixture(generalTaskOptions('hazard-heavy'));
+    const trained = JSON.parse(bad.trainedText) as { runs: readonly { readonly id: string; readonly trainerSeed: number }[] };
+    const runs = trained.runs.filter((run) => !(run.id === 'P' && run.trainerSeed === 303));
+    const tasks = STUDY_TASK_IDS.map((id) =>
+      id === 'hazard-heavy' ? { ...bad, trainedText: JSON.stringify({ ...trained, runs }) } : taskFixture(generalTaskOptions(id))
+    );
+    expect(() => buildArtifact(tasks)).toThrow(/missing the P run at trainer seed 303/);
+  });
+
+  it('throws when a per-task null-summary was scored against a different biological graph than the manifest', () => {
+    const bad = taskFixture(generalTaskOptions('hazard-heavy'));
+    const nullSummary = JSON.parse(bad.nullSummaryText) as { sourceGraphSha256: string };
+    nullSummary.sourceGraphSha256 = SHA('a-different-graph');
+    const tasks = STUDY_TASK_IDS.map((id) => (id === 'hazard-heavy' ? { ...bad, nullSummaryText: JSON.stringify(nullSummary) } : taskFixture(generalTaskOptions(id))));
+    expect(() => buildArtifact(tasks)).toThrow(/does not match the manifest's biological graph/);
+  });
+
+  it('throws when the rewiring-null bytes do not match the manifest\'s pinned rewiringNull.sha256', () => {
+    const tasks = STUDY_TASK_IDS.map((id) => taskFixture(generalTaskOptions(id)));
+    expect(() =>
+      buildTaskGeneralityArtifact({
+        tasks,
+        interventionIndexText,
+        interventionIndexLabel: 'interventions/index.json',
+        interventionIndexBytes,
+        graphIndexBytes,
+        rewiringNullBytes,
+        pathwayInterventionsBytes,
+        pathwayInterventionsParsed,
+        manifestBiologicalSha,
+        manifestRewiringNullSha: SHA('stale-manifest-pin'),
+        manifestPathwayInterventionsSha
+      })
+    ).toThrow(/does not match the manifest's rewiringNull\.sha256/);
+  });
+
+  it('throws when the pathway-interventions bytes do not match the manifest\'s pinned pathwayInterventions.sha256', () => {
+    const tasks = STUDY_TASK_IDS.map((id) => taskFixture(generalTaskOptions(id)));
+    expect(() =>
+      buildTaskGeneralityArtifact({
+        tasks,
+        interventionIndexText,
+        interventionIndexLabel: 'interventions/index.json',
+        interventionIndexBytes,
+        graphIndexBytes,
+        rewiringNullBytes,
+        pathwayInterventionsBytes,
+        pathwayInterventionsParsed,
+        manifestBiologicalSha,
+        manifestRewiringNullSha,
+        manifestPathwayInterventionsSha: SHA('stale-manifest-pin')
+      })
+    ).toThrow(/does not match the manifest's pathwayInterventions\.sha256/);
+  });
+
+  it('throws when the pathway-interventions artifact\'s own sources.indexSha is not the intervention index these tasks share', () => {
+    const tasks = STUDY_TASK_IDS.map((id) => taskFixture(generalTaskOptions(id)));
+    const staleIndexPi = {
+      ...pathwayInterventionsParsed,
+      sources: { ...pathwayInterventionsParsed.sources, indexSha: SHA('a-different-index') }
+    } as unknown as PathwayInterventionsArtifact;
+    expect(() =>
+      buildTaskGeneralityArtifact({
+        tasks,
+        interventionIndexText,
+        interventionIndexLabel: 'interventions/index.json',
+        interventionIndexBytes,
+        graphIndexBytes,
+        rewiringNullBytes,
+        pathwayInterventionsBytes,
+        pathwayInterventionsParsed: staleIndexPi,
+        manifestBiologicalSha,
+        manifestRewiringNullSha,
+        manifestPathwayInterventionsSha
+      })
+    ).toThrow(/the P\/C\/M graphs were not reused unchanged/);
   });
 });
 
@@ -329,5 +491,162 @@ describe('renderTaskGeneralityReportMarkdown', () => {
     expect(markdown).toContain('Pathway: **degenerate**');
     expect(markdown).toContain('not robust');
     expect(markdown).toMatch(/single-seed hit, not a robust finding/);
+  });
+
+  it('says "a 2-of-3-seed split", never "single-seed hit", when 2 of 3 trainer seeds reach pathway-supported', () => {
+    const tasks = STUDY_TASK_IDS.map((id, i) =>
+      i === 0 ? taskFixture({ ...generalTaskOptions(id), pTrainedScores: { 101: 100, 202: 100, 303: 1 } }) : taskFixture(generalTaskOptions(id))
+    );
+    const markdown = renderTaskGeneralityReportMarkdown(buildArtifact(tasks));
+    expect(markdown).toMatch(/2 of 3 seeds reach pathway-supported -- a 2-of-3-seed split, not a robust finding/);
+    expect(markdown).not.toMatch(/2 of 3 seeds reach pathway-supported -- this is a single-seed hit/);
+  });
+
+  it('states the Q-vs-MQ channel-specific result for a degenerate task, derived from data, never a hardcoded task name', () => {
+    const [degenerateId, ...restIds] = STUDY_TASK_IDS;
+    const degenerate = taskFixture({
+      ...generalTaskOptions(degenerateId),
+      cArmDegenerate: true,
+      pathwayCategory: 'degenerate',
+      qScore: 1.7,
+      qChannelSpecific: true
+    });
+    const tasks = [degenerate, ...restIds.map((id) => taskFixture(generalTaskOptions(id)))];
+    const markdown = renderTaskGeneralityReportMarkdown(buildArtifact(tasks));
+    expect(markdown).toContain(`\`${degenerateId}\`'s authored pathway category is \`degenerate\``);
+    expect(markdown).toContain('its Q-vs-MQ channel-specific result (holds) is independently valid and is not conflated with the degenerate P/C/M category');
+  });
+
+  it('discloses the no-specific-effect reporting-convention note only when some task actually used it', () => {
+    const allPathwaySupported = STUDY_TASK_IDS.map((id) => taskFixture(generalTaskOptions(id)));
+    const artifact = buildArtifact(allPathwaySupported);
+    // Real generalTaskOptions fixtures use pathway-supported at every seed, so the note should not appear.
+    expect(renderTaskGeneralityReportMarkdown(artifact)).not.toContain(artifact.trainedCategoryNote);
+
+    const withNoSpecificEffect = STUDY_TASK_IDS.map((id, i) =>
+      i === 0 ? taskFixture({ ...generalTaskOptions(id), pTrainedScores: { 101: 1, 202: 1, 303: 1 } }) : taskFixture(generalTaskOptions(id))
+    );
+    const artifactWithNse = buildArtifact(withNoSpecificEffect);
+    expect(renderTaskGeneralityReportMarkdown(artifactWithNse)).toContain(artifactWithNse.trainedCategoryNote);
+  });
+
+  it('TASK_TABLE lists exactly the diffArenaConfig changes for every study task (never lets the two silently disagree)', () => {
+    const tasks = STUDY_TASK_IDS.map((id) => taskFixture(generalTaskOptions(id)));
+    const markdown = renderTaskGeneralityReportMarkdown(buildArtifact(tasks));
+    const taskTableSection = markdown.split('## Predeclared outcome rules')[0];
+    for (const id of STUDY_TASK_IDS) {
+      const row = taskTableSection.split('\n').find((line) => line.startsWith(`| \`${id}\``));
+      expect(row, `no TASK_TABLE row for "${id}"`).toBeDefined();
+      for (const [key, value] of Object.entries(diffArenaConfig(resolveArenaTask(id).config))) {
+        expect(row, `${id}: ${key}`).toContain(`\`${key} ${value}\``);
+      }
+    }
+  });
+});
+
+describe('runTaskGeneralityReport (CLI layer)', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'task-generality-cli-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  // The CLI layer's `runTaskGeneralityReport` genuinely `JSON.parse`s the
+  // pathway-interventions bytes it reads from disk (unlike the pure-builder
+  // tests above, which pass `pathwayInterventionsParsed` in as an
+  // already-parsed object) -- these bytes must be real, valid JSON matching
+  // that same fixture, with its own sha threaded through the manifest and
+  // `pi.sources.rewiringNullSha`/`indexSha`/`biologicalSha` (which already
+  // point at `manifestRewiringNullSha`/`interventionIndexSha`/`manifestBiologicalSha`
+  // via `pathwayInterventionsParsed` above).
+  const pathwayInterventionsJsonBytes = Buffer.from(JSON.stringify(pathwayInterventionsParsed), 'utf8');
+  const cliManifestPathwayInterventionsSha = sha256Hex(pathwayInterventionsJsonBytes);
+
+  /** Writes one complete, internally-consistent world of inputs to `dir`, mirroring the real Spark layout (`--authored-dir`/`--trained-dir` each `<dir>/<task>/...`). */
+  const writeWorld = (): void => {
+    writeFileSync(join(dir, 'interventions-index.json'), interventionIndexText);
+    writeFileSync(join(dir, 'graphs-index.json'), 'graph-index-fixture');
+    writeFileSync(join(dir, 'rewiring-null-v1.json'), rewiringNullBytes);
+    writeFileSync(join(dir, 'pathway-interventions-v1.json'), pathwayInterventionsJsonBytes);
+    // `verifyManifestRoundTrips` (called by `runTaskGeneralityReport`) requires
+    // the file on disk to already be `sortKeysDeep`+`JSON.stringify(..., null, 2)`+'\n' --
+    // exactly the format `updateManifestWithTaskGenerality` itself writes back.
+    const manifestObject = {
+      binarySha256: manifestBiologicalSha,
+      rewiringNull: { sha256: manifestRewiringNullSha },
+      pathwayInterventions: { sha256: cliManifestPathwayInterventionsSha }
+    };
+    writeFileSync(join(dir, 'manifest.json'), `${JSON.stringify(sortKeysDeep(manifestObject), null, 2)}\n`);
+    for (const id of STUDY_TASK_IDS) {
+      const fixture = taskFixture(generalTaskOptions(id));
+      const paths = taskInputPaths(dir, dir, id);
+      mkdirSync(dirname(paths.nullSummary), { recursive: true });
+      writeFileSync(paths.nullSummary, fixture.nullSummaryText, { flag: 'wx' });
+      writeFileSync(paths.interventionStats, fixture.interventionStatsText, { flag: 'wx' });
+      writeFileSync(paths.trained, fixture.trainedText, { flag: 'wx' });
+    }
+  };
+
+  const runArgs = () =>
+    parseTaskGeneralityReportArgs([
+      '--authored-dir',
+      dir,
+      '--trained-dir',
+      dir,
+      '--graph-index',
+      join(dir, 'graphs-index.json'),
+      '--intervention-index',
+      join(dir, 'interventions-index.json'),
+      '--rewiring-null',
+      join(dir, 'rewiring-null-v1.json'),
+      '--pathway-interventions',
+      join(dir, 'pathway-interventions-v1.json'),
+      '--manifest',
+      join(dir, 'manifest.json'),
+      '--out',
+      join(dir, 'task-generality-v1.json'),
+      '--report-md',
+      join(dir, 'task-generality-report.md')
+    ]);
+
+  it('writes the artifact, the manifest key, and the report', () => {
+    writeWorld();
+    const result = runTaskGeneralityReport(runArgs());
+    expect(result.artifact.overall.authored.verdict).toBe('general');
+
+    const writtenArtifact = readFileSync(join(dir, 'task-generality-v1.json'), 'utf8');
+    expect(sha256Hex(writtenArtifact)).toBe(result.artifactSha256);
+
+    const manifest = JSON.parse(readFileSync(join(dir, 'manifest.json'), 'utf8')) as { taskGenerality: { artifact: string; sha256: string } };
+    expect(manifest.taskGenerality).toEqual({ artifact: 'task-generality-v1.json', sha256: result.artifactSha256 });
+
+    const reportMd = readFileSync(join(dir, 'task-generality-report.md'), 'utf8');
+    expect(reportMd).toContain('# Task generality of the null and pathway findings');
+  });
+
+  it('regenerating twice against the same inputs gives byte-identical output', () => {
+    writeWorld();
+    const first = runTaskGeneralityReport(runArgs());
+    const firstBytes = readFileSync(first.out);
+    // The manifest now carries the first run's taskGenerality key -- an
+    // exact rerun (no input changed) must still reproduce the same bytes,
+    // matching the "regeneration is byte-identical" acceptance criterion.
+    const second = runTaskGeneralityReport(runArgs());
+    const secondBytes = readFileSync(second.out);
+    expect(secondBytes.equals(firstBytes)).toBe(true);
+    expect(second.artifactSha256).toBe(first.artifactSha256);
+  });
+
+  it('rejects an unknown CLI flag', () => {
+    expect(() => parseTaskGeneralityReportArgs(['--bogus', 'x'])).toThrow(/Unknown argument/);
+  });
+
+  it('rejects --out and --report-md pointing at the same path', () => {
+    expect(() => parseTaskGeneralityReportArgs(['--out', '/tmp/x.json', '--report-md', '/tmp/x.json'])).toThrow(
+      /--out and --report-md must not be the same path/
+    );
   });
 });

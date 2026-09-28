@@ -85,6 +85,7 @@ describe('loadTaskGenerality (shape validation, with a synthetic manifest sha256
   const validArtifact = {
     version: 1,
     sources: {
+      biologicalSha: manifest.binarySha256,
       rewiringNullSha: manifest.rewiringNull?.sha256 ?? 'a'.repeat(64),
       pathwayInterventionsSha: manifest.pathwayInterventions?.sha256 ?? 'b'.repeat(64)
     },
@@ -126,7 +127,7 @@ describe('loadTaskGenerality (shape validation, with a synthetic manifest sha256
     });
     const result = await loadTaskGenerality(manifestForBody, '/data');
     expect(result.status).toBe('invalid');
-    if (result.status === 'invalid') expect(result.reason).toMatch(/malformed "tasks"/);
+    if (result.status === 'invalid') expect(result.reason).toMatch(/malformed "pathway"/);
   });
 
   it('is "invalid" when a non-degenerate trained task is missing a required trainer seed', async () => {
@@ -140,7 +141,69 @@ describe('loadTaskGenerality (shape validation, with a synthetic manifest sha256
     });
     const result = await loadTaskGenerality(manifestForBody, '/data');
     expect(result.status).toBe('invalid');
-    if (result.status === 'invalid') expect(result.reason).toMatch(/malformed "tasks"/);
+    if (result.status === 'invalid') expect(result.reason).toMatch(/valid category for every trainer seed/);
+  });
+
+  it('is "invalid" when a task\'s categorized boolean disagrees with its own pathway.category', async () => {
+    const { manifest: manifestForBody } = manifestServing({
+      ...validArtifact,
+      tasks: [{ ...validArtifact.tasks[0], categorized: true, pathway: { category: 'degenerate', generalizes: false } }, ...validArtifact.tasks.slice(1)]
+    });
+    const result = await loadTaskGenerality(manifestForBody, '/data');
+    expect(result.status).toBe('invalid');
+    if (result.status === 'invalid') expect(result.reason).toMatch(/categorized disagrees with pathway\.category/);
+  });
+
+  it('is "invalid" when a task\'s pathway.generalizes disagrees with its own pathway.category', async () => {
+    const { manifest: manifestForBody } = manifestServing({
+      ...validArtifact,
+      tasks: [
+        { ...validArtifact.tasks[0], pathway: { category: 'not-supported', generalizes: true } },
+        ...validArtifact.tasks.slice(1)
+      ]
+    });
+    const result = await loadTaskGenerality(manifestForBody, '/data');
+    expect(result.status).toBe('invalid');
+    if (result.status === 'invalid') expect(result.reason).toMatch(/pathway\.generalizes disagrees with pathway\.category/);
+  });
+
+  it('is "invalid" when a task\'s trainedRobust disagrees with its own per-seed categories', async () => {
+    const { manifest: manifestForBody } = manifestServing({
+      ...validArtifact,
+      tasks: [
+        {
+          ...validArtifact.tasks[0],
+          trained: {
+            ...validArtifact.tasks[0].trained,
+            perSeed: { '101': 'pathway-supported', '202': 'no-specific-effect', '303': 'no-specific-effect' }
+          }
+        },
+        ...validArtifact.tasks.slice(1)
+      ]
+    });
+    const result = await loadTaskGenerality(manifestForBody, '/data');
+    expect(result.status).toBe('invalid');
+    if (result.status === 'invalid') expect(result.reason).toMatch(/trainedRobust disagrees with its own perSeed categories/);
+  });
+
+  it('is "invalid" when a task\'s trained.category disagrees with the representative trainer seed\'s own category', async () => {
+    const { manifest: manifestForBody } = manifestServing({
+      ...validArtifact,
+      tasks: [{ ...validArtifact.tasks[0], trained: { ...validArtifact.tasks[0].trained, category: 'edge-class-effect' } }, ...validArtifact.tasks.slice(1)]
+    });
+    const result = await loadTaskGenerality(manifestForBody, '/data');
+    expect(result.status).toBe('invalid');
+    if (result.status === 'invalid') expect(result.reason).toMatch(/category disagrees with perSeed/);
+  });
+
+  it('is "invalid" when sources.biologicalSha does not match the manifest\'s compiled biological graph (a stale/re-pinned artifact)', async () => {
+    const { manifest: manifestForBody } = manifestServing({
+      ...validArtifact,
+      sources: { ...validArtifact.sources, biologicalSha: 'f'.repeat(64) }
+    });
+    const result = await loadTaskGenerality(manifestForBody, '/data');
+    expect(result.status).toBe('invalid');
+    if (result.status === 'invalid') expect(result.reason).toMatch(/sources\.biologicalSha does not match/);
   });
 
   it('is "invalid" when overall.authored disagrees with its own per-task data (a hash-valid but internally inconsistent artifact)', async () => {
