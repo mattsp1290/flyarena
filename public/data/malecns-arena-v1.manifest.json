@@ -72,6 +72,6 @@
   "sourceDataset": "male-cns:v1.0 (Janelia FlyEM Male CNS connectome)",
   "taskGenerality": {
     "artifact": "task-generality-v1.json",
-    "sha256": "74f217ab877f1af47e86c8e0dc77ca8c7f5b9d232924a398cb42813c56bb1e83"
+    "sha256": "c7b1fd065d2e5b9eeae1a25804d836876d3c4671eabfd163d9ecc52daa545805"
   }
 }
