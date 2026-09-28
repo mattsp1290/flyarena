@@ -32,10 +32,25 @@ test.describe('Findings panel (task generality)', () => {
     // reaches a robust pathway-supported category).
     await expect(step).toContainText(/authored: general/);
     await expect(step).toContainText(/trained: task-dependent/);
-    // A single-seed pathway-supported hit is disclosed as "not robust"
-    // alongside its category, never only in a footnote.
-    await expect(step).toContainText(/not robust/);
-    await expect(step.locator('p.sentence')).toHaveText(/under this model\.$/);
+    // Thermo review (Important, both reviewers): the summary sentence
+    // itself stays short (no per-task/per-seed enumeration); "no specific
+    // effect" is defined once in the sentence, not repeated per task.
+    const sentenceEl = step.locator('p.sentence');
+    await expect(sentenceEl).toHaveText(/under this model\.$/);
+    const sentenceText = (await sentenceEl.textContent()) ?? '';
+    expect(sentenceText.length).toBeLessThan(400);
+    expect(sentenceText).toContain('"no specific effect" means neither pathway-supported nor edge-class holds');
+
+    // Per-task detail lives in its own screen-reader-friendly <ul>/<li>
+    // list, one item per task. "not robust" and the dissenting seed(s) are
+    // stated inline there (never only in a footnote).
+    const perTaskItems = step.locator('ul.per-task > li');
+    await expect(perTaskItems).toHaveCount(4);
+    await expect(step.locator('ul.per-task')).toContainText(/not robust \(seed \d+ pathway-supported\)/);
+    // no-movement's degenerate authored result is its own list item, never
+    // merged with anything else.
+    const noMovementItem = perTaskItems.filter({ hasText: 'no-movement' });
+    await expect(noMovementItem).toContainText('degenerate');
 
     const reportLink = step.getByRole('link', { name: /report/i });
     await expect(reportLink).toHaveAttribute('href', 'https://github.com/mattsp1290/flyarena/blob/main/docs/task-generality-report.md');

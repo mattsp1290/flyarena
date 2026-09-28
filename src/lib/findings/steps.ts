@@ -38,7 +38,7 @@ import {
   type PathwayInterventionsTrainedCategory
 } from '../experiment/pathwayInterventions';
 import type { RepertoireNullLoadResult } from '../experiment/repertoireNull';
-import type { TaskGeneralityLoadResult, TaskGeneralityTask } from '../experiment/taskGenerality';
+import type { TaskGeneralityLoadResult, TaskGeneralityTask, TaskGeneralityTrainedCategory } from '../experiment/taskGenerality';
 import { metricVerdictLabel } from '../atlas/repertoireStrip';
 import { CELL_COUNT } from '../atlas/types';
 import { githubDocUrl } from '../ui/links';
@@ -75,6 +75,18 @@ export interface FindingStep {
   readonly provenance: readonly FindingStepProvenance[];
   /** The underlying loader's own honest reason string, present only when `status` is `'unavailable'` or `'invalid'`. */
   readonly reason?: string;
+  /**
+   * Optional per-item detail rendered as its own `<ul>/<li>` list under
+   * `sentence` (`FindingsPanel.svelte`), for a step whose result is
+   * naturally a small collection rather than one flat fact -- currently
+   * only the task-generality step (`buildTaskGeneralityStep`). Thermo
+   * review (Important): an earlier version crammed this same per-task
+   * detail into `sentence` itself, producing a single ~1050-character
+   * run-on sentence with no navigable structure for a screen-reader user
+   * stepping through the panel. Absent (never an empty array) for every
+   * step whose result fits in one sentence.
+   */
+  readonly perTask?: readonly { readonly id: string; readonly authored: string; readonly trained: string }[];
 }
 
 export interface BuildFindingStepsInputs {
@@ -488,44 +500,56 @@ const buildTrainedInterventionsStep = (inputs: BuildFindingStepsInputs): Finding
  * decoder's fixed trainer-seed set is study-wide, not per-artifact.
  */
 
-/** One task's authored clause, e.g. `"hazard-heavy: pathway-supported"` or `"no-movement: degenerate"`. Null-holds is called out only when it does *not* hold (the common case needs no extra clause). */
+/**
+ * One task's authored clause, e.g. `"pathway-supported"` or `"degenerate"`.
+ * Null-holds is called out only when it does *not* hold (the common case
+ * needs no extra clause).
+ */
 const authoredTaskClause = (task: Readonly<TaskGeneralityTask>): string => {
-  if (!task.categorized) return `${task.id}: degenerate`;
+  if (!task.categorized) return 'degenerate';
   const holdsSuffix = task.null.nullHolds ? '' : ', null does not hold';
-  return `${task.id}: ${task.pathway.category}${holdsSuffix}`;
+  return `${task.pathway.category}${holdsSuffix}`;
 };
 
 /**
- * One task's trained clause -- "not robust" is always stated alongside the
- * category (never a footnote), with the per-seed breakdown so a
- * single-seed hit is never mistaken for a robust finding.
- *
- * `hasNote` (thermo-review-style finding, task-generality WP4 fix pass):
- * `'no-specific-effect'` reads as "no effect" to an unprimed reader, when it
- * actually means the trained side's predeclared rules cannot decide between
- * `edge-class-effect`/`not-supported` -- see `describeTrainedCategory`'s own
- * doc comment. Passed through only when the artifact's own
- * `trainedCategoryNote` field is present (never unconditionally), and only
- * on the headline (robust-branch) category, matching step 6's own
- * `buildTrainedInterventionsStep` precedent exactly -- the per-seed
- * disagreement listing omits it so a dissenting seed doesn't repeat the same
- * caveat once per seed.
+ * The short per-task category label -- deliberately *not*
+ * `describeTrainedCategory` (`./format.ts`), which always expands
+ * `'no-specific-effect'` to the full "no specific effect (neither
+ * pathway-supported nor edge-class...)" gloss with no way to omit it. That
+ * gloss is exactly what made the old per-task-per-seed sentence repeat the
+ * same 7-word phrase up to 8 times (thermo review, Important, both
+ * reviewers). Here the gloss is stated exactly once, in
+ * `buildTaskGeneralityStep`'s own `sentence`; every per-task/per-seed use
+ * gets only the plain label.
  */
-const trainedTaskClause = (task: Readonly<TaskGeneralityTask>, hasNote: boolean): string => {
-  // Narrowed into a local first (rather than repeatedly re-narrowing
-  // `task.trained.degenerate` at each use), since TypeScript does not carry
-  // a nested-property discriminant narrowing across a function-closure
-  // boundary (the `.map()` callback below) -- a plain local `const`
-  // narrows fine there.
+const shortTrainedCategoryLabel = (category: TaskGeneralityTrainedCategory): string =>
+  category === 'no-specific-effect' ? 'no specific effect' : category;
+
+/**
+ * One task's trained clause -- "not robust" is always stated inline (never
+ * a footnote), naming only the seed(s) that dissent from the headline
+ * (representative-seed) category, e.g. `"no specific effect, not robust
+ * (seed 202 pathway-supported)"`.
+ */
+const trainedTaskClauseShort = (task: Readonly<TaskGeneralityTask>): string => {
   const trained = task.trained;
-  if (trained.degenerate) return `${task.id}: degenerate`;
-  if (trained.trainedRobust) {
-    return `${task.id}: ${describeTrainedCategory(trained.category, { withCaveat: hasNote })} (robust)`;
-  }
-  const category = describeTrainedCategory(trained.category);
-  const perSeedText = P_TRAINER_SEEDS.map((seed) => `seed ${seed} ${describeTrainedCategory(trained.perSeed[seed])}`).join(', ');
-  return `${task.id}: ${category} (not robust -- ${perSeedText})`;
+  if (trained.degenerate) return 'degenerate';
+  const category = shortTrainedCategoryLabel(trained.category);
+  if (trained.trainedRobust) return `${category} (robust)`;
+  // Dissenting = disagrees with the headline value (`trained.category`,
+  // the representative trainer seed's own category -- already validated by
+  // the loader to equal `perSeed[P_TRAINER_SEEDS[0]]`), not a freshly
+  // computed "majority": this reuses the one representative-category
+  // convention the producer/report already establish, rather than
+  // introducing a second, different voting rule for this one surface.
+  const dissenting = P_TRAINER_SEEDS.filter((seed) => trained.perSeed[seed] !== trained.category);
+  const dissentingText = dissenting.map((seed) => `seed ${seed} ${shortTrainedCategoryLabel(trained.perSeed[seed])}`).join(', ');
+  return `${category}, not robust (${dissentingText})`;
 };
+
+/** Whether any non-degenerate task's trained result actually uses `'no-specific-effect'` at any seed -- the same condition the report's own `buildResultDependentLimitations`/`buildClearanceLimitations` gate their disclosures on, reused here so the step and the report never disagree about when this needs explaining. */
+const anyNoSpecificEffect = (tasks: readonly Readonly<TaskGeneralityTask>[]): boolean =>
+  tasks.some((t) => !t.trained.degenerate && Object.values(t.trained.perSeed).includes('no-specific-effect'));
 
 const buildTaskGeneralityStep = (inputs: BuildFindingStepsInputs): FindingStep => {
   const provenance = provenanceFor(
@@ -547,18 +571,48 @@ const buildTaskGeneralityStep = (inputs: BuildFindingStepsInputs): FindingStep =
   }
   const { tasks, overall, trainedCategoryNote } = inputs.taskGenerality.data;
 
-  const authoredClause =
+  // Thermo review (Important, both reviewers): a single sentence folding in
+  // all 4 tasks' full per-seed detail ran to ~1050 characters with no
+  // navigable structure. `sentence` now states only the two overall
+  // verdicts (plus the "no specific effect" definition/convention
+  // disclosure, stated once here rather than once per task); the per-task
+  // breakdown moves to `perTask`, rendered as its own `<ul>/<li>` list by
+  // `FindingsPanel.svelte` -- a natural stop for both a sighted skim and a
+  // screen-reader user walking the step.
+  const authoredSummary =
     overall.authored.verdict === 'general'
-      ? `general (${overall.authored.nonDegenerateCount} of ${overall.authored.totalCount} tasks non-degenerate, null holds and the pathway generalizes in every one)`
-      : `task-dependent (${tasks.map(authoredTaskClause).join('; ')})`;
-  const trainedClause =
+      ? `general (${overall.authored.nonDegenerateCount} of ${overall.authored.totalCount} non-degenerate, null holds and the pathway generalizes in every one)`
+      : `task-dependent (${overall.authored.nonDegenerateCount} of ${overall.authored.totalCount} non-degenerate; see per-task detail below)`;
+  const trainedSummary =
     overall.trained.verdict === 'general'
-      ? `general (${overall.trained.nonDegenerateCount} of ${overall.trained.totalCount} tasks non-degenerate)`
-      : `task-dependent (${tasks.map((task) => trainedTaskClause(task, Boolean(trainedCategoryNote))).join('; ')})`;
+      ? `general (${overall.trained.nonDegenerateCount} of ${overall.trained.totalCount} non-degenerate)`
+      : `task-dependent (${overall.trained.nonDegenerateCount} of ${overall.trained.totalCount} non-degenerate; see per-task detail below)`;
+
+  // Defined once here (never per task/per seed) -- every step's own
+  // sentence must still end with "under this model." (the fixed ending
+  // every step in this panel shares), so this clause is inserted *before*
+  // that ending, not appended after it.
+  const definitionClause = anyNoSpecificEffect(tasks)
+    ? `; "no specific effect" means neither pathway-supported nor edge-class holds${trainedCategoryNote ? ' (a reporting convention adopted after the trained scores were known, not a predeclared category)' : ''}`
+    : '';
 
   const sentence =
-    `Across ${tasks.length} task variants, authored: ${authoredClause}; trained: ${trainedClause}, under this model.`;
-  return { ...base, status: 'ok', sentence };
+    `Across ${tasks.length} task variants, authored: ${authoredSummary}; trained: ${trainedSummary}${definitionClause}, under this model.`;
+
+  // Every task gets its own list item regardless of the overall verdicts
+  // (never conditionally hidden), each stating both decoders' results --
+  // "not robust" and the dissenting seed(s) stay inline (never a footnote),
+  // and no-movement's degenerate P/C/M category is never merged with any
+  // other clause (its authored text is simply "degenerate"; the
+  // independently-valid Q-vs-MQ result lives only in the full report, not
+  // duplicated here).
+  const perTask = tasks.map((task) => ({
+    id: task.id,
+    authored: authoredTaskClause(task),
+    trained: trainedTaskClauseShort(task)
+  }));
+
+  return { ...base, status: 'ok', sentence, perTask };
 };
 
 // ---------------------------------------------------------------------------

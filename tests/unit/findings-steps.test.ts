@@ -332,7 +332,7 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     expect(step.sentence).not.toContain('reporting convention');
   });
 
-  it('step 7 (task generality) states the real authored/trained overall verdicts, under this model', () => {
+  it('step 7 (task generality) states the real authored/trained overall verdicts as a short summary, with per-task detail in perTask', () => {
     const steps = buildFindingSteps(baseInputs());
     const step = findStep(steps, 'task-generality');
     expect(step.status).toBe('ok');
@@ -345,12 +345,32 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     expect(step.sentence).toContain(`${realTaskGenerality.tasks.length} task variants`);
     expect(step.sentence).toContain('authored: general');
     expect(step.sentence).toContain('trained: task-dependent');
-    // A single-seed pathway-supported hit is disclosed as "not robust"
-    // alongside its category, never only in a footnote.
-    expect(step.sentence).toMatch(/not robust/);
     expect(step.sentence).toMatch(/under this model\.$/);
+    // Thermo review (Important, both reviewers): the sentence itself must
+    // stay short -- no per-task/per-seed enumeration folded in.
+    expect(step.sentence?.length).toBeLessThan(400);
+    expect(step.sentence).not.toMatch(/seed \d+ (pathway-supported|no specific effect)/);
+    // "No specific effect" is defined once, in the sentence, not per task.
+    expect(step.sentence).toContain('"no specific effect" means neither pathway-supported nor edge-class holds');
     expect(step.provenance).toHaveLength(1);
     expect(step.provenance[0].sha256Prefix).toBe(manifest.taskGenerality?.sha256.slice(0, 12));
+
+    // Per-task detail: one entry per task, "not robust" and the dissenting
+    // seed(s) stated inline, never all three seeds when only one dissents.
+    expect(step.perTask).toHaveLength(4);
+    const hazardHeavy = step.perTask?.find((t) => t.id === 'hazard-heavy');
+    expect(hazardHeavy?.authored).toBe('pathway-supported');
+    expect(hazardHeavy?.trained).toBe('no specific effect, not robust (seed 202 pathway-supported)');
+    const crowded = step.perTask?.find((t) => t.id === 'crowded');
+    expect(crowded?.trained).toBe('no specific effect, not robust (seed 303 pathway-supported)');
+    const sparseFood = step.perTask?.find((t) => t.id === 'sparse-food');
+    expect(sparseFood?.trained).toBe('no specific effect (robust)');
+    const noMovement = step.perTask?.find((t) => t.id === 'no-movement');
+    // no-movement's degenerate authored (P/C/M) result stays separate from
+    // its independently-valid Q-vs-MQ result -- the step never mentions
+    // Q/MQ at all (that detail lives only in the full report), so there is
+    // nothing here to conflate.
+    expect(noMovement?.authored).toBe('degenerate');
   });
 
   it('step 7 states "general" for both authored and trained when every non-degenerate task generalizes/reaches a robust pathway-supported category', () => {
@@ -378,10 +398,10 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     expect(step.sentence).toContain('authored: general');
     expect(step.sentence).toContain('trained: general');
     expect(step.sentence).not.toContain('not robust');
-    // "non-degenerate" is expected static text even in the general branch
-    // (the parenthetical count) -- only a per-task "<id>: degenerate" clause
-    // (the task-dependent listing) would be wrong here.
-    expect(step.sentence).not.toMatch(/: degenerate/);
+    // No task uses no-specific-effect here, so the definition clause is absent.
+    expect(step.sentence).not.toContain('"no specific effect" means');
+    expect(step.perTask?.every((t) => t.authored === 'pathway-supported')).toBe(true);
+    expect(step.perTask?.every((t) => t.trained === 'pathway-supported (robust)')).toBe(true);
   });
 
   it('step 7 lists per-task detail, including a degenerate task, when the authored side is task-dependent', () => {
@@ -415,9 +435,13 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     };
     const step = findStep(buildFindingSteps({ ...baseInputs(), taskGenerality: taskGeneralityOk(taskDependent) }), 'task-generality');
     expect(step.sentence).toContain('authored: task-dependent');
-    expect(step.sentence).toContain('no-movement: degenerate');
-    expect(step.sentence).toContain('hazard-heavy: not-supported');
     expect(step.sentence).toContain('trained: task-dependent');
+    expect(step.sentence).toContain('see per-task detail below');
+    const noMovement = step.perTask?.find((t) => t.id === 'no-movement');
+    expect(noMovement?.authored).toBe('degenerate');
+    const hazardHeavy = step.perTask?.find((t) => t.id === 'hazard-heavy');
+    expect(hazardHeavy?.authored).toBe('not-supported');
+    expect(hazardHeavy?.trained).toBe('no specific effect (robust)');
   });
 
   it('step 7 is "missing" with no sentence when the task-generality artifact has not been published', () => {

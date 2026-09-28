@@ -141,6 +141,23 @@
             <p class="status-line">{findingStepStatusLabel(step.status)}{step.reason ? `: ${step.reason}` : ''}</p>
           {/if}
 
+          {#if step.status === 'ok' && step.perTask && step.perTask.length > 0}
+            <!-- WP4 fix pass (thermo review, Important, both reviewers): the
+                 task-generality step's per-task detail used to be folded
+                 into `sentence` itself, producing one ~1050-character
+                 run-on sentence with no navigable internal structure. Each
+                 task is now its own `<li>` -- a natural stop for both a
+                 sighted skim and a screen-reader user walking the step
+                 (this list sits inside the same `<li class="step">`, so it
+                 reads immediately after the summary sentence, before the
+                 provenance links). -->
+            <ul class="per-task">
+              {#each step.perTask as task (task.id)}
+                <li><strong>{task.id}</strong> — authored: {task.authored}; trained: {task.trained}</li>
+              {/each}
+            </ul>
+          {/if}
+
           {#if step.id === 'behavior-repertoire'}
             <p class="see-also">
               {#if step.status === 'ok'}
@@ -291,6 +308,23 @@
     margin: 0.4rem 0;
     color: #9aacc2;
     font-size: 0.8rem;
+  }
+
+  .per-task {
+    margin: 0.4rem 0;
+    padding-left: 1.1rem;
+    display: grid;
+    gap: 0.3rem;
+  }
+
+  .per-task li {
+    color: #cbd8e7;
+    font-size: 0.78rem;
+    line-height: 1.4;
+  }
+
+  .per-task strong {
+    color: #e8f0f8;
   }
 
   .see-also a {

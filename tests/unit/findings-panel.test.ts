@@ -143,7 +143,7 @@ describe('FindingsPanel', () => {
     expect(screen.getByText('Step 1 of 8')).toBeInTheDocument();
   });
 
-  it('step 7 (task generality) states the real overall verdicts and links to the report', async () => {
+  it('step 7 (task generality) states the real overall verdicts in a short summary, plus a per-task <ul> list', async () => {
     render(FindingsPanel, okProps());
     await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
     const step7 = document.querySelectorAll('ol.steps > li.step')[6] as HTMLElement;
@@ -151,6 +151,14 @@ describe('FindingsPanel', () => {
     expect(sentence.textContent).toMatch(new RegExp(`authored: ${realTaskGenerality.overall.authored.verdict}`));
     expect(sentence.textContent).toMatch(new RegExp(`trained: ${realTaskGenerality.overall.trained.verdict}`));
     expect(sentence.textContent).toMatch(/under this model\.$/);
+    // Thermo review (Important, both reviewers): per-task detail moved out
+    // of the sentence into its own screen-reader-friendly <ul>/<li> list.
+    const perTaskItems = step7.querySelectorAll('ul.per-task > li');
+    expect(perTaskItems).toHaveLength(realTaskGenerality.tasks.length);
+    const itemTexts = Array.from(perTaskItems).map((li) => li.textContent ?? '');
+    for (const task of realTaskGenerality.tasks) {
+      expect(itemTexts.some((text) => text.includes(task.id))).toBe(true);
+    }
   });
 
   it('step 7 shows "Not yet published" when the task-generality artifact is missing', async () => {
