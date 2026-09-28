@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { readoutFromFlat } from '../../src/lib/connectome/readout-serialization';
 import { readNpyFloat32Array } from '../../scripts/training/npy';
 import {
+  arenaTaskFingerprintOf,
   assertArmMatchesGraphId,
   assertTaskGraphMatchesDefaultGraph,
   buildArchivedReadout,
@@ -574,6 +575,33 @@ describe('mergeReadouts', () => {
   });
 });
 
+describe('arenaTaskFingerprintOf', () => {
+  it('returns the stored value for a task-intervention entry', () => {
+    const entry = makeEntry({
+      kind: 'task-intervention',
+      arenaTask: 'hazard-heavy',
+      arenaTaskFingerprint: 'stored-hazard-heavy-fingerprint'
+    });
+    expect(arenaTaskFingerprintOf(entry)).toBe('stored-hazard-heavy-fingerprint');
+  });
+
+  it('resolves the DEFAULT task\'s real fingerprint for a default entry with no stored field, never "any"/"unknown"', () => {
+    const entry = makeEntry({ kind: 'bigq', arenaTask: 'default', arenaTaskFingerprint: undefined });
+    const resolved = arenaTaskFingerprintOf(entry);
+    expect(resolved).toMatch(/^arena-config-v1\|/);
+    // Matches what a real default-task entry's fingerprint would resolve to
+    // (cross-checked against a real task-intervention entry's own resolved
+    // fingerprint being DIFFERENT, so this isn't vacuously true for any string).
+    const hazardHeavy = arenaTaskFingerprintOf(makeEntry({ kind: 'task-intervention', arenaTask: 'hazard-heavy' }));
+    expect(resolved).not.toBe(hazardHeavy);
+  });
+
+  it('throws on an entry with an unrecognized arenaTask id (never silently resolves to "any")', () => {
+    const entry = makeEntry({ arenaTask: 'not-a-real-task', arenaTaskFingerprint: undefined });
+    expect(() => arenaTaskFingerprintOf(entry)).toThrow();
+  });
+});
+
 describe('assertTaskGraphMatchesDefaultGraph', () => {
   it('is a no-op for a non-task-intervention entry', () => {
     const addition = makeEntry({ kind: 'bigq' });
@@ -845,7 +873,15 @@ describe('runArchiveReadouts', () => {
           arenaTask: 'hazard-heavy',
           arenaTaskFingerprint: 'fingerprint',
           graphListSha256,
-          runs: [{ id: 'C000', trainerSeed: 101, armBundleSha256: 'archived-task-sha', movementScore: [1, 2, 3] }]
+          runs: [
+            {
+              id: 'C000',
+              trainerSeed: 101,
+              armBundleSha256: 'archived-task-sha',
+              gzipSha256: 'raw-file-gzip-sha',
+              movementScore: [1, 2, 3]
+            }
+          ]
         })
       );
 
@@ -898,7 +934,7 @@ describe('runArchiveReadouts', () => {
         JSON.stringify({
           arenaTask: 'hazard-heavy',
           graphListSha256: 'f'.repeat(64), // wrong -- does not match indexPath's own sha256
-          runs: [{ id: 'C000', trainerSeed: 101, armBundleSha256: 'x', movementScore: [1] }]
+          runs: [{ id: 'C000', trainerSeed: 101, armBundleSha256: 'x', gzipSha256: 'y', movementScore: [1] }]
         })
       );
       const args = baseArgs({

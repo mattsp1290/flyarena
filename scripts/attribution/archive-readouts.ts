@@ -18,11 +18,6 @@ import {
 import { copyInterventionIndex, readAndValidateInterventionIndex } from './intervention-index';
 import { buildInterventionSwapsArchive, extractInterventionSwaps } from './intervention-swaps';
 import { copyVerbatim } from './copy-verbatim';
-import {
-  assertTaskArmBundlesMatchRawScores,
-  readTaskInterventionRawScores,
-  type TaskArmBundleCheckable
-} from './task-intervention-raw-scores';
 
 /**
  * `.agents/plans/readout-attribution/01-archive-and-types.md`'s WP1: archive
@@ -103,7 +98,7 @@ export const DEFAULT_INTERVENTION_SWAPS_OUT = resolve(repoRoot, 'training/archiv
 /**
  * WP1b: `<dir>/task-intervention-trained-raw-<arenaTask>-v1.json` -- one file
  * per arena task (never merged into one file -- see
- * `task-intervention-raw-scores.ts`'s doc comment), so each stays a
+ * `raw-intervention-scores.ts`'s doc comment), so each stays a
  * byte-for-byte copy of that task's own `flyarena-s8z8` `trained.json`, each
  * independently checkable against its own recorded sha256. `resolveArenaTask`
  * validates `arenaTask` (throws on an unrecognized id) before it is
@@ -157,6 +152,15 @@ export interface ArchivedReadout {
    * (not merely re-derivable by re-resolving `arenaTask`) so a reader/test
    * can check it against `tests/fixtures/golden/tasks.json` without importing
    * `resolveArenaTask` itself.
+   *
+   * DO NOT read this field directly to answer "what is this entry's arena-
+   * task fingerprint" -- `undefined` here does NOT mean "unknown" or "any
+   * task" (unlike most other optional fields in this codebase, e.g. a
+   * legacy run's absent `arenaTaskFingerprint` in `null-trained-worker.ts`'s
+   * `assertRunMatchesExpectedIdentity`); it means "the default task's,
+   * omitted only to keep these bytes stable." Use `arenaTaskFingerprintOf`
+   * below, the sanctioned read path, instead (a thermo-maintainability
+   * review finding).
    */
   readonly arenaTaskFingerprint?: string;
   readonly graphArtifactSha256: string;
@@ -223,6 +227,21 @@ export interface ArchivedReadout {
    */
   readonly sourcePath: string;
 }
+
+/**
+ * The sanctioned way to read an `ArchivedReadout`'s arena-task fingerprint
+ * (a thermo-maintainability review finding on `arenaTaskFingerprint`'s own
+ * doc comment above): always resolvable from `arenaTask` -- which is never
+ * optional -- even when the stored field itself is omitted for byte-identity
+ * reasons on a default-task entry. Never returns "any"/"unknown": a default
+ * entry resolves to the DEFAULT task's own fingerprint, exactly what
+ * `resolveArenaTask('default').fingerprint` (equivalently
+ * `resolveArenaTask(undefined).fingerprint`) already is. WP2 code should
+ * call this rather than branch on `entry.arenaTaskFingerprint === undefined`
+ * itself.
+ */
+export const arenaTaskFingerprintOf = (entry: Readonly<ArchivedReadout>): string =>
+  entry.arenaTaskFingerprint ?? resolveArenaTask(entry.arenaTask).fingerprint;
 
 export interface TrainedReadoutArchive {
   readonly version: 1;
@@ -292,7 +311,7 @@ export interface TaskInterventionRawScoreSpec {
  * (`outDir` defaults to `DEFAULT_TASK_INTERVENTION_RAW_SCORES_OUT_DIR`,
  * overridable with `--task-intervention-raw-scores-out-dir`). No `idSuffix`
  * (unlike `--source`): one raw-scores file per arena task is the whole shape
- * (`task-intervention-raw-scores.ts`'s doc comment).
+ * (`raw-intervention-scores.ts`'s doc comment).
  */
 export const parseTaskInterventionRawScoresArg = (flag: string, value: string): TaskInterventionRawScoreSpec => {
   const eq = value.indexOf('=');
@@ -302,6 +321,28 @@ export const parseTaskInterventionRawScoresArg = (flag: string, value: string): 
   if (!path) throw new Error(`${flag} must be "<arenaTaskId>=<path>", got "${value}"`);
   resolveArenaTask(arenaTask); // throws on an unrecognized arena-task id
   return { arenaTask, path: resolve(process.cwd(), path) };
+};
+
+/**
+ * Rejects two `--task-intervention-raw-scores` specs for the SAME arena
+ * task in one invocation (a dual-review finding): both would validate
+ * independently and the second would silently overwrite the first's output
+ * file (both resolve to the same `taskInterventionRawScoresOutPath`) --
+ * unlike `mergeReadouts`, which always refuses to silently overwrite a
+ * conflicting entry. Extracted into its own named function (a
+ * thermo-provenance review suggestion) for stylistic consistency with this
+ * file's other `parseArgs`-adjacent validators (`parseSourceArg`,
+ * `parseTaskInterventionRawScoresArg`), rather than a bare block inline in
+ * `parseArgs`.
+ */
+export const assertNoDuplicateTaskInterventionRawScores = (specs: readonly TaskInterventionRawScoreSpec[]): void => {
+  const seenArenaTasks = new Set<string>();
+  for (const spec of specs) {
+    if (seenArenaTasks.has(spec.arenaTask)) {
+      throw new Error(`archive-readouts: --task-intervention-raw-scores "${spec.arenaTask}" was given more than once`);
+    }
+    seenArenaTasks.add(spec.arenaTask);
+  }
 };
 
 export interface ArchiveReadoutsArgs {
@@ -379,24 +420,11 @@ export const parseArgs = (argv: readonly string[]): ArchiveReadoutsArgs => {
         '--intervention-attribution/--task-intervention-raw-scores is required'
     );
   }
-  // A dual-review finding: without this, two `--task-intervention-raw-scores`
-  // for the SAME arena task would both validate independently and the
-  // second would silently overwrite the first's output file (both resolve
-  // to the same `taskInterventionRawScoresOutPath`) -- unlike `mergeReadouts`,
-  // which always refuses to silently overwrite a conflicting entry. Checked
-  // here (all of `argv` parsed, one pass) rather than in `runArchiveReadouts`,
-  // so a CLI-level operator mistake is caught before any file is even read.
-  {
-    const seenArenaTasks = new Set<string>();
-    for (const spec of taskInterventionRawScores) {
-      if (seenArenaTasks.has(spec.arenaTask)) {
-        throw new Error(
-          `archive-readouts: --task-intervention-raw-scores "${spec.arenaTask}" was given more than once`
-        );
-      }
-      seenArenaTasks.add(spec.arenaTask);
-    }
-  }
+  // Checked here (all of `argv` parsed, one pass) rather than in
+  // `runArchiveReadouts`, so a CLI-level operator mistake is caught before
+  // any file is even read -- see `assertNoDuplicateTaskInterventionRawScores`'s
+  // own doc comment for why this check exists at all.
+  assertNoDuplicateTaskInterventionRawScores(taskInterventionRawScores);
   for (const [flagName, path] of [
     ['--out', out],
     ['--raw-intervention-scores-out', rawInterventionScoresOut],
@@ -791,7 +819,7 @@ export const runArchiveReadouts = (args: Readonly<ArchiveReadoutsArgs>): RunArch
     );
   }
   const taskRawFiles = args.taskInterventionRawScores.map((spec) => {
-    const read = readTaskInterventionRawScores(spec.path, spec.arenaTask);
+    const read = readRawInterventionScores(spec.path, { expectedArenaTask: spec.arenaTask });
     // "The per-task runs use the same intervention graphs as the default
     // task, and archive-readouts must verify this rather than assume it"
     // (01-archive-and-types.md) -- checked here at the raw-scores level too,
@@ -819,7 +847,7 @@ export const runArchiveReadouts = (args: Readonly<ArchiveReadoutsArgs>): RunArch
   });
   if (rawScores) assertArmBundlesMatchRawScores(additions, rawScores.runs);
   for (const taskRawFile of taskRawFiles) {
-    assertTaskArmBundlesMatchRawScores(additions as readonly TaskArmBundleCheckable[], taskRawFile.arenaTask, taskRawFile.parsed.runs);
+    assertArmBundlesMatchRawScores(additions, taskRawFile.runs, { kind: 'task-intervention', arenaTask: taskRawFile.arenaTask });
   }
 
   const existing = args.sources.length > 0 ? loadExistingArchive(args.out) : null;

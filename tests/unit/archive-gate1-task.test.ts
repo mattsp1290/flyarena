@@ -3,7 +3,7 @@ import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { sha256Hex } from '../../scripts/training/fsio';
-import type { ArchivedReadout, TrainedReadoutArchive } from '../../scripts/attribution/archive-readouts';
+import { arenaTaskFingerprintOf, type ArchivedReadout, type TrainedReadoutArchive } from '../../scripts/attribution/archive-readouts';
 
 /**
  * `.agents/plans/readout-attribution/01-archive-and-types.md`'s WP1b Gate 1
@@ -21,18 +21,25 @@ import type { ArchivedReadout, TrainedReadoutArchive } from '../../scripts/attri
  * `flyarena-s8z8`'s committed `training/runs/tasks/<task>/trained.json`
  * bit-for-bit -- every `movementScore` array, not merely its mean -- for
  * all 52 runs across all 4 tasks (verified against the exact trained.json
- * shas the bead recorded: hazard-heavy 10006b64…, sparse-food 6fbae4e2…,
- * no-movement 78bdaf1b…, crowded 98c19e06…). That full rescore is too
- * expensive to re-run as a unit test (5,200 episodes); this file is the
- * static half that would have caught a hand-edit or a future regression in
- * `archive-readouts.ts` (or in the committed `task-intervention-trained-raw-
- * *-v1.json` files) immediately -- it reads only files this repository
- * already commits, no worktree, no episode simulation. `EXPECTED_MEANS`
- * below are the exact per-run means from that verified rescore (computed
- * here from the committed raw `movementScore` arrays via plain arithmetic,
- * not re-simulated), so a future edit that silently swapped a raw-scores
- * file or an archive entry would fail this test even if every other
- * cross-reference happened to still line up.
+ * shas the bead recorded, pinned below as `EXPECTED_RAW_FILE_SHA256`). That
+ * full rescore is too expensive to re-run as a unit test (5,200 episodes);
+ * this file is the static half that would have caught a hand-edit or a
+ * future regression in `archive-readouts.ts` (or in the committed
+ * `task-intervention-trained-raw-*-v1.json` files) immediately -- it reads
+ * only files this repository already commits, no worktree, no episode
+ * simulation.
+ *
+ * A thermo-maintainability review found an earlier version of this file
+ * pinned 52 hand-computed per-run mean `movementScore` floats
+ * (`EXPECTED_MEANS`) instead of the four raw files' own sha256 -- strictly
+ * weaker (protects only the mean of one field, not the file's other bytes:
+ * `heldOutSeeds`, `gzipSha256`, `armBundleSha256`, `ticks`, ...) and noisier
+ * (52 ~15-significant-digit constants vs. 4 hex strings that were already
+ * sitting in this doc comment as the verified-rescore provenance). Pinning
+ * each raw file's own sha256 -- exactly what `copyVerbatim`'s whole purpose
+ * already is elsewhere in this archive -- catches corruption of ANY byte in
+ * the file, is smaller, and needs no new information: `EXPECTED_MEANS` is
+ * gone.
  */
 
 const repoRoot = resolve(__dirname, '../..');
@@ -68,67 +75,18 @@ const goldenTasks = readJson<Record<string, string>>('tests/fixtures/golden/task
 
 const interventionEntries = archive.readouts.filter((r) => r.kind === 'intervention');
 
-const mean = (values: readonly number[]): number => values.reduce((sum, v) => sum + v, 0) / values.length;
-
 /**
- * The exact per-run mean movement score from the verified rescore (this
- * file's own doc comment) -- `<graphId>-seed<trainerSeed>-<arenaTask>`,
- * matching `ArchivedReadout.id`'s own format.
+ * The verified rescore's own provenance (this file's doc comment): each
+ * task's raw-scores file's sha256, exactly as `flyarena-s8z8`'s bead
+ * recorded it. A thermo-maintainability-review suggestion, replacing a
+ * previous 52-entry hand-computed mean table -- see the doc comment above.
  */
-const EXPECTED_MEANS: ReadonlyMap<string, number> = new Map([
-  ['C000-seed101-crowded', 95.19914927275973],
-  ['C000-seed101-hazard-heavy', 26.0725327620016],
-  ['C000-seed101-no-movement', 51.7],
-  ['C000-seed101-sparse-food', 44.466663647620756],
-  ['C001-seed101-crowded', 92.42038888192845],
-  ['C001-seed101-hazard-heavy', 52.30779569585795],
-  ['C001-seed101-no-movement', 55.3],
-  ['C001-seed101-sparse-food', 43.928357644156286],
-  ['C002-seed101-crowded', 112.02450993084136],
-  ['C002-seed101-hazard-heavy', 35.467567745665264],
-  ['C002-seed101-no-movement', 58.42],
-  ['C002-seed101-sparse-food', 44.12507647495929],
-  ['C003-seed101-crowded', 111.67692900726094],
-  ['C003-seed101-hazard-heavy', 50.22682831796527],
-  ['C003-seed101-no-movement', 54.6],
-  ['C003-seed101-sparse-food', 43.249659030448385],
-  ['C004-seed101-crowded', 109.35731776818056],
-  ['C004-seed101-hazard-heavy', 55.81700065017724],
-  ['C004-seed101-no-movement', 55.66],
-  ['C004-seed101-sparse-food', 41.81708264925878],
-  ['M1000-seed101-crowded', 95.15836881361496],
-  ['M1000-seed101-hazard-heavy', 47.55037668662937],
-  ['M1000-seed101-no-movement', 48.24],
-  ['M1000-seed101-sparse-food', 43.67897797046632],
-  ['M1001-seed101-crowded', 93.33902111733344],
-  ['M1001-seed101-hazard-heavy', 49.94973320887546],
-  ['M1001-seed101-no-movement', 29.3],
-  ['M1001-seed101-sparse-food', 45.55990603102984],
-  ['M1002-seed101-crowded', 114.1691926748693],
-  ['M1002-seed101-hazard-heavy', 49.68896438477141],
-  ['M1002-seed101-no-movement', 56.04],
-  ['M1002-seed101-sparse-food', 44.003700492192976],
-  ['M1003-seed101-crowded', 108.85213170719247],
-  ['M1003-seed101-hazard-heavy', 49.076932496726215],
-  ['M1003-seed101-no-movement', 59.62],
-  ['M1003-seed101-sparse-food', 45.074270465629425],
-  ['M1004-seed101-crowded', 86.58248588702449],
-  ['M1004-seed101-hazard-heavy', 37.410368494934474],
-  ['M1004-seed101-no-movement', 69.14],
-  ['M1004-seed101-sparse-food', 43.9359035213899],
-  ['P-seed101-crowded', 92.7795677997876],
-  ['P-seed101-hazard-heavy', 37.918642167784135],
-  ['P-seed101-no-movement', 56.26],
-  ['P-seed101-sparse-food', 39.65600048306926],
-  ['P-seed202-crowded', 93.56504615995198],
-  ['P-seed202-hazard-heavy', 59.087402450365644],
-  ['P-seed202-no-movement', 56.2],
-  ['P-seed202-sparse-food', 39.47761767478665],
-  ['P-seed303-crowded', 114.79844118015906],
-  ['P-seed303-hazard-heavy', 51.462333674606654],
-  ['P-seed303-no-movement', 54.68],
-  ['P-seed303-sparse-food', 41.15037294764599]
-]);
+const EXPECTED_RAW_FILE_SHA256: Readonly<Record<(typeof TASKS)[number], string>> = {
+  'hazard-heavy': '10006b64a8dd3f7a25f3bdebb023d1d1c4a99c804a47aa1d3a6b9761f8b8832d',
+  'sparse-food': '6fbae4e239ce4ef0afce49330faf51244706d77b6b8ca7ede4f76aa58377cbb9',
+  'no-movement': '78bdaf1b212fa6f044a4447eb34302989d87d97cd31602e658b928bc61967402',
+  crowded: '98c19e06b7678c0096739502d35b50168a114eb23befbbc356a481b4382798d1'
+};
 
 describe('WP1b archive vs flyarena-s8z8 per-task trained.json (Gate 1, task-intervention identity/score half)', () => {
   it('has exactly 52 task-intervention entries (13 per task x 4 tasks)', () => {
@@ -144,18 +102,26 @@ describe('WP1b archive vs flyarena-s8z8 per-task trained.json (Gate 1, task-inte
     expect(archive.readouts).toHaveLength(75); // 10 bigq + 13 intervention + 52 task-intervention
   });
 
-  it('every task-intervention entry\'s arenaTaskFingerprint matches tests/fixtures/golden/tasks.json', () => {
+  it('every task-intervention entry\'s arenaTaskFingerprintOf(entry) matches tests/fixtures/golden/tasks.json', () => {
     expect(taskIntervention.length).toBeGreaterThan(0);
     for (const entry of taskIntervention) {
       const expected = goldenTasks[entry.arenaTask];
       expect(expected, `no golden fixture for arenaTask "${entry.arenaTask}"`).toBeDefined();
-      expect(entry.arenaTaskFingerprint).toBe(expected);
+      // The sanctioned read path (a thermo-maintainability review finding),
+      // not the raw `entry.arenaTaskFingerprint` field directly.
+      expect(arenaTaskFingerprintOf(entry)).toBe(expected);
     }
   });
 
-  it('no bigq/default-task-intervention entry carries an arenaTaskFingerprint (only task-intervention entries do)', () => {
+  it('no bigq/default-task-intervention entry carries a STORED arenaTaskFingerprint (only task-intervention entries do), but arenaTaskFingerprintOf still resolves the default task\'s real fingerprint for them', () => {
     for (const entry of archive.readouts.filter((r) => r.kind !== 'task-intervention')) {
+      // Testing the storage/optionality mechanic itself here -- the raw
+      // field, not the accessor, is the thing under test in this assertion.
       expect(entry.arenaTaskFingerprint).toBeUndefined();
+      // But the accessor never returns "any"/"unknown": a default entry
+      // resolves to the DEFAULT task's own fingerprint, matching the golden
+      // fixture's own "default" entry.
+      expect(arenaTaskFingerprintOf(entry)).toBe(goldenTasks.default);
     }
   });
 
@@ -209,16 +175,19 @@ describe('WP1b archive vs flyarena-s8z8 per-task trained.json (Gate 1, task-inte
     });
   }
 
-  it('every archived task-intervention entry\'s per-run mean (from its task\'s raw scores file) matches the verified rescore exactly', () => {
-    expect(EXPECTED_MEANS.size).toBe(52);
+  it('every task\'s raw-scores file matches its verified-rescore sha256 exactly (protects every byte, not just movementScore\'s mean)', () => {
+    for (const task of TASKS) {
+      const actual = sha256Hex(readBytes(`training/archive/task-intervention-trained-raw-${task}-v1.json`));
+      expect(actual, `${task}'s raw-scores file`).toBe(EXPECTED_RAW_FILE_SHA256[task]);
+    }
+  });
+
+  it('every archived task-intervention entry has a corresponding run in its task\'s raw scores file with 100 held-out movement scores', () => {
     for (const entry of taskIntervention) {
       const raw = rawByTask.get(entry.arenaTask)!;
       const rawRun = raw.runs.find((r) => r.id === entry.graphId && r.trainerSeed === entry.trainerSeed);
       expect(rawRun, `no raw run for ${entry.id}`).toBeDefined();
       expect(rawRun?.movementScore).toHaveLength(100);
-      const expected = EXPECTED_MEANS.get(entry.id);
-      expect(expected, `no EXPECTED_MEANS entry for ${entry.id}`).toBeDefined();
-      expect(mean(rawRun!.movementScore)).toBe(expected);
     }
   });
 
