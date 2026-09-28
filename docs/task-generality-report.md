@@ -33,26 +33,26 @@ capacity check.
 ### `hazard-heavy` (hazardCount=4, hazardPenalty=6)
 
 - Null: biological -10.86 (1.8%) vs 25th percentile -9.27 (median -8.19) -- holds.
-- Pathway: **pathway-supported** (generalizes). P=-5.64, C p95=-10.86, M p95=-9.26.
-- Trained: **no-specific-effect** (not robust (1 of 3 seeds reach pathway-supported -- this is a single-seed hit, not a robust finding)). Per seed: seed 101: no-specific-effect, seed 202: pathway-supported, seed 303: no-specific-effect.
+- Pathway: **pathway-supported** (generalizes). P=-5.64, C p95=-10.86, M p95=-9.26. Q-vs-MQ channel-specific (Q=-5.90): holds.
+- Trained: **no-specific-effect** (not robust (1 of 3 seeds reach pathway-supported -- a single-seed hit, not a robust finding)). Per seed: seed 101: no-specific-effect, seed 202: pathway-supported, seed 303: no-specific-effect.
 
 ### `sparse-food` (halfWidth=18, halfDepth=12, foodCount=1)
 
 - Null: biological -0.42 (0.0%) vs 25th percentile 0.94 (median 1.30) -- holds.
-- Pathway: **pathway-supported** (generalizes). P=1.11, C p95=-0.42, M p95=-0.06.
+- Pathway: **pathway-supported** (generalizes). P=1.11, C p95=-0.42, M p95=-0.06. Q-vs-MQ channel-specific (Q=1.15): holds.
 - Trained: **no-specific-effect** (robust). Per seed: seed 101: no-specific-effect, seed 202: no-specific-effect, seed 303: no-specific-effect.
 
 ### `no-movement` (movementScorePerUnit=0)
 
 - Null: biological -0.62 (0.0%) vs 25th percentile 0.60 (median 1.10) -- holds.
-- Pathway: **degenerate** (C arm degenerate: true, M arm degenerate: false) -- not categorized. P=1.82, C p95=-0.58, M p95=-0.08.
+- Pathway: **degenerate** (C arm IQR below threshold) -- not categorized. P=1.82, C p95=-0.58, M p95=-0.08. Q-vs-MQ channel-specific (Q=1.70): holds.
 - Trained: **no-specific-effect** (robust). Per seed: seed 101: no-specific-effect, seed 202: no-specific-effect, seed 303: no-specific-effect.
 
 ### `crowded` (halfWidth=8, halfDepth=5.5)
 
 - Null: biological -1.88 (0.2%) vs 25th percentile 0.17 (median 0.88) -- holds.
-- Pathway: **pathway-supported** (generalizes). P=1.59, C p95=-1.82, M p95=-1.26.
-- Trained: **no-specific-effect** (not robust (1 of 3 seeds reach pathway-supported -- this is a single-seed hit, not a robust finding)). Per seed: seed 101: no-specific-effect, seed 202: no-specific-effect, seed 303: pathway-supported.
+- Pathway: **pathway-supported** (generalizes). P=1.59, C p95=-1.82, M p95=-1.26. Q-vs-MQ channel-specific (Q=1.14): holds.
+- Trained: **no-specific-effect** (not robust (1 of 3 seeds reach pathway-supported -- a single-seed hit, not a robust finding)). Per seed: seed 101: no-specific-effect, seed 202: no-specific-effect, seed 303: pathway-supported.
 
 ## Overall
 
@@ -60,16 +60,17 @@ capacity check.
 - **Trained:** **task-dependent** (4 of 4 tasks non-degenerate).
 
 The default task's own separately-published results are context only, not a fifth study task: authored category
-**pathway-supported**; trained category **no-specific-effect** (robust across trainer seeds). A single-seed pathway-supported hit on a task variant above is never framed as generalizing this default-task result.
+**pathway-supported**; trained category **no-specific-effect** (robust across trainer seeds). A non-robust trained hit on a task variant above is never framed as generalizing this default-task result.
 
 ## Limitations
 
+- `no-movement`'s authored pathway category is `degenerate` (C arm IQR below the predeclared threshold), while its Q-vs-MQ channel-specific result (holds) is independently valid and is not conflated with the degenerate P/C/M category.
+- The trained decoder's predeclared C/M-max comparison can rule pathway-supported and edge-class-effect in or out (P above/below the max of the freshly-trained 5-graph C/M arms at trainer seed 101), but 00-overview.md does not say how to report the finer generic-rewiring-effect vs not-supported split when P does not clear the C arm: that split needs a trained-null percentile floor, and this study's only trained null (rewiring-null-v1.json's published n=20 sample) is reported for context only, per 00-overview.md, not as a decisive threshold. 'no-specific-effect' is a reporting convention this study's coordinator adopted after the trained scores were known (methodology review, 2026-09-26), to avoid forcing an unlicensed generic/not-supported label -- it does not change which predeclared comparison P passed or failed, only how the undecidable case is named.
 - This experiment covers this model only: config variants of the existing arena, no new physics, sensors, or reward code, and no claim about fly behavior.
 - `sensorRange` is unchanged (24) in every task, so observation scaling is unchanged, but the measured clearance and `foodDistance` distributions differ per task -- reported values, not a formula. Wall clearance saturates near its reachable maximum in `sparse-food` and is compressed in `crowded`; `foodDistance` saturates at 1 (uninformative) far more often in `sparse-food`'s enlarged arena.
-- `no-movement` severs the direct channel through which thrust earned score (distance x `movementScorePerUnit`, set to 0); any pathway result there reflects only thrust's indirect effect on food and hazard outcomes. Its authored pathway category is `degenerate` (the C control arm's IQR is 0, the predeclared guard), while its Q-vs-MQ channel-specific result is independently valid and is not conflated with the degenerate P/C/M category above.
-- P/C/M/Q/MQ graphs were selected once on the default task's task-independent transfer matrix and reused unchanged across all four tasks -- this study never re-selects them per task.
+- `no-movement` severs the direct channel through which thrust earned score (distance x `movementScorePerUnit`, set to 0); any pathway result there reflects only thrust's indirect effect on food and hazard outcomes.
+- P/C/M/Q/MQ graphs were selected once on the default task's task-independent transfer matrix and reused unchanged across all four tasks (checked against the default study's own `sources.indexSha` above) -- this study never re-selects them per task.
 - Degenerate tasks (authored or trained) are not categorized at all, and are excluded from the "at least 3 of 4 non-degenerate" overall verdict's eligible set.
-- Trained results use only 5 freshly-trained controls per arm (a coarse resolution) and are reported robust only when all 3 P trainer seeds agree; a category reached at only 1 of 3 seeds is disclosed as a single-seed hit next to that category, never presented as if it were the robust finding, and is never treated as generalizing the default task's own separately-published trained result.
-- `no-specific-effect` (trained side) is a reporting convention adopted after the trained scores were known, not a predeclared category (see `docs/pathway-interventions-report.md`).
+- Trained results use only 5 freshly-trained controls per arm (a coarse resolution) and are reported robust only when all 3 P trainer seeds agree; a category reached at fewer than all 3 seeds is disclosed as a split next to that category, never presented as if it were the robust finding, and is never treated as generalizing the default task's own separately-published trained result.
 - The null and pathway comparisons are repeated across 4 tasks x 2 decoders (8 combinations) without correction for multiple comparisons; each is reported and read on its own predeclared terms.
 - Everything here is descriptive and bound to this model only; no causal claim is made about the real fly.
