@@ -7,17 +7,19 @@
   import type { RepertoireNullLoadResult } from '../experiment/repertoireNull';
   import type { TaskGeneralityLoadResult } from '../experiment/taskGenerality';
   import { buildFindingSteps, findingStepStatusLabel, type FindingStep } from '../findings/steps';
+  import { groupSteps } from '../findings/sections';
 
   /**
-   * WP1 of `.agents/plans/findings-tour` (`01-findings-panel.md`): a
-   * collapsible ARIA stepper that walks a visitor through the (now
-   * eight-step, since task-generality WP4) evidence chain, in order, each
-   * step templated from an already fetched/sha256-verified/shape-validated
-   * artifact (`src/lib/findings/steps.ts#buildFindingSteps`) — never a
-   * hard-coded number. Framing (user constraint, no biological claims): the
-   * header reads "Findings under this model — not claims about the real
-   * fly," and every templated sentence names its decoder condition and ends
-   * with "under this model."
+   * WP1 of `.agents/plans/findings-tour` (`01-findings-panel.md`), grouped
+   * into question sections by WP1 of `.agents/plans/consolidated-release`
+   * (`01-findings-sections.md`): a collapsible ARIA stepper that walks a
+   * visitor through the evidence chain, each step templated from an already
+   * fetched/sha256-verified/shape-validated artifact
+   * (`src/lib/findings/steps.ts#buildFindingSteps`) — never a hard-coded
+   * number. Framing (user constraint, no biological claims): the header
+   * reads "Findings under this model — not claims about the real fly," and
+   * every templated sentence names its decoder condition and ends with
+   * "under this model."
    *
    * Collapsed by default, like `ActivityPanel.svelte`'s own "expand to see
    * more" convention — it never blocks the arena or Start. Placed directly
@@ -27,19 +29,30 @@
    * the panel" discipline `LedgerPanel`/`NullExplanationNote` already
    * follow.
    *
-   * Every one of the `<li>` steps is always rendered with its own full
-   * content (sentence, provenance) — nothing is hidden behind a
-   * wizard-style single-step view, so the tampering/degradation coverage in
+   * Once the panel itself is expanded, the steps are grouped into
+   * collapsible question sections (`../findings/sections.ts#groupSteps`),
+   * each open by default (`01-findings-sections.md`'s "matches today's
+   * behavior where all steps are visible once the panel is expanded"),
+   * following the WAI-ARIA APG accordion pattern: an `<h3>` wraps each
+   * section's own toggle `<button>`, with `aria-expanded`/`aria-controls`
+   * pointing at that section's `<ol>`. Every one of the `<li>` steps is
+   * always rendered with its own full content (sentence, provenance) once
+   * its section is open — nothing is hidden behind a wizard-style
+   * single-step view, so the tampering/degradation coverage in
    * `tests/e2e/findings.spec.ts` can assert every step's state at once, and
    * a screen-reader user is never forced through Next clicks to reach a
-   * later step's content. "Current step" (`aria-current="step"`, the
-   * `<ol>`'s own concept per `01-findings-panel.md`) is a keyboard-walking
-   * cursor only: Previous/Next move which step has it and move DOM focus to
-   * that step's own heading, and a polite live region announces "Step N of
-   * M" (`steps.length`, never a hard-coded literal) on every move — the
-   * accessible way to walk the chain in order without requiring a
-   * screen-reader user to tab through every earlier step's worth of links
-   * first.
+   * later step's content.
+   *
+   * "Current step" (`aria-current="step"`) is a keyboard-walking cursor
+   * only, over the flattened grouped order (section order, then each
+   * section's own declared step order — never `steps.ts`'s own array
+   * order, which no longer matches display): Previous/Next move which step
+   * has it, expanding that step's section first if it is collapsed, and
+   * move DOM focus to that step's own heading. A polite live region
+   * announces "Step N of M in <section title>" (`flatSteps.length`, never a
+   * hard-coded literal) on every move — the accessible way to walk the
+   * chain in order without requiring a screen-reader user to tab through
+   * every earlier step's worth of links first.
    */
 
   interface Props {
@@ -58,6 +71,11 @@
   let expanded = $state(false);
   let currentIndex = $state(0);
   let headingEls = $state<(HTMLElement | undefined)[]>([]);
+  // Section ids the visitor has collapsed. Empty by default: every section
+  // starts open (`01-findings-sections.md`'s "open by default"). Membership
+  // in this set, not a positive "open" flag, so a still-unseen section
+  // (e.g. one a future bean adds) also defaults to open with no extra code.
+  let collapsedSectionIds = $state(new Set<string>());
 
   // Mirrors `ExperimentController#initialize()`'s own `dataBaseUrl`
   // (`${import.meta.env.BASE_URL}data`) — the same base every loader this
@@ -70,8 +88,77 @@
     buildFindingSteps({ manifest, dataBaseUrl, rewiringNull, nullExplanation, pathwayInterventions, repertoireNull, taskGenerality })
   );
 
+  // The steps grouped into question sections (`../findings/sections.ts`).
+  // This is the panel's one flattened display order from here on --
+  // `steps.ts`'s own array order no longer determines position on screen.
+  const groups = $derived(groupSteps(steps));
+
+  // Each entry pairs a step with the id/title of the section that contains
+  // it, in the same flattened order the `<ol>`s render -- the single source
+  // `goTo`/the live region/the per-step heading number all read from, so
+  // none of them can drift from what is actually on screen.
+  const flatSteps = $derived(
+    groups.flatMap((group) => group.steps.map((step) => ({ step, sectionId: group.section.id, sectionTitle: group.section.title })))
+  );
+  const stepIndexById = $derived(new Map(flatSteps.map((entry, index) => [entry.step.id, index] as const)));
+  const currentSectionTitle = $derived(flatSteps[currentIndex]?.sectionTitle ?? '');
+
   const toggle = (): void => {
     expanded = !expanded;
+  };
+
+  const isSectionOpen = (sectionId: string): boolean => !collapsedSectionIds.has(sectionId);
+
+  const isStepVisible = (index: number, collapsed: ReadonlySet<string>): boolean => {
+    const entry = flatSteps[index];
+    return entry !== undefined && !collapsed.has(entry.sectionId);
+  };
+
+  /**
+   * The nearest still-visible step to `fromIndex` once `collapsed` takes
+   * effect -- searched forward first (the natural "keep reading on" order),
+   * falling back to backward when `fromIndex` was the last visible step.
+   * `undefined` only when every section ends up collapsed at once.
+   */
+  const nearestVisibleIndex = (fromIndex: number, collapsed: ReadonlySet<string>): number | undefined => {
+    for (let i = fromIndex + 1; i < flatSteps.length; i += 1) {
+      if (isStepVisible(i, collapsed)) return i;
+    }
+    for (let i = fromIndex - 1; i >= 0; i -= 1) {
+      if (isStepVisible(i, collapsed)) return i;
+    }
+    return undefined;
+  };
+
+  const toggleSection = (sectionId: string): void => {
+    const collapsing = !collapsedSectionIds.has(sectionId);
+    const next = new Set(collapsedSectionIds);
+    if (collapsing) next.add(sectionId);
+    else next.delete(sectionId);
+
+    // (dual review, Important) Collapsing the section that owns the current
+    // step would otherwise hide the only Previous/Next controls in the
+    // panel (they render inside the current step's own `<li>`), stranding
+    // keyboard/screen-reader navigation with no way to move until the
+    // visitor deduces they must reopen that exact section. Relocate the
+    // cursor to the nearest step that stays visible instead -- silently,
+    // without moving DOM focus away from the toggle button the visitor
+    // just activated (matching the WAI-ARIA APG accordion's own "focus
+    // stays on the trigger" convention); the live region still announces
+    // the new current step/section on the next mutation.
+    if (collapsing && flatSteps[currentIndex]?.sectionId === sectionId) {
+      const relocated = nearestVisibleIndex(currentIndex, next);
+      if (relocated !== undefined) currentIndex = relocated;
+    }
+
+    collapsedSectionIds = next;
+  };
+
+  const expandSection = (sectionId: string): void => {
+    if (!collapsedSectionIds.has(sectionId)) return;
+    const next = new Set(collapsedSectionIds);
+    next.delete(sectionId);
+    collapsedSectionIds = next;
   };
 
   const focusHeading = async (index: number): Promise<void> => {
@@ -80,8 +167,12 @@
   };
 
   const goTo = (index: number): void => {
-    if (index < 0 || index >= steps.length) return;
+    if (index < 0 || index >= flatSteps.length) return;
     currentIndex = index;
+    // Moving into a collapsed section expands it first (`01-findings-sections.md`),
+    // so the step's heading is actually visible/reachable when focus lands there.
+    const target = flatSteps[index];
+    if (target) expandSection(target.sectionId);
     void focusHeading(index);
   };
 
@@ -104,7 +195,7 @@
   </div>
 
   {#if !expanded}
-    <p class="reason">Expand to walk the evidence chain: {steps.length} steps, each templated from a verified artifact.</p>
+    <p class="reason">Expand to walk the evidence chain: {flatSteps.length} steps, each templated from a verified artifact.</p>
   {/if}
 
   <!-- (thermo review, maintainability Suggestion) Mounted unconditionally
@@ -114,7 +205,9 @@
        same DOM update; they announce only a later mutation of an
        already-present node. The first "Step 1 of N" text on expand is then
        a real mutation of an existing node, not a simultaneous insertion. -->
-  <div aria-live="polite" class="sr-only">{expanded ? `Step ${currentIndex + 1} of ${steps.length}` : ''}</div>
+  <div aria-live="polite" class="sr-only">
+    {expanded ? `Step ${currentIndex + 1} of ${flatSteps.length} in ${currentSectionTitle}` : ''}
+  </div>
 
   {#if expanded}
     <p class="disclaimer">
@@ -123,105 +216,132 @@
       authored decoder is a fixed, hand-written mapping, not biology and not trained.
     </p>
 
-    <ol class="steps">
-      {#each steps as step, index (step.id)}
-        <li aria-current={index === currentIndex ? 'step' : undefined} class="step" class:current={index === currentIndex}>
-          <h3
-            id={`finding-step-${step.id}-heading`}
-            bind:this={headingEls[index]}
-            tabindex="-1"
+    {#each groups as group (group.section.id)}
+      {@const sectionOpen = isSectionOpen(group.section.id)}
+      {@const sectionStepsId = `finding-section-${group.section.id}-steps`}
+      <div class="finding-section">
+        <h3 class="section-toggle-heading">
+          <button
+            type="button"
+            class="section-toggle"
+            onclick={() => toggleSection(group.section.id)}
+            aria-expanded={sectionOpen}
+            aria-controls={sectionOpen ? sectionStepsId : undefined}
           >
-            {index + 1}. {step.title}
-            <span class="condition">{conditionLabel(step.condition)}</span>
-          </h3>
+            <span class="section-disclosure" aria-hidden="true">{sectionOpen ? '▾' : '▸'}</span>
+            {group.section.title}
+          </button>
+        </h3>
 
-          {#if step.status === 'ok' && step.sentence}
-            <p class="sentence">{step.sentence}</p>
-          {:else if step.status !== 'ok'}
-            <p class="status-line">{findingStepStatusLabel(step.status)}{step.reason ? `: ${step.reason}` : ''}</p>
-          {/if}
+        {#if sectionOpen}
+          <ol class="steps" id={sectionStepsId} data-section-id={group.section.id}>
+            {#each group.steps as step (step.id)}
+              {@const index = stepIndexById.get(step.id) ?? 0}
+              <li
+                data-step-id={step.id}
+                aria-current={index === currentIndex ? 'step' : undefined}
+                class="step"
+                class:current={index === currentIndex}
+              >
+                <h4
+                  id={`finding-step-${step.id}-heading`}
+                  bind:this={headingEls[index]}
+                  tabindex="-1"
+                >
+                  {index + 1}. {step.title}
+                  <span class="condition">{conditionLabel(step.condition)}</span>
+                </h4>
 
-          {#if step.status === 'ok' && step.perTask && step.perTask.length > 0}
-            <!-- WP4 fix pass (thermo review, Important, both reviewers): the
-                 task-generality step's per-task detail used to be folded
-                 into `sentence` itself, producing one ~1050-character
-                 run-on sentence with no navigable internal structure. Each
-                 task is now its own `<li>` -- a natural stop for both a
-                 sighted skim and a screen-reader user walking the step
-                 (this list sits inside the same `<li class="step">`, so it
-                 reads immediately after the summary sentence, before the
-                 provenance links). -->
-            <ul class="per-task">
-              {#each step.perTask as task (task.id)}
-                <li><strong>{task.id}</strong> — authored: {task.authored}; trained: {task.trained}</li>
-              {/each}
-            </ul>
-          {/if}
+                {#if step.status === 'ok' && step.sentence}
+                  <p class="sentence">{step.sentence}</p>
+                {:else if step.status !== 'ok'}
+                  <p class="status-line">{findingStepStatusLabel(step.status)}{step.reason ? `: ${step.reason}` : ''}</p>
+                {/if}
 
-          {#if step.id === 'behavior-repertoire'}
-            <p class="see-also">
-              {#if step.status === 'ok'}
-                <!-- A dual review (Important) caught this claiming content
-                     the atlas view does not show -- `Atlas.svelte` renders
-                     only the one-line comparison and a "Full report" link;
-                     the occupancy map and per-graph audit table exist only
-                     in `docs/behavior-repertoire-null-report.md` (see
-                     `repertoireNull.ts`'s own doc comment: that detail is
-                     "intentionally not carried into this browser-side
-                     shape"). -->
-                See the one-line comparison in the <a href="#atlas">behavior atlas</a>; the occupancy map and
-                per-graph audit table are in the full report (linked below).
-              {:else if step.status === 'missing' || step.status === 'loading'}
-                Once published, this step will compare the measured topology's behavior repertoire against the
-                rewired null. See the <a href="#atlas">behavior atlas</a> in the meantime.
-              {:else}
-                <!-- `unavailable`/`invalid`: the artifact *is* published but
-                     failed to load or verify -- the step's own status line
-                     above already says so; this line only adds the atlas
-                     link, not a "not yet published" claim that would be
-                     false here (a maintainability review, Suggestion). -->
-                See the <a href="#atlas">behavior atlas</a> in the meantime.
-              {/if}
-            </p>
-          {/if}
+                {#if step.status === 'ok' && step.perTask && step.perTask.length > 0}
+                  <!-- WP4 fix pass (thermo review, Important, both reviewers): the
+                       task-generality step's per-task detail used to be folded
+                       into `sentence` itself, producing one ~1050-character
+                       run-on sentence with no navigable internal structure. Each
+                       task is now its own `<li>` -- a natural stop for both a
+                       sighted skim and a screen-reader user walking the step
+                       (this list sits inside the same `<li class="step">`, so it
+                       reads immediately after the summary sentence, before the
+                       provenance links). -->
+                  <ul class="per-task">
+                    {#each step.perTask as task (task.id)}
+                      <li><strong>{task.id}</strong> — authored: {task.authored}; trained: {task.trained}</li>
+                    {/each}
+                  </ul>
+                {/if}
 
-          {#if step.provenance.length > 0}
-            <ul class="provenance">
-              {#each step.provenance as entry (entry.label)}
-                <li>
-                  <span class="provenance-label">{entry.label}</span>
-                  <span class="provenance-hash">sha256 {entry.sha256Prefix}…</span>
-                  <a href={entry.artifactPath} target="_blank" rel="noreferrer">Pinned JSON</a>
-                  <a href={entry.reportPath} target="_blank" rel="noreferrer">Report</a>
-                </li>
-              {/each}
-            </ul>
-          {/if}
+                {#if step.id === 'behavior-repertoire'}
+                  <p class="see-also">
+                    {#if step.status === 'ok'}
+                      <!-- A dual review (Important) caught this claiming content
+                           the atlas view does not show -- `Atlas.svelte` renders
+                           only the one-line comparison and a "Full report" link;
+                           the occupancy map and per-graph audit table exist only
+                           in `docs/behavior-repertoire-null-report.md` (see
+                           `repertoireNull.ts`'s own doc comment: that detail is
+                           "intentionally not carried into this browser-side
+                           shape"). -->
+                      See the one-line comparison in the <a href="#atlas">behavior atlas</a>; the occupancy map and
+                      per-graph audit table are in the full report (linked below).
+                    {:else if step.status === 'missing' || step.status === 'loading'}
+                      Once published, this step will compare the measured topology's behavior repertoire against the
+                      rewired null. See the <a href="#atlas">behavior atlas</a> in the meantime.
+                    {:else}
+                      <!-- `unavailable`/`invalid`: the artifact *is* published but
+                           failed to load or verify -- the step's own status line
+                           above already says so; this line only adds the atlas
+                           link, not a "not yet published" claim that would be
+                           false here (a maintainability review, Suggestion). -->
+                      See the <a href="#atlas">behavior atlas</a> in the meantime.
+                    {/if}
+                  </p>
+                {/if}
 
-          {#if index === currentIndex}
-            <!-- (dual review, Important; narrowed by thermo review,
-                 maintainability Important — the prior comment here
-                 overclaimed "the next Tab reaches Next directly," which a
-                 real Playwright/Chromium Tab-key session showed is false
-                 whenever the current step has its own provenance links:
-                 Tab lands on "Pinned JSON"/"Report" first, then Next/
-                 Previous) Rendered inside the current step, immediately
-                 after its own content — not above the `<ol>` — so Tab no
-                 longer walks through *every earlier step's* own links to
-                 reach Next again, only the *current* step's own (a normal
-                 "read the evidence, then act" order: 1-4 links, one pair
-                 per provenance entry, not the six-steps'-worth a control
-                 placed above the list would force). See
-                 `tests/e2e/findings.spec.ts`'s real-Tab-order test for the
-                 guarantee this comment actually makes. -->
-            <div class="stepper-controls">
-              <button type="button" onclick={goPrevious} disabled={currentIndex === 0}>Previous</button>
-              <button type="button" onclick={goNext} disabled={currentIndex === steps.length - 1}>Next</button>
-            </div>
-          {/if}
-        </li>
-      {/each}
-    </ol>
+                {#if step.provenance.length > 0}
+                  <ul class="provenance">
+                    {#each step.provenance as entry (entry.label)}
+                      <li>
+                        <span class="provenance-label">{entry.label}</span>
+                        <span class="provenance-hash">sha256 {entry.sha256Prefix}…</span>
+                        <a href={entry.artifactPath} target="_blank" rel="noreferrer">Pinned JSON</a>
+                        <a href={entry.reportPath} target="_blank" rel="noreferrer">Report</a>
+                      </li>
+                    {/each}
+                  </ul>
+                {/if}
+
+                {#if index === currentIndex}
+                  <!-- (dual review, Important; narrowed by thermo review,
+                       maintainability Important — the prior comment here
+                       overclaimed "the next Tab reaches Next directly," which a
+                       real Playwright/Chromium Tab-key session showed is false
+                       whenever the current step has its own provenance links:
+                       Tab lands on "Pinned JSON"/"Report" first, then Next/
+                       Previous) Rendered inside the current step, immediately
+                       after its own content — not above the `<ol>` — so Tab no
+                       longer walks through *every earlier step's* own links to
+                       reach Next again, only the *current* step's own (a normal
+                       "read the evidence, then act" order: 1-4 links, one pair
+                       per provenance entry, not every step in the panel's worth
+                       a control placed above every list would force). See
+                       `tests/e2e/findings.spec.ts`'s real-Tab-order test for the
+                       guarantee this comment actually makes. -->
+                  <div class="stepper-controls">
+                    <button type="button" onclick={goPrevious} disabled={currentIndex === 0}>Previous</button>
+                    <button type="button" onclick={goNext} disabled={currentIndex === flatSteps.length - 1}>Next</button>
+                  </div>
+                {/if}
+              </li>
+            {/each}
+          </ol>
+        {/if}
+      </div>
+    {/each}
   {/if}
 </section>
 
@@ -246,8 +366,47 @@
     margin-top: 0.6rem;
   }
 
-  .steps {
+  .finding-section {
+    margin: 0.9rem 0 0;
+  }
+
+  .finding-section:first-of-type {
+    margin-top: 0.7rem;
+  }
+
+  .section-toggle-heading {
     margin: 0;
+  }
+
+  .section-toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    width: 100%;
+    background: none;
+    border: none;
+    padding: 0.3rem 0;
+    color: #edf4ff;
+    font-size: 0.9rem;
+    font-weight: 600;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .section-toggle:focus-visible {
+    outline: 2px solid #7be5c5;
+    outline-offset: 2px;
+  }
+
+  .section-disclosure {
+    color: #79d8d0;
+    font-size: 0.75rem;
+    width: 0.8rem;
+    flex: none;
+  }
+
+  .steps {
+    margin: 0.6rem 0 0;
     padding: 0;
     list-style: none;
     display: grid;
@@ -266,9 +425,10 @@
     background: rgb(121 216 208 / 10%);
   }
 
-  .step h3 {
+  .step h4 {
     margin: 0 0 0.4rem;
     font-size: 0.85rem;
+    font-weight: 600;
     color: #edf4ff;
     display: flex;
     align-items: center;
@@ -276,7 +436,7 @@
     outline: none;
   }
 
-  .step h3:focus-visible {
+  .step h4:focus-visible {
     outline: 2px solid #7be5c5;
     outline-offset: 2px;
   }

@@ -332,7 +332,7 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     expect(step.sentence).not.toContain('reporting convention');
   });
 
-  it('step 7 (task generality) states the real authored/trained overall verdicts as a short summary, with per-task detail in perTask', () => {
+  it('the task-generality step states the real authored/trained overall verdicts as a short summary, with per-task detail in perTask', () => {
     const steps = buildFindingSteps(baseInputs());
     const step = findStep(steps, 'task-generality');
     expect(step.status).toBe('ok');
@@ -373,7 +373,7 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     expect(noMovement?.authored).toBe('degenerate');
   });
 
-  it('step 7 states "general" for both authored and trained when every non-degenerate task generalizes/reaches a robust pathway-supported category', () => {
+  it('the task-generality step states "general" for both authored and trained when every non-degenerate task generalizes/reaches a robust pathway-supported category', () => {
     const general: TaskGeneralityArtifact = {
       version: 1,
       sources: realTaskGenerality.sources,
@@ -404,7 +404,7 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     expect(step.perTask?.every((t) => t.trained === 'pathway-supported (robust)')).toBe(true);
   });
 
-  it('step 7 lists per-task detail, including a degenerate task, when the authored side is task-dependent', () => {
+  it('the task-generality step lists per-task detail, including a degenerate task, when the authored side is task-dependent', () => {
     const taskDependent: TaskGeneralityArtifact = {
       ...realTaskGenerality,
       tasks: [
@@ -444,7 +444,7 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     expect(hazardHeavy?.trained).toBe('no specific effect (robust)');
   });
 
-  it('step 7 is "missing" with no sentence when the task-generality artifact has not been published', () => {
+  it('the task-generality step is "missing" with no sentence when the task-generality artifact has not been published', () => {
     const steps = buildFindingSteps({
       ...baseInputs(),
       taskGenerality: { status: 'missing', reason: 'The manifest has no taskGenerality artifact entry.' }
@@ -454,7 +454,7 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     expect(step.sentence).toBeUndefined();
   });
 
-  it('step 7 is "invalid" with the honest reason when the task-generality artifact fails verification, without affecting other steps', () => {
+  it('the task-generality step is "invalid" with the honest reason when the task-generality artifact fails verification, without affecting other steps', () => {
     const steps = buildFindingSteps({
       ...baseInputs(),
       taskGenerality: { status: 'invalid', reason: 'sha256 mismatch' }
@@ -466,7 +466,7 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     expect(findStep(steps, 'behavior-repertoire').status).toBe('ok');
   });
 
-  it('step 8 (behavior repertoire) states the real primary category, occupied count, rewired median, and search-seed robustness', () => {
+  it('the behavior-repertoire step states the real primary category, occupied count, rewired median, and search-seed robustness', () => {
     const steps = buildFindingSteps(baseInputs());
     const step = findStep(steps, 'behavior-repertoire');
     expect(step.status).toBe('ok');
@@ -484,7 +484,7 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     expect(step.provenance[0].sha256Prefix).toBe(manifest.behaviorRepertoireNull?.sha256.slice(0, 12));
   });
 
-  it('step 8 states "robust across all 5 search seeds" when every seed agrees', () => {
+  it('the behavior-repertoire step states "robust across all 5 search seeds" when every seed agrees', () => {
     const robust: RepertoireNullArtifact = {
       ...realRepertoireNull,
       robustness: {
@@ -498,7 +498,7 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     expect(step.sentence).not.toContain('not robust');
   });
 
-  it('step 8 is "missing" with no sentence when the repertoire-null artifact has not been published', () => {
+  it('the behavior-repertoire step is "missing" with no sentence when the repertoire-null artifact has not been published', () => {
     const steps = buildFindingSteps({
       ...baseInputs(),
       repertoireNull: { status: 'missing', reason: 'The manifest has no behaviorRepertoireNull artifact entry.' }

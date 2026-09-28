@@ -22,7 +22,7 @@ import {
  */
 
 test.describe('Findings panel', () => {
-  test('expanding walks all eight steps, rendered from the real verified artifacts, with resolvable provenance links', async ({
+  test('expanding walks every step across its question section, rendered from the real verified artifacts, with resolvable provenance links', async ({
     page,
     request
   }) => {
@@ -34,77 +34,81 @@ test.describe('Findings panel', () => {
     const panel = page.locator('section.findings');
     await expect(panel.getByRole('heading', { name: 'Findings under this model — not claims about the real fly' })).toBeVisible();
 
-    // Step 1: Rewiring null -- the real shipped bioPercentile/null.n.
-    const step1 = panel.locator('li.step').nth(0);
-    await expect(step1).toContainText(/1\. rewiring null/i);
-    await expect(step1).toContainText(/authored \(hand-written\) decoder/i);
-    await expect(step1).toContainText(/0\.0th percentile/);
-    await expect(step1).toContainText(/500 degree-preserving rewirings/);
-    await expect(step1.locator('p.sentence')).toHaveText(/under this model\.$/);
+    const step = (id: string) => panel.locator(`li.step[data-step-id="${id}"]`);
 
-    // Step 2: Mirrored decoder -- real data has both baseline and mirrored
+    // Rewiring null -- the real shipped bioPercentile/null.n.
+    const rewiringNull = step('rewiring-null');
+    await expect(rewiringNull).toContainText(/rewiring null/i);
+    await expect(rewiringNull).toContainText(/authored \(hand-written\) decoder/i);
+    await expect(rewiringNull).toContainText(/0\.0th percentile/);
+    await expect(rewiringNull).toContainText(/500 degree-preserving rewirings/);
+    await expect(rewiringNull.locator('p.sentence')).toHaveText(/under this model\.$/);
+
+    // Mirrored decoder -- real data has both baseline and mirrored
     // bioPercentile at 0, so the "still leaves ... at the bottom" clause.
-    const step2 = panel.locator('li.step').nth(1);
-    await expect(step2).toContainText(/still leaves biological at the bottom/i);
+    const mirroredDecoder = step('mirrored-decoder');
+    await expect(mirroredDecoder).toContainText(/still leaves biological at the bottom/i);
 
-    // Step 3: Explanation -- the real qualifying metrics, plain-named.
-    const step3 = panel.locator('li.step').nth(2);
-    await expect(step3).toContainText(/T:rightClearance->thrust/);
-    await expect(step3).toContainText(/ρ = 0\.467/);
+    // Explanation -- the real qualifying metrics, plain-named.
+    const explanation = step('explanation');
+    await expect(explanation).toContainText(/T:rightClearance->thrust/);
+    await expect(explanation).toContainText(/ρ = 0\.467/);
 
-    // Step 4: Intervention (authored) -- the real category/modifier.
-    const step4 = panel.locator('li.step').nth(3);
-    await expect(step4).toContainText(/pathway-supported category/);
-    await expect(step4).toContainText(/channel-specific modifier holding/);
+    // Intervention (authored) -- the real category/modifier.
+    const intervention = step('intervention');
+    await expect(intervention).toContainText(/pathway-supported category/);
+    await expect(intervention).toContainText(/channel-specific modifier holding/);
 
-    // Step 5: Trained null -- real per-seed spread (0th to 40th percentile).
-    const step5 = panel.locator('li.step').nth(4);
-    await expect(step5).toContainText(/trained decoder/i);
-    await expect(step5).toContainText(/0\.0th percentile to 40\.0th percentile/);
+    // Trained null -- real per-seed spread (0th to 40th percentile).
+    const trainedNull = step('trained-null');
+    await expect(trainedNull).toContainText(/trained decoder/i);
+    await expect(trainedNull).toContainText(/0\.0th percentile to 40\.0th percentile/);
 
-    // Step 6: Trained interventions -- the fixed polarity sentence; the
-    // real shipped data has authored=pathway-supported, trained (robust)
+    // Trained interventions -- the fixed polarity sentence; the real
+    // shipped data has authored=pathway-supported, trained (robust)
     // =no-specific-effect, so this must say "does not reproduce", never
     // "matches" (the bean's own "fix the step-6 polarity sentence" ask).
     // Rendered through the shared `describeTrainedCategory` helper (thermo
     // review, methodology I1/I2), never the raw enum slug, plus the
     // artifact's own disclosed reporting-convention caveat.
-    const step6 = panel.locator('li.step').nth(5);
-    await expect(step6).not.toContainText(/no-specific-effect/);
-    await expect(step6).toContainText(/all 3 seeds agree: no specific effect \(neither pathway-supported nor edge-class/);
-    await expect(step6).toContainText(/reporting convention adopted after the trained scores were known/);
-    await expect(step6).toContainText(/does not reproduce/);
-    await expect(step6).not.toContainText(/this matches/);
+    const trainedInterventions = step('trained-interventions');
+    await expect(trainedInterventions).not.toContainText(/no-specific-effect/);
+    await expect(trainedInterventions).toContainText(/all 3 seeds agree: no specific effect \(neither pathway-supported nor edge-class/);
+    await expect(trainedInterventions).toContainText(/reporting convention adopted after the trained scores were known/);
+    await expect(trainedInterventions).toContainText(/does not reproduce/);
+    await expect(trainedInterventions).not.toContainText(/this matches/);
 
-    // Step 7: Task generality -- WP4 of `.agents/plans/task-generality`,
-    // inserted before "Behavior repertoire" (which shifts to step 8). The
-    // real shipped artifact's own overall authored/trained verdicts:
-    // authored is general (3 of 4 non-degenerate tasks hold and generalize),
-    // trained is task-dependent (no task reaches a robust pathway-supported
-    // result -- two tasks hit it at only 1 of 3 trainer seeds).
-    const step7 = panel.locator('li.step').nth(6);
-    await expect(step7).toContainText(/4 task variants/);
-    await expect(step7).toContainText(/authored: general/);
-    await expect(step7).toContainText(/trained: task-dependent/);
-    await expect(step7).toContainText(/not robust/);
-    await expect(step7.locator('p.sentence')).toHaveText(/under this model\.$/);
+    // Task generality -- WP4 of `.agents/plans/task-generality`, grouped
+    // into the "Does it generalize?" section by WP1 of
+    // `.agents/plans/consolidated-release`. The real shipped artifact's own
+    // overall authored/trained verdicts: authored is general (3 of 4
+    // non-degenerate tasks hold and generalize), trained is task-dependent
+    // (no task reaches a robust pathway-supported result -- two tasks hit
+    // it at only 1 of 3 trainer seeds).
+    const taskGenerality = step('task-generality');
+    await expect(taskGenerality).toContainText(/4 task variants/);
+    await expect(taskGenerality).toContainText(/authored: general/);
+    await expect(taskGenerality).toContainText(/trained: task-dependent/);
+    await expect(taskGenerality).toContainText(/not robust/);
+    await expect(taskGenerality.locator('p.sentence')).toHaveText(/under this model\.$/);
 
-    // Step 8: Behavior repertoire -- WP3 of `.agents/plans/repertoire-null`
-    // landed and wired this step (per `findings-tour`'s own anticipated
-    // "optional repertoireNull" input); the real shipped artifact's own
-    // occupied count/rewired median/category/robustness disclosure, not the
-    // pre-WP3 "Not yet published" placeholder.
-    const step8 = panel.locator('li.step').nth(7);
-    await expect(step8).toContainText(/biological occupies 28 of 36 behavior cells against a rewired median of 29/);
+    // Behavior repertoire -- WP3 of `.agents/plans/repertoire-null` landed
+    // and wired this step (per `findings-tour`'s own anticipated "optional
+    // repertoireNull" input); the real shipped artifact's own occupied
+    // count/rewired median/category/robustness disclosure, not the pre-WP3
+    // "Not yet published" placeholder. Grouped into the "Is the measured
+    // wiring special?" section, alongside rewiring-null/mirrored-decoder.
+    const behaviorRepertoire = step('behavior-repertoire');
+    await expect(behaviorRepertoire).toContainText(/biological occupies 28 of 36 behavior cells against a rewired median of 29/);
     // Methodology review (Important): the category must never be stated
     // next to only `occupied` -- `qd` and the joint basis are now shown too.
-    await expect(step8).toContainText(/qd 637 vs rewired median 763/);
-    await expect(step8).toContainText(/narrower on both metrics at search seed 1729/);
-    await expect(step8).toContainText(
+    await expect(behaviorRepertoire).toContainText(/qd 637 vs rewired median 763/);
+    await expect(behaviorRepertoire).toContainText(/narrower on both metrics at search seed 1729/);
+    await expect(behaviorRepertoire).toContainText(
       /not robust across search seeds \(seed 1729: narrower, seed 1730: narrower, seed 1731: typical, seed 1732: typical, seed 1733: typical\)/
     );
-    await expect(step8.locator('p.sentence')).toHaveText(/under this model\.$/);
-    await expect(step8.getByRole('link', { name: /behavior atlas/i })).toHaveAttribute('href', '#atlas');
+    await expect(behaviorRepertoire.locator('p.sentence')).toHaveText(/under this model\.$/);
+    await expect(behaviorRepertoire.getByRole('link', { name: /behavior atlas/i })).toHaveAttribute('href', '#atlas');
 
     // Every provenance link (pinned JSON + report) actually resolves.
     const jsonLinks = await panel.getByRole('link', { name: 'Pinned JSON' }).evaluateAll((links) =>
@@ -133,7 +137,7 @@ test.describe('Findings panel', () => {
     }
   });
 
-  test('a tampered pathway-interventions-v1.json fails only steps 4 and 6, while the rest of the panel and the experiment (Start included) keep working', async ({
+  test('a tampered pathway-interventions-v1.json fails only the intervention and trained-interventions steps, while the rest of the panel and the experiment (Start included) keep working', async ({
     page
   }) => {
     const original = readFileSync(resolve(publicDataDir, 'pathway-interventions-v1.json'));
@@ -149,18 +153,19 @@ test.describe('Findings panel', () => {
     await expandFindingsPanel(page);
 
     const panel = page.locator('section.findings');
-    const step4 = panel.locator('li.step').nth(3);
-    const step6 = panel.locator('li.step').nth(5);
-    await expect(step4).toContainText(/failed verification/i);
-    await expect(step6).toContainText(/failed verification/i);
+    const step = (id: string) => panel.locator(`li.step[data-step-id="${id}"]`);
+    const intervention = step('intervention');
+    const trainedInterventions = step('trained-interventions');
+    await expect(intervention).toContainText(/failed verification/i);
+    await expect(trainedInterventions).toContainText(/failed verification/i);
 
     // Every other step is unaffected -- still its own real templated sentence.
-    const step1 = panel.locator('li.step').nth(0);
-    const step3 = panel.locator('li.step').nth(2);
-    await expect(step1.locator('p.sentence')).toHaveText(/under this model\.$/);
-    await expect(step1).not.toContainText(/failed verification/i);
-    await expect(step3.locator('p.sentence')).toHaveText(/under this model\.$/);
-    await expect(step3).not.toContainText(/failed verification/i);
+    const rewiringNull = step('rewiring-null');
+    const explanation = step('explanation');
+    await expect(rewiringNull.locator('p.sentence')).toHaveText(/under this model\.$/);
+    await expect(rewiringNull).not.toContainText(/failed verification/i);
+    await expect(explanation.locator('p.sentence')).toHaveText(/under this model\.$/);
+    await expect(explanation).not.toContainText(/failed verification/i);
 
     // Start still works -- the panel is optional presentation, never a gate.
     await expect(startOrResumeButton(page)).toBeEnabled();
@@ -197,8 +202,8 @@ test.describe('Findings panel', () => {
     await expandFindingsPanel(page);
     await page.getByRole('button', { name: /^next$/i }).click();
 
-    const step2 = page.locator('section.findings li.step').nth(1);
-    await expect(step2.locator('h3')).toBeFocused();
+    const step2 = page.locator('section.findings li.step[data-step-id="mirrored-decoder"]');
+    await expect(step2.locator('h4')).toBeFocused();
 
     const focusedSummary = async (): Promise<string> =>
       page.evaluate(() => {

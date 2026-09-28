@@ -120,8 +120,8 @@ export interface ExperimentControllerCallbacks {
    * — fired in parallel with every fork above (this artifact's own
    * cross-check needs `manifest`, not any other resolved load result), and
    * independently of `onPathwayInterventions` itself. Never blocks
-   * reaching `ready`. The host's hook for the Findings panel's step 8
-   * ("Behavior repertoire") sentence.
+   * reaching `ready`. The host's hook for the Findings panel's
+   * "Behavior repertoire" step's sentence.
    */
   onRepertoireNull: (result: RepertoireNullLoadResult) => void;
   /**
@@ -130,8 +130,10 @@ export interface ExperimentControllerCallbacks {
    * above (this artifact's own cross-check needs `manifest`, not any other
    * resolved load result), and independently of `onRepertoireNull` itself.
    * Never blocks reaching `ready`. The host's hook for the Findings panel's
-   * step 7 ("Task generality"), placed before the "Behavior repertoire"
-   * step.
+   * "Task generality" step, placed before the "Behavior repertoire" step in
+   * `src/lib/findings/steps.ts#buildFindingSteps`'s own evidence-chain
+   * array order (`src/lib/findings/sections.ts` regroups both for display,
+   * so their rendered order can differ from this array order).
    */
   onTaskGenerality: (result: TaskGeneralityLoadResult) => void;
   /**

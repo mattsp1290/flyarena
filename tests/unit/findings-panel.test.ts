@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { cleanup, fireEvent, render, screen } from '@testing-library/svelte';
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/svelte';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import FindingsPanel from '../../src/lib/ui/FindingsPanel.svelte';
 import type { ArenaManifest } from '../../src/lib/experiment/assets';
@@ -14,18 +14,32 @@ import {
 } from '../../src/lib/experiment/pathwayInterventions';
 import { loadRepertoireNull, type RepertoireNullArtifact, type RepertoireNullLoadResult } from '../../src/lib/experiment/repertoireNull';
 import { loadTaskGenerality, type TaskGeneralityArtifact, type TaskGeneralityLoadResult } from '../../src/lib/experiment/taskGenerality';
+import { buildFindingSteps } from '../../src/lib/findings/steps';
+import { groupSteps } from '../../src/lib/findings/sections';
 import { createPublicDataFetch } from '../helpers/fake-worker';
 
 /**
- * WP1 of `.agents/plans/findings-tour`: component coverage for
- * `FindingsPanel.svelte`'s ARIA stepper — collapsed by default,
- * `aria-expanded` toggles, `aria-current="step"` moves with Next/Previous
- * with focus landing on the new step's heading, the live region's text
- * updates, and the missing/unavailable/invalid status texts render per
- * step. Fixture data is loaded through the real loaders (not a bare
- * `JSON.parse`), for the same "raw JSON's `trained.perSeed` differs from
- * the validated `trained.perSeedCategory` shape" reason
- * `tests/unit/findings-steps.test.ts` documents.
+ * WP1 of `.agents/plans/findings-tour`, grouped into question sections by
+ * WP1 of `.agents/plans/consolidated-release` (`01-findings-sections.md`):
+ * component coverage for `FindingsPanel.svelte`'s ARIA stepper/accordion —
+ * collapsed by default, `aria-expanded` toggles, each question section is
+ * its own `<h3>`-wrapped `<button>` accordion toggle (open by default,
+ * `aria-expanded`/`aria-controls`), `aria-current="step"` moves with
+ * Next/Previous across sections with focus landing on the new step's
+ * heading (expanding a collapsed section first), the live region's text
+ * updates with the current section's title, and the missing/unavailable/
+ * invalid status texts render per step. Fixture data is loaded through the
+ * real loaders (not a bare `JSON.parse`), for the same "raw JSON's
+ * `trained.perSeed` differs from the validated `trained.perSeedCategory`
+ * shape" reason `tests/unit/findings-steps.test.ts` documents.
+ *
+ * Grouping reorders steps for display (`01-findings-sections.md`'s own
+ * "recompute every position-based assertion against the flattened grouped
+ * order"): assertions here select by `data-step-id` rather than position
+ * wherever practical, and the few genuinely position-based assertions (the
+ * first/last step in the flattened walk) derive their expectations from
+ * `groupSteps(buildFindingSteps(...))` directly rather than a hard-coded
+ * literal, so they can never silently go stale when a step lands or moves.
  */
 
 afterEach(() => {
@@ -75,6 +89,21 @@ const okProps = () => ({
   taskGenerality: { status: 'ok', data: realTaskGenerality } as TaskGeneralityLoadResult
 });
 
+/**
+ * The exact flattened, grouped order `FindingsPanel.svelte` renders the
+ * real fixtures in -- one `{ id, sectionTitle }` entry per step, computed
+ * from the same `buildFindingSteps`/`groupSteps` the component itself
+ * calls, never a hand-copied literal. Every position-based assertion below
+ * reads its expectation from this, so it tracks the real grouped order
+ * automatically if a future bean adds or reclassifies a step.
+ */
+const expectedFlatSteps = (): readonly { id: string; sectionTitle: string }[] =>
+  groupSteps(buildFindingSteps({ ...okProps(), dataBaseUrl: '/data' })).flatMap((group) =>
+    group.steps.map((step) => ({ id: step.id, sectionTitle: group.section.title }))
+  );
+
+const stepLocator = (id: string): HTMLElement => document.querySelector(`li.step[data-step-id="${id}"]`) as HTMLElement;
+
 describe('FindingsPanel', () => {
   it('is collapsed by default, with an accessible toggle', () => {
     render(FindingsPanel, okProps());
@@ -83,15 +112,19 @@ describe('FindingsPanel', () => {
     expect(screen.queryByRole('list')).not.toBeInTheDocument();
   });
 
-  it('expanding shows the eight-step list and flips aria-expanded', async () => {
-    const { container } = render(FindingsPanel, okProps());
+  it('expanding renders every step, each carrying data-step-id matching its own step id, and flips aria-expanded', async () => {
+    render(FindingsPanel, okProps());
     const toggle = screen.getByRole('button', { name: /^expand$/i });
     await fireEvent.click(toggle);
     expect(screen.getByRole('button', { name: /^collapse$/i })).toHaveAttribute('aria-expanded', 'true');
-    // Scoped to the top-level step `<li>`s specifically -- `getAllByRole('listitem')`
-    // would also pick up each step's own nested `<ul class="provenance">` items.
-    const items = container.querySelectorAll('ol.steps > li.step');
-    expect(items).toHaveLength(8);
+    const expected = expectedFlatSteps();
+    const items = document.querySelectorAll('ol.steps > li.step');
+    expect(items).toHaveLength(expected.length);
+    for (const { id } of expected) {
+      const item = stepLocator(id);
+      expect(item).toBeInTheDocument();
+      expect(item).toHaveAttribute('data-step-id', id);
+    }
   });
 
   it('the header names the model framing constraint verbatim', async () => {
@@ -101,59 +134,162 @@ describe('FindingsPanel', () => {
     ).toBeInTheDocument();
   });
 
-  it('step 1 has aria-current="step" by default once expanded, and the live region announces "Step 1 of 8"', async () => {
-    const { container } = render(FindingsPanel, okProps());
+  it('renders one accordion section per non-empty group, open by default, each with a distinct accessible toggle name and aria-controls pointing at its own <ol>', async () => {
+    render(FindingsPanel, okProps());
     await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
-    const items = container.querySelectorAll('ol.steps > li.step');
-    expect(items[0]).toHaveAttribute('aria-current', 'step');
-    for (const item of Array.from(items).slice(1)) expect(item).not.toHaveAttribute('aria-current');
-    expect(screen.getByText('Step 1 of 8')).toBeInTheDocument();
+
+    const expectedSectionTitles = [...new Set(expectedFlatSteps().map((step) => step.sectionTitle))];
+    expect(expectedSectionTitles.length).toBeGreaterThan(0);
+
+    for (const title of expectedSectionTitles) {
+      const sectionToggle = screen.getByRole('button', { name: title });
+      expect(sectionToggle).toHaveAttribute('aria-expanded', 'true');
+      const controlsId = sectionToggle.getAttribute('aria-controls');
+      expect(controlsId).toBeTruthy();
+      const controlled = document.getElementById(controlsId as string);
+      expect(controlled).toBeInTheDocument();
+      expect(controlled?.tagName).toBe('OL');
+    }
+
+    // "Other findings" never appears while every shipped step id is classified.
+    expect(screen.queryByRole('button', { name: 'Other findings' })).not.toBeInTheDocument();
   });
 
-  it('Next moves aria-current to step 2, moves focus to its heading, and updates the live region', async () => {
-    const { container } = render(FindingsPanel, okProps());
+  it('collapsing a section hides its steps and flips aria-expanded to false; expanding it again restores them', async () => {
+    render(FindingsPanel, okProps());
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+
+    const firstSectionTitle = expectedFlatSteps()[0].sectionTitle;
+    const sectionToggle = screen.getByRole('button', { name: firstSectionTitle });
+    const controlsId = sectionToggle.getAttribute('aria-controls') as string;
+
+    await fireEvent.click(sectionToggle);
+    expect(sectionToggle).toHaveAttribute('aria-expanded', 'false');
+    expect(document.getElementById(controlsId)).not.toBeInTheDocument();
+    // (accessibility review, Important) `aria-controls` must never point at
+    // an id that doesn't exist in the document -- omitted entirely while
+    // collapsed, not left pointing at the now-unmounted `<ol>`.
+    expect(sectionToggle).not.toHaveAttribute('aria-controls');
+
+    await fireEvent.click(sectionToggle);
+    expect(sectionToggle).toHaveAttribute('aria-expanded', 'true');
+    expect(document.getElementById(controlsId)).toBeInTheDocument();
+    expect(sectionToggle).toHaveAttribute('aria-controls', controlsId);
+  });
+
+  it('collapsing the section that owns the current step relocates the cursor to the nearest visible step, so Previous/Next never disappear', async () => {
+    render(FindingsPanel, okProps());
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+
+    const expected = expectedFlatSteps();
+    const firstSectionTitle = expected[0].sectionTitle;
+    const firstSectionToggle = screen.getByRole('button', { name: firstSectionTitle });
+
+    // (dual review, Critical/Important) Collapsing the section holding
+    // `currentIndex` (the first step, by default) used to unmount the only
+    // Previous/Next controls in the panel, with no other way to move the
+    // stepper. Collapsing it now relocates the cursor to the nearest step
+    // that stays visible, so exactly one Previous and one Next button keep
+    // existing somewhere in the panel.
+    await fireEvent.click(firstSectionToggle);
+    expect(firstSectionToggle).toHaveAttribute('aria-expanded', 'false');
+
+    expect(screen.getByRole('button', { name: /^previous$/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^next$/i })).toBeInTheDocument();
+
+    // The new current step is the first one outside the now-collapsed
+    // first section.
+    const relocatedTo = expected.find((entry) => entry.sectionTitle !== firstSectionTitle);
+    if (!relocatedTo) throw new Error('Fixture has only one section; cannot test relocation');
+    expect(stepLocator(relocatedTo.id)).toHaveAttribute('aria-current', 'step');
+    for (const { id, sectionTitle } of expected) {
+      if (sectionTitle === firstSectionTitle) continue;
+      if (id === relocatedTo.id) continue;
+      expect(stepLocator(id)).not.toHaveAttribute('aria-current');
+    }
+  });
+
+  it('the first step has aria-current="step" by default once expanded, and the live region announces it, with its section', async () => {
+    render(FindingsPanel, okProps());
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    const [first, ...rest] = expectedFlatSteps();
+    expect(stepLocator(first.id)).toHaveAttribute('aria-current', 'step');
+    for (const { id } of rest) expect(stepLocator(id)).not.toHaveAttribute('aria-current');
+    expect(screen.getByText(`Step 1 of ${expectedFlatSteps().length} in ${first.sectionTitle}`)).toBeInTheDocument();
+  });
+
+  it('Next moves aria-current to the second step in the grouped order, moves focus to its heading, and updates the live region', async () => {
+    render(FindingsPanel, okProps());
     await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
     await fireEvent.click(screen.getByRole('button', { name: /^next$/i }));
-    const items = container.querySelectorAll('ol.steps > li.step');
-    expect(items[0]).not.toHaveAttribute('aria-current');
-    expect(items[1]).toHaveAttribute('aria-current', 'step');
-    expect(screen.getByText('Step 2 of 8')).toBeInTheDocument();
-    const heading = screen.getByRole('heading', { name: /2\. mirrored decoder/i });
+    const [first, second] = expectedFlatSteps();
+    expect(stepLocator(first.id)).not.toHaveAttribute('aria-current');
+    expect(stepLocator(second.id)).toHaveAttribute('aria-current', 'step');
+    expect(screen.getByText(`Step 2 of ${expectedFlatSteps().length} in ${second.sectionTitle}`)).toBeInTheDocument();
+    const heading = within(stepLocator(second.id)).getByRole('heading', { level: 4 });
     expect(heading).toHaveFocus();
   });
 
-  it('Previous is disabled on step 1 and Next is disabled on step 8', async () => {
+  it('Previous is disabled on the first step and Next is disabled on the last step of the grouped order', async () => {
     render(FindingsPanel, okProps());
     await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    const expected = expectedFlatSteps();
     expect(screen.getByRole('button', { name: /^previous$/i })).toBeDisabled();
-    for (let i = 0; i < 7; i += 1) {
+    for (let i = 0; i < expected.length - 1; i += 1) {
       await fireEvent.click(screen.getByRole('button', { name: /^next$/i }));
     }
-    expect(screen.getByText('Step 8 of 8')).toBeInTheDocument();
+    const last = expected[expected.length - 1];
+    expect(screen.getByText(`Step ${expected.length} of ${expected.length} in ${last.sectionTitle}`)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /^next$/i })).toBeDisabled();
   });
 
-  it('Previous moves focus back to the prior step\'s heading', async () => {
+  it("Previous moves focus back to the prior step's heading", async () => {
     render(FindingsPanel, okProps());
     await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
     await fireEvent.click(screen.getByRole('button', { name: /^next$/i }));
     await fireEvent.click(screen.getByRole('button', { name: /^previous$/i }));
-    const heading = screen.getByRole('heading', { name: /1\. rewiring null/i });
+    const [first] = expectedFlatSteps();
+    const heading = within(stepLocator(first.id)).getByRole('heading', { level: 4 });
     expect(heading).toHaveFocus();
-    expect(screen.getByText('Step 1 of 8')).toBeInTheDocument();
+    expect(screen.getByText(`Step 1 of ${expectedFlatSteps().length} in ${first.sectionTitle}`)).toBeInTheDocument();
   });
 
-  it('step 7 (task generality) states the real overall verdicts in a short summary, plus a per-task <ul> list', async () => {
+  it('Next into a step whose section was collapsed expands that section, so the new current step is actually visible', async () => {
     render(FindingsPanel, okProps());
     await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
-    const step7 = document.querySelectorAll('ol.steps > li.step')[6] as HTMLElement;
-    const sentence = step7.querySelector('p.sentence') as HTMLElement;
+    const expected = expectedFlatSteps();
+    const secondSectionFirstStep = expected.find((step) => step.sectionTitle !== expected[0].sectionTitle);
+    if (!secondSectionFirstStep) throw new Error('Fixture has only one section; cannot test cross-section navigation');
+
+    // Collapse the second section before walking into it.
+    const secondSectionToggle = screen.getByRole('button', { name: secondSectionFirstStep.sectionTitle });
+    await fireEvent.click(secondSectionToggle);
+    expect(secondSectionToggle).toHaveAttribute('aria-expanded', 'false');
+
+    // Walk Next until the current step's section changes.
+    let current = expected[0];
+    while (current.sectionTitle === expected[0].sectionTitle) {
+      await fireEvent.click(screen.getByRole('button', { name: /^next$/i }));
+      const index = expected.findIndex((step) => step.id === current.id) + 1;
+      current = expected[index];
+    }
+
+    expect(secondSectionToggle).toHaveAttribute('aria-expanded', 'true');
+    expect(stepLocator(current.id)).toBeInTheDocument();
+    expect(stepLocator(current.id)).toHaveAttribute('aria-current', 'step');
+  });
+
+  it('the task-generality step states the real overall verdicts in a short summary, plus a per-task <ul> list', async () => {
+    render(FindingsPanel, okProps());
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    const step = stepLocator('task-generality');
+    const sentence = step.querySelector('p.sentence') as HTMLElement;
     expect(sentence.textContent).toMatch(new RegExp(`authored: ${realTaskGenerality.overall.authored.verdict}`));
     expect(sentence.textContent).toMatch(new RegExp(`trained: ${realTaskGenerality.overall.trained.verdict}`));
     expect(sentence.textContent).toMatch(/under this model\.$/);
     // Thermo review (Important, both reviewers): per-task detail moved out
     // of the sentence into its own screen-reader-friendly <ul>/<li> list.
-    const perTaskItems = step7.querySelectorAll('ul.per-task > li');
+    const perTaskItems = step.querySelectorAll('ul.per-task > li');
     expect(perTaskItems).toHaveLength(realTaskGenerality.tasks.length);
     const itemTexts = Array.from(perTaskItems).map((li) => li.textContent ?? '');
     for (const task of realTaskGenerality.tasks) {
@@ -161,7 +297,7 @@ describe('FindingsPanel', () => {
     }
   });
 
-  it('step 7 shows "Not yet published" when the task-generality artifact is missing', async () => {
+  it('the task-generality step shows "Not yet published" when the task-generality artifact is missing', async () => {
     render(FindingsPanel, {
       ...okProps(),
       taskGenerality: { status: 'missing', reason: 'The manifest has no taskGenerality artifact entry.' } as TaskGeneralityLoadResult
@@ -170,14 +306,14 @@ describe('FindingsPanel', () => {
     expect(screen.getByText('Not yet published')).toBeInTheDocument();
   });
 
-  it('step 8 (behavior repertoire) states the real category and links to the atlas', async () => {
+  it('the behavior-repertoire step states the real category and links to the atlas', async () => {
     render(FindingsPanel, okProps());
     await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
     expect(screen.getByText(new RegExp(`biological occupies ${realRepertoireNull.primary.bio.occupied} of 36`))).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /behavior atlas/i })).toHaveAttribute('href', '#atlas');
   });
 
-  it('step 8 shows "Not yet published" when the repertoire-null artifact is missing', async () => {
+  it('the behavior-repertoire step shows "Not yet published" when the repertoire-null artifact is missing', async () => {
     render(FindingsPanel, {
       ...okProps(),
       repertoireNull: {
@@ -197,9 +333,10 @@ describe('FindingsPanel', () => {
       rewiringNull: { status: 'unavailable', reason: 'network hiccup' } as RewiringNullLoadResult
     });
     await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
-    // Steps 1, 2, and 5 all depend on `rewiringNull` (step 2's mirrored-
-    // decoder baseline needs it too) and degrade to the same honest status
-    // line; steps 3, 4, and 6 do not depend on it and stay unaffected.
+    // The rewiring-null, mirrored-decoder, and trained-null steps all
+    // depend on rewiringNull (mirrored-decoder's baseline needs it too) and
+    // degrade to the same honest status line; explanation, intervention,
+    // and trained-interventions do not depend on it and stay unaffected.
     expect(screen.getAllByText('Could not be loaded: network hiccup').length).toBe(3);
   });
 
@@ -212,7 +349,7 @@ describe('FindingsPanel', () => {
     expect(screen.getAllByText(/Failed verification: sha256 mismatch/).length).toBeGreaterThan(0);
   });
 
-  it('a "missing" pathwayInterventions shows "Not yet published" for steps 4 and 6', async () => {
+  it('a "missing" pathwayInterventions shows "Not yet published" for the intervention and trained-interventions steps', async () => {
     render(FindingsPanel, {
       ...okProps(),
       pathwayInterventions: {
@@ -221,7 +358,8 @@ describe('FindingsPanel', () => {
       } as PathwayInterventionsLoadResult
     });
     await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
-    expect(screen.getAllByText('Not yet published').length).toBeGreaterThanOrEqual(2);
+    expect(stepLocator('intervention')).toHaveTextContent('Not yet published');
+    expect(stepLocator('trained-interventions')).toHaveTextContent('Not yet published');
   });
 
   it('every provenance entry links the pinned JSON and the report, with the manifest sha256 prefix', async () => {
