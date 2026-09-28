@@ -96,6 +96,7 @@ const taskFixture = (options: TaskFixtureOptions): BuildTaskInputs => {
   const interventionStats = {
     arenaTask: { id: options.id, fingerprint },
     statsOnly: true,
+    biologicalReproduction: { computedScore: options.bioScore, publishedScore: options.bioScore, matches: true },
     inputs: { indexSha256: interventionIndexSha, publishedNullSha256: publishedNullSha },
     armDegeneracy: {
       nullArm: { iqr: 1, degenerate: false },
