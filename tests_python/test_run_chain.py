@@ -57,6 +57,12 @@ def test_dry_run_fixture_emits_every_step_command_under_the_selection_scratch_tr
         "null:report -- --authored",
         "--variant-out",
         "--trained",  # the trained-arm contamination fix (I2): must be present and point under $B
+        "--decoder authored-flip-thrust",
+        "--decoder authored-flip-yaw",
+        "variant-flip-thrust.json",
+        "variant-flip-yaw.json",
+        "--variant-flip-thrust",
+        "--variant-flip-yaw",
         "transfer.py --index",
         "features.py --index",
         "null:regime-check --",
@@ -110,6 +116,17 @@ GRAPH_SHA = "a" * 64
 NULL_EXPLANATION_BYTES = b'{"stub":true}\n'
 NULL_EXPLANATION_SHA256 = hashlib.sha256(NULL_EXPLANATION_BYTES).hexdigest()
 
+# scripts/analysis/explain.py:109 -- run-chain.sh's step 2b parses this exact
+# constant out of the real file rather than hardcoding 0.25 itself (see that
+# step's own comment). The fake repo below never executes explain.py (the
+# `uv` stub just exits 0), so a one-line stub carrying only this assignment
+# is enough for the grep to find it -- below the default bioPercentile
+# (BIO_PERCENTILE_BELOW_THRESHOLD), so the fully-stubbed base fixture keeps
+# step 2b a no-producer skip, same as every other already-computed step.
+DECODER_PERCENTILE_THRESHOLD = 0.25
+BIO_PERCENTILE_BELOW_THRESHOLD = 0.1
+BIO_PERCENTILE_ABOVE_THRESHOLD = 0.294  # the real random-bridge mirrored value
+
 
 def _make_executable(path: Path) -> None:
     path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
@@ -118,27 +135,62 @@ def _make_executable(path: Path) -> None:
 def _write_stub_bin(bin_dir: Path) -> None:
     """A `npm`/`uv` on `PATH` that immediately exits 0 and does nothing --
     proves a step attempted to run (its `run()` call still logs `+ ...`
-    before executing) without ever running a real producer."""
+    before executing) without ever running a real producer.
+
+    One exception: when invoked with `--variant-out <path>` (as step
+    2a/2b's `null:report` calls always are), it writes a minimal stub JSON
+    carrying the fixture's own `GRAPH_SHA` as `sourceGraphSha256` to that
+    path. Every other step's `check_sha` call is satisfied by the fixture's
+    pre-populated files (never touched by the no-op stub); step 2b's
+    single-axis outputs are the one case a test needs to force *not*
+    pre-existing (to prove the step actually ran), so the stub has to leave
+    something on disk for `check_sha` to read immediately afterward, same
+    as a real `null-report.ts --variant-out` run would."""
     bin_dir.mkdir(parents=True, exist_ok=True)
+    stub_body = (
+        "#!/usr/bin/env bash\n"
+        'prev=""\n'
+        'for arg in "$@"; do\n'
+        '  if [[ "$prev" == "--variant-out" ]]; then\n'
+        '    mkdir -p "$(dirname "$arg")"\n'
+        f'    printf \'{{"sourceGraphSha256":"{GRAPH_SHA}"}}\' > "$arg"\n'
+        "  fi\n"
+        '  prev="$arg"\n'
+        "done\n"
+        "exit 0\n"
+    )
     for name in ("npm", "uv"):
         stub = bin_dir / name
-        stub.write_text("#!/usr/bin/env bash\nexit 0\n")
+        stub.write_text(stub_body)
         _make_executable(stub)
 
 
-def _build_fake_repo(tmp_path: Path, selection: str = "default") -> tuple[Path, Path]:
+def _build_fake_repo(
+    tmp_path: Path, selection: str = "default", bio_percentile: float = BIO_PERCENTILE_BELOW_THRESHOLD
+) -> tuple[Path, Path]:
     """A synthetic repo with `run-chain.sh` copied to the real script's own
     relative path, and a fully populated `$B` scratch tree: every
     producer's output already present and cross-stamped with `GRAPH_SHA`
     (including the selection's own manifest's `nullExplanation` entry,
     matching `null-explanation.json`'s actual bytes) so a real (non-dry-run)
-    invocation skips every step. Returns `(fake_repo_root, B)`."""
+    invocation skips every step. `scripts/analysis/explain.py` is stubbed
+    with only its `DECODER_PERCENTILE_THRESHOLD` assignment -- step 2b greps
+    that line out of the real file, and the stub is never executed (the `uv`
+    stub below exits 0 immediately). `bio_percentile` becomes
+    `variant-flip-both.json`'s `bioPercentile`, the same field explain.py
+    itself reads (scripts/analysis/explain.py:754) -- defaulting below the
+    threshold keeps the base fixture's step 2b a no-producer skip, matching
+    every other already-computed step. Returns `(fake_repo_root, B)`."""
     fake_repo = tmp_path / "fake-repo"
     script_dir = fake_repo / "scripts" / "selections"
     script_dir.mkdir(parents=True)
     fake_script = script_dir / "run-chain.sh"
     shutil.copy(RUN_CHAIN_SCRIPT, fake_script)
     _make_executable(fake_script)
+
+    analysis_dir = fake_repo / "scripts" / "analysis"
+    analysis_dir.mkdir(parents=True)
+    (analysis_dir / "explain.py").write_text(f"DECODER_PERCENTILE_THRESHOLD = {DECODER_PERCENTILE_THRESHOLD}\n")
 
     b_dir = fake_repo / "training" / "runs" / "selections" / selection
     (b_dir / "graphs").mkdir(parents=True)
@@ -158,7 +210,9 @@ def _build_fake_repo(tmp_path: Path, selection: str = "default") -> tuple[Path, 
     (b_dir / "graphs" / "index.json").write_text(json.dumps({"sourceSha256": GRAPH_SHA}))
     (b_dir / "rewiring-null.json").write_text(json.dumps({"sourceGraphSha256": GRAPH_SHA}))
     (b_dir / "rewiring-null-report.md").write_text("stub\n")
-    (b_dir / "variant-flip-both.json").write_text(json.dumps({"sourceGraphSha256": GRAPH_SHA}))
+    (b_dir / "variant-flip-both.json").write_text(
+        json.dumps({"sourceGraphSha256": GRAPH_SHA, "bioPercentile": bio_percentile})
+    )
     (b_dir / "transfer.json").write_text("{}")
     (b_dir / "features.json").write_text("{}")
     (b_dir / "regime.json").write_text("{}")
@@ -281,4 +335,134 @@ def test_real_run_final_guard_trips_when_public_is_dirty(tmp_path) -> None:
     result = _run_real(fake_repo, "default", stub_bin)
     assert result.returncode != 0
     assert "public/ or docs/ changed during this chain" in result.stderr
-    assert "public/" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Step 2b: the predeclared conditional single-axis follow-up
+# (.agents/plans/null-explanation/00-overview.md:35) -- only if the mirrored
+# run's bioPercentile is >= explain.py's own DECODER_PERCENTILE_THRESHOLD
+# (0.25) does the chain also run authored-flip-thrust/authored-flip-yaw and
+# pass their outputs to explain.py's --variant-flip-thrust/--variant-flip-yaw.
+# ---------------------------------------------------------------------------
+
+
+def _explain_invocation_line(stdout: str) -> str:
+    return next(line for line in stdout.splitlines() if "explain.py --selection-mode" in line)
+
+
+def test_real_run_single_axis_steps_run_and_explain_flags_passed_when_threshold_met(tmp_path) -> None:
+    fake_repo, b_dir = _build_fake_repo(tmp_path, bio_percentile=BIO_PERCENTILE_ABOVE_THRESHOLD)
+    # Force step 3d to actually run (not skip) so its logged command can be
+    # inspected for the conditional flags -- same technique as
+    # test_real_run_does_not_skip_step_3d_when_the_manifest_null_explanation_entry_is_missing.
+    manifest_path = b_dir / "malecns-arena-default.manifest.json"
+    manifest_path.write_text(json.dumps({"binarySha256": GRAPH_SHA}))
+    stub_bin = tmp_path / "stub-bin"
+    _write_stub_bin(stub_bin)
+
+    result = _run_real(fake_repo, "default", stub_bin)
+    assert result.returncode == 0, result.stderr
+    out = result.stdout
+
+    assert "meets the predeclared >= " in out
+    assert "--decoder authored-flip-thrust" in out
+    assert "--decoder authored-flip-yaw" in out
+    assert "variant-flip-thrust.json" in out
+    assert "variant-flip-yaw.json" in out
+
+    explain_line = _explain_invocation_line(out)
+    assert "--variant-flip-thrust" in explain_line
+    assert "--variant-flip-yaw" in explain_line
+    assert "variant-flip-thrust.json" in explain_line
+    assert "variant-flip-yaw.json" in explain_line
+    assert (b_dir / "variant-flip-thrust.json").is_file()
+    assert (b_dir / "variant-flip-yaw.json").is_file()
+
+
+def test_real_run_single_axis_steps_skipped_and_no_explain_flags_when_threshold_not_met(tmp_path) -> None:
+    fake_repo, b_dir = _build_fake_repo(tmp_path, bio_percentile=BIO_PERCENTILE_BELOW_THRESHOLD)
+    manifest_path = b_dir / "malecns-arena-default.manifest.json"
+    manifest_path.write_text(json.dumps({"binarySha256": GRAPH_SHA}))
+    stub_bin = tmp_path / "stub-bin"
+    _write_stub_bin(stub_bin)
+
+    result = _run_real(fake_repo, "default", stub_bin)
+    assert result.returncode == 0, result.stderr
+    out = result.stdout
+
+    assert "is below the predeclared >= " in out
+    assert "skipping authored-flip-thrust/authored-flip-yaw" in out
+    assert "--decoder authored-flip-thrust" not in out
+    assert "--decoder authored-flip-yaw" not in out
+    assert not (b_dir / "variant-flip-thrust.json").exists()
+    assert not (b_dir / "variant-flip-yaw.json").exists()
+
+    explain_line = _explain_invocation_line(out)
+    assert "--variant-flip-thrust" not in explain_line
+    assert "--variant-flip-yaw" not in explain_line
+
+
+def test_real_run_step_2b_resume_skips_completed_single_axis_outputs(tmp_path) -> None:
+    fake_repo, b_dir = _build_fake_repo(tmp_path, bio_percentile=BIO_PERCENTILE_ABOVE_THRESHOLD)
+    (b_dir / "variant-flip-thrust.json").write_text(json.dumps({"sourceGraphSha256": GRAPH_SHA}))
+    (b_dir / "variant-flip-yaw.json").write_text(json.dumps({"sourceGraphSha256": GRAPH_SHA}))
+    stub_bin = tmp_path / "stub-bin"
+    _write_stub_bin(stub_bin)
+
+    result = _run_real(fake_repo, "default", stub_bin)
+    assert result.returncode == 0, result.stderr
+    out = result.stdout
+
+    assert "variant-flip-thrust.json exists, skipping" in out
+    assert "variant-flip-yaw.json exists, skipping" in out
+    assert "--decoder authored-flip-thrust" not in out
+    assert "--decoder authored-flip-yaw" not in out
+    assert "chain complete for selection=default" in out
+
+
+def test_real_run_single_axis_triggers_at_exact_25_percent_boundary(tmp_path) -> None:
+    # The plan says "at least the 25th percentile" -- exactly meeting the
+    # threshold must trigger the single-axis runs, not only exceeding it.
+    fake_repo, b_dir = _build_fake_repo(tmp_path, bio_percentile=DECODER_PERCENTILE_THRESHOLD)
+    stub_bin = tmp_path / "stub-bin"
+    _write_stub_bin(stub_bin)
+
+    result = _run_real(fake_repo, "default", stub_bin)
+    assert result.returncode == 0, result.stderr
+    out = result.stdout
+
+    assert "meets the predeclared >= " in out
+    assert "--decoder authored-flip-thrust" in out
+    assert "--decoder authored-flip-yaw" in out
+    assert (b_dir / "variant-flip-thrust.json").is_file()
+    assert (b_dir / "variant-flip-yaw.json").is_file()
+
+
+def test_real_run_step_2b_check_sha_mismatch_fails(tmp_path) -> None:
+    fake_repo, b_dir = _build_fake_repo(tmp_path, bio_percentile=BIO_PERCENTILE_ABOVE_THRESHOLD)
+    (b_dir / "variant-flip-thrust.json").write_text(json.dumps({"sourceGraphSha256": "b" * 64}))
+    stub_bin = tmp_path / "stub-bin"
+    _write_stub_bin(stub_bin)
+
+    result = _run_real(fake_repo, "default", stub_bin)
+    assert result.returncode != 0
+    assert "sha mismatch" in result.stderr
+    assert "variant-flip-thrust.json sourceGraphSha256" in result.stderr
+
+
+def test_real_run_step_2b_fails_loudly_on_a_missing_bio_percentile_field(tmp_path) -> None:
+    # A dual-review finding: jq -r on a missing key prints the string
+    # "null", which --argjson happily parses as JSON null, and `null >=
+    # 0.25` is just `false` -- silently "not triggered" instead of an
+    # error. variant-flip-both.json without a bioPercentile field at all
+    # must fail the chain, not quietly skip the single-axis steps.
+    fake_repo, b_dir = _build_fake_repo(tmp_path)
+    (b_dir / "variant-flip-both.json").write_text(json.dumps({"sourceGraphSha256": GRAPH_SHA}))
+    stub_bin = tmp_path / "stub-bin"
+    _write_stub_bin(stub_bin)
+
+    result = _run_real(fake_repo, "default", stub_bin)
+    assert result.returncode != 0
+    assert "no numeric bioPercentile field" in result.stderr
+    assert "--decoder authored-flip-thrust" not in result.stdout
+    assert "--decoder authored-flip-yaw" not in result.stdout

@@ -246,6 +246,78 @@ else
 fi
 check_sha "variant-flip-both.json sourceGraphSha256" "$B/variant-flip-both.json" '.sourceGraphSha256' "$GRAPH_SHA"
 
+# --- Step 2b: single-axis decoder-variant nulls (conditional follow-up) ---
+# The predeclared rule (.agents/plans/null-explanation/00-overview.md:35):
+# only if the mirrored run (step 2a) moves biological to at least the 25th
+# percentile do the single-axis variants (authored-flip-thrust,
+# authored-flip-yaw) run too, to find which axis is responsible. explain.py
+# enforces this same rule at read time (scripts/analysis/explain.py:757,
+# comparing variant_flip_both["bioPercentile"] against its own
+# DECODER_PERCENTILE_THRESHOLD constant, defined at explain.py:109) and
+# refuses to run --selection-mode if the single-axis files are supplied
+# without having been triggered, or triggered without both being supplied.
+# Rather than hardcoding 0.25 here too and risking the two drifting apart,
+# this script parses the threshold straight out of explain.py's own source.
+if [[ "$DRY_RUN" == 1 ]]; then
+  log "step 2b (single-axis nulls): dry-run -- printing both authored-flip-thrust/authored-flip-yaw commands structurally (the real chain gates them on variant-flip-both.json's bioPercentile vs. explain.py's DECODER_PERCENTILE_THRESHOLD)"
+  SINGLE_AXIS_TRIGGERED=1
+else
+  DECODER_PERCENTILE_THRESHOLD="$(grep -m1 '^DECODER_PERCENTILE_THRESHOLD = ' scripts/analysis/explain.py | sed -E 's/^DECODER_PERCENTILE_THRESHOLD = ([0-9.]+).*/\1/')"
+  if [[ -z "$DECODER_PERCENTILE_THRESHOLD" ]]; then
+    echo "run-chain.sh: could not parse DECODER_PERCENTILE_THRESHOLD out of scripts/analysis/explain.py" >&2
+    exit 1
+  fi
+  BIO_PERCENTILE="$(jq -r '.bioPercentile // empty' "$B/variant-flip-both.json")"
+  # A missing/non-numeric field must fail loudly, the same way the
+  # threshold parse just above does -- not silently fall through to
+  # "not triggered" (jq -r on a missing key prints the string "null",
+  # which --argjson happily accepts as JSON null, and `null >= 0.25` is
+  # just `false`, no error). explain.py itself fails loudly on this same
+  # field via an unchecked dict index (explain.py:754), so this guard
+  # keeps run-chain.sh's own read no less strict.
+  if ! [[ "$BIO_PERCENTILE" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "run-chain.sh: variant-flip-both.json has no numeric bioPercentile field: $B/variant-flip-both.json" >&2
+    exit 1
+  fi
+  SINGLE_AXIS_TRIGGERED=0
+  if jq -n --argjson bio "$BIO_PERCENTILE" --argjson threshold "$DECODER_PERCENTILE_THRESHOLD" -e \
+    '$bio >= $threshold' >/dev/null; then
+    SINGLE_AXIS_TRIGGERED=1
+  fi
+fi
+
+if [[ "$SINGLE_AXIS_TRIGGERED" == 1 ]]; then
+  if [[ "$DRY_RUN" != 1 ]]; then
+    log "step 2b (single-axis nulls): mirrored bioPercentile ${BIO_PERCENTILE} meets the predeclared >= ${DECODER_PERCENTILE_THRESHOLD} threshold -- running authored-flip-thrust and authored-flip-yaw"
+  fi
+
+  if [[ "$DRY_RUN" != 1 && -f "$B/variant-flip-thrust.json" ]]; then
+    log "step 2b (flip-thrust null): $B/variant-flip-thrust.json exists, skipping"
+  else
+    if [[ "$DRY_RUN" == 1 || ! -f "$B/null-flip-thrust-raw.json" ]]; then
+      run npm run null:evaluate -- --biological --graph "$GRAPH" --rewired-index "$B/graphs/index.json" \
+        --graphs-dir "$B/graphs" --held-out-start "$HELD_OUT_START" --held-out-count "$HELD_OUT_COUNT" \
+        --ticks "$TICKS" --shards "$SHARDS" --decoder authored-flip-thrust --out "$B/null-flip-thrust-raw.json"
+    fi
+    run npm run null:report -- --authored "$B/null-flip-thrust-raw.json" --variant-out "$B/variant-flip-thrust.json"
+  fi
+  check_sha "variant-flip-thrust.json sourceGraphSha256" "$B/variant-flip-thrust.json" '.sourceGraphSha256' "$GRAPH_SHA"
+
+  if [[ "$DRY_RUN" != 1 && -f "$B/variant-flip-yaw.json" ]]; then
+    log "step 2b (flip-yaw null): $B/variant-flip-yaw.json exists, skipping"
+  else
+    if [[ "$DRY_RUN" == 1 || ! -f "$B/null-flip-yaw-raw.json" ]]; then
+      run npm run null:evaluate -- --biological --graph "$GRAPH" --rewired-index "$B/graphs/index.json" \
+        --graphs-dir "$B/graphs" --held-out-start "$HELD_OUT_START" --held-out-count "$HELD_OUT_COUNT" \
+        --ticks "$TICKS" --shards "$SHARDS" --decoder authored-flip-yaw --out "$B/null-flip-yaw-raw.json"
+    fi
+    run npm run null:report -- --authored "$B/null-flip-yaw-raw.json" --variant-out "$B/variant-flip-yaw.json"
+  fi
+  check_sha "variant-flip-yaw.json sourceGraphSha256" "$B/variant-flip-yaw.json" '.sourceGraphSha256' "$GRAPH_SHA"
+else
+  log "step 2b (single-axis nulls): mirrored bioPercentile ${BIO_PERCENTILE} is below the predeclared >= ${DECODER_PERCENTILE_THRESHOLD} threshold -- skipping authored-flip-thrust/authored-flip-yaw per .agents/plans/null-explanation/00-overview.md:35"
+fi
+
 # --- Step 3: explanation (transfer, features, regime, explain) ---
 if [[ "$DRY_RUN" != 1 && -f "$B/transfer.json" ]]; then
   log "step 3a (transfer): exists, skipping"
@@ -284,8 +356,21 @@ else
   # --manifest alike, and --selection-mode makes
   # --features-exploratory-unrestricted optional (omitted here: this
   # study's historical snapshot has no per-selection counterpart).
+  #
+  # --variant-flip-thrust/--variant-flip-yaw are passed exactly when step
+  # 2b's threshold check triggered them: explain.py itself requires
+  # both-or-neither, keyed off the same bioPercentile it reads from
+  # variant-flip-both.json (explain.py:757-777) -- passing them
+  # unconditionally (or omitting them) here would just make explain.py
+  # throw, so SINGLE_AXIS_TRIGGERED (set in step 2b, still in scope) is the
+  # single source of truth for whether they exist on disk at all.
+  EXPLAIN_SINGLE_AXIS_ARGS=()
+  if [[ "$SINGLE_AXIS_TRIGGERED" == 1 ]]; then
+    EXPLAIN_SINGLE_AXIS_ARGS+=(--variant-flip-thrust "$B/variant-flip-thrust.json" --variant-flip-yaw "$B/variant-flip-yaw.json")
+  fi
   run uv run python scripts/analysis/explain.py --selection-mode \
     --rewiring-null "$B/rewiring-null.json" --variant-flip-both "$B/variant-flip-both.json" \
+    "${EXPLAIN_SINGLE_AXIS_ARGS[@]}" \
     --transfer "$B/transfer.json" --features "$B/features.json" --regime "$B/regime.json" \
     --out "$B/null-explanation.json" --report-out "$B/null-explanation-report.md" --manifest "$MANIFEST"
 fi
