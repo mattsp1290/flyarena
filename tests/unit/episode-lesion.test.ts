@@ -321,7 +321,7 @@ describe('runEpisode onSubstep: decoder gating', () => {
   // for `onSubstep`'s new trained/silenced-branch behavior (accepted, and
   // does not change the outcome).
 
-  it('no longer throws for trained merely for lacking a graph/weights match to onSubstep -- it falls through to the ordinary "requires a graph" check', () => {
+  it('accepts onSubstep for trained (no longer rejected); the config still fails its own separate "requires a graph" check', () => {
     expect(() =>
       runEpisode({
         seed: 1,
@@ -332,7 +332,7 @@ describe('runEpisode onSubstep: decoder gating', () => {
     ).toThrow(/requires a graph/);
   });
 
-  it('no longer throws for silenced merely for lacking a graph/weights match to onSubstep -- it falls through to the ordinary "requires a graph" check', () => {
+  it('accepts onSubstep for silenced (no longer rejected); the config still fails its own separate "requires a graph" check', () => {
     expect(() =>
       runEpisode({
         seed: 1,

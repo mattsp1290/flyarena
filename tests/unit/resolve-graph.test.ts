@@ -103,7 +103,7 @@ describe('resolveReadoutGraph', () => {
     expect(graph.metadata.neuronCount).toBe(createTraceGraph().metadata.neuronCount);
   });
 
-  it('throws for an unknown graphId', () => {
+  it('throws for an unknown graphId, with the intervention index\'s own "no entry" message', () => {
     const { manifestPath } = writeManifest();
     const { indexPath, archivedIndexPath } = writeInterventionIndex();
     expect(() =>
@@ -111,7 +111,23 @@ describe('resolveReadoutGraph', () => {
         { graphId: 'not-a-real-id', graphGzipSha256: null, graphBinarySha256: null },
         { manifestPath, interventionIndexPath: indexPath, archivedInterventionIndexPath: archivedIndexPath }
       )
-    ).toThrow();
+    ).toThrow(/no entry for id "not-a-real-id"/);
+  });
+
+  it('throws for an unknown graphId with no intervention config at all -- it never falls back to the shipped rewired graph', () => {
+    const { manifestPath } = writeManifest();
+    expect(() =>
+      resolveReadoutGraph({ graphId: 'not-a-real-id', graphGzipSha256: null, graphBinarySha256: null }, { manifestPath })
+    ).toThrow(/looks like an intervention id/);
+  });
+
+  it('near-miss ids ("rewired", "rewired-seed1") throw rather than silently resolving to the shipped "rewired-seed0" graph', () => {
+    const { manifestPath } = writeManifest();
+    for (const graphId of ['rewired', 'rewired-seed1', 'Rewired-Seed0', 'biological ']) {
+      expect(() =>
+        resolveReadoutGraph({ graphId, graphGzipSha256: null, graphBinarySha256: null }, { manifestPath })
+      ).toThrow(/looks like an intervention id/);
+    }
   });
 
   it('throws when the physical intervention index does not byte-match the archived copy', () => {

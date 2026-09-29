@@ -5,15 +5,16 @@ import { fileURLToPath } from 'node:url';
 import { OUTPUT_POPULATION } from '../../src/lib/arena/actions';
 import { outputNeuronIndices } from '../../src/lib/connectome/readout';
 import { atomicWriteFileSync, sha256Hex } from '../training/fsio';
-import { conditionRng } from '../training/stats';
 import {
+  assertSameArchive,
+  computeArchiveSha256,
   DEFAULT_ARCHIVE_PATH,
   DEFAULT_ARCHIVED_INTERVENTION_INDEX_PATH,
   DEFAULT_MANIFEST_PATH,
   defaultResolveGraphConfig,
   graphForEntry,
   loadArchive,
-  parsePathFlags,
+  parseFlags,
   resolvePathFlag
 } from './shared';
 
@@ -44,24 +45,40 @@ export interface HypothesisResult {
 }
 
 // ---------------------------------------------------------------------------
-// Shared bootstrap CI (90%) -- `training/stats.ts`'s `bootstrapCI` is fixed
-// at 95%; H2/H3 both need a 90% CI (TOST-style), so this module has its own
-// small helper rather than parameterizing that shared 95%-CI-everywhere
-// convention used throughout the rest of this repo.
+// Mean 90% CI for H2/H3, both always paired on exactly the 3 predeclared
+// trainer seeds (`H2_SEED_PAIRS`/`H3_SEEDS`).
+//
+// A dual-review finding: a percentile bootstrap of the mean at n = 3 has
+// only 10 distinct resample multisets and can never extend beyond
+// `[min(values), max(values)]` -- P(every one of 3 draws lands on the same
+// extreme value) = 1/27 ~= 3.7% < 5%, so its 90% interval is narrower than
+// the data's real sampling uncertainty and makes a TOST-style "supported"
+// verdict too easy to reach (worked example, an earlier version of this
+// function: paired differences [0.05, -0.02, 0.08] bootstrap to a 90% CI of
+// [0.0033, 0.0700], entirely inside +-0.10 -- "supported" -- while the
+// textbook t-based 90% CI for the same 3 numbers is [-0.0498, 0.1232],
+// which straddles +0.10 and is honestly `inconclusive`). This module uses
+// the standard one-sample t interval instead (df = n - 1, always 2 here
+// since n is always 3), which is the conventional TOST construction for a
+// small paired sample and does not silently understate uncertainty at
+// n = 3. `00-overview.md`'s own text ("With n = 3 pairs the resolution is
+// coarse") is a plan requirement that this interval actually reflects,
+// rather than one the previous bootstrap-based interval quietly hid.
 // ---------------------------------------------------------------------------
 
-const bootstrapMeanCI90 = (values: readonly number[], resamples: number, rng: () => number): readonly [number, number] => {
+/** Two-sided 90% (one-sided 95%) t critical value, keyed by degrees of freedom (n - 1). Only n = 3 (df = 2) is ever used by this module today; a couple of neighbors are kept for headroom, and an unlisted df throws rather than silently extrapolating. */
+const T_95_ONE_SIDED: Readonly<Record<number, number>> = { 1: 6.313752, 2: 2.919986, 3: 2.353363, 4: 2.131847 };
+
+const tMeanCI90 = (values: readonly number[]): readonly [number, number] => {
   const n = values.length;
-  const draws = new Array<number>(resamples);
-  for (let r = 0; r < resamples; r += 1) {
-    let sum = 0;
-    for (let i = 0; i < n; i += 1) sum += values[Math.floor(rng() * n)];
-    draws[r] = sum / n;
+  const t = T_95_ONE_SIDED[n - 1];
+  if (n < 2 || t === undefined) {
+    throw new Error(`hypotheses: tMeanCI90 needs 2 <= n <= ${Object.keys(T_95_ONE_SIDED).length + 1}, got n=${n}`);
   }
-  draws.sort((a, b) => a - b);
-  const lowIndex = Math.floor(0.05 * resamples);
-  const highIndex = Math.min(resamples - 1, Math.ceil(0.95 * resamples) - 1);
-  return [draws[lowIndex], draws[highIndex]];
+  const mean = values.reduce((a, b) => a + b, 0) / n;
+  const variance = values.reduce((sum, v) => sum + (v - mean) ** 2, 0) / (n - 1);
+  const halfWidth = t * Math.sqrt(variance / n);
+  return [mean - halfWidth, mean + halfWidth];
 };
 
 // ---------------------------------------------------------------------------
@@ -80,9 +97,11 @@ interface IndependenceEntry {
 }
 interface LinkageEntry {
   readonly id: string;
-  readonly rhoThrust: number;
-  readonly ciCluster: readonly [number, number];
-  readonly ciNeuron: readonly [number, number];
+  /** `null` when `linkage.py` flagged this readout `degenerate` (a constant `|T_clear|` or saliency vector -- Spearman's rho is mathematically undefined, not "measured zero"). */
+  readonly degenerate?: boolean;
+  readonly rhoThrust: number | null;
+  readonly ciCluster: readonly [number, number] | null;
+  readonly ciNeuron: readonly [number, number] | null;
   readonly clusterCount: number;
 }
 interface RegimeEntry {
@@ -112,15 +131,33 @@ const RHO_THRESHOLD = 0.3;
 interface H1SeedEvidence {
   readonly id: string;
   readonly regimeValid: boolean;
-  readonly rho: number;
-  readonly ciCluster: readonly [number, number];
-  readonly ciNeuron: readonly [number, number];
+  readonly degenerate: boolean;
+  readonly rho: number | null;
+  readonly ciCluster: readonly [number, number] | null;
+  readonly ciNeuron: readonly [number, number] | null;
   readonly clusterExcludesZero: boolean;
   readonly neuronExcludesZero: boolean;
   readonly agree: boolean;
   readonly meetsThreshold: boolean;
 }
 
+/**
+ * H1 has only two outcomes -- `supported` or `inconclusive` -- never
+ * `not-supported`, unlike H2/H3. This is deliberate, grounded in
+ * `00-overview.md`'s own text: H1's rule only ever defines what "consistent
+ * with routing around" (`supported`) means, plus two named routes to
+ * `inconclusive` (regime-invalid, cluster/neuron-bootstrap disagreement);
+ * it never defines a "refuted"/`not-supported` condition, unlike H2
+ * ("'Not supported' means...") and H3 (same). H1 is explicitly correlational
+ * ("H1 is always described in correlational language ('consistent with')")
+ * -- a `not-supported` verdict on a correlational hypothesis at n = 3
+ * biological seeds would itself overclaim (absence of a threshold-meeting
+ * correlation is not evidence the correlation is truly absent), so a
+ * regime-valid, bootstrap-agreeing, threshold-missing result is reported as
+ * `inconclusive` with `reason: 'threshold-not-met-in-all-seeds'`, not
+ * `not-supported` (a dual-review question, resolved against the plan text
+ * above rather than by adding a branch the plan never asked for).
+ */
 export const evaluateH1 = (
   linkageById: Map<string, LinkageEntry>,
   regimeById: Map<string, RegimeEntry>
@@ -129,22 +166,32 @@ export const evaluateH1 = (
     const linkage = linkageById.get(id);
     const regime = regimeById.get(id);
     if (!linkage || !regime) throw new Error(`hypotheses: H1 missing linkage/regime data for "${id}"`);
-    const clusterExcludesZero = excludesZero(linkage.ciCluster);
-    const neuronExcludesZero = excludesZero(linkage.ciNeuron);
+    // `linkage.py` flags a biological seed `degenerate` when its |T_clear|
+    // or thrust-saliency vector is constant, making Spearman's rho
+    // mathematically undefined (not a real "no correlation" measurement).
+    // Treated as failing threshold/agreement here, never crashing on a
+    // `null` CI -- `00-overview.md` has no real archived biological
+    // readout that hits this (verified: none of the three do), but this
+    // path is exercised defensively rather than left to throw a TypeError.
+    const degenerate = linkage.degenerate === true || linkage.rhoThrust === null || linkage.ciCluster === null || linkage.ciNeuron === null;
+    const clusterExcludesZero = !degenerate && excludesZero(linkage.ciCluster as readonly [number, number]);
+    const neuronExcludesZero = !degenerate && excludesZero(linkage.ciNeuron as readonly [number, number]);
     return {
       id,
       regimeValid: regime.valid,
+      degenerate,
       rho: linkage.rhoThrust,
       ciCluster: linkage.ciCluster,
       ciNeuron: linkage.ciNeuron,
       clusterExcludesZero,
       neuronExcludesZero,
-      agree: clusterExcludesZero === neuronExcludesZero,
-      meetsThreshold: linkage.rhoThrust >= RHO_THRESHOLD && clusterExcludesZero
+      agree: degenerate || clusterExcludesZero === neuronExcludesZero,
+      meetsThreshold: !degenerate && (linkage.rhoThrust as number) >= RHO_THRESHOLD && clusterExcludesZero
     };
   });
 
   const anyRegimeInvalid = perSeed.some((s) => !s.regimeValid);
+  const anyDegenerate = perSeed.some((s) => s.degenerate);
   const anyDisagreement = perSeed.some((s) => !s.agree);
   const allMeetThreshold = perSeed.every((s) => s.meetsThreshold);
 
@@ -152,6 +199,8 @@ export const evaluateH1 = (
   let reason: string | undefined;
   if (anyRegimeInvalid) {
     reason = 'regime-invalid';
+  } else if (anyDegenerate) {
+    reason = 'degenerate-correlation';
   } else if (anyDisagreement) {
     reason = 'cluster-neuron-bootstrap-disagreement';
   } else if (allMeetThreshold) {
@@ -174,11 +223,7 @@ const H2_SEED_PAIRS: readonly { readonly seed: number; readonly biological: stri
 ];
 const H2_EQUIVALENCE_BOUND = 0.1;
 
-export const evaluateH2 = (
-  independenceById: Map<string, IndependenceEntry>,
-  resamples: number,
-  bootstrapSeed: number
-): HypothesisResult => {
+export const evaluateH2 = (independenceById: Map<string, IndependenceEntry>): HypothesisResult => {
   const pairs = H2_SEED_PAIRS.map(({ seed, biological, rewired }) => {
     const bio = independenceById.get(biological);
     const rew = independenceById.get(rewired);
@@ -196,8 +241,7 @@ export const evaluateH2 = (
   }
 
   const differences = pairs.map((p) => (p.biological.ratio as number) - (p.rewired.ratio as number));
-  const rng = conditionRng(bootstrapSeed, 'H2');
-  const ci = bootstrapMeanCI90(differences, resamples, rng);
+  const ci = tMeanCI90(differences);
 
   // "Supported": the whole CI lies inside (-0.10, 0.10). "Not supported":
   // the whole CI lies OUTSIDE [-0.10, 0.10] on one side (`ci[0] >
@@ -229,9 +273,7 @@ const H3_RATIO_BOUND = 1.25;
 
 export const evaluateH3 = (
   saliencyById: Map<string, SaliencyEntry>,
-  newlyConnectedThrustDIndices: readonly number[],
-  resamples: number,
-  bootstrapSeed: number
+  newlyConnectedThrustDIndices: readonly number[]
 ): HypothesisResult => {
   if (newlyConnectedThrustDIndices.length === 0) {
     return {
@@ -243,21 +285,36 @@ export const evaluateH3 = (
   const meanAt = (entry: SaliencyEntry): number =>
     newlyConnectedThrustDIndices.reduce((sum, d) => sum + entry.thrust[d], 0) / newlyConnectedThrustDIndices.length;
 
+  // `ratio: null` when the biological mean is not strictly positive (mean
+  // absolute saliency is non-negative by construction, so this is only the
+  // degenerate all-zero case) -- previously `bioMean !== 0 ? ... :
+  // Number.POSITIVE_INFINITY`, which silently turned a genuinely undefined
+  // 0/0 ratio into `+Infinity` (itself then serialized as `null` by
+  // `JSON.stringify`, indistinguishable from missing data) and, worse, made
+  // `ci[0] > H3_RATIO_BOUND` true -- reporting a real `not-supported`
+  // verdict from an undefined ratio (a dual-review finding). A seed with an
+  // undefined ratio now makes the whole hypothesis `inconclusive`, the same
+  // failure-closed convention `evaluateH2` already uses for
+  // `defined: false` independence shares.
   const ratios = H3_SEEDS.map((seed) => {
     const p = saliencyById.get(`P-seed${seed}`);
     const bio = saliencyById.get(`biological-seed${seed}`);
     if (!p || !bio) throw new Error(`hypotheses: H3 missing saliency data for seed ${seed}`);
     const pMean = meanAt(p);
     const bioMean = meanAt(bio);
-    return { seed, pMean, bioMean, ratio: bioMean !== 0 ? pMean / bioMean : Number.POSITIVE_INFINITY };
+    return { seed, pMean, bioMean, ratio: bioMean > 0 ? pMean / bioMean : null };
   });
 
-  const rng = conditionRng(bootstrapSeed, 'H3');
-  const ci = bootstrapMeanCI90(
-    ratios.map((r) => r.ratio),
-    resamples,
-    rng
-  );
+  const undefinedSeeds = ratios.filter((r) => r.ratio === null).map((r) => r.seed);
+  if (undefinedSeeds.length > 0) {
+    return {
+      outcome: 'inconclusive',
+      reason: 'undefined-saliency-ratio',
+      evidence: { ratioBound: H3_RATIO_BOUND, ratios, undefinedSeeds, newlyConnectedThrustDIndices }
+    };
+  }
+
+  const ci = tMeanCI90(ratios.map((r) => r.ratio as number));
 
   let outcome: HypothesisOutcome = 'inconclusive';
   if (ci[1] <= H3_RATIO_BOUND) outcome = 'supported';
@@ -301,8 +358,6 @@ interface HypothesesArgs {
   readonly interventionIndexPath?: string;
   readonly archivedInterventionIndexPath: string;
   readonly out: string;
-  readonly resamples: number;
-  readonly bootstrapSeed: number;
 }
 
 const parseArgs = (argv: readonly string[]): HypothesesArgs => {
@@ -316,9 +371,7 @@ const parseArgs = (argv: readonly string[]): HypothesesArgs => {
   let interventionIndexPath: string | undefined;
   let archivedInterventionIndexPath = DEFAULT_ARCHIVED_INTERVENTION_INDEX_PATH;
   let out = resolve(process.cwd(), 'training/runs/attribution/hypotheses.json');
-  let resamples = 5000;
-  let bootstrapSeed = 1;
-  parsePathFlags('hypotheses', argv, {
+  parseFlags('hypotheses', argv, {
     '--archive': (v) => (archivePath = resolvePathFlag(v)),
     '--saliency': (v) => (saliencyPath = resolvePathFlag(v)),
     '--independence': (v) => (independencePath = resolvePathFlag(v)),
@@ -328,9 +381,7 @@ const parseArgs = (argv: readonly string[]): HypothesesArgs => {
     '--manifest': (v) => (manifestPath = resolvePathFlag(v)),
     '--intervention-index': (v) => (interventionIndexPath = resolvePathFlag(v)),
     '--archived-intervention-index': (v) => (archivedInterventionIndexPath = resolvePathFlag(v)),
-    '--out': (v) => (out = resolvePathFlag(v)),
-    '--resamples': (v) => (resamples = Number(v)),
-    '--bootstrap-seed': (v) => (bootstrapSeed = Number(v))
+    '--out': (v) => (out = resolvePathFlag(v))
   });
   return {
     archivePath,
@@ -342,9 +393,7 @@ const parseArgs = (argv: readonly string[]): HypothesesArgs => {
     manifestPath,
     interventionIndexPath,
     archivedInterventionIndexPath,
-    out,
-    resamples,
-    bootstrapSeed
+    out
   };
 };
 
@@ -352,16 +401,36 @@ export const runHypotheses = (
   args: Readonly<HypothesesArgs>
 ): { readonly out: string; readonly sha256: string } => {
   const readouts = loadArchive(args.archivePath);
-  const saliencyById = byId(
-    (JSON.parse(readFileSync(args.saliencyPath, 'utf8')) as { entries: SaliencyEntry[] }).entries
-  );
-  const independenceById = byId(
-    (JSON.parse(readFileSync(args.independencePath, 'utf8')) as { entries: IndependenceEntry[] }).entries
-  );
-  const linkageById = byId(
-    (JSON.parse(readFileSync(args.linkagePath, 'utf8')) as { readouts: LinkageEntry[] }).readouts
-  );
-  const regimeById = byId((JSON.parse(readFileSync(args.regimePath, 'utf8')) as { entries: RegimeEntry[] }).entries);
+  const archiveSha256 = computeArchiveSha256(args.archivePath);
+
+  const saliencyOutput = JSON.parse(readFileSync(args.saliencyPath, 'utf8')) as {
+    readonly archiveSha256?: string;
+    readonly entries: SaliencyEntry[];
+  };
+  assertSameArchive('hypotheses', args.saliencyPath, saliencyOutput.archiveSha256, archiveSha256);
+  const saliencyById = byId(saliencyOutput.entries);
+
+  const independenceOutput = JSON.parse(readFileSync(args.independencePath, 'utf8')) as {
+    readonly archiveSha256?: string;
+    readonly entries: IndependenceEntry[];
+  };
+  assertSameArchive('hypotheses', args.independencePath, independenceOutput.archiveSha256, archiveSha256);
+  const independenceById = byId(independenceOutput.entries);
+
+  const linkageOutput = JSON.parse(readFileSync(args.linkagePath, 'utf8')) as {
+    readonly archiveSha256?: string;
+    readonly readouts: LinkageEntry[];
+  };
+  assertSameArchive('hypotheses', args.linkagePath, linkageOutput.archiveSha256, archiveSha256);
+  const linkageById = byId(linkageOutput.readouts);
+
+  const regimeOutput = JSON.parse(readFileSync(args.regimePath, 'utf8')) as {
+    readonly archiveSha256?: string;
+    readonly entries: RegimeEntry[];
+  };
+  assertSameArchive('hypotheses', args.regimePath, regimeOutput.archiveSha256, archiveSha256);
+  const regimeById = byId(regimeOutput.entries);
+
   const swaps = JSON.parse(readFileSync(args.swapsPath, 'utf8')) as InterventionSwapsArchive;
   const pSwap = swaps.swaps.find((s) => s.id === 'P');
   if (!pSwap) throw new Error('hypotheses: intervention-swaps-v1.json has no "P" entry');
@@ -374,11 +443,12 @@ export const runHypotheses = (
   const thrustDIndices = newlyConnectedThrustDIndices(pSwap.addedEdges, biologicalGraph.outputPopulationIndex, indices);
 
   const h1 = evaluateH1(linkageById, regimeById);
-  const h2 = evaluateH2(independenceById, args.resamples, args.bootstrapSeed);
-  const h3 = evaluateH3(saliencyById, thrustDIndices, args.resamples, args.bootstrapSeed);
+  const h2 = evaluateH2(independenceById);
+  const h3 = evaluateH3(saliencyById, thrustDIndices);
 
   const body = JSON.stringify({
     version: 1,
+    archiveSha256,
     hypothesisCount: 3,
     multipleComparisonCorrection: 'none',
     H1: h1,

@@ -73,6 +73,13 @@ RIGHT_CLEARANCE_IDX = OBSERVATION_CHANNEL_INDEX["rightClearance"]
 FORWARD_CLEARANCE_IDX = OBSERVATION_CHANNEL_INDEX["forwardClearance"]
 
 DEFAULT_RESAMPLES = 2000
+#: Mirrors `scripts/attribution/shared.ts`'s `DEFAULT_ARCHIVED_INTERVENTION_INDEX_PATH` --
+#: the committed archive copy every physical intervention index must byte-match
+#: (`_load_intervention_index`). Defaulted here too (a dual-review finding: an
+#: earlier version defaulted this flag to `None`, so passing `--intervention-index`
+#: alone silently dropped the byte-equality check entirely instead of running it
+#: against the one archive copy that always exists).
+DEFAULT_ARCHIVED_INTERVENTION_INDEX = REPO_ROOT / "training" / "archive" / "intervention-index-v1.json"
 
 
 # ---------------------------------------------------------------------------
@@ -105,13 +112,43 @@ def _load_intervention_index(index_path: Path, archived_index_path: Path) -> dic
     return {entry["id"]: entry for entry in index["entries"]}
 
 
+def build_archive_shas(readouts: list[dict]) -> dict[str, tuple]:
+    """One `(graphGzipSha256, graphBinarySha256)` per unique `graphId`, refusing
+    (not silently keeping the first) if two archive entries for the SAME
+    graphId disagree, and enforcing the `disconnected` null-sha invariant --
+    a dual-review finding: an earlier version used `dict.setdefault`, which
+    kept only the first entry per graphId and never checked `disconnected`
+    at all, so a later entry recording a different (or a non-null
+    `disconnected`) sha would go unnoticed while the TypeScript side
+    (`resolve-graph.ts`'s `assertIdentityMatchesArchive`, called once per
+    entry) would have thrown on it."""
+    archive_shas: dict[str, tuple] = {}
+    for entry in readouts:
+        graph_id = entry["graphId"]
+        shas = (entry["graphGzipSha256"], entry["graphBinarySha256"])
+        if graph_id == "disconnected":
+            if shas != (None, None):
+                raise ValueError(f"linkage: \"disconnected\" archive entry \"{entry['id']}\" must have null graph shas")
+            continue
+        prior = archive_shas.setdefault(graph_id, shas)
+        if prior != shas:
+            raise ValueError(
+                f"linkage: archive entries for graphId \"{graph_id}\" disagree on graph shas: {prior} vs {shas} "
+                f"(entry \"{entry['id']}\")"
+            )
+    return archive_shas
+
+
 def _assert_matches_archive(graph_id: str, gzip_sha256: str, binary_sha256: str, archive_shas: Mapping[str, tuple]) -> None:
+    """Throws (never silently skips) unless `graph_id` has an archive entry
+    with non-null shas matching the just-resolved graph -- mirrors
+    `resolve-graph.ts`'s `assertIdentityMatchesArchive`, which throws in
+    both of these cases rather than returning early (a dual-review finding
+    on an earlier version of this function)."""
     expected = archive_shas.get(graph_id)
     if expected is None:
-        return
+        raise ValueError(f"linkage: no archive entry for graphId \"{graph_id}\" to verify against")
     expected_gzip, expected_binary = expected
-    if expected_gzip is None or expected_binary is None:
-        return
     if gzip_sha256 != expected_gzip or binary_sha256 != expected_binary:
         raise ValueError(
             f"linkage: resolved graph for \"{graph_id}\" (gzipSha256 {gzip_sha256}, binarySha256 {binary_sha256}) "
@@ -160,7 +197,7 @@ def resolve_graph(
         )
 
     if intervention_index is None or intervention_graphs_dir is None:
-        raise ValueError(f"linkage: graphId \"{graph_id}\" needs --intervention-index/--intervention-graphs-dir")
+        raise ValueError(f"linkage: graphId \"{graph_id}\" needs --intervention-index (a physical interventions.py index.json)")
     entry = intervention_index.get(graph_id)
     if entry is None:
         raise ValueError(f"linkage: the intervention index has no entry for id \"{graph_id}\"")
@@ -226,7 +263,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--descending-types", type=Path, required=True, help="public/data/descending-types-v1.json")
     parser.add_argument("--manifest", type=Path, default=PUBLIC_DATA_DIR / "malecns-arena-v1.manifest.json")
     parser.add_argument("--intervention-index", type=Path, default=None, help="physical interventions.py index.json")
-    parser.add_argument("--archived-intervention-index", type=Path, default=None)
+    parser.add_argument("--archived-intervention-index", type=Path, default=DEFAULT_ARCHIVED_INTERVENTION_INDEX)
     parser.add_argument("--steady-state-dir", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--resamples", type=int, default=DEFAULT_RESAMPLES)
@@ -255,9 +292,24 @@ def main(argv: list[str] | None = None) -> None:
         if value is not None:
             setattr(args, path_attr, value.resolve())
 
-    archive = json.loads(args.archive.read_text())
+    archive_bytes = args.archive.read_bytes()
+    archive_sha256 = sha256_hex(archive_bytes)
+    archive = json.loads(archive_bytes.decode("utf-8"))
     readouts = archive["readouts"]
-    saliency_by_id = {e["id"]: e for e in json.loads(args.saliency.read_text())["entries"]}
+    saliency_doc = json.loads(args.saliency.read_text())
+    # `saliency.ts`'s own `archiveSha256` stamp -- a dual-review finding:
+    # this pipeline sha-verifies every graph and every theta, but previously
+    # had no check tying its OWN intermediate JSON inputs back to the
+    # archive that produced them, so a stale `saliency.json` left over from
+    # a different archive version would silently drive this module's
+    # correlation with no error at all.
+    saliency_archive_sha256 = saliency_doc.get("archiveSha256")
+    if saliency_archive_sha256 != archive_sha256:
+        raise ValueError(
+            f"linkage: {args.saliency} was produced from a different archive (archiveSha256 "
+            f"{saliency_archive_sha256!r}, expected {archive_sha256!r}) -- rerun saliency.ts against the current archive"
+        )
+    saliency_by_id = {e["id"]: e for e in saliency_doc["entries"]}
     descending_types = json.loads(args.descending_types.read_text())
     # `descending-types-v1.json`'s `neurons[i].index` is the RAW graph
     # neuron id (0..neuronCount-1, e.g. 387/405/445 for this study's
@@ -275,17 +327,32 @@ def main(argv: list[str] | None = None) -> None:
         [n["group"] if n["group"] is not None else n["population"] for n in neurons], dtype=np.int64
     )
 
+    # `--steady-state-dir` must be inside the repo: `sidecarPath` below is
+    # recorded relative to `REPO_ROOT` (`regime.ts` resolves it the same
+    # way, against its own `repoRoot`, unconditionally -- see that file's
+    # `runRegime`), so a directory outside the repo could never be read
+    # back correctly regardless of whether this check catches it. Checked
+    # here, before any graph is loaded or any dense O(n^3) solve runs (a
+    # dual-review finding: an earlier version only discovered this via
+    # `sidecar_path.relative_to(REPO_ROOT)` raising AFTER the first graph's
+    # solve, whose cost this check is meant to avoid wasting).
+    try:
+        args.steady_state_dir.relative_to(REPO_ROOT)
+    except ValueError:
+        raise ValueError(
+            f"linkage: --steady-state-dir {args.steady_state_dir} must be inside the repository ({REPO_ROOT}) -- "
+            "linkage.json records sidecar paths repo-root-relative, and regime.ts resolves them against the repo root"
+        ) from None
+
     manifest = _read_manifest(args.manifest)
     manifest_dir = args.manifest.parent
     intervention_index = (
         _load_intervention_index(args.intervention_index, args.archived_intervention_index)
-        if args.intervention_index and args.archived_intervention_index
+        if args.intervention_index is not None
         else None
     )
 
-    archive_shas: dict[str, tuple] = {}
-    for entry in readouts:
-        archive_shas.setdefault(entry["graphId"], (entry["graphGzipSha256"], entry["graphBinarySha256"]))
+    archive_shas = build_archive_shas(readouts)
 
     unique_graph_ids = sorted({entry["graphId"] for entry in readouts})
     t_clear_d_space_by_graph: dict[str, np.ndarray] = {}
@@ -339,27 +406,56 @@ def main(argv: list[str] | None = None) -> None:
         if saliency_entry is None:
             raise ValueError(f"linkage: no saliency entry for readout \"{entry['id']}\" -- run saliency.ts first")
         t_clear_abs = np.abs(t_clear_d_space_by_graph[graph_id])
+        thrust = np.array(saliency_entry["thrust"])
+        yaw = np.array(saliency_entry["yaw"])
 
-        rho_thrust = spearman_rho(np.array(saliency_entry["thrust"]), t_clear_abs)
-        rho_yaw = spearman_rho(np.array(saliency_entry["yaw"]), t_clear_abs)
+        # A constant `|T_clear|` (e.g. "disconnected", whose A is zeroed --
+        # confirmed empirically in this study's own archive: every
+        # descending neuron's clearance transfer is exactly 0 there) or a
+        # constant saliency vector makes Spearman's rho mathematically
+        # undefined (zero variance in one of the two ranked variables).
+        # `explain_stats._pearson` (via `spearman_rho`) returns a bare `0.0`
+        # for that case (`denom == 0`), and the bootstrap CIs collapse to
+        # `[0.0, 0.0]` the same way -- both would otherwise look exactly
+        # like a real, measured "no correlation" in the shipped
+        # `linkage.json` (a dual-review finding). Flagged here instead:
+        # `rho*`/`ci*` are `null` and `degenerate: true` when this happens,
+        # so a downstream reader (the WP3 report) can tell "no correlation"
+        # from "not a meaningful question for this readout".
+        t_clear_degenerate = bool(np.ptp(t_clear_abs) == 0.0)
+        thrust_degenerate = t_clear_degenerate or bool(np.ptp(thrust) == 0.0)
+        yaw_degenerate = t_clear_degenerate or bool(np.ptp(yaw) == 0.0)
 
-        rank_saliency = _rank(np.array(saliency_entry["thrust"]))
-        rank_t_clear = _rank(t_clear_abs)
-        rng_cluster = metric_rng(args.bootstrap_seed, f"cluster|{entry['id']}")
-        rng_neuron = metric_rng(args.bootstrap_seed, f"neuron|{entry['id']}")
-        ci_cluster_lo, ci_cluster_hi, cluster_count, cluster_sizes = bootstrap_spearman_ci_clustered(
-            rank_saliency, rank_t_clear, cluster_of_index, args.resamples, rng_cluster
-        )
-        ci_neuron_lo, ci_neuron_hi = bootstrap_spearman_ci(rank_saliency, rank_t_clear, args.resamples, rng_neuron)
+        rho_thrust = None if thrust_degenerate else spearman_rho(thrust, t_clear_abs)
+        rho_yaw = None if yaw_degenerate else spearman_rho(yaw, t_clear_abs)
+
+        if thrust_degenerate:
+            ci_cluster: list[float] | None = None
+            ci_neuron: list[float] | None = None
+            cluster_count = int(np.unique(cluster_of_index).size)
+            _, counts = np.unique(cluster_of_index, return_counts=True)
+            cluster_sizes = sorted(int(c) for c in counts)
+        else:
+            rank_saliency = _rank(thrust)
+            rank_t_clear = _rank(t_clear_abs)
+            rng_cluster = metric_rng(args.bootstrap_seed, f"cluster|{entry['id']}")
+            rng_neuron = metric_rng(args.bootstrap_seed, f"neuron|{entry['id']}")
+            ci_cluster_lo, ci_cluster_hi, cluster_count, cluster_sizes = bootstrap_spearman_ci_clustered(
+                rank_saliency, rank_t_clear, cluster_of_index, args.resamples, rng_cluster
+            )
+            ci_neuron_lo, ci_neuron_hi = bootstrap_spearman_ci(rank_saliency, rank_t_clear, args.resamples, rng_neuron)
+            ci_cluster = [ci_cluster_lo, ci_cluster_hi]
+            ci_neuron = [ci_neuron_lo, ci_neuron_hi]
 
         out_entries.append(
             {
                 "id": entry["id"],
                 "graphId": graph_id,
+                "degenerate": thrust_degenerate,
                 "rhoThrust": rho_thrust,
                 "rhoYaw": rho_yaw,
-                "ciCluster": [ci_cluster_lo, ci_cluster_hi],
-                "ciNeuron": [ci_neuron_lo, ci_neuron_hi],
+                "ciCluster": ci_cluster,
+                "ciNeuron": ci_neuron,
                 "clusterCount": cluster_count,
                 "clusterSizes": cluster_sizes,
                 "n": len(neurons),
@@ -369,6 +465,7 @@ def main(argv: list[str] | None = None) -> None:
 
     payload = {
         "version": 1,
+        "archiveSha256": archive_sha256,
         "producer": transfer_producer(),
         "clearanceChannels": ["rightClearance", "forwardClearance"],
         "resamples": args.resamples,

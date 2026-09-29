@@ -8,11 +8,12 @@ import { runEpisode } from '../training/episode';
 import { atomicWriteFileSync, sha256Hex } from '../training/fsio';
 import { mean } from '../training/stats';
 import {
+  computeArchiveSha256,
   DEFAULT_ARCHIVE_PATH,
   defaultResolveGraphConfig,
   graphForEntry,
   loadArchive,
-  parsePathFlags,
+  parseFlags,
   resolvePathFlag,
   SCORING_SEEDS,
   SCORING_TICKS,
@@ -98,7 +99,7 @@ const parseArgs = (argv: readonly string[]): IndependenceArgs => {
   let interventionIndexPath: string | undefined;
   let archivedInterventionIndexPath: string | undefined;
   let out = resolve(process.cwd(), 'training/runs/attribution/independence.json');
-  parsePathFlags('independence', argv, {
+  parseFlags('independence', argv, {
     '--archive': (v) => (archivePath = resolvePathFlag(v)),
     '--manifest': (v) => (manifestPath = resolvePathFlag(v)),
     '--intervention-index': (v) => (interventionIndexPath = resolvePathFlag(v)),
@@ -134,7 +135,7 @@ export const runIndependence = (
     });
   }
   entries.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-  const body = JSON.stringify({ version: 1, entries });
+  const body = JSON.stringify({ version: 1, archiveSha256: computeArchiveSha256(args.archivePath), entries });
   mkdirSync(resolve(args.out, '..'), { recursive: true });
   atomicWriteFileSync(args.out, body);
   return { out: args.out, count: entries.length, sha256: sha256Hex(body) };

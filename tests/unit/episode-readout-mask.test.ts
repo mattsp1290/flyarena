@@ -65,6 +65,10 @@ describe('readoutMask identities (Gate 2)', () => {
       right: { decoder: 'parked' }
     });
     expect(masked).toEqual(silenced);
+    // Not vacuous: the unmasked trained run must actually differ from
+    // silenced, or this identity would pass trivially regardless of
+    // whether the mask does anything at all.
+    expect(runTrained()).not.toEqual(silenced);
   });
 
   it('a partial mask changes the outcome relative to no mask (sanity: masking is not a no-op)', () => {
@@ -95,12 +99,8 @@ describe('readoutMask identities (Gate 2)', () => {
   });
 
   it('throws on an out-of-range or unsorted readoutMask index', () => {
-    const graph = createTraceGraph();
-    const weights = buildWeights();
     expect(() => runTrained({ readoutMask: Int32Array.from([D]) })).toThrow(/range/);
     expect(() => runTrained({ readoutMask: Int32Array.from([2, 1]) })).toThrow(/sorted/);
-    void graph;
-    void weights;
   });
 });
 
@@ -131,12 +131,30 @@ describe('onReadoutInput', () => {
     expect(seenRows).toHaveLength(TICKS);
   });
 
-  it('reports the masked (post-mask) rate, not the raw network rate, when a readoutMask is set', () => {
+  it('reports the masked (post-mask) rate, not the raw network rate, when a readoutMask is set -- and leaves every unmasked D-space position untouched', () => {
     const graph = createTraceGraph();
     const weights = buildWeights();
     const indices = outputNeuronIndices(graph);
     const mask = Int32Array.from([1]);
-    let sawZeroAtMaskedInput = true;
+
+    const unmaskedRows: Float32Array[] = [];
+    runEpisode({
+      seed: SEED,
+      ticks: TICKS,
+      left: {
+        decoder: 'trained',
+        graph,
+        weights,
+        onReadoutInput: (rate) => {
+          const row = new Float32Array(D);
+          for (let i = 0; i < D; i += 1) row[i] = rate[indices[i]];
+          unmaskedRows.push(row);
+        }
+      },
+      right: { decoder: 'parked' }
+    });
+
+    const maskedRows: Float32Array[] = [];
     runEpisode({
       seed: SEED,
       ticks: TICKS,
@@ -146,12 +164,32 @@ describe('onReadoutInput', () => {
         weights,
         readoutMask: mask,
         onReadoutInput: (rate) => {
-          if (rate[indices[1]] !== 0) sawZeroAtMaskedInput = false;
+          const row = new Float32Array(D);
+          for (let i = 0; i < D; i += 1) row[i] = rate[indices[i]];
+          maskedRows.push(row);
         }
       },
       right: { decoder: 'parked' }
     });
-    expect(sawZeroAtMaskedInput).toBe(true);
+
+    expect(maskedRows).toHaveLength(TICKS);
+    for (let t = 0; t < TICKS; t += 1) {
+      // Masked position (D-space index 1) is exactly zero, every tick.
+      expect(maskedRows[t][1]).toBe(0);
+    }
+    // Every other D-space position equals the SAME tick's unmasked run
+    // exactly -- not merely "not the whole buffer zeroed" -- but only at
+    // tick 0: this is a closed-loop simulation (the readout's masked vs.
+    // unmasked output at tick 0 decodes to a different action, which feeds
+    // back into the world and diverges every later observation/state.rate
+    // between the two runs -- expected, not a bug). Tick 0's `state.rate`
+    // is still driven only by the initial world's observation, identical
+    // for both runs before either has taken any action, so it is the one
+    // tick this comparison is valid at.
+    for (let d = 0; d < D; d += 1) {
+      if (d === 1) continue;
+      expect(maskedRows[0][d]).toBe(unmaskedRows[0][d]);
+    }
   });
 
   it('is rejected on the authored decoder', () => {

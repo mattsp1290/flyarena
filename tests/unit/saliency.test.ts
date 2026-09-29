@@ -46,7 +46,7 @@ const buildRows = (seedOffset: number): Float32Array[] =>
   });
 
 describe('readoutSaliency', () => {
-  it('matches the mean absolute finite-difference gradient within 1e-6 (thrust, ordinary case)', () => {
+  it('matches the mean absolute finite-difference gradient to a tight absolute+relative tolerance (thrust, ordinary case)', () => {
     const weights = buildWeights(1);
     const rows = buildRows(0);
     const result = readoutSaliency(weights, rows);
@@ -60,7 +60,7 @@ describe('readoutSaliency', () => {
     }
   });
 
-  it('matches the mean absolute finite-difference gradient within 1e-6 (yaw)', () => {
+  it('matches the mean absolute finite-difference gradient to a tight absolute+relative tolerance (yaw)', () => {
     const weights = buildWeights(1);
     const rows = buildRows(5);
     const result = readoutSaliency(weights, rows);
@@ -80,6 +80,26 @@ describe('readoutSaliency', () => {
       // Saturation should drive the gradient (and therefore saliency) close to zero.
       expect(result.thrust[d]).toBeLessThan(1e-2);
     }
+  });
+
+  it('matches finite differences in a PARTIALLY saturated case (f_o\' materially non-trivial, not near 0 or 1)', () => {
+    // A fully saturated bias (the previous test) drives f_o' so close to 0
+    // that the comparison would pass even if the output-nonlinearity factor
+    // were dropped entirely from the analytic gradient. `biasScale = 3.5`
+    // keeps f_o' in a range (roughly 0.01-0.3 depending on the row) where
+    // omitting it would produce a clearly wrong analytic value, while the
+    // float32 finite difference still resolves the gradient cleanly.
+    const weights = buildWeights(3.5);
+    const rows = buildRows(9);
+    const result = readoutSaliency(weights, rows);
+    for (let d = 0; d < D; d += 1) {
+      const meanAbsFiniteThrust = rows.reduce((sum, row) => sum + Math.abs(numericalGradient(weights, row, 0, d)), 0) / rows.length;
+      expect(Math.abs(result.thrust[d] - meanAbsFiniteThrust)).toBeLessThan(1e-5 + 1e-4 * Math.abs(meanAbsFiniteThrust));
+    }
+    // Sanity: this case is not (near-)vacuous the way the fully saturated
+    // one is -- at least one input's saliency is well above the fully
+    // saturated case's 1e-2 ceiling.
+    expect(Math.max(...result.thrust)).toBeGreaterThan(1e-2);
   });
 
   it('variance-weighted saliency is the mean-absolute saliency scaled by that input\'s own trajectory std', () => {

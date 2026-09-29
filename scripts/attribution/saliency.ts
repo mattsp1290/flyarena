@@ -8,11 +8,12 @@ import { outputNeuronIndices, type ReadoutWeights } from '../../src/lib/connecto
 import { runEpisode } from '../training/episode';
 import { atomicWriteFileSync, sha256Hex } from '../training/fsio';
 import {
+  computeArchiveSha256,
   DEFAULT_ARCHIVE_PATH,
   defaultResolveGraphConfig,
   graphForEntry,
   loadArchive,
-  parsePathFlags,
+  parseFlags,
   resolvePathFlag,
   SALIENCY_SEEDS,
   SALIENCY_TICKS,
@@ -228,7 +229,7 @@ const parseArgs = (argv: readonly string[]): SaliencyArgs => {
   let interventionIndexPath: string | undefined;
   let archivedInterventionIndexPath: string | undefined;
   let out = resolve(process.cwd(), 'training/runs/attribution/saliency.json');
-  parsePathFlags('saliency', argv, {
+  parseFlags('saliency', argv, {
     '--archive': (v) => (archivePath = resolvePathFlag(v)),
     '--manifest': (v) => (manifestPath = resolvePathFlag(v)),
     '--intervention-index': (v) => (interventionIndexPath = resolvePathFlag(v)),
@@ -258,7 +259,7 @@ export const runSaliency = (args: Readonly<SaliencyArgs>): { readonly out: strin
     });
   }
   entries.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-  const body = JSON.stringify({ version: 1, entries });
+  const body = JSON.stringify({ version: 1, archiveSha256: computeArchiveSha256(args.archivePath), entries });
   mkdirSync(resolve(args.out, '..'), { recursive: true });
   atomicWriteFileSync(args.out, body);
   return { out: args.out, count: entries.length, sha256: sha256Hex(body) };

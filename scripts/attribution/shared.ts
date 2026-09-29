@@ -83,17 +83,26 @@ export const graphForEntry = (
 ): ConnectomeGraph => resolveReadoutGraph(entry, config);
 
 /**
- * Minimal shared `--flag value` parser for the WP2 analysis CLIs
- * (`saliency.ts`/`ablate.ts`/`independence.ts`/`regime.ts`/`hypotheses.ts`):
- * every flag takes exactly one RAW value string, handed to `handler`
- * unresolved -- a path-valued flag's own handler calls `resolvePathFlag`
- * (below) itself; a numeric flag's handler (`--shards`, `--bootstrap-seed`,
- * `--resamples`) reads it directly with `Number(...)`. Unrecognized flags
- * throw with `toolName` in the message. Kept intentionally tiny (no repeat
- * flags, no boolean flags) -- every one of these CLIs' own flag sets fits
- * this shape.
+ * Minimal shared `--flag value` table-driven parser for the WP2 analysis
+ * CLIs (`saliency.ts`/`ablate.ts`/`independence.ts`/`regime.ts`/
+ * `hypotheses.ts`). `scripts/training/cli.ts`'s own doc comment records a
+ * deliberate decision AGAINST a generic flag-table parser for its own three
+ * callers ("would add indirection without buying clarity") -- that
+ * reasoning was written for three CLIs with heterogeneous, ad hoc flag
+ * sets; these five WP2 CLIs instead share a near-identical flag set
+ * (archive/manifest/intervention-index/out, plus one or two numeric flags),
+ * which is exactly the case a table-driven parser earns its keep for. Every
+ * flag takes exactly one RAW value string, handed to `handler` unresolved
+ * -- a path-valued flag's own handler calls `resolvePathFlag` (below)
+ * itself; a numeric flag's handler calls `cli.ts`'s own
+ * `requirePositiveInt`/`requireNonNegativeInt` (never bare `Number(...)`,
+ * which would accept `NaN`/non-integers silently) -- so validation still
+ * lives in the one place `cli.ts` already owns it, not reimplemented here.
+ * Unrecognized flags throw with `toolName` in the message. Kept
+ * intentionally tiny (no repeat flags, no boolean flags) -- every one of
+ * these CLIs' own flag sets fits this shape.
  */
-export const parsePathFlags = (
+export const parseFlags = (
   toolName: string,
   argv: readonly string[],
   handlers: Readonly<Record<string, (rawValue: string) => void>>
@@ -109,8 +118,31 @@ export const parsePathFlags = (
   }
 };
 
-/** Resolve a raw CLI value against `process.cwd()` -- call this from a path-flag's own handler passed to `parsePathFlags`. */
+/** Resolve a raw CLI value against `process.cwd()` -- call this from a path-flag's own handler passed to `parseFlags`. */
 export const resolvePathFlag = (rawValue: string): string => resolve(process.cwd(), rawValue);
+
+/**
+ * sha256 of the archive file's own raw bytes -- stamped into every
+ * downstream analysis output (`saliency.json`/`independence.json`/
+ * `regime.json`/`ablation.json`) and cross-checked on read
+ * (`ablate.ts`/`hypotheses.ts`/`linkage.py`), so a stale intermediate left
+ * over from a different archive version is a loud, immediate error instead
+ * of a silently wrong ablation ranking or hypothesis verdict (a dual-review
+ * finding: this pipeline sha-verifies every graph and every theta, but
+ * previously had no check tying its OWN intermediate JSON outputs back to
+ * the archive that produced them).
+ */
+export const computeArchiveSha256 = (archivePath: string): string => sha256Hex(readFileSync(archivePath));
+
+/** Throws unless `actual` (an upstream output's own recorded `archiveSha256`) matches `expected` (the current archive's). */
+export const assertSameArchive = (toolName: string, inputLabel: string, actual: string | undefined, expected: string): void => {
+  if (actual !== expected) {
+    throw new Error(
+      `${toolName}: ${inputLabel} was produced from a different archive (archiveSha256 ${actual ?? '<missing>'}, ` +
+        `expected ${expected}) -- rerun the upstream analysis against the current archive`
+    );
+  }
+};
 
 /** The `ResolveGraphConfig` every analysis CLI builds from its own flags/defaults. */
 export const defaultResolveGraphConfig = (args: {

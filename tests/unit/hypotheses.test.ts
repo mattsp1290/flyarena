@@ -76,13 +76,28 @@ describe('evaluateH2', () => {
     return new Map(pairs.map(([id, ratio]) => [id, { id, defined: true, ratio }]));
   };
 
+  it('uses a t-based CI, not a percentile bootstrap: [0.05, -0.02, 0.08] is inconclusive, not "supported"', () => {
+    // A dual-review finding: a percentile bootstrap of the mean at n = 3
+    // can never extend past [min, max] of the sample and made this exact
+    // case "supported" (bootstrap 90% CI ~ [0.0033, 0.0700]); the honest
+    // t-based 90% CI for these 3 numbers is ~[-0.0498, 0.1232], which
+    // straddles +0.10.
+    const independenceById = build([
+      { bio: 0.55, rewired: 0.5 }, // difference 0.05
+      { bio: 0.48, rewired: 0.5 }, // difference -0.02
+      { bio: 0.58, rewired: 0.5 } // difference 0.08
+    ]);
+    const result = evaluateH2(independenceById);
+    expect(result.outcome).toBe('inconclusive');
+  });
+
   it('is supported when the paired-difference 90% CI lies entirely inside +-0.10', () => {
     const independenceById = build([
       { bio: 0.5, rewired: 0.52 },
       { bio: 0.48, rewired: 0.5 },
       { bio: 0.51, rewired: 0.49 }
     ]);
-    const result = evaluateH2(independenceById, 4000, 7);
+    const result = evaluateH2(independenceById);
     expect(result.outcome).toBe('supported');
   });
 
@@ -92,7 +107,7 @@ describe('evaluateH2', () => {
       { bio: 0.85, rewired: 0.18 },
       { bio: 0.95, rewired: 0.22 }
     ]);
-    const result = evaluateH2(independenceById, 4000, 7);
+    const result = evaluateH2(independenceById);
     expect(result.outcome).toBe('not-supported');
   });
 
@@ -102,7 +117,7 @@ describe('evaluateH2', () => {
       { bio: 0.5, rewired: 0.5 },
       { bio: 0.55, rewired: 0.5 }
     ]);
-    const result = evaluateH2(independenceById, 4000, 7);
+    const result = evaluateH2(independenceById);
     expect(result.outcome).toBe('inconclusive');
   });
 
@@ -115,7 +130,7 @@ describe('evaluateH2', () => {
       ['biological-seed303', { id: 'biological-seed303', defined: true, ratio: 0.5 }],
       ['rewired-seed0-seed303', { id: 'rewired-seed0-seed303', defined: true, ratio: 0.5 }]
     ]);
-    const result = evaluateH2(independenceById, 4000, 7);
+    const result = evaluateH2(independenceById);
     expect(result.outcome).toBe('inconclusive');
     expect(result.reason).toBe('undefined-independence-share');
   });
@@ -133,7 +148,7 @@ describe('evaluateH3', () => {
       saliencyEntry('P-seed303', [0.1, 0.1, 0.1, 0.1]),
       saliencyEntry('biological-seed303', [0.1, 0.1, 0.1, 0.1])
     ]);
-    const result = evaluateH3(saliencyById, [0, 1], 4000, 7);
+    const result = evaluateH3(saliencyById, [0, 1]);
     expect(result.outcome).toBe('supported');
   });
 
@@ -146,7 +161,7 @@ describe('evaluateH3', () => {
       saliencyEntry('P-seed303', [0.29, 0.29, 0.29, 0.29]),
       saliencyEntry('biological-seed303', [0.1, 0.1, 0.1, 0.1])
     ]);
-    const result = evaluateH3(saliencyById, [0, 1], 4000, 7);
+    const result = evaluateH3(saliencyById, [0, 1]);
     expect(result.outcome).toBe('not-supported');
   });
 
@@ -159,15 +174,32 @@ describe('evaluateH3', () => {
       saliencyEntry('P-seed303', [0.2, 0.2, 0.2, 0.2]),
       saliencyEntry('biological-seed303', [0.1, 0.1, 0.1, 0.1])
     ]);
-    const result = evaluateH3(saliencyById, [0, 1], 4000, 7);
+    const result = evaluateH3(saliencyById, [0, 1]);
     expect(result.outcome).toBe('inconclusive');
   });
 
   it('is inconclusive with no newly connected thrust neurons', () => {
     const saliencyById = new Map([saliencyEntry('P-seed101', [0.1]), saliencyEntry('biological-seed101', [0.1])]);
-    const result = evaluateH3(saliencyById, [], 4000, 7);
+    const result = evaluateH3(saliencyById, []);
     expect(result.outcome).toBe('inconclusive');
     expect(result.reason).toBe('no-newly-connected-thrust-neurons');
+  });
+
+  it('is inconclusive (not "not-supported") when a biological mean saliency is exactly 0 (an undefined ratio)', () => {
+    // A dual-review finding: the previous implementation turned a 0/0 ratio
+    // into `+Infinity`, which made `ci[0] > 1.25` true and reported
+    // "not-supported" from an undefined ratio.
+    const saliencyById = new Map([
+      saliencyEntry('P-seed101', [0.1, 0.1, 0.1, 0.1]),
+      saliencyEntry('biological-seed101', [0, 0, 0, 0]),
+      saliencyEntry('P-seed202', [0.1, 0.1, 0.1, 0.1]),
+      saliencyEntry('biological-seed202', [0.1, 0.1, 0.1, 0.1]),
+      saliencyEntry('P-seed303', [0.1, 0.1, 0.1, 0.1]),
+      saliencyEntry('biological-seed303', [0.1, 0.1, 0.1, 0.1])
+    ]);
+    const result = evaluateH3(saliencyById, [0, 1]);
+    expect(result.outcome).toBe('inconclusive');
+    expect(result.reason).toBe('undefined-saliency-ratio');
   });
 });
 

@@ -3,15 +3,18 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { runShardedEvaluation } from '../null/sharded-evaluation';
+import { requireNonNegativeInt, requirePositiveInt } from '../training/cli';
 import { atomicWriteFileSync, sha256Hex } from '../training/fsio';
 import { conditionRng, pairedStats, type PairedStats } from '../training/stats';
 import type { AblateSeedResult, AblateWorkerMessage, AblateWorkerTask } from './ablate-task';
 import {
+  assertSameArchive,
+  computeArchiveSha256,
   DEFAULT_ARCHIVE_PATH,
   DEFAULT_ARCHIVED_INTERVENTION_INDEX_PATH,
   DEFAULT_MANIFEST_PATH,
   loadArchive,
-  parsePathFlags,
+  parseFlags,
   resolvePathFlag,
   SCORING_SEEDS,
   SCORING_TICKS,
@@ -80,6 +83,11 @@ interface SaliencyOutputEntry {
   readonly inputStd: readonly number[];
 }
 
+interface SaliencyOutput {
+  readonly archiveSha256?: string;
+  readonly entries: readonly SaliencyOutputEntry[];
+}
+
 interface AblateOutputEntry {
   readonly id: string;
   readonly graphId: string;
@@ -112,20 +120,17 @@ const parseArgs = (argv: readonly string[]): AblateArgs => {
   let shards = 16;
   let bootstrapSeed = 1;
   let resamples = 2000;
-  parsePathFlags('ablate', argv, {
+  parseFlags('ablate', argv, {
     '--archive': (v) => (archivePath = resolvePathFlag(v)),
     '--saliency': (v) => (saliencyPath = resolvePathFlag(v)),
     '--manifest': (v) => (manifestPath = resolvePathFlag(v)),
     '--intervention-index': (v) => (interventionIndexPath = resolvePathFlag(v)),
     '--archived-intervention-index': (v) => (archivedInterventionIndexPath = resolvePathFlag(v)),
     '--out': (v) => (out = resolvePathFlag(v)),
-    '--shards': (v) => (shards = Number(v)),
-    '--bootstrap-seed': (v) => (bootstrapSeed = Number(v)),
-    '--resamples': (v) => (resamples = Number(v))
+    '--shards': (v) => (shards = requirePositiveInt('--shards', v)),
+    '--bootstrap-seed': (v) => (bootstrapSeed = requireNonNegativeInt('--bootstrap-seed', v)),
+    '--resamples': (v) => (resamples = requirePositiveInt('--resamples', v))
   });
-  if (!Number.isInteger(shards) || shards <= 0) throw new Error(`ablate: --shards must be a positive integer, got ${shards}`);
-  if (!Number.isInteger(bootstrapSeed)) throw new Error('ablate: --bootstrap-seed must be an integer');
-  if (!Number.isInteger(resamples) || resamples <= 0) throw new Error('ablate: --resamples must be a positive integer');
   return { archivePath, saliencyPath, manifestPath, interventionIndexPath, archivedInterventionIndexPath, out, shards, bootstrapSeed, resamples };
 };
 
@@ -136,19 +141,36 @@ export const runAblate = async (
   args: Readonly<AblateArgs>
 ): Promise<{ readonly out: string; readonly count: number; readonly sha256: string }> => {
   const readouts = loadArchive(args.archivePath);
-  const saliencyById = new Map<string, SaliencyOutputEntry>(
-    (JSON.parse(readFileSync(args.saliencyPath, 'utf8')) as { entries: SaliencyOutputEntry[] }).entries.map((e) => [
-      e.id,
-      e
-    ])
-  );
+  const archiveSha256 = computeArchiveSha256(args.archivePath);
+  const seenIds = new Set<string>();
+  for (const entry of readouts) {
+    if (seenIds.has(entry.id)) throw new Error(`ablate: duplicate readout id "${entry.id}" in the archive`);
+    seenIds.add(entry.id);
+  }
+  const saliencyOutput = JSON.parse(readFileSync(args.saliencyPath, 'utf8')) as SaliencyOutput;
+  assertSameArchive('ablate', args.saliencyPath, saliencyOutput.archiveSha256, archiveSha256);
+  const saliencyById = new Map<string, SaliencyOutputEntry>(saliencyOutput.entries.map((e) => [e.id, e]));
 
   const tasks: AblateWorkerTask[] = [];
+  const taskKeys = new Set<string>();
+  const addTask = (task: AblateWorkerTask): void => {
+    if (taskKeys.has(task.graphId)) {
+      throw new Error(`ablate: duplicate task key "${task.graphId}" (duplicate readout id, or an id containing "|"?)`);
+    }
+    taskKeys.add(task.graphId);
+    tasks.push(task);
+  };
   const rankByReadout = new Map<string, { readonly top: readonly number[]; readonly bottom: readonly number[] }>();
 
   for (const entry of readouts) {
     const saliencyEntry = saliencyById.get(entry.id);
     if (!saliencyEntry) throw new Error(`ablate: no saliency entry for readout "${entry.id}" -- run saliency.ts first`);
+    if (saliencyEntry.thrust.length !== entry.D || saliencyEntry.yaw.length !== entry.D) {
+      throw new Error(
+        `ablate: saliency entry "${entry.id}" has thrust/yaw length ${saliencyEntry.thrust.length}/` +
+          `${saliencyEntry.yaw.length}, expected D=${entry.D} (a stale saliency.json from a different archive?)`
+      );
+    }
     const ranked = rankAblationInputs(saliencyEntry.thrust, saliencyEntry.yaw);
     rankByReadout.set(entry.id, ranked);
     const inputs = [...ranked.top, ...ranked.bottom];
@@ -173,9 +195,9 @@ export const runAblate = async (
       arenaTask: entry.arenaTask
     };
 
-    tasks.push({ ...baseTask, graphId: baselineKey(entry.id), mask: null });
+    addTask({ ...baseTask, graphId: baselineKey(entry.id), mask: null });
     for (const input of inputs) {
-      tasks.push({ ...baseTask, graphId: ablationKey(entry.id, input), mask: [input] });
+      addTask({ ...baseTask, graphId: ablationKey(entry.id, input), mask: [input] });
     }
   }
 
@@ -232,7 +254,13 @@ export const runAblate = async (
   }
   outEntries.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 
-  const body = JSON.stringify({ version: 1, bootstrapSeed: args.bootstrapSeed, resamples: args.resamples, entries: outEntries });
+  const body = JSON.stringify({
+    version: 1,
+    archiveSha256,
+    bootstrapSeed: args.bootstrapSeed,
+    resamples: args.resamples,
+    entries: outEntries
+  });
   mkdirSync(resolve(args.out, '..'), { recursive: true });
   atomicWriteFileSync(args.out, body);
   return { out: args.out, count: outEntries.length, sha256: sha256Hex(body) };

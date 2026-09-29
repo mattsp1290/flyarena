@@ -138,19 +138,24 @@ export interface AgentEpisodeConfig {
    */
   readonly lesion?: Int32Array;
   /**
-   * Read-only per-substep observer (`.agents/plans/null-explanation/
-   * 02-transfer-and-features.md`'s WP2 regime check), threaded straight
-   * through to `runLesionedSubsteps`'s own `onSubstep` parameter -- see
-   * `SubstepObserver`'s doc comment (`src/lib/connectome/model.ts`) for
-   * exactly what it observes and why it takes `channelValues` as well as
-   * `rate`. Valid only for the authored decoder family, matching `lesion`'s
-   * own restriction immediately above: `trained`/`silenced` never call
-   * `runLesionedSubsteps`/`runSubsteps` with per-substep visibility wired
-   * up this way, and `parked` never steps a network at all. `runEpisode`
-   * throws if this is set for any other decoder. Omitting it costs nothing
-   * (see `SubstepObserver`'s "optional and additive" doc comment); this is
-   * why `tests/unit/episode-runner-parity.test.ts` and the Worker parity
-   * test do not need to change to cover this addition.
+   * Read-only per-substep observer, originally `.agents/plans/
+   * null-explanation/02-transfer-and-features.md`'s WP2 regime check
+   * (authored-family only), widened by `.agents/plans/readout-attribution/
+   * 02-analyses.md`'s WP2 to the `trained`/`silenced` decoders too (so
+   * `scripts/attribution/regime.ts` can measure the same clamp-fraction/
+   * steady-state-distance statistic on trained-readout trajectories, at the
+   * same granularity as the explanation study). Threaded through to
+   * `runLesionedSubsteps` (authored family) or `runSubsteps` (`trained`/
+   * `silenced`) -- see `SubstepObserver`'s doc comment
+   * (`src/lib/connectome/model.ts`) for exactly what it observes and why it
+   * takes `channelValues` as well as `rate`. For `trained`, the observer
+   * always sees the network's real, unmasked rate (never a `readoutMask`-ed
+   * copy -- use `onReadoutInput` below for the readout's own gathered,
+   * post-mask view). Only `parked` (no network stepped at all) rejects it;
+   * `runEpisode` throws there. Omitting it costs nothing (see
+   * `SubstepObserver`'s "optional and additive" doc comment); this is why
+   * `tests/unit/episode-runner-parity.test.ts` and the Worker parity test
+   * did not need to change for either addition.
    */
   readonly onSubstep?: SubstepObserver;
   /**

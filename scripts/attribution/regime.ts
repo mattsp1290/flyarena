@@ -9,11 +9,13 @@ import { runEpisode } from '../training/episode';
 import { atomicWriteFileSync, sha256Hex } from '../training/fsio';
 import { createRegimeAccumulator } from '../null/regime-metrics';
 import {
+  assertSameArchive,
+  computeArchiveSha256,
   DEFAULT_ARCHIVE_PATH,
   defaultResolveGraphConfig,
   graphForEntry,
   loadArchive,
-  parsePathFlags,
+  parseFlags,
   repoRoot,
   resolvePathFlag,
   SALIENCY_SEEDS,
@@ -65,6 +67,7 @@ interface LinkageGraphManifestEntry {
 }
 
 interface LinkageManifest {
+  readonly archiveSha256?: string;
   readonly graphs: Readonly<Record<string, LinkageGraphManifestEntry>>;
 }
 
@@ -165,7 +168,7 @@ const parseArgs = (argv: readonly string[]): RegimeArgs => {
   let interventionIndexPath: string | undefined;
   let archivedInterventionIndexPath: string | undefined;
   let out = resolve(process.cwd(), 'training/runs/attribution/regime.json');
-  parsePathFlags('regime', argv, {
+  parseFlags('regime', argv, {
     '--archive': (v) => (archivePath = resolvePathFlag(v)),
     '--linkage': (v) => (linkagePath = resolvePathFlag(v)),
     '--manifest': (v) => (manifestPath = resolvePathFlag(v)),
@@ -179,7 +182,9 @@ const parseArgs = (argv: readonly string[]): RegimeArgs => {
 export const runRegime = (args: Readonly<RegimeArgs>): { readonly out: string; readonly count: number; readonly sha256: string } => {
   const readouts = loadArchive(args.archivePath);
   const resolveConfig = defaultResolveGraphConfig(args);
+  const archiveSha256 = computeArchiveSha256(args.archivePath);
   const linkage = JSON.parse(readFileSync(args.linkagePath, 'utf8')) as LinkageManifest;
+  assertSameArchive('regime', args.linkagePath, linkage.archiveSha256, archiveSha256);
   const linkageDir = repoRoot;
 
   const steadyStateByGraph = new Map<string, Float64Array>();
@@ -212,6 +217,7 @@ export const runRegime = (args: Readonly<RegimeArgs>): { readonly out: string; r
   entries.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   const body = JSON.stringify({
     version: 1,
+    archiveSha256,
     clampFractionThreshold: CLAMP_FRACTION_THRESHOLD,
     steadyStateDistanceThreshold: STEADY_STATE_DISTANCE_THRESHOLD,
     entries
