@@ -485,19 +485,24 @@ const buildTrainedInterventionsStep = (inputs: BuildFindingStepsInputs): Finding
 };
 
 // ---------------------------------------------------------------------------
-// Step 7: Task generality
+// Task generality
 // ---------------------------------------------------------------------------
 
 /**
  * WP4 of `.agents/plans/task-generality`: whether the rewiring-null and
  * pathway-intervention findings above hold beyond the default foraging
  * task, across four predeclared `ArenaConfig` variants. Inserted after
- * "Trained interventions" and before "Behavior repertoire" (`04-artifact-and-findings.md`'s
- * own placement), which becomes step 8. `condition: 'both'`: the sentence
- * states both the authored and trained overall verdicts together, mirroring
- * step 6's own "both decoders in one sentence" shape. Reuses the same
- * `P_TRAINER_SEEDS` (already imported above for step 6) -- the trained
- * decoder's fixed trainer-seed set is study-wide, not per-artifact.
+ * "Trained interventions" and before "Behavior repertoire" in this array's
+ * own order (`04-artifact-and-findings.md`'s own placement) -- this array's
+ * order no longer determines the panel's *display* order, which
+ * `../findings/sections.ts#groupSteps` computes separately (WP1 of
+ * `.agents/plans/consolidated-release`); see that module's own doc comment
+ * for the real rendered grouping. `condition: 'both'`: the sentence states
+ * both the authored and trained overall verdicts together, mirroring the
+ * "Trained interventions" step's own "both decoders in one sentence" shape.
+ * Reuses the same `P_TRAINER_SEEDS` (already imported above for that step)
+ * -- the trained decoder's fixed trainer-seed set is study-wide, not
+ * per-artifact.
  */
 
 /**
@@ -616,7 +621,7 @@ const buildTaskGeneralityStep = (inputs: BuildFindingStepsInputs): FindingStep =
 };
 
 // ---------------------------------------------------------------------------
-// Step 8: Behavior repertoire
+// Behavior repertoire
 // ---------------------------------------------------------------------------
 
 /**

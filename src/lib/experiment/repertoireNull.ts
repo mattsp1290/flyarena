@@ -8,8 +8,8 @@
  * type is `scripts/atlas/repertoire-report.ts`'s `RepertoireNullArtifact` —
  * that module is a Node-only pipeline (not part of the browser bundle), so
  * this file independently authors and validates just the subset the atlas
- * strip and the Findings panel's step 8 actually render, the same
- * "reimplemented, not imported" discipline `./nullExplanation.ts`/
+ * strip and the Findings panel's "Behavior repertoire" step actually
+ * render, the same "reimplemented, not imported" discipline `./nullExplanation.ts`/
  * `./rewiringNull.ts`/`./pathwayInterventions.ts` already document for their
  * own artifacts.
  *
@@ -24,7 +24,8 @@
  * manifest and this artifact on its own, independently of
  * `ExperimentController#initialize()` -- `03-artifact-and-atlas-strip.md`:
  * "Its state never delays or fails the atlas load") and
- * `ExperimentController` (Findings step 8, `src/lib/findings/steps.ts`).
+ * `ExperimentController` (the Findings panel's "Behavior repertoire" step,
+ * `src/lib/findings/steps.ts`).
  * Living beside `rewiringNull.ts`/`pathwayInterventions.ts` also means
  * `ExperimentController` importing this module is an ordinary same-directory
  * dependency, not a new `experiment/ -> atlas/` edge.
@@ -184,9 +185,9 @@ const validateShape = (value: unknown): { ok: true; data: RepertoireNullArtifact
   }
   // A maintainability review (Suggestion) noted these two distributions'
   // own `n` must equal the primary search seed's actual rewired sample
-  // size -- both the strip and Findings step 8 print `search.rewiredCount`
-  // next to this distribution's `p50` as if it were that distribution's own
-  // sample size.
+  // size -- both the strip and the Findings panel's "Behavior repertoire"
+  // step print `search.rewiredCount` next to this distribution's `p50` as
+  // if it were that distribution's own sample size.
   const primaryOccupied = primaryDist.occupied as RepertoireRewiredDistribution;
   const primaryQd = primaryDist.qd as RepertoireRewiredDistribution;
   if (primaryOccupied.n !== search.rewiredCount || primaryQd.n !== search.rewiredCount) {
@@ -276,8 +277,8 @@ const validateShape = (value: unknown): { ok: true; data: RepertoireNullArtifact
  * never throws, matching `loadNullExplanation`/`loadRewiringNull`/
  * `loadPathwayInterventions`'s own "never throws, always return a reasoned
  * status" contract, so a missing/tampered/malformed artifact only ever
- * hides or degrades the atlas strip / Findings step 8, never the rest of
- * either surface (`03-artifact-and-atlas-strip.md`: "Its state never
+ * hides or degrades the atlas strip / the Findings panel's "Behavior
+ * repertoire" step, never the rest of either surface (`03-artifact-and-atlas-strip.md`: "Its state never
  * delays or fails the atlas load").
  *
  * Deliberately does **not** cross-check `sources.atlasSha256` here: the
@@ -289,8 +290,9 @@ const validateShape = (value: unknown): { ok: true; data: RepertoireNullArtifact
  * resolved -- a maintainability review, Important: the artifact's own
  * premise is "reuses the shipped atlas search exactly", and this field
  * exists specifically so that premise is checkable, not merely recorded.
- * `ExperimentController` (Findings step 8) never loads the atlas at all, so
- * it has nothing to cross-check `atlasSha256` against either; that step
+ * `ExperimentController` (the Findings panel's "Behavior repertoire" step)
+ * never loads the atlas at all, so it has nothing to cross-check
+ * `atlasSha256` against either; that step
  * links out to `#atlas` rather than rendering beside the live grid.
  *
  * `dataBaseUrl` must be the same value the caller passes to `loadAtlas`
