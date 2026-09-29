@@ -2,7 +2,7 @@
   "artifact": "malecns-arena-v1.bin.gz",
   "behaviorRepertoireNull": {
     "artifact": "behavior-repertoire-null-v1.json",
-    "sha256": "8b95ac509a58e03d410c25c1058b8b037ed6d8f76aea688f26505f856601d6ac"
+    "sha256": "6c319777488f495c11de7416ce9c976bfaa80fff13943ba01aea2b95afa9dca5"
   },
   "binaryBytes": 399792,
   "binarySha256": "f1a0f982ffdfba12ecb2206d064c3dc1ceaae7cffa06a22049093d69a79098f7",
@@ -68,6 +68,10 @@
   "selection": {
     "id": "default",
     "params": {}
+  },
+  "selectionRobustness": {
+    "artifact": "selection-robustness-v1.json",
+    "sha256": "77323713c3b881c88df9fe46fdb8a97d5299d2692f0e9c4685028f828bb047fa"
   },
   "sourceDataset": "male-cns:v1.0 (Janelia FlyEM Male CNS connectome)",
   "taskGenerality": {
