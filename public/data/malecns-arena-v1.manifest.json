@@ -71,7 +71,7 @@
   },
   "selectionRobustness": {
     "artifact": "selection-robustness-v1.json",
-    "sha256": "77323713c3b881c88df9fe46fdb8a97d5299d2692f0e9c4685028f828bb047fa"
+    "sha256": "499b4b943b7b32b502c29222cde9fe30328e3426f5a7a9465b67599924128c72"
   },
   "sourceDataset": "male-cns:v1.0 (Janelia FlyEM Male CNS connectome)",
   "taskGenerality": {

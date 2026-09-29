@@ -94,7 +94,7 @@ This is reported on two axes plus the mapping result by itself, never as "N of 4
 - Default (shipped) graph sha: `f1a0f982ffdf`.
 - Raw MaleCNS file shas (pinned, `scripts/data/download.py`): `2177e246113e`, `95c928922066`, `e35da783d1c6`.
 - Current compiler source sha (`scripts/data/compile.py` + `scripts/data/selections.py`): `c015d9fa5ca0`.
-- Producer: `scripts/selections/selection-report.ts`, source sha `dadf93a9139e`, 48 dependency files.
+- Producer: `scripts/selections/selection-report.ts`, source sha `86a061e2ff0d`, 48 dependency files.
 - Each selection above records its own `compiledFromGitRevision`/`compilerSourceSha256` -- see "Per-selection results".
 
 ## Limitations
@@ -103,7 +103,7 @@ This is reported on two axes plus the mapping result by itself, never as "N of 4
 - The 200-swap cap is not scaled to the bridge-pool size.
 - The exploratory unrestricted feature is not recomputed for any selection (`--selection-mode` records `exploratory: null`).
 - One seed per seeded variant (`random-bridge`, `alt-sensory-mapping`).
-- All selections use the same candidate pools and synapse threshold.
+- All selections use the same candidate pools and synapse threshold, so `bridgePoolSize` is a property of that shared candidate set, not of the selection -- it is expected to be identical across all four rows, not a bug.
 - `alt-sensory-mapping` changes the authored channel assignment; it is not a topology test.
 - Authored decoder and the default arena task only.
 - Uncorrected comparisons across 4 selections x 3 findings each (12 comparisons); no multiple-comparisons adjustment is applied.
