@@ -389,7 +389,7 @@ describe('FindingsPanel', () => {
     expect(sentence.textContent).toMatch(/under this model\.$/);
     // Thermo review (Important, both reviewers): per-task detail moved out
     // of the sentence into its own screen-reader-friendly <ul>/<li> list.
-    const perTaskItems = step.querySelectorAll('ul.per-task > li');
+    const perTaskItems = step.querySelectorAll('ul.detail-list > li');
     expect(perTaskItems).toHaveLength(realTaskGenerality.tasks.length);
     const itemTexts = Array.from(perTaskItems).map((li) => li.textContent ?? '');
     for (const task of realTaskGenerality.tasks) {
@@ -406,7 +406,7 @@ describe('FindingsPanel', () => {
     expect(sentence.textContent).toMatch(new RegExp(`robust to method is ${realSelectionRobustness.overall.robustToMethod.verdict}`));
     expect(sentence.textContent).toMatch(new RegExp(`the channel-mapping result is ${realSelectionRobustness.overall.mapping.verdict}`));
     expect(sentence.textContent).toMatch(/under this model\.$/);
-    const perSelectionItems = step.querySelectorAll('ul.per-task > li');
+    const perSelectionItems = step.querySelectorAll('ul.detail-list > li');
     expect(perSelectionItems).toHaveLength(realSelectionRobustness.selections.length);
     const itemTexts = Array.from(perSelectionItems).map((li) => li.textContent ?? '');
     for (const selection of realSelectionRobustness.selections) {

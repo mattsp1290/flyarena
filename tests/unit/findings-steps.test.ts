@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -349,7 +349,7 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     expect(step.sentence).not.toContain('reporting convention');
   });
 
-  it('the task-generality step states the real authored/trained overall verdicts as a short summary, with per-task detail in perTask', () => {
+  it('the task-generality step states the real authored/trained overall verdicts as a short summary, with per-task detail in details', () => {
     const steps = buildFindingSteps(baseInputs());
     const step = findStep(steps, 'task-generality');
     expect(step.status).toBe('ok');
@@ -374,20 +374,25 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
 
     // Per-task detail: one entry per task, "not robust" and the dissenting
     // seed(s) stated inline, never all three seeds when only one dissents.
-    expect(step.perTask).toHaveLength(4);
-    const hazardHeavy = step.perTask?.find((t) => t.id === 'hazard-heavy');
-    expect(hazardHeavy?.authored).toBe('pathway-supported');
-    expect(hazardHeavy?.trained).toBe('no specific effect, not robust (seed 202 pathway-supported)');
-    const crowded = step.perTask?.find((t) => t.id === 'crowded');
-    expect(crowded?.trained).toBe('no specific effect, not robust (seed 303 pathway-supported)');
-    const sparseFood = step.perTask?.find((t) => t.id === 'sparse-food');
-    expect(sparseFood?.trained).toBe('no specific effect (robust)');
-    const noMovement = step.perTask?.find((t) => t.id === 'no-movement');
+    // (A thermo-maintainability review, Important, I1: `perTask`'s separate
+    // `{authored, trained}` fields were merged into one `text` field shared
+    // with the selection-robustness step's `details` -- the exact same
+    // strings are asserted here via `toContain`, just against the merged
+    // `authored: X; trained: Y` text instead of two separate fields.)
+    expect(step.details).toHaveLength(4);
+    const hazardHeavy = step.details?.find((t) => t.id === 'hazard-heavy');
+    expect(hazardHeavy?.text).toContain('authored: pathway-supported');
+    expect(hazardHeavy?.text).toContain('trained: no specific effect, not robust (seed 202 pathway-supported)');
+    const crowded = step.details?.find((t) => t.id === 'crowded');
+    expect(crowded?.text).toContain('trained: no specific effect, not robust (seed 303 pathway-supported)');
+    const sparseFood = step.details?.find((t) => t.id === 'sparse-food');
+    expect(sparseFood?.text).toContain('trained: no specific effect (robust)');
+    const noMovement = step.details?.find((t) => t.id === 'no-movement');
     // no-movement's degenerate authored (P/C/M) result stays separate from
     // its independently-valid Q-vs-MQ result -- the step never mentions
     // Q/MQ at all (that detail lives only in the full report), so there is
     // nothing here to conflate.
-    expect(noMovement?.authored).toBe('degenerate');
+    expect(noMovement?.text).toContain('authored: degenerate');
   });
 
   it('the task-generality step states "general" for both authored and trained when every non-degenerate task generalizes/reaches a robust pathway-supported category', () => {
@@ -417,8 +422,8 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     expect(step.sentence).not.toContain('not robust');
     // No task uses no-specific-effect here, so the definition clause is absent.
     expect(step.sentence).not.toContain('"no specific effect" means');
-    expect(step.perTask?.every((t) => t.authored === 'pathway-supported')).toBe(true);
-    expect(step.perTask?.every((t) => t.trained === 'pathway-supported (robust)')).toBe(true);
+    expect(step.details?.every((t) => t.text.includes('authored: pathway-supported'))).toBe(true);
+    expect(step.details?.every((t) => t.text.includes('trained: pathway-supported (robust)'))).toBe(true);
   });
 
   it('the task-generality step lists per-task detail, including a degenerate task, when the authored side is task-dependent', () => {
@@ -454,11 +459,11 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     expect(step.sentence).toContain('authored: task-dependent');
     expect(step.sentence).toContain('trained: task-dependent');
     expect(step.sentence).toContain('see per-task detail below');
-    const noMovement = step.perTask?.find((t) => t.id === 'no-movement');
-    expect(noMovement?.authored).toBe('degenerate');
-    const hazardHeavy = step.perTask?.find((t) => t.id === 'hazard-heavy');
-    expect(hazardHeavy?.authored).toBe('not-supported');
-    expect(hazardHeavy?.trained).toBe('no specific effect (robust)');
+    const noMovement = step.details?.find((t) => t.id === 'no-movement');
+    expect(noMovement?.text).toContain('authored: degenerate');
+    const hazardHeavy = step.details?.find((t) => t.id === 'hazard-heavy');
+    expect(hazardHeavy?.text).toContain('authored: not-supported');
+    expect(hazardHeavy?.text).toContain('trained: no specific effect (robust)');
   });
 
   it('the task-generality step is "missing" with no sentence when the task-generality artifact has not been published', () => {
@@ -535,7 +540,7 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
       expect(step.sentence).toContain(`robust to size is ${realSelectionRobustness.overall.robustToSize.verdict}`);
       expect(step.sentence).toContain(`robust to method is ${realSelectionRobustness.overall.robustToMethod.verdict}`);
       expect(step.sentence).toContain(`the channel-mapping result is ${realSelectionRobustness.overall.mapping.verdict}`);
-      expect(step.perSelection).toHaveLength(realSelectionRobustness.selections.length);
+      expect(step.details).toHaveLength(realSelectionRobustness.selections.length);
       expect(step.provenance).toHaveLength(1);
       expect(step.provenance[0].artifactPath).toContain('selection-robustness-v1.json');
       expect(step.provenance[0].reportPath).toContain('selection-robustness-report.md');
@@ -544,32 +549,32 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     it('states the null-holds mechanism and pathway degenerate mechanism plainly for every selection, never a bare tag', () => {
       const step = findStep(buildFindingSteps(baseInputs()), 'selection-robustness');
       for (const selection of realSelectionRobustness.selections) {
-        const entry = step.perSelection?.find((item) => item.id === selection.id);
+        const entry = step.details?.find((item) => item.id === selection.id);
         expect(entry).toBeDefined();
-        expect(entry?.summary).toContain(`null ${selection.null.holds ? 'holds' : 'does not hold'}`);
-        expect(entry?.summary).toContain(`explanation ${selection.explanation.replicates ? 'replicates' : 'does not replicate'}`);
+        expect(entry?.text).toContain(`null ${selection.null.holds ? 'holds' : 'does not hold'}`);
+        expect(entry?.text).toContain(`explanation ${selection.explanation.replicates ? 'replicates' : 'does not replicate'}`);
         if (selection.pathway.cDegenerate || selection.pathway.mDegenerate) {
           // Never a bare "degenerate" tag -- the mechanism is always stated.
-          expect(entry?.summary).toContain('pathway P/Q degenerate, not categorized');
-          expect(entry?.summary).toContain(selection.pathway.degenerateMechanism as string);
+          expect(entry?.text).toContain('pathway P/Q degenerate, not categorized');
+          expect(entry?.text).toContain(selection.pathway.degenerateMechanism as string);
         }
       }
     });
 
     it("random-bridge's summary states the null holds narrowly and the explanation does not replicate", () => {
       const step = findStep(buildFindingSteps(baseInputs()), 'selection-robustness');
-      const randomBridge = step.perSelection?.find((item) => item.id === 'random-bridge');
-      expect(randomBridge?.summary).toContain('null holds');
-      expect(randomBridge?.summary).toContain('explanation does not replicate');
-      expect(randomBridge?.summary).toContain('pathway P/Q degenerate');
+      const randomBridge = step.details?.find((item) => item.id === 'random-bridge');
+      expect(randomBridge?.text).toContain('null holds');
+      expect(randomBridge?.text).toContain('explanation does not replicate');
+      expect(randomBridge?.text).toContain('pathway P/Q degenerate');
     });
 
     it("alt-sensory-mapping's summary states the pathway is not-supported despite the null holding and the explanation replicating", () => {
       const step = findStep(buildFindingSteps(baseInputs()), 'selection-robustness');
-      const altSensoryMapping = step.perSelection?.find((item) => item.id === 'alt-sensory-mapping');
-      expect(altSensoryMapping?.summary).toContain('null holds');
-      expect(altSensoryMapping?.summary).toContain('explanation replicates');
-      expect(altSensoryMapping?.summary).toContain('pathway not-supported');
+      const altSensoryMapping = step.details?.find((item) => item.id === 'alt-sensory-mapping');
+      expect(altSensoryMapping?.text).toContain('null holds');
+      expect(altSensoryMapping?.text).toContain('explanation replicates');
+      expect(altSensoryMapping?.text).toContain('pathway not-supported');
     });
 
     it('is "missing" with no sentence when the selection-robustness artifact has not been published', () => {
@@ -580,7 +585,52 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
       const step = findStep(steps, 'selection-robustness');
       expect(step.status).toBe('missing');
       expect(step.sentence).toBeUndefined();
-      expect(step.perSelection).toBeUndefined();
+      expect(step.details).toBeUndefined();
+    });
+
+    /**
+     * A thermo-maintainability review (Important, I3) found `verdictWord`'s
+     * `'indeterminate'` branch and `selectionSummary`'s `searchLimited`
+     * clause were never exercised by any test with synthetic data -- every
+     * existing test here runs against the real committed artifact, whose
+     * shipped verdicts happen to be `true`/`false`/`false` (never
+     * `'indeterminate'`) and whose only degenerate selection (random-bridge)
+     * hits the `cDegenerate` branch, never `searchLimited`. This closes that
+     * gap on the client-rendering side, mirroring what
+     * `tests/unit/selection-report.test.ts` already does on the producer
+     * side.
+     */
+    it('renders the literal word "indeterminate" for an indeterminate overall verdict, and the "pathway search-limited" clause for a search-limited, categorized selection -- never "not-supported"', () => {
+      const searchLimitedLarger: SelectionRobustnessArtifact['selections'][number] = {
+        ...realSelectionRobustness.selections.find((s) => s.id === 'larger')!,
+        pathway: {
+          ...realSelectionRobustness.selections.find((s) => s.id === 'larger')!.pathway,
+          cDegenerate: false,
+          mDegenerate: false,
+          searchLimited: true,
+          targetReached: false,
+          supported: false
+        },
+        categorized: true,
+        categorizedReason: undefined
+      };
+      const synthetic: SelectionRobustnessArtifact = {
+        ...realSelectionRobustness,
+        selections: realSelectionRobustness.selections.map((s) => (s.id === 'larger' ? searchLimitedLarger : s)),
+        overall: {
+          ...realSelectionRobustness.overall,
+          robustToSize: {
+            verdict: 'indeterminate',
+            reason: 'larger: pathway is search-limited (the swap search reached its cap before the transfer target)'
+          }
+        }
+      };
+      const step = findStep(buildFindingSteps({ ...baseInputs(), selectionRobustness: selectionRobustnessOk(synthetic) }), 'selection-robustness');
+      expect(step.sentence).toContain('robust to size is indeterminate');
+      const larger = step.details?.find((item) => item.id === 'larger');
+      expect(larger?.text).toContain('pathway search-limited (the swap search reached its cap before the transfer target)');
+      expect(larger?.text).not.toContain('pathway not-supported');
+      expect(larger?.text).not.toContain('pathway supported');
     });
 
     it('is "invalid" with the loader\'s own reason when the artifact fails verification', () => {
@@ -755,10 +805,22 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     expect(offenders).toEqual(['among 500 things', 'also 42 things', 'and 7 more things']);
   });
 
-  it('template-lint: steps.ts source contains no hard-coded numeric literal outside an artifact filename', () => {
-    const stepsSourcePath = resolve(here, '../../src/lib/findings/steps.ts');
-    const src = readFileSync(stepsSourcePath, 'utf-8');
-    expect(findNumericLiteralOffenders(src)).toEqual([]);
+  it('template-lint: steps.ts and every src/lib/findings/steps/*.ts file contain no hard-coded numeric literal outside an artifact filename', () => {
+    // A thermo-maintainability review (Important, I2) split the former
+    // single `steps.ts` (808 lines) into one orchestrator plus one
+    // `src/lib/findings/steps/<study>.ts` file per study -- the actual
+    // step-sentence template literals this lint exists to police now live
+    // in those per-study files, not in the orchestrator itself, so the
+    // scan must follow them there or it would pass trivially forever.
+    const stepsDir = resolve(here, '../../src/lib/findings/steps');
+    const stepsOrchestratorPath = resolve(here, '../../src/lib/findings/steps.ts');
+    const perStudyPaths = readdirSync(stepsDir)
+      .filter((name) => name.endsWith('.ts'))
+      .map((name) => resolve(stepsDir, name));
+    for (const path of [stepsOrchestratorPath, ...perStudyPaths]) {
+      const src = readFileSync(path, 'utf-8');
+      expect(findNumericLiteralOffenders(src)).toEqual([]);
+    }
   });
 
   /**

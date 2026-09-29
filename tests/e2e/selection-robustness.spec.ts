@@ -47,7 +47,7 @@ test.describe('Findings panel (selection robustness)', () => {
     // Per-selection detail lives in its own screen-reader-friendly
     // <ul>/<li> list, one item per selection -- four predeclared
     // alternative selections, never folded into the summary sentence.
-    const perSelectionItems = step.locator('ul.per-task > li');
+    const perSelectionItems = step.locator('ul.detail-list > li');
     await expect(perSelectionItems).toHaveCount(4);
 
     // random-bridge's null holds narrowly and its explanation does not

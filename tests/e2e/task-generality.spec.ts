@@ -49,9 +49,9 @@ test.describe('Findings panel (task generality)', () => {
     // Per-task detail lives in its own screen-reader-friendly <ul>/<li>
     // list, one item per task. "not robust" and the dissenting seed(s) are
     // stated inline there (never only in a footnote).
-    const perTaskItems = step.locator('ul.per-task > li');
+    const perTaskItems = step.locator('ul.detail-list > li');
     await expect(perTaskItems).toHaveCount(4);
-    await expect(step.locator('ul.per-task')).toContainText(/not robust \(seed \d+ pathway-supported\)/);
+    await expect(step.locator('ul.detail-list')).toContainText(/not robust \(seed \d+ pathway-supported\)/);
     // no-movement's degenerate authored result is its own list item, never
     // merged with anything else.
     const noMovementItem = perTaskItems.filter({ hasText: 'no-movement' });
