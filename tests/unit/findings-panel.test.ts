@@ -209,6 +209,49 @@ describe('FindingsPanel', () => {
     }
   });
 
+  it('collapsing every section in sequence never reaches zero visible steps: the last remaining open section refuses to collapse, and the live region stays accurate', async () => {
+    // (thermo accessibility review, Important I1) An entirely ordinary
+    // Tab+Enter/Space accordion walk -- collapsing all four sections, left
+    // to right -- used to leave zero visible steps, zero Previous/Next
+    // controls anywhere in the panel, and a stale "Step N of M in
+    // <section>" live-region announcement describing content that no
+    // longer exists (a WCAG 4.1.3 Status Messages violation). The last
+    // collapse is now a no-op instead: at least one section, and therefore
+    // exactly one current step with working Previous/Next, always remains.
+    render(FindingsPanel, okProps());
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+
+    const sectionTitles = [...new Set(expectedFlatSteps().map((step) => step.sectionTitle))];
+    expect(sectionTitles.length).toBeGreaterThan(1);
+
+    for (const title of sectionTitles.slice(0, -1)) {
+      await fireEvent.click(screen.getByRole('button', { name: title }));
+    }
+
+    // Every section but the last is now collapsed; the last one still open
+    // holds the (possibly relocated) current step.
+    const lastTitle = sectionTitles[sectionTitles.length - 1];
+    const lastToggle = screen.getByRole('button', { name: lastTitle });
+    expect(lastToggle).toHaveAttribute('aria-expanded', 'true');
+
+    const liveRegionTextBeforeFinalClick = screen.getByText(/^Step \d+ of \d+ in /).textContent;
+
+    // Attempting to collapse the last remaining open section is a no-op.
+    await fireEvent.click(lastToggle);
+    expect(lastToggle).toHaveAttribute('aria-expanded', 'true');
+
+    // At least one visible step (the last section's own steps), with
+    // working Previous/Next, still exists.
+    const visibleSteps = document.querySelectorAll('ol.steps > li.step');
+    expect(visibleSteps.length).toBeGreaterThan(0);
+    expect(screen.getByRole('button', { name: /^previous$/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^next$/i })).toBeInTheDocument();
+
+    // The live region still describes the one visible step accurately --
+    // unchanged by the refused (no-op) collapse attempt, never stale.
+    expect(screen.getByText(liveRegionTextBeforeFinalClick as string)).toBeInTheDocument();
+  });
+
   it('the first step has aria-current="step" by default once expanded, and the live region announces it, with its section', async () => {
     render(FindingsPanel, okProps());
     await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));

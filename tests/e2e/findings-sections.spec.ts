@@ -114,6 +114,46 @@ test.describe('Findings panel — question sections', () => {
     await expect(explanationStep.locator('h4')).toBeFocused();
   });
 
+  test('collapsing all four sections in sequence, by keyboard, never reaches zero visible steps or a stale live-region announcement', async ({
+    page
+  }) => {
+    // (thermo accessibility review, Important I1) The exact reachable
+    // sequence the review flagged: Tab to each section toggle and activate
+    // it with the keyboard, left to right. Previously the fourth (last)
+    // collapse left zero `<li class="step">` elements, zero Previous/Next
+    // controls, and a stale "Step N of M in <section>" live-region
+    // announcement describing content that no longer existed anywhere on
+    // the page. The last collapse is now a no-op: at least one section
+    // stays open throughout.
+    await page.goto('/');
+    await waitForReady(page);
+    await expandFindingsPanel(page);
+
+    const panel = page.locator('section.findings');
+    const toggles = SECTION_TITLES.map((title) => panel.getByRole('button', { name: title }));
+
+    for (const toggle of toggles) {
+      await toggle.focus();
+      await page.keyboard.press('Enter');
+    }
+
+    // Exactly one toggle (the last section collapse attempt refused) is
+    // still expanded; the other three collapsed successfully.
+    const expandedStates = await Promise.all(toggles.map((toggle) => toggle.getAttribute('aria-expanded')));
+    expect(expandedStates.filter((state) => state === 'true')).toHaveLength(1);
+    expect(expandedStates.filter((state) => state === 'false')).toHaveLength(SECTION_TITLES.length - 1);
+
+    // At least one step is still visible, with working Previous/Next.
+    await expect(panel.locator('li.step')).not.toHaveCount(0);
+    await expect(panel.getByRole('button', { name: /^previous$/i })).toBeVisible();
+    await expect(panel.getByRole('button', { name: /^next$/i })).toBeVisible();
+
+    // The live region still names a real, still-open section -- never
+    // blank and never naming a now-collapsed one.
+    const stillOpenTitle = SECTION_TITLES[expandedStates.findIndex((state) => state === 'true')];
+    await expect(page.getByText(new RegExp(`^Step \\d+ of \\d+ in ${stillOpenTitle.replace(/[?]/g, '\\?')}$`))).toBeVisible();
+  });
+
   test('the live region announces the current step\'s section title', async ({ page }) => {
     await page.goto('/');
     await waitForReady(page);

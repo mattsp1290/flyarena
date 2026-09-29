@@ -8,6 +8,7 @@
   import type { TaskGeneralityLoadResult } from '../experiment/taskGenerality';
   import { buildFindingSteps, findingStepStatusLabel, type FindingStep } from '../findings/steps';
   import { groupSteps } from '../findings/sections';
+  import { hasAnyVisibleStep, nearestVisibleIndex } from '../findings/navigation';
 
   /**
    * WP1 of `.agents/plans/findings-tour` (`01-findings-panel.md`), grouped
@@ -53,6 +54,14 @@
    * hard-coded literal) on every move — the accessible way to walk the
    * chain in order without requiring a screen-reader user to tab through
    * every earlier step's worth of links first.
+   *
+   * Collapsing a section always leaves at least one step visible
+   * (`toggleSection`, using `../findings/navigation.ts#hasAnyVisibleStep`):
+   * collapsing the section that owns the current step relocates the cursor
+   * to the nearest step that stays visible, and collapsing the last
+   * remaining visible section is a no-op (thermo accessibility review,
+   * Important I1 — see `toggleSection`'s own doc comment for why this, not
+   * an "all sections collapsed" empty state, is the APG-conformant choice).
    */
 
   interface Props {
@@ -109,32 +118,33 @@
 
   const isSectionOpen = (sectionId: string): boolean => !collapsedSectionIds.has(sectionId);
 
-  const isStepVisible = (index: number, collapsed: ReadonlySet<string>): boolean => {
-    const entry = flatSteps[index];
-    return entry !== undefined && !collapsed.has(entry.sectionId);
-  };
-
-  /**
-   * The nearest still-visible step to `fromIndex` once `collapsed` takes
-   * effect -- searched forward first (the natural "keep reading on" order),
-   * falling back to backward when `fromIndex` was the last visible step.
-   * `undefined` only when every section ends up collapsed at once.
-   */
-  const nearestVisibleIndex = (fromIndex: number, collapsed: ReadonlySet<string>): number | undefined => {
-    for (let i = fromIndex + 1; i < flatSteps.length; i += 1) {
-      if (isStepVisible(i, collapsed)) return i;
-    }
-    for (let i = fromIndex - 1; i >= 0; i -= 1) {
-      if (isStepVisible(i, collapsed)) return i;
-    }
-    return undefined;
-  };
-
   const toggleSection = (sectionId: string): void => {
     const collapsing = !collapsedSectionIds.has(sectionId);
     const next = new Set(collapsedSectionIds);
     if (collapsing) next.add(sectionId);
     else next.delete(sectionId);
+
+    // (thermo accessibility review, Important I1) Collapsing every section
+    // in sequence used to leave zero visible steps and zero Previous/Next
+    // controls anywhere in the panel, with the live region stuck on its
+    // last, now-stale "Step N of M in <section>" text -- a WCAG 4.1.3
+    // (Status Messages) violation reachable by an entirely ordinary
+    // Tab+Enter/Space accordion walk, not a keyboard trap (every toggle
+    // stays reachable) but a real "the stepper silently stopped working"
+    // defect. Fixed by refusing the collapse that would leave nothing
+    // visible: the vanilla WAI-ARIA APG accordion pattern permits an
+    // all-collapsed state for a pure content-disclosure widget, but this
+    // component layers a second, custom contract on top -- exactly one
+    // `aria-current="step"` cursor with a working Previous/Next pair --
+    // that the APG pattern doesn't have and doesn't need to accommodate.
+    // The APG's own "accordion with always one panel expanded" variant
+    // exists for precisely this situation (a consumer that depends on a
+    // panel always being visible), so keeping the last visible section open
+    // is the pattern-conformant choice, not a deviation from it. No new UI
+    // is required: the toggle simply has no effect when it is the last
+    // section with a visible step, the same "can't clear the last required
+    // selection" precedent many minimum-one widgets already use.
+    if (collapsing && !hasAnyVisibleStep(flatSteps, next)) return;
 
     // (dual review, Important) Collapsing the section that owns the current
     // step would otherwise hide the only Previous/Next controls in the
@@ -145,9 +155,10 @@
     // without moving DOM focus away from the toggle button the visitor
     // just activated (matching the WAI-ARIA APG accordion's own "focus
     // stays on the trigger" convention); the live region still announces
-    // the new current step/section on the next mutation.
+    // the new current step/section on the next mutation. The guard above
+    // guarantees `nearestVisibleIndex` never returns `undefined` here.
     if (collapsing && flatSteps[currentIndex]?.sectionId === sectionId) {
-      const relocated = nearestVisibleIndex(currentIndex, next);
+      const relocated = nearestVisibleIndex(flatSteps, currentIndex, next);
       if (relocated !== undefined) currentIndex = relocated;
     }
 
