@@ -13,6 +13,11 @@ import {
 } from '../../src/lib/experiment/pathwayInterventions';
 import { loadRepertoireNull, type RepertoireNullArtifact, type RepertoireNullLoadResult } from '../../src/lib/experiment/repertoireNull';
 import { loadTaskGenerality, type TaskGeneralityArtifact, type TaskGeneralityLoadResult } from '../../src/lib/experiment/taskGenerality';
+import {
+  loadSelectionRobustness,
+  type SelectionRobustnessArtifact,
+  type SelectionRobustnessLoadResult
+} from '../../src/lib/experiment/selectionRobustness';
 import { createPublicDataFetch } from '../helpers/fake-worker';
 
 /**
@@ -43,6 +48,7 @@ let realNullExplanation: NullExplanationArtifact;
 let realPathwayInterventions: PathwayInterventionsArtifact;
 let realRepertoireNull: RepertoireNullArtifact;
 let realTaskGenerality: TaskGeneralityArtifact;
+let realSelectionRobustness: SelectionRobustnessArtifact;
 
 beforeAll(async () => {
   vi.stubGlobal('fetch', createPublicDataFetch());
@@ -51,6 +57,7 @@ beforeAll(async () => {
   const pathwayInterventionsResult = await loadPathwayInterventions(manifest, '/data');
   const repertoireNullResult = await loadRepertoireNull(manifest, '/data');
   const taskGeneralityResult = await loadTaskGenerality(manifest, '/data');
+  const selectionRobustnessResult = await loadSelectionRobustness(manifest, '/data');
   if (rewiringNullResult.status !== 'ok') throw new Error(`Fixture setup: rewiringNull is "${rewiringNullResult.status}"`);
   if (nullExplanationResult.status !== 'ok') throw new Error(`Fixture setup: nullExplanation is "${nullExplanationResult.status}"`);
   if (pathwayInterventionsResult.status !== 'ok') {
@@ -58,11 +65,15 @@ beforeAll(async () => {
   }
   if (repertoireNullResult.status !== 'ok') throw new Error(`Fixture setup: repertoireNull is "${repertoireNullResult.status}"`);
   if (taskGeneralityResult.status !== 'ok') throw new Error(`Fixture setup: taskGenerality is "${taskGeneralityResult.status}"`);
+  if (selectionRobustnessResult.status !== 'ok') {
+    throw new Error(`Fixture setup: selectionRobustness is "${selectionRobustnessResult.status}"`);
+  }
   realRewiringNull = rewiringNullResult.data;
   realNullExplanation = nullExplanationResult.data;
   realPathwayInterventions = pathwayInterventionsResult.data;
   realRepertoireNull = repertoireNullResult.data;
   realTaskGenerality = taskGeneralityResult.data;
+  realSelectionRobustness = selectionRobustnessResult.data;
   vi.unstubAllGlobals();
 });
 
@@ -85,6 +96,10 @@ const taskGeneralityOk = (data: TaskGeneralityArtifact = realTaskGenerality): Ta
   status: 'ok',
   data
 });
+const selectionRobustnessOk = (data: SelectionRobustnessArtifact = realSelectionRobustness): SelectionRobustnessLoadResult => ({
+  status: 'ok',
+  data
+});
 
 const baseInputs = (): BuildFindingStepsInputs => ({
   manifest,
@@ -93,7 +108,8 @@ const baseInputs = (): BuildFindingStepsInputs => ({
   nullExplanation: nullExplanationOk(),
   pathwayInterventions: pathwayInterventionsOk(),
   repertoireNull: repertoireNullOk(),
-  taskGenerality: taskGeneralityOk()
+  taskGenerality: taskGeneralityOk(),
+  selectionRobustness: selectionRobustnessOk()
 });
 
 const findStep = (steps: readonly FindingStep[], id: string): FindingStep => {
@@ -103,7 +119,7 @@ const findStep = (steps: readonly FindingStep[], id: string): FindingStep => {
 };
 
 describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
-  it('builds exactly eight steps, in evidence-chain order', () => {
+  it('builds exactly nine steps, in evidence-chain order', () => {
     const steps = buildFindingSteps(baseInputs());
     expect(steps.map((step) => step.id)).toEqual([
       'rewiring-null',
@@ -113,7 +129,8 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
       'trained-null',
       'trained-interventions',
       'task-generality',
-      'behavior-repertoire'
+      'behavior-repertoire',
+      'selection-robustness'
     ]);
   });
 
@@ -508,6 +525,75 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     expect(step.sentence).toBeUndefined();
   });
 
+  describe('selection-robustness step (against the real committed WP3 artifact)', () => {
+    it('states the authored decoder and the real overall verdicts, with per-selection detail listed separately', () => {
+      const step = findStep(buildFindingSteps(baseInputs()), 'selection-robustness');
+      expect(step.status).toBe('ok');
+      expect(step.condition).toBe('authored');
+      expect(step.sentence).toContain('authored');
+      expect(step.sentence).toMatch(/under this model\.$/);
+      expect(step.sentence).toContain(`robust to size is ${realSelectionRobustness.overall.robustToSize.verdict}`);
+      expect(step.sentence).toContain(`robust to method is ${realSelectionRobustness.overall.robustToMethod.verdict}`);
+      expect(step.sentence).toContain(`the channel-mapping result is ${realSelectionRobustness.overall.mapping.verdict}`);
+      expect(step.perSelection).toHaveLength(realSelectionRobustness.selections.length);
+      expect(step.provenance).toHaveLength(1);
+      expect(step.provenance[0].artifactPath).toContain('selection-robustness-v1.json');
+      expect(step.provenance[0].reportPath).toContain('selection-robustness-report.md');
+    });
+
+    it('states the null-holds mechanism and pathway degenerate mechanism plainly for every selection, never a bare tag', () => {
+      const step = findStep(buildFindingSteps(baseInputs()), 'selection-robustness');
+      for (const selection of realSelectionRobustness.selections) {
+        const entry = step.perSelection?.find((item) => item.id === selection.id);
+        expect(entry).toBeDefined();
+        expect(entry?.summary).toContain(`null ${selection.null.holds ? 'holds' : 'does not hold'}`);
+        expect(entry?.summary).toContain(`explanation ${selection.explanation.replicates ? 'replicates' : 'does not replicate'}`);
+        if (selection.pathway.cDegenerate || selection.pathway.mDegenerate) {
+          // Never a bare "degenerate" tag -- the mechanism is always stated.
+          expect(entry?.summary).toContain('pathway P/Q degenerate, not categorized');
+          expect(entry?.summary).toContain(selection.pathway.degenerateMechanism as string);
+        }
+      }
+    });
+
+    it("random-bridge's summary states the null holds narrowly and the explanation does not replicate", () => {
+      const step = findStep(buildFindingSteps(baseInputs()), 'selection-robustness');
+      const randomBridge = step.perSelection?.find((item) => item.id === 'random-bridge');
+      expect(randomBridge?.summary).toContain('null holds');
+      expect(randomBridge?.summary).toContain('explanation does not replicate');
+      expect(randomBridge?.summary).toContain('pathway P/Q degenerate');
+    });
+
+    it("alt-sensory-mapping's summary states the pathway is not-supported despite the null holding and the explanation replicating", () => {
+      const step = findStep(buildFindingSteps(baseInputs()), 'selection-robustness');
+      const altSensoryMapping = step.perSelection?.find((item) => item.id === 'alt-sensory-mapping');
+      expect(altSensoryMapping?.summary).toContain('null holds');
+      expect(altSensoryMapping?.summary).toContain('explanation replicates');
+      expect(altSensoryMapping?.summary).toContain('pathway not-supported');
+    });
+
+    it('is "missing" with no sentence when the selection-robustness artifact has not been published', () => {
+      const steps = buildFindingSteps({
+        ...baseInputs(),
+        selectionRobustness: { status: 'missing', reason: 'The manifest has no selectionRobustness artifact entry.' }
+      });
+      const step = findStep(steps, 'selection-robustness');
+      expect(step.status).toBe('missing');
+      expect(step.sentence).toBeUndefined();
+      expect(step.perSelection).toBeUndefined();
+    });
+
+    it('is "invalid" with the loader\'s own reason when the artifact fails verification', () => {
+      const steps = buildFindingSteps({
+        ...baseInputs(),
+        selectionRobustness: { status: 'invalid', reason: 'sha256 mismatch' }
+      });
+      const step = findStep(steps, 'selection-robustness');
+      expect(step.status).toBe('invalid');
+      expect(step.reason).toBe('sha256 mismatch');
+    });
+  });
+
   it('every step is "loading" when its inputs are undefined (the controller has not resolved yet)', () => {
     const steps = buildFindingSteps({
       manifest: undefined,
@@ -516,7 +602,8 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
       nullExplanation: undefined,
       pathwayInterventions: undefined,
       repertoireNull: undefined,
-      taskGenerality: undefined
+      taskGenerality: undefined,
+      selectionRobustness: undefined
     });
     expect(findStep(steps, 'rewiring-null').status).toBe('loading');
     expect(findStep(steps, 'mirrored-decoder').status).toBe('loading');
@@ -526,6 +613,7 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     expect(findStep(steps, 'trained-interventions').status).toBe('loading');
     expect(findStep(steps, 'task-generality').status).toBe('loading');
     expect(findStep(steps, 'behavior-repertoire').status).toBe('loading');
+    expect(findStep(steps, 'selection-robustness').status).toBe('loading');
   });
 
   it('maps rewiringNull "absent" onto the step vocabulary\'s "missing", with no sentence', () => {

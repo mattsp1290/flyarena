@@ -62,7 +62,7 @@ test.describe('Findings panel — question sections', () => {
 
     expect(await sectionStepIds('Is the measured wiring special?')).toEqual(['rewiring-null', 'mirrored-decoder', 'behavior-repertoire']);
     expect(await sectionStepIds('Why does it score low?')).toEqual(['explanation', 'intervention']);
-    expect(await sectionStepIds('Does it generalize?')).toEqual(['task-generality']);
+    expect(await sectionStepIds('Does it generalize?')).toEqual(['task-generality', 'selection-robustness']);
     expect(await sectionStepIds('What do trained readouts do?')).toEqual(['trained-null', 'trained-interventions']);
   });
 

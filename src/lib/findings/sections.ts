@@ -9,15 +9,16 @@
  * `FindingStep['id']` from `./steps.ts` (grounded against the current
  * `buildFindingSteps` order rather than the plan's own worked table, which
  * names the still-unlanded selection-robustness and readout-attribution
- * steps only by description, not by id). Two beans that add Findings steps
- * are still in flight (`flyarena-9mls`, selection robustness; `flyarena-hd0j`,
- * readout attribution) — per the plan's own "merge-order rule"
- * (`01-findings-sections.md`'s Acceptance section), whichever lands after
- * this change adds its exact step id to the matching section's `stepIds` in
- * the same change. Until then, "Does it generalize?" and "What do trained
- * readouts do?" simply carry fewer ids than the plan's worked table shows —
- * `groupSteps` below never fails on a section with fewer entries than
- * expected, only on a step id with *no* entry anywhere.
+ * steps only by description, not by id). `flyarena-9mls` (selection
+ * robustness) lands its exact step id, `'selection-robustness'`, into
+ * "Does it generalize?" in this same change, per the plan's own
+ * "merge-order rule" (`01-findings-sections.md`'s Acceptance section):
+ * whichever of the two in-flight Findings-step beans (`flyarena-9mls`,
+ * `flyarena-hd0j` readout attribution) lands second adds its id in the same
+ * change. "What do trained readouts do?" still carries fewer ids than the
+ * plan's worked table shows until `flyarena-hd0j` lands — `groupSteps`
+ * below never fails on a section with fewer entries than expected, only on
+ * a step id with *no* entry anywhere.
  */
 
 export interface FindingSection {
@@ -40,9 +41,7 @@ export const FINDING_SECTIONS: readonly FindingSection[] = [
   {
     id: 'generalizes',
     title: 'Does it generalize?',
-    // The selection-robustness step (`flyarena-9mls`) is not yet landed --
-    // its id is added here, in the same change, by whichever lands second.
-    stepIds: ['task-generality']
+    stepIds: ['task-generality', 'selection-robustness']
   },
   {
     id: 'trained-readouts',

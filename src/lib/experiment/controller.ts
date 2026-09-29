@@ -15,6 +15,7 @@ import { loadNullExplanation, type NullExplanationLoadResult } from './nullExpla
 import { loadPathwayInterventions, type PathwayInterventionsLoadResult } from './pathwayInterventions';
 import { loadRepertoireNull, type RepertoireNullLoadResult } from './repertoireNull';
 import { loadTaskGenerality, type TaskGeneralityLoadResult } from './taskGenerality';
+import { loadSelectionRobustness, type SelectionRobustnessLoadResult } from './selectionRobustness';
 import { buildGraphBufferForMode, createWorkerAgentBinding } from './bindings';
 import { ExperimentRunner, isNotInitializedRejection, type ExperimentTelemetry } from './runner';
 import { transition, type ExperimentStatus } from './state';
@@ -137,6 +138,15 @@ export interface ExperimentControllerCallbacks {
    */
   onTaskGenerality: (result: TaskGeneralityLoadResult) => void;
   /**
+   * Fired once `loadSelectionRobustness` resolves (WP3 of
+   * `.agents/plans/selection-robustness`) — fired in parallel with every
+   * fork above (this artifact's own cross-check needs only `manifest`, not
+   * any other resolved load result), and independently of
+   * `onTaskGenerality` itself. Never blocks reaching `ready`. The host's
+   * hook for the Findings panel's "Selection robustness" step.
+   */
+  onSelectionRobustness: (result: SelectionRobustnessLoadResult) => void;
+  /**
    * Fired once per agent right after `setDecoder()` has successfully applied
    * a decoder switch to both arms' Workers and reset the run to tick 0 —
    * mirrors `onTopologyApplied`'s "never speculatively before a switch is
@@ -186,6 +196,12 @@ export interface ExperimentControllerOptions {
    * Same seam-for-testability reasoning as `loadRepertoireNull` above.
    */
   loadTaskGenerality?: typeof loadTaskGenerality;
+  /**
+   * Injectable for tests; defaults to
+   * `./selectionRobustness.ts#loadSelectionRobustness`. Same
+   * seam-for-testability reasoning as `loadTaskGenerality` above.
+   */
+  loadSelectionRobustness?: typeof loadSelectionRobustness;
   /** Passed straight through to the constructed `ExperimentRunner` (see `ExperimentRunnerOptions.targetTickIntervalMs`); `0` disables real-time pacing entirely, which unit tests use to run a many-tick determinism check without waiting out real seconds. Omitted in production, matching the runner's own real-time default. */
   targetTickIntervalMs?: number;
 }
@@ -491,6 +507,7 @@ export class ExperimentController {
     const loadInterventions = this.options.loadPathwayInterventions ?? loadPathwayInterventions;
     const loadRepertoire = this.options.loadRepertoireNull ?? loadRepertoireNull;
     const loadTaskGeneralityFn = this.options.loadTaskGenerality ?? loadTaskGenerality;
+    const loadSelectionRobustnessFn = this.options.loadSelectionRobustness ?? loadSelectionRobustness;
     const dataBaseUrl = `${import.meta.env.BASE_URL}data`;
     let artifacts: LoadedArenaArtifacts;
     try {
@@ -558,6 +575,11 @@ export class ExperimentController {
       'the task-generality study',
       () => loadTaskGeneralityFn(artifacts.manifest, dataBaseUrl),
       (result) => this.options.callbacks.onTaskGenerality(result)
+    );
+    this.registerSidecar<SelectionRobustnessLoadResult>(
+      'the selection-robustness study',
+      () => loadSelectionRobustnessFn(artifacts.manifest, dataBaseUrl),
+      (result) => this.options.callbacks.onSelectionRobustness(result)
     );
 
     // Trained-readout artifact: optional relative to the required arena

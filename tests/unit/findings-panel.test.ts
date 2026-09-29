@@ -14,6 +14,11 @@ import {
 } from '../../src/lib/experiment/pathwayInterventions';
 import { loadRepertoireNull, type RepertoireNullArtifact, type RepertoireNullLoadResult } from '../../src/lib/experiment/repertoireNull';
 import { loadTaskGenerality, type TaskGeneralityArtifact, type TaskGeneralityLoadResult } from '../../src/lib/experiment/taskGenerality';
+import {
+  loadSelectionRobustness,
+  type SelectionRobustnessArtifact,
+  type SelectionRobustnessLoadResult
+} from '../../src/lib/experiment/selectionRobustness';
 import { buildFindingSteps } from '../../src/lib/findings/steps';
 import { groupSteps } from '../../src/lib/findings/sections';
 import { createPublicDataFetch } from '../helpers/fake-worker';
@@ -57,6 +62,7 @@ let realNullExplanation: NullExplanationArtifact;
 let realPathwayInterventions: PathwayInterventionsArtifact;
 let realRepertoireNull: RepertoireNullArtifact;
 let realTaskGenerality: TaskGeneralityArtifact;
+let realSelectionRobustness: SelectionRobustnessArtifact;
 
 beforeAll(async () => {
   vi.stubGlobal('fetch', createPublicDataFetch());
@@ -65,6 +71,7 @@ beforeAll(async () => {
   const pathwayInterventionsResult = await loadPathwayInterventions(manifest, '/data');
   const repertoireNullResult = await loadRepertoireNull(manifest, '/data');
   const taskGeneralityResult = await loadTaskGenerality(manifest, '/data');
+  const selectionRobustnessResult = await loadSelectionRobustness(manifest, '/data');
   if (rewiringNullResult.status !== 'ok') throw new Error(`Fixture setup: rewiringNull is "${rewiringNullResult.status}"`);
   if (nullExplanationResult.status !== 'ok') throw new Error(`Fixture setup: nullExplanation is "${nullExplanationResult.status}"`);
   if (pathwayInterventionsResult.status !== 'ok') {
@@ -72,11 +79,15 @@ beforeAll(async () => {
   }
   if (repertoireNullResult.status !== 'ok') throw new Error(`Fixture setup: repertoireNull is "${repertoireNullResult.status}"`);
   if (taskGeneralityResult.status !== 'ok') throw new Error(`Fixture setup: taskGenerality is "${taskGeneralityResult.status}"`);
+  if (selectionRobustnessResult.status !== 'ok') {
+    throw new Error(`Fixture setup: selectionRobustness is "${selectionRobustnessResult.status}"`);
+  }
   realRewiringNull = rewiringNullResult.data;
   realNullExplanation = nullExplanationResult.data;
   realPathwayInterventions = pathwayInterventionsResult.data;
   realRepertoireNull = repertoireNullResult.data;
   realTaskGenerality = taskGeneralityResult.data;
+  realSelectionRobustness = selectionRobustnessResult.data;
   vi.unstubAllGlobals();
 });
 
@@ -86,7 +97,8 @@ const okProps = () => ({
   nullExplanation: { status: 'ok', data: realNullExplanation } as NullExplanationLoadResult,
   pathwayInterventions: { status: 'ok', data: realPathwayInterventions } as PathwayInterventionsLoadResult,
   repertoireNull: { status: 'ok', data: realRepertoireNull } as RepertoireNullLoadResult,
-  taskGenerality: { status: 'ok', data: realTaskGenerality } as TaskGeneralityLoadResult
+  taskGenerality: { status: 'ok', data: realTaskGenerality } as TaskGeneralityLoadResult,
+  selectionRobustness: { status: 'ok', data: realSelectionRobustness } as SelectionRobustnessLoadResult
 });
 
 /**
@@ -383,6 +395,35 @@ describe('FindingsPanel', () => {
     for (const task of realTaskGenerality.tasks) {
       expect(itemTexts.some((text) => text.includes(task.id))).toBe(true);
     }
+  });
+
+  it('the selection-robustness step states the real overall verdicts in a short summary, plus a per-selection <ul> list', async () => {
+    render(FindingsPanel, okProps());
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    const step = stepLocator('selection-robustness');
+    const sentence = step.querySelector('p.sentence') as HTMLElement;
+    expect(sentence.textContent).toMatch(new RegExp(`robust to size is ${realSelectionRobustness.overall.robustToSize.verdict}`));
+    expect(sentence.textContent).toMatch(new RegExp(`robust to method is ${realSelectionRobustness.overall.robustToMethod.verdict}`));
+    expect(sentence.textContent).toMatch(new RegExp(`the channel-mapping result is ${realSelectionRobustness.overall.mapping.verdict}`));
+    expect(sentence.textContent).toMatch(/under this model\.$/);
+    const perSelectionItems = step.querySelectorAll('ul.per-task > li');
+    expect(perSelectionItems).toHaveLength(realSelectionRobustness.selections.length);
+    const itemTexts = Array.from(perSelectionItems).map((li) => li.textContent ?? '');
+    for (const selection of realSelectionRobustness.selections) {
+      expect(itemTexts.some((text) => text.includes(selection.id))).toBe(true);
+    }
+  });
+
+  it('the selection-robustness step shows "Not yet published" when the artifact is missing', async () => {
+    render(FindingsPanel, {
+      ...okProps(),
+      selectionRobustness: {
+        status: 'missing',
+        reason: 'The manifest has no selectionRobustness artifact entry.'
+      } as SelectionRobustnessLoadResult
+    });
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    expect(screen.getByText('Not yet published')).toBeInTheDocument();
   });
 
   it('the task-generality step shows "Not yet published" when the task-generality artifact is missing', async () => {

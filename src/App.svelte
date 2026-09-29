@@ -14,6 +14,7 @@
   import type { PathwayInterventionsLoadResult } from './lib/experiment/pathwayInterventions';
   import type { RepertoireNullLoadResult } from './lib/experiment/repertoireNull';
   import type { TaskGeneralityLoadResult } from './lib/experiment/taskGenerality';
+  import type { SelectionRobustnessLoadResult } from './lib/experiment/selectionRobustness';
   import { ExperimentController } from './lib/experiment/controller';
   import type { ExperimentRunner, ExperimentTelemetry } from './lib/experiment/runner';
   import type { ExperimentStatus } from './lib/experiment/state';
@@ -95,6 +96,8 @@
   let repertoireNullStatus = $state<RepertoireNullLoadResult | undefined>(undefined);
   /** `undefined` until `initialize()`'s task-generality load resolves (WP4 of `.agents/plans/task-generality`); feeds the Findings panel's task-generality step, placed before the "Behavior repertoire" step. Loading it never blocks Start, and never blocks reaching a settled `repertoireNullStatus` either — see `ExperimentController#initialize`'s doc comment. */
   let taskGeneralityStatus = $state<TaskGeneralityLoadResult | undefined>(undefined);
+  /** `undefined` until `initialize()`'s selection-robustness load resolves (WP3 of `.agents/plans/selection-robustness`); feeds the Findings panel's "Selection robustness" step. Loading it never blocks Start, and never blocks reaching a settled `taskGeneralityStatus` either — see `ExperimentController#initialize`'s doc comment. */
+  let selectionRobustnessStatus = $state<SelectionRobustnessLoadResult | undefined>(undefined);
   /** True for the duration of an in-flight `controller.setDecoder()` call — set/cleared locally around that call (there is only ever one decoder shared by both arms, unlike per-arm topology switches, so a single flag suffices). */
   let decoderSwitchPending = $state(false);
 
@@ -351,6 +354,9 @@
         onTaskGenerality: (result) => {
           if (!destroyed) taskGeneralityStatus = result;
         },
+        onSelectionRobustness: (result) => {
+          if (!destroyed) selectionRobustnessStatus = result;
+        },
         onDecoderApplied: (next) => {
           if (!destroyed) decoder = next;
         }
@@ -518,6 +524,7 @@
       pathwayInterventions={pathwayInterventionsStatus}
       repertoireNull={repertoireNullStatus}
       taskGenerality={taskGeneralityStatus}
+      selectionRobustness={selectionRobustnessStatus}
     />
 
     <LedgerPanel

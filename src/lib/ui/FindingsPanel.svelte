@@ -6,6 +6,7 @@
   import type { PathwayInterventionsLoadResult } from '../experiment/pathwayInterventions';
   import type { RepertoireNullLoadResult } from '../experiment/repertoireNull';
   import type { TaskGeneralityLoadResult } from '../experiment/taskGenerality';
+  import type { SelectionRobustnessLoadResult } from '../experiment/selectionRobustness';
   import { buildFindingSteps, findingStepStatusLabel, type FindingStep } from '../findings/steps';
   import { groupSteps } from '../findings/sections';
   import { hasAnyVisibleStep, nearestVisibleIndex } from '../findings/navigation';
@@ -79,9 +80,12 @@
     repertoireNull: RepertoireNullLoadResult | undefined;
     /** WP4 of `.agents/plans/task-generality`. `undefined` while `App.svelte`'s task-generality load has not yet resolved. */
     taskGenerality: TaskGeneralityLoadResult | undefined;
+    /** WP3 of `.agents/plans/selection-robustness`. `undefined` while `App.svelte`'s selection-robustness load has not yet resolved. */
+    selectionRobustness: SelectionRobustnessLoadResult | undefined;
   }
 
-  let { manifest, rewiringNull, nullExplanation, pathwayInterventions, repertoireNull, taskGenerality }: Props = $props();
+  let { manifest, rewiringNull, nullExplanation, pathwayInterventions, repertoireNull, taskGenerality, selectionRobustness }: Props =
+    $props();
 
   let expanded = $state(false);
   let currentIndex = $state(0);
@@ -100,7 +104,16 @@
   const dataBaseUrl = `${import.meta.env.BASE_URL}data`;
 
   const steps = $derived<readonly FindingStep[]>(
-    buildFindingSteps({ manifest, dataBaseUrl, rewiringNull, nullExplanation, pathwayInterventions, repertoireNull, taskGenerality })
+    buildFindingSteps({
+      manifest,
+      dataBaseUrl,
+      rewiringNull,
+      nullExplanation,
+      pathwayInterventions,
+      repertoireNull,
+      taskGenerality,
+      selectionRobustness
+    })
   );
 
   // The steps grouped into question sections (`../findings/sections.ts`).
@@ -308,6 +321,19 @@
                   <ul class="per-task">
                     {#each step.perTask as task (task.id)}
                       <li><strong>{task.id}</strong> — authored: {task.authored}; trained: {task.trained}</li>
+                    {/each}
+                  </ul>
+                {/if}
+
+                {#if step.status === 'ok' && step.perSelection && step.perSelection.length > 0}
+                  <!-- Same "own `<li>` per item, not folded into `sentence`"
+                       rationale as `perTask` above -- see `steps.ts`'s
+                       `FindingStep.perSelection` doc comment. Reuses the
+                       `.per-task` list styling (identical visual shape: one
+                       small-caps id label per item, one detail sentence). -->
+                  <ul class="per-task">
+                    {#each step.perSelection as selection (selection.id)}
+                      <li><strong>{selection.id}</strong> — {selection.summary}</li>
                     {/each}
                   </ul>
                 {/if}

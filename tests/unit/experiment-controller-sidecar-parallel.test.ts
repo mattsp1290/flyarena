@@ -5,12 +5,13 @@ import { createCallbacks, createWorker, SEED, TOTAL_TICKS, useControllerTestLife
 /**
  * Thermo-maintainability review (Important, I1): `ExperimentController#initialize()`
  * used to chain its sidecar loads (rewiring-null, null-explanation,
- * pathway-interventions, repertoire-null, and — since task-generality WP4 —
- * task-generality) in sequence, each waiting on the previous one's settled
- * promise, even though every one of them only needs
- * `artifacts.manifest`/`dataBaseUrl` -- already available the instant the
- * arena artifacts load, not the *result* of any other sidecar load. Fixed
- * by firing all five directly off the manifest in parallel (see
+ * pathway-interventions, repertoire-null, task-generality since WP4, and —
+ * since selection-robustness WP3 — selection-robustness) in sequence, each
+ * waiting on the previous one's settled promise, even though every one of
+ * them only needs `artifacts.manifest`/`dataBaseUrl` -- already available
+ * the instant the arena artifacts load, not the *result* of any other
+ * sidecar load. Fixed by firing all six directly off the manifest in
+ * parallel (see
  * `controller.ts`'s `runSidecarLoad` doc comment and each fork's own
  * comment). The per-sidecar test files
  * (`experiment-controller-null-explanation.test.ts`,
@@ -56,13 +57,15 @@ describe('ExperimentController: one sidecar loader failing does not block the ot
     await vi.waitFor(() => expect(callbacks.nullExplanationResults).toHaveLength(1));
     await vi.waitFor(() => expect(callbacks.repertoireNullResults).toHaveLength(1));
     await vi.waitFor(() => expect(callbacks.taskGeneralityResults).toHaveLength(1));
+    await vi.waitFor(() => expect(callbacks.selectionRobustnessResults).toHaveLength(1));
     expect(callbacks.rewiringNullResults[0].status).toBe('ok');
     expect(callbacks.nullExplanationResults[0].status).toBe('ok');
     expect(callbacks.repertoireNullResults[0].status).toBe('ok');
     expect(callbacks.taskGeneralityResults[0].status).toBe('ok');
+    expect(callbacks.selectionRobustnessResults[0].status).toBe('ok');
   });
 
-  it('all five sidecar loaders are invoked in the same microtask turn (no fork waits on another to even start)', async () => {
+  it('all six sidecar loaders are invoked in the same microtask turn (no fork waits on another to even start)', async () => {
     const started: string[] = [];
     const callbacks = createCallbacks();
     const controller = new ExperimentController({
@@ -95,18 +98,30 @@ describe('ExperimentController: one sidecar loader failing does not block the ot
         started.push('taskGenerality');
         const { loadTaskGenerality } = await import('../../src/lib/experiment/taskGenerality');
         return loadTaskGenerality(manifest, dataBaseUrl);
+      },
+      loadSelectionRobustness: async (manifest, dataBaseUrl) => {
+        started.push('selectionRobustness');
+        const { loadSelectionRobustness } = await import('../../src/lib/experiment/selectionRobustness');
+        return loadSelectionRobustness(manifest, dataBaseUrl);
       }
     });
     trackController(controller);
 
     await controller.initialize();
 
-    // All five were already invoked by the time `initialize()`'s own
+    // All six were already invoked by the time `initialize()`'s own
     // returned promise resolves -- if any fork were still chained behind
     // another (the old sequential shape), the later ones would not have
     // started yet at this point (they only would have after that earlier
     // fork's own fetch/verify round trip settled, well after `initialize()`
     // itself returns).
-    expect(started.sort()).toEqual(['nullExplanation', 'pathwayInterventions', 'repertoireNull', 'rewiringNull', 'taskGenerality']);
+    expect(started.sort()).toEqual([
+      'nullExplanation',
+      'pathwayInterventions',
+      'repertoireNull',
+      'rewiringNull',
+      'selectionRobustness',
+      'taskGenerality'
+    ]);
   });
 });

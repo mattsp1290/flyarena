@@ -40,6 +40,15 @@ test('all views work beneath /fly/ with root asset routes deliberately unavailab
   const taskGeneralityJsonLink=taskGeneralityStep.getByRole('link',{name:'Pinned JSON'});
   await expect(taskGeneralityJsonLink).toHaveAttribute('href','/fly/data/task-generality-v1.json');
   expect((await request.get(await taskGeneralityJsonLink.getAttribute('href')as string)).status()).toBe(200);
+  // WP3 of `.agents/plans/selection-robustness`: `loadSelectionRobustness`
+  // (fired independently, same /fly/-prefixed `dataBaseUrl`) must resolve
+  // to its real "ok" selection-robustness-step sentence here too, not
+  // silently 404 against the deliberately-unavailable root /data/ path.
+  const selectionRobustnessStep=page.locator('section.findings ol.steps li.step[data-step-id="selection-robustness"]');
+  await expect(selectionRobustnessStep).toContainText(/robust to size is true/,{timeout:20000});
+  const selectionRobustnessJsonLink=selectionRobustnessStep.getByRole('link',{name:'Pinned JSON'});
+  await expect(selectionRobustnessJsonLink).toHaveAttribute('href','/fly/data/selection-robustness-v1.json');
+  expect((await request.get(await selectionRobustnessJsonLink.getAttribute('href')as string)).status()).toBe(200);
   // Collapsed again so the rest of this test's unscoped `getByRole('button',
   // {name:/^collapse$/i})` (the activity panel's own toggle, below) keeps
   // resolving to exactly one match.
@@ -162,4 +171,18 @@ test('a tampered task-generality-v1.json under /fly/ shows an honest verificatio
   const taskGeneralityStep=page.locator('section.findings ol.steps li.step[data-step-id="task-generality"]');
   await expect(taskGeneralityStep).toContainText(/failed verification/i,{timeout:20000});
   await expect(page.locator('body')).not.toContainText(/authored: general/);
+});
+
+test('a tampered selection-robustness-v1.json under /fly/ shows an honest verification-failure line on the selection-robustness step, while the rest of the Findings panel and the app keep working', async ({page}) => {
+  await page.route('**/data/selection-robustness-v1.json', async route => {
+    const bytes = await readFile('public/data/selection-robustness-v1.json');
+    bytes[10] ^= 0xff;
+    await route.fulfill({status:200, contentType:'application/json', body:bytes});
+  });
+  await page.goto('/fly/');
+  await expect(page.getByRole('status')).toHaveText('ready');
+  await page.locator('section.findings button').first().click();
+  const selectionRobustnessStep=page.locator('section.findings ol.steps li.step[data-step-id="selection-robustness"]');
+  await expect(selectionRobustnessStep).toContainText(/failed verification/i,{timeout:20000});
+  await expect(page.locator('body')).not.toContainText(/robust to size is true/);
 });

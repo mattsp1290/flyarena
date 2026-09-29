@@ -39,6 +39,7 @@ import {
 } from '../experiment/pathwayInterventions';
 import type { RepertoireNullLoadResult } from '../experiment/repertoireNull';
 import type { TaskGeneralityLoadResult, TaskGeneralityTask, TaskGeneralityTrainedCategory } from '../experiment/taskGenerality';
+import type { RobustnessVerdict, SelectionResult, SelectionRobustnessLoadResult } from '../experiment/selectionRobustness';
 import { metricVerdictLabel } from '../atlas/repertoireStrip';
 import { CELL_COUNT } from '../atlas/types';
 import { githubDocUrl } from '../ui/links';
@@ -87,6 +88,15 @@ export interface FindingStep {
    * step whose result fits in one sentence.
    */
   readonly perTask?: readonly { readonly id: string; readonly authored: string; readonly trained: string }[];
+  /**
+   * Same "per-item detail moves out of `sentence`" rationale as `perTask`
+   * above, for the selection-robustness step's four selections -- a
+   * `{authored, trained}` shape does not fit here (the whole study is
+   * authored-decoder-only; see `.agents/plans/selection-robustness/00-overview.md`'s
+   * non-goals), so this is its own field rather than overloading `perTask`
+   * with an empty `trained` string.
+   */
+  readonly perSelection?: readonly { readonly id: string; readonly summary: string }[];
 }
 
 export interface BuildFindingStepsInputs {
@@ -99,6 +109,8 @@ export interface BuildFindingStepsInputs {
   readonly repertoireNull: RepertoireNullLoadResult | undefined;
   /** WP4 of `.agents/plans/task-generality`. `undefined` while the task-generality load has not yet resolved -- the same `'loading'` convention every other step's `undefined` input already uses. */
   readonly taskGenerality: TaskGeneralityLoadResult | undefined;
+  /** WP3 of `.agents/plans/selection-robustness`. `undefined` while the selection-robustness load has not yet resolved -- the same `'loading'` convention every other step's `undefined` input already uses. */
+  readonly selectionRobustness: SelectionRobustnessLoadResult | undefined;
 }
 
 const STATUS_LABEL: Record<Exclude<FindingStepStatus, 'ok'>, string> = {
@@ -139,7 +151,13 @@ const rewiringNullStepStatus = (result: RewiringNullLoadResult | undefined): Exc
 };
 
 const sidecarStepStatus = (
-  result: NullExplanationLoadResult | PathwayInterventionsLoadResult | RepertoireNullLoadResult | TaskGeneralityLoadResult | undefined
+  result:
+    | NullExplanationLoadResult
+    | PathwayInterventionsLoadResult
+    | RepertoireNullLoadResult
+    | TaskGeneralityLoadResult
+    | SelectionRobustnessLoadResult
+    | undefined
 ): Exclude<FindingStepStatus, 'ok'> | 'ok' => {
   if (result === undefined) return 'loading';
   return result.status;
@@ -702,12 +720,80 @@ const buildBehaviorRepertoireStep = (inputs: BuildFindingStepsInputs): FindingSt
   return { ...base, status: 'ok', sentence };
 };
 
+// ---------------------------------------------------------------------------
+// Selection robustness
+// ---------------------------------------------------------------------------
+
+/** `RobustnessVerdict['verdict']` rendered as plain text -- never a raw `${verdict}` interpolation, so a future fourth verdict value fails to compile here instead of silently rendering `"true"`/`"false"`/`"indeterminate"`'s JS-native stringification. */
+const verdictWord = (verdict: RobustnessVerdict['verdict']): string => (verdict === true ? 'true' : verdict === false ? 'false' : 'indeterminate');
+
 /**
- * Builds all eight Findings-panel steps, in evidence-chain order
+ * One selection's null/explanation/pathway result in plain English --
+ * `perSelection`'s own per-item detail (this file's top `FindingStep.perSelection`
+ * doc comment), not folded into the main `sentence`. Every clause states the
+ * mechanism, never a bare status tag: a degenerate pathway names *why*
+ * (`degenerateMechanism`, already a full sentence fragment from
+ * `scripts/selections/selection-report.ts`'s own producer -- see that
+ * file's top doc comment for the exact wording convention), and
+ * `search-limited` is distinguished from `not-supported` per `00-overview.md`'s
+ * predeclared "Search-budget disclosure" rule.
+ */
+const selectionSummary = (selection: Readonly<SelectionResult>): string => {
+  const nullClause = `null ${selection.null.holds ? 'holds' : 'does not hold'} (biological at the ${formatPercentile(selection.null.bioPercentile)} of the rewired null)`;
+  const explanationClause = `explanation ${selection.explanation.replicates ? 'replicates' : 'does not replicate'}`;
+  const pathwayClause =
+    selection.pathway.cDegenerate || selection.pathway.mDegenerate
+      ? `pathway P/Q degenerate, not categorized -- ${selection.pathway.degenerateMechanism}`
+      : selection.pathway.searchLimited
+        ? "pathway search-limited (the swap search reached its cap before the transfer target)"
+        : `pathway ${selection.pathway.supported ? 'supported' : 'not-supported'}`;
+  return `${nullClause}; ${explanationClause}; ${pathwayClause}.`;
+};
+
+/**
+ * WP3 of `.agents/plans/selection-robustness` (`03-artifact-and-findings.md`):
+ * whether the rewiring-null/explanation/pathway findings above hold across
+ * four predeclared alternative subgraph selections (bridge-population size,
+ * bridge-selection method, and the authored sensory-channel mapping).
+ * `condition: 'authored'`: the whole study runs the authored decoder only,
+ * on the default arena task (a trained arm is a predeclared follow-up, not
+ * part of this WP -- `00-overview.md`'s non-goals).
+ */
+const buildSelectionRobustnessStep = (inputs: BuildFindingStepsInputs): FindingStep => {
+  const provenance = provenanceFor(
+    inputs.manifest,
+    inputs.manifest?.selectionRobustness,
+    'Selection-robustness result (selection-robustness-v1.json)',
+    'selection-robustness-report.md',
+    inputs.dataBaseUrl
+  );
+  const status = sidecarStepStatus(inputs.selectionRobustness);
+  const base = {
+    id: 'selection-robustness',
+    title: 'Selection robustness',
+    condition: 'authored' as const,
+    provenance: provenance ? [provenance] : []
+  };
+  if (status !== 'ok' || inputs.selectionRobustness?.status !== 'ok') {
+    return { ...base, status, reason: reasonFor(status, inputs.selectionRobustness) };
+  }
+  const { selections, overall } = inputs.selectionRobustness.data;
+  const sentence =
+    `Across ${selections.length} alternative subgraph selections, under the authored (hand-written) decoder only: ` +
+    `robust to size is ${verdictWord(overall.robustToSize.verdict)}; robust to method is ${verdictWord(overall.robustToMethod.verdict)}; ` +
+    `the channel-mapping result is ${verdictWord(overall.mapping.verdict)} -- see per-selection detail below, under this model.`;
+  const perSelection = selections.map((selection) => ({ id: selection.id, summary: selectionSummary(selection) }));
+  return { ...base, status: 'ok', sentence, perSelection };
+};
+
+/**
+ * Builds all nine Findings-panel steps, in evidence-chain order
  * (`01-findings-panel.md`'s step list, extended by task-generality WP4's
- * "before Behavior repertoire" placement). Pure and synchronous: every
- * input is a value the caller already has in scope (controller callback
- * mirrors), never a fetch performed here.
+ * "before Behavior repertoire" placement, and by selection-robustness WP3's
+ * own "Append the step at the end of the step list present at
+ * implementation time"). Pure and synchronous: every input is a value the
+ * caller already has in scope (controller callback mirrors), never a fetch
+ * performed here.
  */
 export const buildFindingSteps = (inputs: BuildFindingStepsInputs): readonly FindingStep[] => [
   buildRewiringNullStep(inputs),
@@ -717,5 +803,6 @@ export const buildFindingSteps = (inputs: BuildFindingStepsInputs): readonly Fin
   buildTrainedNullStep(inputs),
   buildTrainedInterventionsStep(inputs),
   buildTaskGeneralityStep(inputs),
-  buildBehaviorRepertoireStep(inputs)
+  buildBehaviorRepertoireStep(inputs),
+  buildSelectionRobustnessStep(inputs)
 ];

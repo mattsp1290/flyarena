@@ -240,6 +240,19 @@ export interface ArenaManifest {
    * sentence rather than pretending it exists.
    */
   taskGenerality?: SidecarManifestEntry;
+  /**
+   * WP3 of `.agents/plans/selection-robustness`: whether the headline
+   * rewiring-null/explanation/pathway findings hold across four predeclared
+   * alternative subgraph selections. `scripts/selections/selection-report.ts`
+   * writes this once `selection-robustness-v1.json` exists — see
+   * `./selectionRobustness.ts#loadSelectionRobustness`. Optional: a manifest
+   * produced before that WP (or a hand-built test fixture) simply has no
+   * selection-robustness study to show — `loadSelectionRobustness` reports
+   * that as `status: 'missing'` rather than throwing, and the Findings
+   * panel's selection-robustness step simply omits its sentence rather than
+   * pretending it exists.
+   */
+  selectionRobustness?: SidecarManifestEntry;
   sourceDataset: string;
   rewiredArms: Record<
     string,
