@@ -112,6 +112,19 @@ def _load_intervention_index(index_path: Path, archived_index_path: Path) -> dic
     return {entry["id"]: entry for entry in index["entries"]}
 
 
+def default_task_readouts(readouts: list[dict]) -> list[dict]:
+    """Scope to the default-task readouts only -- mirrors `scripts/
+    attribution/shared.ts`'s `loadArchive` exactly. `flyarena-qp2e`'s
+    per-task archive additions (52 `kind: "task-intervention"` entries
+    across 4 non-default arena tasks) are out of scope for this WP (see
+    that TS function's own doc comment for why). `saliency.json`/
+    `independence.json`/`regime.json` are themselves already scoped this
+    way (produced by the TS side's `loadArchive`), so this module must
+    apply the identical filter, or a per-task entry here would have no
+    matching saliency entry to join against."""
+    return [entry for entry in readouts if entry["arenaTask"] == "default"]
+
+
 def build_archive_shas(readouts: list[dict]) -> dict[str, tuple]:
     """One `(graphGzipSha256, graphBinarySha256)` per unique `graphId`, refusing
     (not silently keeping the first) if two archive entries for the SAME
@@ -295,7 +308,7 @@ def main(argv: list[str] | None = None) -> None:
     archive_bytes = args.archive.read_bytes()
     archive_sha256 = sha256_hex(archive_bytes)
     archive = json.loads(archive_bytes.decode("utf-8"))
-    readouts = archive["readouts"]
+    readouts = default_task_readouts(archive["readouts"])
     saliency_doc = json.loads(args.saliency.read_text())
     # `saliency.ts`'s own `archiveSha256` stamp -- a dual-review finding:
     # this pipeline sha-verifies every graph and every theta, but previously

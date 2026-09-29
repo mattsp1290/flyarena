@@ -126,6 +126,25 @@ def test_t_clear_on_hand_graph_matches_closed_form():
 
 
 # ---------------------------------------------------------------------------
+# default_task_readouts
+# ---------------------------------------------------------------------------
+
+
+def test_default_task_readouts_filters_out_per_task_entries():
+    # flyarena-qp2e's per-task archive additions (kind: "task-intervention",
+    # arenaTask != "default") are out of scope for this WP -- see the
+    # function's own doc comment.
+    readouts = [
+        {"id": "biological-seed101", "arenaTask": "default"},
+        {"id": "C000-seed101-crowded", "arenaTask": "crowded"},
+        {"id": "P-seed202", "arenaTask": "default"},
+        {"id": "C000-seed101-sparse-food", "arenaTask": "sparse-food"},
+    ]
+    result = linkage.default_task_readouts(readouts)
+    assert [r["id"] for r in result] == ["biological-seed101", "P-seed202"]
+
+
+# ---------------------------------------------------------------------------
 # build_archive_shas
 # ---------------------------------------------------------------------------
 
