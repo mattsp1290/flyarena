@@ -62,6 +62,12 @@
    * remaining visible section is a no-op (thermo accessibility review,
    * Important I1 — see `toggleSection`'s own doc comment for why this, not
    * an "all sections collapsed" empty state, is the APG-conformant choice).
+   * That toggle also carries `aria-disabled="true"` (never the native
+   * `disabled` attribute, which would drop it from the tab order) while its
+   * own collapse would be refused, per the APG's own "always one panel
+   * expanded" variant, which names exactly this attribute for exactly this
+   * situation (`wouldRefuseCollapse`) — so the no-op is announced, not
+   * silent, and clears the moment another section opens.
    */
 
   interface Props {
@@ -117,6 +123,24 @@
   };
 
   const isSectionOpen = (sectionId: string): boolean => !collapsedSectionIds.has(sectionId);
+
+  /**
+   * Whether *this* section's toggle would have its own collapse refused
+   * right now -- the same `!hasAnyVisibleStep(flatSteps, next)` condition
+   * `toggleSection`'s own no-op guard uses, computed per section so the
+   * button can announce it (thermo accessibility review, follow-up to
+   * Important I1). Only an already-open section's toggle can ever be
+   * refused (collapsing a closed section is nonsensical -- its own click
+   * always *expands*, which `toggleSection` never refuses), so a closed
+   * section's toggle is never marked this way regardless of how many other
+   * sections are collapsed.
+   */
+  const wouldRefuseCollapse = (sectionId: string): boolean => {
+    if (!isSectionOpen(sectionId)) return false;
+    const hypothetical = new Set(collapsedSectionIds);
+    hypothetical.add(sectionId);
+    return !hasAnyVisibleStep(flatSteps, hypothetical);
+  };
 
   const toggleSection = (sectionId: string): void => {
     const collapsing = !collapsedSectionIds.has(sectionId);
@@ -230,6 +254,7 @@
     {#each groups as group (group.section.id)}
       {@const sectionOpen = isSectionOpen(group.section.id)}
       {@const sectionStepsId = `finding-section-${group.section.id}-steps`}
+      {@const collapseRefused = wouldRefuseCollapse(group.section.id)}
       <div class="finding-section">
         <h3 class="section-toggle-heading">
           <button
@@ -238,6 +263,7 @@
             onclick={() => toggleSection(group.section.id)}
             aria-expanded={sectionOpen}
             aria-controls={sectionOpen ? sectionStepsId : undefined}
+            aria-disabled={collapseRefused ? 'true' : undefined}
           >
             <span class="section-disclosure" aria-hidden="true">{sectionOpen ? '▾' : '▸'}</span>
             {group.section.title}
@@ -407,6 +433,15 @@
   .section-toggle:focus-visible {
     outline: 2px solid #7be5c5;
     outline-offset: 2px;
+  }
+
+  /* Still focusable (never the native `disabled` attribute -- see the
+     component's own doc comment), just a visual echo of `aria-disabled`
+     for a sighted user: the last section with a visible step can't be
+     collapsed further. */
+  .section-toggle[aria-disabled='true'] {
+    cursor: default;
+    opacity: 0.7;
   }
 
   .section-disclosure {

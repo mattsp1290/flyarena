@@ -150,8 +150,38 @@ test.describe('Findings panel — question sections', () => {
 
     // The live region still names a real, still-open section -- never
     // blank and never naming a now-collapsed one.
-    const stillOpenTitle = SECTION_TITLES[expandedStates.findIndex((state) => state === 'true')];
+    const stillOpenIndex = expandedStates.findIndex((state) => state === 'true');
+    const stillOpenTitle = SECTION_TITLES[stillOpenIndex];
     await expect(page.getByText(new RegExp(`^Step \\d+ of \\d+ in ${stillOpenTitle.replace(/[?]/g, '\\?')}$`))).toBeVisible();
+
+    // (coordinator follow-up to I1) The APG's own "always one panel
+    // expanded" variant names aria-disabled="true" for exactly this
+    // situation, so the refusal is announced to assistive tech, not
+    // silent. Only the still-open toggle carries it -- a collapsed
+    // toggle's own click always *expands*, which is never refused.
+    const stillOpenToggle = toggles[stillOpenIndex];
+    await expect(stillOpenToggle).toHaveAttribute('aria-disabled', 'true');
+    // Still a real, focusable button -- never the native `disabled`
+    // attribute, which would drop it from the tab order (checked directly
+    // at the DOM level: Playwright's own `toBeEnabled()` treats
+    // `aria-disabled="true"` as non-actionable, which is exactly the
+    // ARIA-level signal this fix intends, not a claim about the native
+    // attribute).
+    expect(await stillOpenToggle.getAttribute('disabled')).toBeNull();
+    await stillOpenToggle.focus();
+    await expect(stillOpenToggle).toBeFocused();
+    for (const [index, toggle] of toggles.entries()) {
+      if (index === stillOpenIndex) continue;
+      await expect(toggle).not.toHaveAttribute('aria-disabled');
+    }
+
+    // Reopening any collapsed section clears aria-disabled from the
+    // previously-refused toggle -- the attribute tracks section state
+    // reactively, not just at first collapse.
+    const anyCollapsedIndex = toggles.findIndex((_, index) => index !== stillOpenIndex);
+    await toggles[anyCollapsedIndex].click();
+    await expect(stillOpenToggle).not.toHaveAttribute('aria-disabled');
+    await expect(toggles[anyCollapsedIndex]).not.toHaveAttribute('aria-disabled');
   });
 
   test('the live region announces the current step\'s section title', async ({ page }) => {

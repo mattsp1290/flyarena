@@ -252,6 +252,51 @@ describe('FindingsPanel', () => {
     expect(screen.getByText(liveRegionTextBeforeFinalClick as string)).toBeInTheDocument();
   });
 
+  it('aria-disabled appears only on the last open section\'s toggle (never the native disabled attribute), and clears reactively once another section reopens', async () => {
+    // (coordinator follow-up to thermo accessibility review I1) The APG's
+    // own "always one panel expanded" accordion variant names
+    // `aria-disabled="true"` for exactly this situation -- a toggle whose
+    // own collapse is refused. Verified here as its own regression,
+    // independent of the "collapsing every section" scenario above: the
+    // attribute must track section state reactively (present only while
+    // this really is the last section with a visible step), and the button
+    // must stay in the tab order throughout (real `disabled` would remove
+    // it).
+    render(FindingsPanel, okProps());
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+
+    const sectionTitles = [...new Set(expectedFlatSteps().map((step) => step.sectionTitle))];
+    expect(sectionTitles.length).toBeGreaterThan(1);
+
+    // Every section starts open -- none is aria-disabled yet.
+    for (const title of sectionTitles) {
+      expect(screen.getByRole('button', { name: title })).not.toHaveAttribute('aria-disabled');
+    }
+
+    // Collapse every section but the last.
+    for (const title of sectionTitles.slice(0, -1)) {
+      await fireEvent.click(screen.getByRole('button', { name: title }));
+    }
+
+    const lastTitle = sectionTitles[sectionTitles.length - 1];
+    const lastToggle = screen.getByRole('button', { name: lastTitle });
+    expect(lastToggle).toHaveAttribute('aria-disabled', 'true');
+    // Still a real, focusable, enabled button -- aria-disabled communicates
+    // the refusal to assistive tech without removing it from the tab order.
+    expect(lastToggle).not.toBeDisabled();
+    lastToggle.focus();
+    expect(lastToggle).toHaveFocus();
+
+    // Reopening an earlier section clears aria-disabled from the last
+    // toggle (its own collapse would no longer leave nothing visible), and
+    // the reopened section's own toggle is not disabled either.
+    const firstCollapsedTitle = sectionTitles[0];
+    const reopenedToggle = screen.getByRole('button', { name: firstCollapsedTitle });
+    await fireEvent.click(reopenedToggle);
+    expect(lastToggle).not.toHaveAttribute('aria-disabled');
+    expect(reopenedToggle).not.toHaveAttribute('aria-disabled');
+  });
+
   it('the first step has aria-current="step" by default once expanded, and the live region announces it, with its section', async () => {
     render(FindingsPanel, okProps());
     await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
