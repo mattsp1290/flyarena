@@ -147,6 +147,70 @@ describe('loadSelectionRobustness (shape validation, with a synthetic manifest s
     }
   });
 
+  it('accepts a categorized, search-limited selection\'s "indeterminate" overall verdict -- never requires it to read as a "not-supported" failure', async () => {
+    // A thermo review of this WP3 change (methodology I1) caught that both
+    // `aggregateVerdict` (producer) and this loader's own `recomputeVerdict`
+    // folded a search-limited, categorized pathway into a `false` "not
+    // supported" failure at the aggregate level -- contradicting the
+    // per-selection label's own predeclared rule. This is the loader-side
+    // regression test for that fix: a shipped artifact whose `larger`
+    // selection is categorized, `searchLimited: true`, and
+    // `pathway.supported: false` (the search simply never finished) must be
+    // accepted with `robustToSize: 'indeterminate'`, not rejected as
+    // internally inconsistent, and must never be forced to `false`.
+    const searchLimitedLarger = {
+      ...baseSelection('larger'),
+      pathway: {
+        ...baseSelection('larger').pathway,
+        supported: false,
+        searchLimited: true,
+        targetReached: false,
+        k: 200
+      }
+    };
+    const { manifest: manifestForBody } = manifestServing({
+      ...validArtifact,
+      selections: [searchLimitedLarger, ...validArtifact.selections.filter((s) => s.id !== 'larger')],
+      overall: {
+        ...validArtifact.overall,
+        robustToSize: { verdict: 'indeterminate', reason: 'larger: pathway is search-limited (the swap search reached its cap)' }
+      }
+    });
+    const result = await loadSelectionRobustness(manifestForBody, '/data');
+    expect(result.status).toBe('ok');
+    if (result.status === 'ok') {
+      expect(result.data.overall.robustToSize.verdict).toBe('indeterminate');
+      expect(result.data.overall.robustToSize.reason).toContain('search-limited');
+      expect(result.data.overall.robustToSize.reason).not.toContain('not-supported');
+    }
+  });
+
+  it('is "invalid" when a categorized, search-limited selection\'s overall verdict is forced to "false" (the exact bug the fix above closes)', async () => {
+    const searchLimitedLarger = {
+      ...baseSelection('larger'),
+      pathway: {
+        ...baseSelection('larger').pathway,
+        supported: false,
+        searchLimited: true,
+        targetReached: false,
+        k: 200
+      }
+    };
+    const { manifest: manifestForBody } = manifestServing({
+      ...validArtifact,
+      selections: [searchLimitedLarger, ...validArtifact.selections.filter((s) => s.id !== 'larger')],
+      overall: {
+        ...validArtifact.overall,
+        // The bug this fix closes: folding search-limited into a plain
+        // "not-supported" failure would have produced this exact shape.
+        robustToSize: { verdict: false, reason: 'larger: pathway is not-supported' }
+      }
+    });
+    const result = await loadSelectionRobustness(manifestForBody, '/data');
+    expect(result.status).toBe('invalid');
+    if (result.status === 'invalid') expect(result.reason).toMatch(/overall\.robustToSize disagrees/);
+  });
+
   it('is "invalid" for the wrong version', async () => {
     const { manifest: manifestForBody } = manifestServing({ ...validArtifact, version: 2 });
     const result = await loadSelectionRobustness(manifestForBody, '/data');

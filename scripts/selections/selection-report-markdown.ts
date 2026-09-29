@@ -118,7 +118,8 @@ const STATIC_LIMITATIONS = [
   'The 200-swap cap is not scaled to the bridge-pool size.',
   'The exploratory unrestricted feature is not recomputed for any selection (`--selection-mode` records `exploratory: null`).',
   'One seed per seeded variant (`random-bridge`, `alt-sensory-mapping`).',
-  'All selections use the same candidate pools and synapse threshold.',
+  'All selections use the same candidate pools and synapse threshold, so `bridgePoolSize` is a property of that ' +
+    'shared candidate set, not of the selection -- it is expected to be identical across all four rows, not a bug.',
   '`alt-sensory-mapping` changes the authored channel assignment; it is not a topology test.',
   'Authored decoder and the default arena task only.',
   'Uncorrected comparisons across 4 selections x 3 findings each (12 comparisons); no multiple-comparisons adjustment is applied.',

@@ -235,13 +235,25 @@ describe('buildSelectionRobustnessArtifact (pure builder, against a synthetic fi
     expect(artifact.overall.mapping.verdict).toBe(false);
   });
 
-  it('a P that hits the swap cap without reaching its target is reported search-limited, never folded into "not-supported"', () => {
+  it('a P that hits the swap cap without reaching its target is reported search-limited, never folded into "not-supported" -- at both the per-selection field AND the aggregate overall verdict/reason', () => {
     writeAllUnremarkable(dir);
     writeSelectionFixture(dir, 'larger', { k: 200, maxSwaps: 200, targetReached: false, pScore: 0 });
     const artifact = buildSelectionRobustnessArtifact({ selectionsDir: dir, defaultGraphSha: 'z'.repeat(64) });
     const larger = artifact.selections.find((s) => s.id === 'larger');
     expect(larger?.pathway.searchLimited).toBe(true);
     expect(larger?.pathway.targetReached).toBe(false);
+    // A thermo review of this WP3 change (methodology I1) caught that this
+    // test's own title made a guarantee it never actually checked:
+    // `aggregateVerdict` folded a search-limited, categorized pathway into
+    // a plain "not-supported" failure at the *aggregate* level, even though
+    // the per-selection prose already correctly said "search-limited".
+    // `larger` is categorized (not degenerate) and search-limited, so it
+    // contributes a gap, not a failure -- `smaller` (unremarkable) supplies
+    // no failure of its own, so `robustToSize` is `"indeterminate"`, and its
+    // reason must say "search-limited", never "not-supported".
+    expect(artifact.overall.robustToSize.verdict).toBe('indeterminate');
+    expect(artifact.overall.robustToSize.reason).toContain('larger: pathway is search-limited');
+    expect(artifact.overall.robustToSize.reason).not.toContain('not-supported');
   });
 
   it("random-bridge's single-axis variants are carried through only when present, null otherwise", () => {

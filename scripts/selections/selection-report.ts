@@ -511,6 +511,23 @@ const buildSelectionResult = (selectionsDir: string, id: SelectionId): Selection
  * failure even though its pathway leg is separately degenerate/uncategorized.
  * Only when *no* finding fails, and at least one is uncategorized, is the
  * result `"indeterminate"`.
+ *
+ * A `categorized` selection whose pathway is `searchLimited` is its own
+ * third case, resolved here explicitly (a thermo review of this WP3 change,
+ * item I1: the plan's "Search-budget disclosure" fixes the *per-selection
+ * label* -- "reported as 'search-limited', not 'not supported'" -- but does
+ * not itself state the *aggregate* rule, leaving a real gap this producer
+ * must not paper over with silence). A search-limited P's swap search hit
+ * the 200-swap cap before reaching its transfer target, so whether it would
+ * have gone on to clear the pathway-supported threshold is genuinely
+ * unknown -- `pathway.supported`'s mechanical `false` in that case is not
+ * evidence the pathway *fails*, only that the search didn't finish. Treating
+ * it as a failure would silently reintroduce the exact "search-limited
+ * folded into not-supported" bug the per-selection label already guards
+ * against, just one layer up. It is therefore treated the same as an
+ * uncategorized gap -- contributing to `"indeterminate"` only when nothing
+ * else fails -- with its own reason string that always says
+ * "search-limited", never "not-supported".
  */
 const aggregateVerdict = (selections: readonly SelectionResult[]): RobustnessVerdict => {
   const failures: string[] = [];
@@ -520,6 +537,11 @@ const aggregateVerdict = (selections: readonly SelectionResult[]): RobustnessVer
     if (!selection.explanation.replicates) failures.push(`${selection.id}: explanation does not replicate`);
     if (!selection.categorized) {
       gaps.push(`${selection.id}: pathway is not categorized (${selection.categorizedReason})`);
+    } else if (selection.pathway.searchLimited) {
+      gaps.push(
+        `${selection.id}: pathway is search-limited (the swap search reached its cap before the transfer target, ` +
+          'so pathway-supported can be neither confirmed nor ruled out)'
+      );
     } else if (!selection.pathway.supported) {
       failures.push(`${selection.id}: pathway is not-supported`);
     }

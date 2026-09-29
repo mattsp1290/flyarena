@@ -261,13 +261,28 @@ const selectionReason = (value: unknown): string | undefined => {
 
 const isSelection = (value: unknown): value is SelectionResult => selectionReason(value) === undefined;
 
-/** `scripts/selections/selection-report.ts`'s own `aggregateVerdict` -- reimplemented (not imported), same per-finding-across-selections rule: a categorized finding that fails makes the whole verdict `false` regardless of any other finding being uncategorized on the same or another selection; `'indeterminate'` only when nothing failed and at least one finding is uncategorized. */
+/**
+ * `scripts/selections/selection-report.ts`'s own `aggregateVerdict` --
+ * reimplemented (not imported), same per-finding-across-selections rule: a
+ * categorized finding that fails makes the whole verdict `false` regardless
+ * of any other finding being uncategorized on the same or another
+ * selection; `'indeterminate'` only when nothing failed and at least one
+ * finding is uncategorized or search-limited. A `searchLimited` pathway
+ * (the swap search hit its cap before reaching the transfer target) is
+ * treated the same as an uncategorized gap, never as a `not-supported`
+ * failure -- see the producer's identical fix and doc comment (a thermo
+ * review of this WP3 change, item I1) for why folding it into "not
+ * supported" would be wrong: the search simply never finished, so
+ * pathway-supported is neither confirmed nor ruled out for that selection.
+ */
 const recomputeVerdict = (selections: readonly SelectionResult[]): RobustnessVerdict => {
   let anyGap = false;
   for (const selection of selections) {
     if (!selection.null.holds) return { verdict: false };
     if (!selection.explanation.replicates) return { verdict: false };
     if (!selection.categorized) {
+      anyGap = true;
+    } else if (selection.pathway.searchLimited) {
       anyGap = true;
     } else if (!selection.pathway.supported) {
       return { verdict: false };
