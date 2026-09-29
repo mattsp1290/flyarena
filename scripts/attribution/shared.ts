@@ -4,10 +4,11 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import type { ConnectomeGraph } from '../../src/lib/connectome/format';
+import { resolveArenaTask } from '../../src/lib/arena/tasks';
 import { readoutFromFlat } from '../../src/lib/connectome/readout-serialization';
 import type { ReadoutWeights } from '../../src/lib/connectome/readout';
 import { sha256Hex } from '../training/fsio';
-import type { ArchivedReadout } from './archive-readouts';
+import { arenaTaskFingerprintOf, type ArchivedReadout } from './archive-readouts';
 import { resolveReadoutGraph, type ResolveGraphConfig } from './resolve-graph';
 
 /**
@@ -43,13 +44,45 @@ interface TrainedReadoutArchive {
   readonly readouts: readonly ArchivedReadout[];
 }
 
-/** Load and lightly validate `training/archive/trained-readouts-v1.json`, sorted by id (the archive's own committed order). */
+const DEFAULT_TASK_FINGERPRINT = resolveArenaTask('default').fingerprint;
+
+/**
+ * Load and lightly validate `training/archive/trained-readouts-v1.json`,
+ * sorted by id (the archive's own committed order), scoped to the
+ * default-task readouts only (`entry.arenaTask === 'default'`) --
+ * WP1b's per-task archive (`flyarena-qp2e`, merged) added 52
+ * `kind: "task-intervention"` entries across 4 non-default arena tasks
+ * (`crowded`/`hazard-heavy`/`no-movement`/`sparse-food`) that this WP's own
+ * predeclared analyses and H1-H3 (`00-overview.md`) were never scoped
+ * around: every hypothesis rule reads fixed default-task ids
+ * (`biological-seed101`, `P-seed202`, ...), and including the per-task
+ * entries would roughly triple the ablation compute (75 readouts x 17
+ * tasks x 100 seeds vs 23's) for zero effect on any H1-H3 outcome. Scoped
+ * here, in one place, rather than per-CLI, so every WP2 analysis stays
+ * consistently scoped without repeating the filter five times. Each
+ * default-task entry's `arenaTaskFingerprintOf(entry)` is cross-checked
+ * against the default task's own fingerprint (not merely trusting the
+ * `arenaTask` string label) -- the sanctioned read path
+ * (`archive-readouts.ts`'s own doc comment on `arenaTaskFingerprint`),
+ * catching a hypothetical future entry mislabeled `arenaTask: "default"`
+ * whose stored fingerprint disagrees.
+ */
 export const loadArchive = (archivePath: string): readonly ArchivedReadout[] => {
   const parsed = JSON.parse(readFileSync(archivePath, 'utf8')) as Partial<TrainedReadoutArchive>;
   if (!Array.isArray(parsed.readouts)) {
     throw new Error(`shared: ${archivePath} is missing a "readouts" array`);
   }
-  return [...parsed.readouts].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  const defaultTaskReadouts = parsed.readouts.filter((entry) => entry.arenaTask === 'default');
+  for (const entry of defaultTaskReadouts) {
+    const fingerprint = arenaTaskFingerprintOf(entry);
+    if (fingerprint !== DEFAULT_TASK_FINGERPRINT) {
+      throw new Error(
+        `shared: archive entry "${entry.id}" has arenaTask "default" but arenaTaskFingerprintOf resolves to ` +
+          `"${fingerprint}", not the default task's own fingerprint "${DEFAULT_TASK_FINGERPRINT}"`
+      );
+    }
+  }
+  return [...defaultTaskReadouts].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 };
 
 /**
