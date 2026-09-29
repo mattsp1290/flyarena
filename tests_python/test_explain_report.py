@@ -65,3 +65,45 @@ def test_render_metric_stats_table_does_not_bold_when_field_absent():
     rendered = explain_report.render_metric_stats_table([metric])
     assert "**T:a->b**" not in rendered
     assert "| T:a->b |" in rendered
+
+
+# ---------------------------------------------------------------------------
+# `_null_comparison_clause`: the "Question" paragraph's lead clause must be
+# derived from the real biological percentile/null size, not the fixed
+# "scoring below all 500 ... rewirings" string that was only ever true at
+# the 0th percentile (a thermo-methodology review finding, C3 -- committed
+# proof: `random-bridge/null-explanation-report.md`'s 24.8th-percentile
+# report shipped the "below all 500" clause anyway, contradicting the
+# percentile quoted two words later in the same sentence).
+# ---------------------------------------------------------------------------
+
+
+def test_null_comparison_clause_at_zero_percentile_says_below_all():
+    # This is the shipped default's exact case (bioPercentile 0.0, 500
+    # rewirings): the fixed phrasing this bug hardcoded is correct here,
+    # and the byte-identity requirement on the published default artifact
+    # depends on this exact string never changing for this input.
+    assert explain_report._null_comparison_clause(0.0, 500) == "scoring below all 500 degree-preserving rewirings"
+
+
+def test_null_comparison_clause_nonzero_percentile_says_at_the_nth_percentile_of():
+    # random-bridge's real, committed number: 24.8th percentile of 500.
+    assert (
+        explain_report._null_comparison_clause(0.248, 500)
+        == "scoring at the 24.8th percentile of 500 degree-preserving rewirings"
+    )
+    assert "below all" not in explain_report._null_comparison_clause(0.248, 500)
+
+
+def test_null_comparison_clause_tied_with_null_floor_is_not_treated_as_below_all():
+    # `explain_stats.rank_statistics`'s `bioPercentile = (kBelow + 0.5 *
+    # kEqual) / n`: biological *tied* with the single lowest null value
+    # (kBelow=0, kEqual=1) gives a tiny but strictly non-zero percentile
+    # (0.5/500 = 0.001), not 0.0 -- "at the null floor" is a distinct case
+    # from "below all N", and must not collapse into the same "below all"
+    # wording just because it is numerically close to zero.
+    floor_percentile = 0.5 / 500
+    assert floor_percentile != 0.0
+    clause = explain_report._null_comparison_clause(floor_percentile, 500)
+    assert clause == "scoring at the 0.1th percentile of 500 degree-preserving rewirings"
+    assert "below all" not in clause

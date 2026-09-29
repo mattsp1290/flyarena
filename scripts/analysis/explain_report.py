@@ -38,6 +38,25 @@ def _fmt(value: float | None, digits: int = 4) -> str:
     return f"{value:.{digits}f}"
 
 
+def _null_comparison_clause(bio_percentile: float, null_size: int) -> str:
+    """The "Question" paragraph's lead clause (`render_report_markdown`),
+    derived from the real `bio_percentile`/`null_size` rather than a fixed
+    "scoring below all 500 ... rewirings" string. That fixed phrasing is
+    only true when biological sits at the 0th percentile -- the shipped
+    default (`docs/null-explanation-report.md`) and, so far, three of the
+    four `selection-robustness` runs -- and is false, self-contradicting
+    the percentile quoted two words later in the same sentence, for any
+    selection whose biological score is not the absolute minimum (e.g.
+    `random-bridge`, 24.8th percentile; a thermo-methodology review
+    finding, C3). Uses `explain_stats.format_pct` for the non-zero case so
+    this phrase's percentile wording can never drift from every other
+    percentile string this report already prints (the decoder-convention
+    and feature-6 sections)."""
+    if bio_percentile == 0.0:
+        return f"scoring below all {null_size} degree-preserving rewirings"
+    return f"scoring at the {format_pct(bio_percentile)} of {null_size} degree-preserving rewirings"
+
+
 def render_transfer_matrix(metrics_by_name: Mapping[str, dict], field: str) -> str:
     """`metrics_by_name.get(...)` (not direct indexing): if biological's own
     transfer solve is singular, `explain.build_all_metrics` drops every
@@ -547,6 +566,14 @@ def render_report_markdown(explanation: dict, rewiring_null: dict) -> str:
     authored_bio_score = rewiring_null_baseline["biological"]["score"]
     authored_null_mean = rewiring_null_baseline["null"]["mean"]
     authored_null_std = rewiring_null_baseline["null"]["std"]
+    # `len(rewired)`, not `null["n"]` -- `null["n"]` is present in the real
+    # `rewiring-null-v1.json` (and always equals `len(rewired)` there) but
+    # is not a field every caller's `rewiring_null` guarantees (e.g.
+    # `tests_python/test_explain.py`'s `synthetic_inputs` fixture omits it);
+    # `rewired` itself is unconditionally required elsewhere in this module
+    # (`score_by_seed`, seed-coverage checks), so counting it directly can
+    # never KeyError.
+    authored_null_size = len(rewiring_null_baseline["rewired"])
     authored_bio_percentile = rewiring_null_baseline["bioPercentile"]
     authored_p_low = rewiring_null_baseline["pLow"]
 
@@ -554,8 +581,9 @@ def render_report_markdown(explanation: dict, rewiring_null: dict) -> str:
     lines.append("# Explaining the null result (under this model)")
     lines.append("")
     lines.append(
-        "**Question.** `docs/rewiring-null-report.md` found the biological MaleCNS graph scoring below all 500 "
-        f"degree-preserving rewirings under the authored decoder (biological {authored_bio_score:.4f}, null mean "
+        "**Question.** `docs/rewiring-null-report.md` found the biological MaleCNS graph "
+        f"{_null_comparison_clause(authored_bio_percentile, authored_null_size)} "
+        f"under the authored decoder (biological {authored_bio_score:.4f}, null mean "
         f"{authored_null_mean:.4f}, sd {authored_null_std:.4f}, {authored_bio_percentile * 100:.1f}th percentile, "
         f"`p_low = {authored_p_low:.4f}`). This report tests three predeclared, descriptive explanations for "
         "that result under this model only -- the authored encoder, this rate-model dynamics, and this arena -- "

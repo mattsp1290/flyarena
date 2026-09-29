@@ -289,6 +289,88 @@ def test_build_manifest_and_ledger_threads_artifact_name_and_selection():
 
 
 # ---------------------------------------------------------------------------
+# selectionPolicy.bridgeTarget: must echo the *resolved* bridge_target
+# (thermo-methodology review I5) -- `select_subgraph`'s own local at
+# compile.py:532, not the raw `BRIDGE_TARGET` module constant -- so a
+# non-default selection's ledger does not contradict its own
+# `selection.params.bridge_target`/`selectionCounts.bridgeSelectedCount`.
+# Each test below feeds `build_manifest_and_ledger` the REAL
+# `select_subgraph(...)` return value (via `_selection_fixture()`, not a
+# hand-built stub), so `selectionPolicy.bridgeTarget` is read from the
+# actual `"bridge_target"` key `select_subgraph` now returns -- not a
+# second, independent re-derivation from `selection_params`/`SELECTIONS`
+# that could silently drift from what `select_subgraph` really resolved (a
+# code-review finding on this fix's first draft).
+# ---------------------------------------------------------------------------
+
+
+def test_default_selection_ledger_records_default_bridge_target():
+    # The default IS 800, so this pins that the fix does not perturb the
+    # unchanged-default case: `selectionPolicy.bridgeTarget` must still read
+    # `BRIDGE_TARGET` (800) verbatim when no override is given.
+    annotations, weights = _selection_fixture()
+    real_selection = compiler.select_subgraph(annotations, weights, selection=compiler.SELECTIONS["default"])
+    assert real_selection["bridge_target"] == compiler.BRIDGE_TARGET == 800
+    manifest, ledger = compiler.build_manifest_and_ledger(**_build_args(selection=real_selection))
+    assert ledger["selectionPolicy"]["bridgeTarget"] == compiler.BRIDGE_TARGET == 800
+    assert manifest["selection"]["params"] == {}
+
+
+def test_larger_selection_ledger_records_resolved_bridge_target_not_module_default():
+    annotations, weights = _selection_fixture()
+    real_selection = compiler.select_subgraph(annotations, weights, selection=compiler.SELECTIONS["larger"])
+    assert real_selection["bridge_target"] == 1600
+    manifest, ledger = compiler.build_manifest_and_ledger(
+        **_build_args(
+            selection=real_selection,
+            artifact_name="malecns-arena-larger",
+            selection_id="larger",
+            selection_params=compiler.SELECTIONS["larger"],
+        )
+    )
+    assert ledger["selectionPolicy"]["bridgeTarget"] == 1600
+    assert ledger["selectionPolicy"]["bridgeTarget"] != compiler.BRIDGE_TARGET
+    # No longer self-contradicting: the ledger's own resolved policy field
+    # now agrees with the selection params recorded a few keys away.
+    assert ledger["selectionPolicy"]["bridgeTarget"] == ledger["selection"]["params"]["bridge_target"]
+
+
+def test_smaller_selection_ledger_records_resolved_bridge_target_not_module_default():
+    annotations, weights = _selection_fixture()
+    real_selection = compiler.select_subgraph(annotations, weights, selection=compiler.SELECTIONS["smaller"])
+    assert real_selection["bridge_target"] == 400
+    manifest, ledger = compiler.build_manifest_and_ledger(
+        **_build_args(
+            selection=real_selection,
+            artifact_name="malecns-arena-smaller",
+            selection_id="smaller",
+            selection_params=compiler.SELECTIONS["smaller"],
+        )
+    )
+    assert ledger["selectionPolicy"]["bridgeTarget"] == 400
+    assert ledger["selectionPolicy"]["bridgeTarget"] == ledger["selection"]["params"]["bridge_target"]
+
+
+def test_random_bridge_selection_ledger_bridge_target_is_accidentally_the_module_default():
+    # random-bridge overrides bridge_mode, not bridge_target -- the resolved
+    # value falls back to BRIDGE_TARGET (800) the same way select_subgraph's
+    # own local does, so this stays correct (not merely unaffected by the
+    # bug) for this selection too.
+    annotations, weights = _selection_fixture()
+    real_selection = compiler.select_subgraph(annotations, weights, selection=compiler.SELECTIONS["random-bridge"])
+    assert real_selection["bridge_target"] == compiler.BRIDGE_TARGET == 800
+    manifest, ledger = compiler.build_manifest_and_ledger(
+        **_build_args(
+            selection=real_selection,
+            artifact_name="malecns-arena-random-bridge",
+            selection_id="random-bridge",
+            selection_params=compiler.SELECTIONS["random-bridge"],
+        )
+    )
+    assert ledger["selectionPolicy"]["bridgeTarget"] == compiler.BRIDGE_TARGET == 800
+
+
+# ---------------------------------------------------------------------------
 # Refusal rule: a variant into public/data, or under the default artifact
 # name, is refused before any raw data is loaded or any file is written.
 # ---------------------------------------------------------------------------

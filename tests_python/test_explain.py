@@ -680,6 +680,59 @@ def test_main_produces_deterministic_output(tmp_path, synthetic_inputs):
     assert producers["features"]["sourceSha256"] == explain.current_features_source_sha256()
     assert producers["regime"]["sourceSha256"] == explain.current_regime_source_sha256()
 
+    # The report's "Question" paragraph lead clause (a thermo-methodology
+    # review finding, C3): `synthetic_inputs`' `rewiring-null.json` has
+    # `bioPercentile: 0.0` over 20 rewirings (`REWIRED_COUNT` monkeypatched
+    # down from the real study's 500), so the fixed "below all 500"
+    # phrasing this bug hardcoded would already have been wrong here even
+    # before considering `random-bridge` -- confirms the derived clause
+    # reads the fixture's real null size, not a hardcoded constant.
+    report_text = report_a.read_text()
+    assert "scoring below all 20 degree-preserving rewirings" in report_text
+    assert "scoring below all 500 degree-preserving rewirings" not in report_text
+
+
+def test_report_question_paragraph_derives_from_nonzero_bio_percentile(tmp_path, synthetic_inputs):
+    # `random-bridge`'s real, committed regression: biological at the 24.8th
+    # percentile (not the 0th), which the old hardcoded "scoring below all
+    # 500 ... rewirings" clause stated as fact regardless. Mutate the
+    # fixture's `rewiring-null.json` to a non-zero percentile and confirm
+    # the rendered report no longer claims "below all".
+    rewiring_null_path = synthetic_inputs["rewiring-null.json"]
+    rewiring_null = json.loads(rewiring_null_path.read_text())
+    rewiring_null["bioPercentile"] = 0.248
+    rewiring_null_path.write_text(json.dumps(rewiring_null))
+
+    out_path = tmp_path / "out.json"
+    report_path = tmp_path / "report.md"
+    explain.main(
+        [
+            "--rewiring-null",
+            str(rewiring_null_path),
+            "--variant-flip-both",
+            str(synthetic_inputs["variant-flip-both.json"]),
+            "--transfer",
+            str(synthetic_inputs["transfer.json"]),
+            "--features",
+            str(synthetic_inputs["features.json"]),
+            "--features-exploratory-unrestricted",
+            str(synthetic_inputs["features-exploratory-unrestricted.json"]),
+            "--regime",
+            str(synthetic_inputs["regime.json"]),
+            "--out",
+            str(out_path),
+            "--report-out",
+            str(report_path),
+            "--skip-manifest-update",
+        ]
+    )
+    report_text = report_path.read_text()
+    assert "scoring at the 24.8th percentile of 20 degree-preserving rewirings" in report_text
+    assert "below all" not in report_text
+    # The parenthetical percentile figure quoted later in the same
+    # sentence must agree with (not contradict) the lead clause.
+    assert "24.8th percentile, `p_low" in report_text
+
 
 # ---------------------------------------------------------------------------
 # Single-axis variant validation (I7: both-or-neither, trigger-consistent)

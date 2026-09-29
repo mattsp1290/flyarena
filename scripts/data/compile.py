@@ -591,6 +591,20 @@ def select_subgraph(
         "descending_ids": descending_ids,
         "bridge_ids": bridge_ids,
         "node_ids": node_ids,
+        # The resolved value this call actually used (line 532) -- carried
+        # in the return value, not just the `bridge_mode`/`seed` inputs, so
+        # a caller (`build_manifest_and_ledger`'s `selectionPolicy.
+        # bridgeTarget`) can echo what was *really* selected by reading it
+        # from here instead of re-deriving it a second time from
+        # `SELECTIONS`/`selection_params` -- two independent
+        # implementations of the same `.get("bridge_target",
+        # BRIDGE_TARGET)` fallback is exactly the kind of drift risk a
+        # thermo-methodology review pass (code-review, high effort) flagged
+        # about this fix's first draft: if `select_subgraph`'s own
+        # resolution logic ever changes (a clamp, a bridge_mode-dependent
+        # target), a second copy of that logic elsewhere would silently
+        # stop matching it.
+        "bridge_target": bridge_target,
         "counts": {
             "tracedBodyCount": len(traced_ids),
             "sensoryCandidateCount": len(sensory_candidates),
@@ -762,6 +776,30 @@ def build_manifest_and_ledger(
     selection_params = default_if_none(selection_params)
     selection_record = {"id": selection_id, "params": dict(selection_params)}
 
+    # The resolved `bridge_target` this selection actually used, read from
+    # `selection` (`select_subgraph`'s own return value) rather than
+    # re-derived here from `selection_params`/`SELECTIONS`: `select_subgraph`
+    # already resolves and returns it (compile.py:532 and its own return
+    # dict's `"bridge_target"` key), and reading that value instead of
+    # recomputing `int(selection_params.get("bridge_target",
+    # BRIDGE_TARGET))` a second time avoids two independent implementations
+    # of the same fallback silently drifting apart if `select_subgraph`'s
+    # own resolution logic ever changes (a code-review finding on this
+    # fix's first draft). `.get(..., BRIDGE_TARGET)` here is only a fixture
+    # fallback for direct unit-test calls that pass a minimal `selection`
+    # dict without going through `select_subgraph` at all; the real `main()`
+    # call site always supplies the full return value. `sensoryTarget`/
+    # `descendingTarget`/`synapseThreshold` need no equivalent resolution:
+    # no `SELECTIONS` entry overrides them, and `select_subgraph` always
+    # applies `SENSORY_TARGET`/`DESCENDING_TARGET`/`SYNAPSE_THRESHOLD`
+    # directly (see `select_subgraph`'s own docstring: "sensory and
+    # descending selection are never affected by it"), so those three
+    # constants are already correct verbatim. `bridge_mode`/`channel_mode`
+    # are not module-level policy constants this block echoes -- they are
+    # already recorded faithfully in `selection_record["params"]` above
+    # whenever a selection sets them.
+    resolved_bridge_target = int(selection.get("bridge_target", BRIDGE_TARGET))
+
     meta = graph.metadata
     manifest = {
         "formatVersion": meta["formatVersion"],
@@ -826,7 +864,7 @@ def build_manifest_and_ledger(
             "descendingSuperclass": DESCENDING_SUPERCLASS,
             "sensoryTarget": SENSORY_TARGET,
             "descendingTarget": DESCENDING_TARGET,
-            "bridgeTarget": BRIDGE_TARGET,
+            "bridgeTarget": resolved_bridge_target,
             "synapseThreshold": SYNAPSE_THRESHOLD,
         },
         "selectionCounts": selection["counts"],
