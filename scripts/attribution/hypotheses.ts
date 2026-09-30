@@ -1,10 +1,9 @@
-import { mkdirSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { OUTPUT_POPULATION } from '../../src/lib/arena/actions';
 import { outputNeuronIndices } from '../../src/lib/connectome/readout';
-import { atomicWriteFileSync, sha256Hex } from '../training/fsio';
 import {
   assertSameArchive,
   computeArchiveSha256,
@@ -15,7 +14,8 @@ import {
   graphForEntry,
   loadArchive,
   parseFlags,
-  resolvePathFlag
+  resolvePathFlag,
+  writeJsonArtifact
 } from './shared';
 
 /**
@@ -270,6 +270,12 @@ export const evaluateH2 = (independenceById: Map<string, IndependenceEntry>): Hy
 
 const H3_SEEDS = [101, 202, 303];
 const H3_RATIO_BOUND = 1.25;
+// Observed on the real archive: seed 202's ratio is dominated by an
+// extremely small (but non-zero) `bioMean` denominator (~3.5e-5, versus
+// ~2.9e-4 and ~5.6e-3 for the other two seeds), producing a single outsized
+// ratio (~228x) that by itself pushes the whole `tMeanCI90` interval well
+// past `H3_RATIO_BOUND` and forces `inconclusive` -- descriptive of this
+// dataset, not a claim about the statistic itself.
 
 export const evaluateH3 = (
   saliencyById: Map<string, SaliencyEntry>,
@@ -442,6 +448,26 @@ export const runHypotheses = (
   const indices = outputNeuronIndices(biologicalGraph);
   const thrustDIndices = newlyConnectedThrustDIndices(pSwap.addedEdges, biologicalGraph.outputPopulationIndex, indices);
 
+  // `evaluateH3` reuses `thrustDIndices` (D-space indices derived from
+  // `biologicalGraph` ABOVE) to index directly into P's OWN saliency entries
+  // (`saliencyById.get('P-seed...')`, see `evaluateH3`'s `meanAt`). That is
+  // only correct if P's graph assigns D-space order (which raw neuron ids
+  // are output-assigned, and their ascending order) identically to the
+  // biological graph's. This module cannot check that itself without a
+  // physical intervention-graph index (P's actual swapped binary isn't
+  // resolvable from the committed archive alone -- `resolve-graph.ts`
+  // requires `--intervention-index`/`--archived-intervention-index` for any
+  // non-bigq graphId, and no physical copy of the intervention graphs ships
+  // in the repo). The invariant IS independently enforced, just in a
+  // different process: `scripts/analysis/linkage.py`'s `output_idx` check
+  // asserts, for every graph including every intervention graph (P
+  // included), that its output-assigned raw neuron indices match
+  // `descending-types-v1.json`'s own sorted-by-index D-space order -- so
+  // every graph in this archive shares one fixed, descending-types-derived
+  // D-space order by construction, and `linkage.py` would already have
+  // thrown before this file could ever see a mismatched archive (a
+  // thermo-methodology review finding, S3).
+
   const h1 = evaluateH1(linkageById, regimeById);
   const h2 = evaluateH2(independenceById);
   const h3 = evaluateH3(saliencyById, thrustDIndices);
@@ -455,9 +481,7 @@ export const runHypotheses = (
     H2: h2,
     H3: h3
   });
-  mkdirSync(resolve(args.out, '..'), { recursive: true });
-  atomicWriteFileSync(args.out, body);
-  return { out: args.out, sha256: sha256Hex(body) };
+  return writeJsonArtifact(args.out, body);
 };
 
 const main = (): void => {

@@ -205,10 +205,12 @@ describe('evaluateH3', () => {
 
 describe('newlyConnectedThrustDIndices', () => {
   it('keeps only added-edge targets assigned to the thrust population, mapped to D-space', () => {
-    // Raw neurons 5 (thrust), 6 (yaw), 7 (thrust, but not output-assigned -> excluded).
+    // Raw neurons 5 (thrust), 6 (yaw), 7 (thrust, but deliberately left out of
+    // `indices` below -> excluded, exercising the `dByNeuron.get(edge.post)
+    // === undefined` branch even though `outputPopulationIndex[7]` itself is
+    // thrust).
     const outputPopulationIndex = Int32Array.from([-1, -1, -1, -1, -1, OUTPUT_POPULATION.thrust, OUTPUT_POPULATION.yaw, OUTPUT_POPULATION.thrust]);
-    // D-space: outputNeuronIndices would be [5, 6] (neuron 7 has no output assignment here... wait it does; fix below).
-    const indices = Int32Array.from([5, 6]); // D-space order for this hand-built fixture
+    const indices = Int32Array.from([5, 6]); // D-space order for this hand-built fixture -- 7 is not in it
     const addedEdges = [
       { pre: 1, post: 5 }, // thrust, output-assigned -> d=0
       { pre: 2, post: 6 }, // yaw -> excluded

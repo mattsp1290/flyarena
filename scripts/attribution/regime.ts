@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -6,7 +6,7 @@ import type { ConnectomeGraph } from '../../src/lib/connectome/format';
 import type { ReadoutWeights } from '../../src/lib/connectome/readout';
 import { NEURAL_SUBSTEPS_PER_TICK } from '../../src/lib/connectome/constants';
 import { runEpisode } from '../training/episode';
-import { atomicWriteFileSync, sha256Hex } from '../training/fsio';
+import { sha256Hex } from '../training/fsio';
 import { createRegimeAccumulator } from '../null/regime-metrics';
 import {
   assertSameArchive,
@@ -20,7 +20,8 @@ import {
   resolvePathFlag,
   SALIENCY_SEEDS,
   SALIENCY_TICKS,
-  weightsForEntry
+  weightsForEntry,
+  writeJsonArtifact
 } from './shared';
 
 /**
@@ -222,9 +223,7 @@ export const runRegime = (args: Readonly<RegimeArgs>): { readonly out: string; r
     steadyStateDistanceThreshold: STEADY_STATE_DISTANCE_THRESHOLD,
     entries
   });
-  mkdirSync(resolve(args.out, '..'), { recursive: true });
-  atomicWriteFileSync(args.out, body);
-  return { out: args.out, count: entries.length, sha256: sha256Hex(body) };
+  return { ...writeJsonArtifact(args.out, body), count: entries.length };
 };
 
 const main = (): void => {

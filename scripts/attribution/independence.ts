@@ -1,11 +1,9 @@
-import { mkdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import type { ConnectomeGraph } from '../../src/lib/connectome/format';
 import type { ReadoutWeights } from '../../src/lib/connectome/readout';
 import { runEpisode } from '../training/episode';
-import { atomicWriteFileSync, sha256Hex } from '../training/fsio';
 import { mean } from '../training/stats';
 import {
   computeArchiveSha256,
@@ -17,7 +15,8 @@ import {
   resolvePathFlag,
   SCORING_SEEDS,
   SCORING_TICKS,
-  weightsForEntry
+  weightsForEntry,
+  writeJsonArtifact
 } from './shared';
 
 /**
@@ -136,9 +135,7 @@ export const runIndependence = (
   }
   entries.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   const body = JSON.stringify({ version: 1, archiveSha256: computeArchiveSha256(args.archivePath), entries });
-  mkdirSync(resolve(args.out, '..'), { recursive: true });
-  atomicWriteFileSync(args.out, body);
-  return { out: args.out, count: entries.length, sha256: sha256Hex(body) };
+  return { ...writeJsonArtifact(args.out, body), count: entries.length };
 };
 
 const main = (): void => {

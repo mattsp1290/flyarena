@@ -1,10 +1,9 @@
-import { mkdirSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { runShardedEvaluation } from '../null/sharded-evaluation';
 import { requireNonNegativeInt, requirePositiveInt } from '../training/cli';
-import { atomicWriteFileSync, sha256Hex } from '../training/fsio';
 import { conditionRng, pairedStats, type PairedStats } from '../training/stats';
 import type { AblateSeedResult, AblateWorkerMessage, AblateWorkerTask } from './ablate-task';
 import {
@@ -18,7 +17,8 @@ import {
   resolvePathFlag,
   SCORING_SEEDS,
   SCORING_TICKS,
-  weightsForEntry
+  weightsForEntry,
+  writeJsonArtifact
 } from './shared';
 
 /**
@@ -261,9 +261,7 @@ export const runAblate = async (
     resamples: args.resamples,
     entries: outEntries
   });
-  mkdirSync(resolve(args.out, '..'), { recursive: true });
-  atomicWriteFileSync(args.out, body);
-  return { out: args.out, count: outEntries.length, sha256: sha256Hex(body) };
+  return { ...writeJsonArtifact(args.out, body), count: outEntries.length };
 };
 
 /** Decode an archive entry's base64 `theta` into a plain flat `number[]` (JSON-transportable over `child_process.fork`'s IPC). */

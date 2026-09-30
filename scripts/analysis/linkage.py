@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Mapping
@@ -112,17 +113,102 @@ def _load_intervention_index(index_path: Path, archived_index_path: Path) -> dic
     return {entry["id"]: entry for entry in index["entries"]}
 
 
+#: Mirrors `src/lib/arena/config.ts`'s `ARENA_CONFIG` field-for-field, in the
+#: same declaration order `Object.keys(ARENA_CONFIG)` walks -- the `default`
+#: arena task's own config, unmodified (`src/lib/arena/tasks.ts`:
+#: `ARENA_TASKS.default: ARENA_CONFIG`). Only the default task's fingerprint
+#: is needed on this side (`default_task_readouts` below only ever looks at
+#: `arenaTask == "default"` entries), so the other four `ARENA_TASKS`
+#: variants (`hazard-heavy`/`sparse-food`/`no-movement`/`crowded`) are not
+#: ported.
+_DEFAULT_ARENA_CONFIG: dict[str, float] = {
+    "fixedDeltaSeconds": 1 / 30,
+    "halfWidth": 12,
+    "halfDepth": 8,
+    "agentRadius": 0.35,
+    "foodRadius": 0.25,
+    "hazardRadius": 0.6,
+    "foodCount": 4,
+    "hazardCount": 2,
+    "spawnInset": 1,
+    "maxSpeed": 6,
+    "acceleration": 9,
+    "turnRate": math.pi,
+    "rollingDrag": 0.7,
+    "brakeDrag": 8,
+    "movementScorePerUnit": 0.1,
+    "foodScore": 10,
+    "hazardPenalty": 2,
+    "sensorRange": 24,
+}
+
+
+def _canonical_number(value: float) -> str:
+    """Mirrors `src/lib/arena/config.ts`'s `canonicalNumber`: plain `String(value)`
+    for every value this config ever holds (`-0` never occurs among these
+    fields, so that branch is not ported). Python's `repr()` for a float and
+    JS's `Number.prototype.toString()` both use shortest-round-trip decimal
+    formatting (ES2015 / Python 3.1+), so e.g. `repr(1 / 30)` and
+    `(1 / 30).toString()` both give `"0.03333333333333333"`, and
+    `repr(math.pi)`/`Math.PI.toString()` both give `"3.141592653589793"` --
+    checked against a live `node` run of `createArenaConfigFingerprint`
+    against this exact config when this was written. An integral Python
+    value (e.g. `12`) uses `str()` instead of `repr()` so it renders `"12"`,
+    matching JS's `String(12)`, not Python's `repr(12.0)` -> `"12.0"`."""
+    return str(int(value)) if float(value).is_integer() else repr(value)
+
+
+def _create_arena_config_fingerprint(config: Mapping[str, float]) -> str:
+    """Mirrors `src/lib/arena/config.ts`'s `createArenaConfigFingerprint` exactly."""
+    parts = [f"{key}={_canonical_number(value)}" for key, value in config.items()]
+    return "arena-config-v1|" + "|".join(parts)
+
+
+#: `resolveArenaTask('default').fingerprint` -- the default arena task's
+#: fixed, always-reproducible fingerprint (`src/lib/arena/tasks.ts`'s
+#: `resolveArenaTask` docstring).
+DEFAULT_TASK_FINGERPRINT = _create_arena_config_fingerprint(_DEFAULT_ARENA_CONFIG)
+
+
+def _arena_task_fingerprint_of(entry: dict) -> str:
+    """Mirrors `scripts/attribution/archive-readouts.ts`'s
+    `arenaTaskFingerprintOf`: an entry's own recorded `arenaTaskFingerprint`
+    when present, else the resolved arena task's fingerprint. Only entries
+    already filtered to `arenaTask == "default"` ever reach this (see
+    `default_task_readouts`), so the "else" side is always
+    `DEFAULT_TASK_FINGERPRINT` here -- `resolveArenaTask('default')` always
+    returns `ARENA_CONFIG` itself, unmodified, regardless of what a
+    mislabeled entry's own `arenaTaskFingerprint` field says."""
+    stored = entry.get("arenaTaskFingerprint")
+    return stored if stored is not None else DEFAULT_TASK_FINGERPRINT
+
+
 def default_task_readouts(readouts: list[dict]) -> list[dict]:
     """Scope to the default-task readouts only -- mirrors `scripts/
-    attribution/shared.ts`'s `loadArchive` exactly. `flyarena-qp2e`'s
-    per-task archive additions (52 `kind: "task-intervention"` entries
-    across 4 non-default arena tasks) are out of scope for this WP (see
-    that TS function's own doc comment for why). `saliency.json`/
-    `independence.json`/`regime.json` are themselves already scoped this
-    way (produced by the TS side's `loadArchive`), so this module must
-    apply the identical filter, or a per-task entry here would have no
-    matching saliency entry to join against."""
-    return [entry for entry in readouts if entry["arenaTask"] == "default"]
+    attribution/shared.ts`'s `loadArchive` exactly, including its
+    fingerprint cross-check. `flyarena-qp2e`'s per-task archive additions
+    (52 `kind: "task-intervention"` entries across 4 non-default arena
+    tasks) are out of scope for this WP (see that TS function's own doc
+    comment for why). `saliency.json`/`independence.json`/`regime.json` are
+    themselves already scoped this way (produced by the TS side's
+    `loadArchive`), so this module must apply the identical filter, or a
+    per-task entry here would have no matching saliency entry to join
+    against. Each surviving entry's `_arena_task_fingerprint_of(entry)` is
+    cross-checked against the default task's own fingerprint (not merely
+    trusting the `arenaTask` string label) so a hypothetical future entry
+    mislabeled `arenaTask: "default"` whose stored fingerprint disagrees
+    raises loudly here too, not just on the TS side (a thermo-maintainability
+    review finding, I1: this filter previously trusted the label alone)."""
+    filtered = [entry for entry in readouts if entry["arenaTask"] == "default"]
+    for entry in filtered:
+        fingerprint = _arena_task_fingerprint_of(entry)
+        if fingerprint != DEFAULT_TASK_FINGERPRINT:
+            raise ValueError(
+                f'linkage: archive entry "{entry["id"]}" has arenaTask "default" but arenaTaskFingerprintOf '
+                f'resolves to "{fingerprint}", not the default task\'s own fingerprint '
+                f'"{DEFAULT_TASK_FINGERPRINT}"'
+            )
+    return filtered
 
 
 def build_archive_shas(readouts: list[dict]) -> dict[str, tuple]:

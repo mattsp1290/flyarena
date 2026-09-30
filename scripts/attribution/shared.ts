@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
 
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -7,7 +7,7 @@ import type { ConnectomeGraph } from '../../src/lib/connectome/format';
 import { resolveArenaTask } from '../../src/lib/arena/tasks';
 import { readoutFromFlat } from '../../src/lib/connectome/readout-serialization';
 import type { ReadoutWeights } from '../../src/lib/connectome/readout';
-import { sha256Hex } from '../training/fsio';
+import { atomicWriteFileSync, sha256Hex } from '../training/fsio';
 import { arenaTaskFingerprintOf, type ArchivedReadout } from './archive-readouts';
 import { resolveReadoutGraph, type ResolveGraphConfig } from './resolve-graph';
 
@@ -187,3 +187,24 @@ export const defaultResolveGraphConfig = (args: {
   interventionIndexPath: args.interventionIndexPath,
   archivedInterventionIndexPath: args.archivedInterventionIndexPath ?? DEFAULT_ARCHIVED_INTERVENTION_INDEX_PATH
 });
+
+/**
+ * Write `body` (a fully-serialized JSON string, already `JSON.stringify`d by
+ * the caller so it can also be hashed) to `outPath`: `mkdirSync` its parent
+ * directory, `atomicWriteFileSync` it, and hash the same bytes with
+ * `sha256Hex`. Every WP2 analysis CLI (`saliency.ts`/`independence.ts`/
+ * `regime.ts`/`ablate.ts`/`hypotheses.ts`) ended its `run*` function with an
+ * identical four/five-line copy of exactly this sequence -- a
+ * thermo-maintainability review finding (I2): `fsio.ts`'s own doc comment
+ * already tells the story of `sha256Hex`/`atomicWriteFileSync` themselves
+ * needing consolidation for drifting into per-file copies, and this PR
+ * re-introduced the same drift one layer up (the *composition* of those two
+ * primitives, not the primitives themselves). Callers merge this result's
+ * `{ out, sha256 }` with their own extra fields (`count`, etc.) rather than
+ * this helper trying to guess a generic return shape.
+ */
+export const writeJsonArtifact = (outPath: string, body: string): { out: string; sha256: string } => {
+  mkdirSync(resolve(outPath, '..'), { recursive: true });
+  atomicWriteFileSync(outPath, body);
+  return { out: outPath, sha256: sha256Hex(body) };
+};

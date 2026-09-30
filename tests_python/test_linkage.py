@@ -7,6 +7,7 @@ groups, not neurons" requirement).
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -142,6 +143,54 @@ def test_default_task_readouts_filters_out_per_task_entries():
     ]
     result = linkage.default_task_readouts(readouts)
     assert [r["id"] for r in result] == ["biological-seed101", "P-seed202"]
+
+
+def test_default_task_readouts_raises_on_mislabeled_entry_with_disagreeing_fingerprint():
+    # A hypothetical future archive-writer bug: an entry labeled
+    # `arenaTask: "default"` but carrying a stale/wrong `arenaTaskFingerprint`
+    # (e.g. copy-pasted from a per-task entry with only the label fixed).
+    # `shared.ts`'s `loadArchive` throws on this (thermo-maintainability
+    # review finding I1); `default_task_readouts` must too, not silently
+    # include the mislabeled entry.
+    readouts = [
+        {"id": "biological-seed101", "arenaTask": "default"},
+        {
+            "id": "mislabeled-entry",
+            "arenaTask": "default",
+            "arenaTaskFingerprint": "arena-config-v1|halfWidth=8|hazardCount=4",  # some other task's fingerprint
+        },
+    ]
+    with pytest.raises(ValueError, match='has arenaTask "default" but arenaTaskFingerprintOf'):
+        linkage.default_task_readouts(readouts)
+
+
+def test_default_task_readouts_accepts_entry_whose_stored_fingerprint_matches_default():
+    # An entry that DOES carry an explicit `arenaTaskFingerprint` equal to
+    # the default task's own fingerprint is legitimate (the check is on
+    # agreement, not on the field's mere presence).
+    readouts = [
+        {
+            "id": "biological-seed101",
+            "arenaTask": "default",
+            "arenaTaskFingerprint": linkage.DEFAULT_TASK_FINGERPRINT,
+        }
+    ]
+    result = linkage.default_task_readouts(readouts)
+    assert [r["id"] for r in result] == ["biological-seed101"]
+
+
+def test_default_task_readouts_passes_real_archive_default_entries():
+    # The real archive's 23 `arenaTask == "default"` entries (`training/
+    # archive/trained-readouts-v1.json`, WP1b's per-task additions bring the
+    # total to 75) must all pass the fingerprint cross-check unchanged --
+    # this is the non-degenerate "real data still works" companion to the
+    # synthetic mismatch case above.
+    archive_path = REPO_ROOT / "training" / "archive" / "trained-readouts-v1.json"
+    if not archive_path.exists():
+        pytest.skip("training/archive/trained-readouts-v1.json not present in this checkout")
+    archive = json.loads(archive_path.read_text())
+    result = linkage.default_task_readouts(archive["readouts"])
+    assert len(result) == 23
 
 
 # ---------------------------------------------------------------------------
