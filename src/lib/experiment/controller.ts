@@ -272,7 +272,7 @@ const graphBinarySha256ForMode = (manifest: ArenaManifest, mode: GraphMode): str
  *
  * Returns the settled result promise (never rejects), which a caller
  * *could* use as a sequencing gate for a second, dependent sidecar load —
- * but as of the five `initialize()` forks below, none of them actually
+ * but as of the sidecar forks in `initialize()` below, none of them actually
  * needs to (a thermo-maintainability review, Important: an earlier version
  * chained all four onto one another in sequence purely as an authorial
  * habit copied from the first fork onto every fork added since, even
@@ -283,8 +283,8 @@ const graphBinarySha256ForMode = (manifest: ArenaManifest, mode: GraphMode): str
  * cost of loading all four sidecar artifacts the *sum* of their fetch
  * latencies rather than the *max* — a real, user-visible difference for the
  * Findings panel and the ledger on a throttled connection, not a
- * micro-optimization, and one that would only have grown worse with a
- * fifth artifact). If a future sidecar load genuinely needs to wait on
+ * micro-optimization, and one that would only have grown worse as more
+ * artifacts were added). If a future sidecar load genuinely needs to wait on
  * another one's *result* (not just its manifest), chain it the way the
  * pre-parallelization version of this file did, and say so in that fork's
  * own comment — chaining for no data dependency is the anti-pattern this

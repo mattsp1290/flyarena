@@ -43,21 +43,21 @@ import { provenanceFor, reasonFor, sidecarStepStatus, type BuildFindingStepsInpu
 const hLabel = (n: 1 | 2 | 3): string => `H${n}`;
 
 const H1_CLAUSE: Record<HypothesisOutcome, string> = {
-  supported: 'consistent with routing around the missing wiring',
-  'not-supported': 'not consistent with routing around the missing wiring',
-  inconclusive: 'inconclusive on whether it is consistent with routing around the missing wiring'
+  supported: 'saliency is consistent with routing around the missing wiring',
+  'not-supported': 'saliency is not consistent with routing around the missing wiring',
+  inconclusive: 'the evidence is inconclusive on whether saliency is consistent with routing around the missing wiring'
 };
 
 const H2_CLAUSE: Record<HypothesisOutcome, string> = {
-  supported: 'equivalent between biological and rewired readouts, within the predeclared bound',
-  'not-supported': 'not equivalent between biological and rewired readouts, outside the predeclared bound',
-  inconclusive: 'inconclusive on whether it is equivalent between biological and rewired readouts'
+  supported: 'the constant-policy share is equivalent between biological and rewired readouts, within the predeclared bound',
+  'not-supported': 'the constant-policy share is not equivalent between biological and rewired readouts, outside the predeclared bound',
+  inconclusive: 'the evidence is inconclusive on whether the constant-policy share is equivalent between biological and rewired readouts'
 };
 
 const H3_CLAUSE: Record<HypothesisOutcome, string> = {
-  supported: 'not used more than the biological wiring, within the predeclared bound',
-  'not-supported': 'used more than the biological wiring, beyond the predeclared bound',
-  inconclusive: 'inconclusive on whether it is used more than the biological wiring'
+  supported: "P's new wiring is not used more than the biological wiring, within the predeclared bound",
+  'not-supported': "P's new wiring is used more than the biological wiring, beyond the predeclared bound",
+  inconclusive: "the evidence is inconclusive on whether P's new wiring is used more than the biological wiring"
 };
 
 const hypothesisDetail = (
@@ -103,9 +103,12 @@ export const buildReadoutAttributionStep = (inputs: BuildFindingStepsInputs): Fi
   // latter presupposes an answer this study's own data does not give (all
   // three hypotheses came back inconclusive on the real committed data).
   // Every clause -- including the `'supported'`/`'not-supported'` branches,
-  // not only `'inconclusive'` -- is its own grammatical, hedged statement
-  // of exactly what that predeclared rule's outcome means, never a bare
-  // category label. The first clause is the only one phrased in
+  // not only `'inconclusive'` -- is its own self-contained grammatical,
+  // hedged statement of exactly what that predeclared rule's outcome
+  // means, never a bare category label. Each clause carries its own
+  // subject so `'inconclusive'` predicates the *evidence*, never the
+  // quantity under test ("P's new wiring is inconclusive" was a category
+  // error). The first clause is the only one phrased in
   // correlational language even when `'supported'` ("consistent with"),
   // matching `00-overview.md`'s "H1 is always described in correlational
   // language" rule; only the ablation results (not rendered in this
@@ -113,9 +116,9 @@ export const buildReadoutAttributionStep = (inputs: BuildFindingStepsInputs): Fi
   // `docs/readout-attribution-report.md`) support causal wording.
   const sentence =
     'Testing why trained readouts close the gap (trained decoder): ' +
-    `saliency is ${H1_CLAUSE[hypotheses.H1.outcome]} (${hLabel(1)}: ${hypotheses.H1.outcome}); ` +
-    `the constant-policy share is ${H2_CLAUSE[hypotheses.H2.outcome]} (${hLabel(2)}: ${hypotheses.H2.outcome}); ` +
-    `P's new wiring is ${H3_CLAUSE[hypotheses.H3.outcome]} (${hLabel(3)}: ${hypotheses.H3.outcome}), under this model.`;
+    `${H1_CLAUSE[hypotheses.H1.outcome]} (${hLabel(1)}: ${hypotheses.H1.outcome}); ` +
+    `${H2_CLAUSE[hypotheses.H2.outcome]} (${hLabel(2)}: ${hypotheses.H2.outcome}); ` +
+    `${H3_CLAUSE[hypotheses.H3.outcome]} (${hLabel(3)}: ${hypotheses.H3.outcome}), under this model.`;
 
   const details = [
     hypothesisDetail(1, 'consistent with routing around', hypotheses.H1),

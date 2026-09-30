@@ -694,9 +694,12 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
       expect(realReadoutAttribution.hypotheses.H2.outcome).toBe('inconclusive');
       expect(realReadoutAttribution.hypotheses.H3.outcome).toBe('inconclusive');
       const step = findStep(buildFindingSteps(baseInputs()), 'readout-attribution');
-      expect(step.sentence).toContain('saliency is inconclusive on whether it is consistent with routing around the missing wiring');
-      expect(step.sentence).toContain('the constant-policy share is inconclusive on whether it is equivalent between biological and rewired readouts');
-      expect(step.sentence).toContain("P's new wiring is inconclusive on whether it is used more than the biological wiring");
+      expect(step.sentence).toContain('the evidence is inconclusive on whether saliency is consistent with routing around the missing wiring');
+      expect(step.sentence).toContain('the evidence is inconclusive on whether the constant-policy share is equivalent between biological and rewired readouts');
+      expect(step.sentence).toContain("the evidence is inconclusive on whether P's new wiring is used more than the biological wiring");
+      // The quantity under test is never itself predicated as "inconclusive"
+      // (only the evidence is) -- the category error two review rounds caught.
+      expect(step.sentence).not.toMatch(/(saliency|share|wiring) is inconclusive/);
       expect(step.sentence).not.toContain('not consistent with routing around');
       expect(step.sentence).not.toContain('not equivalent between biological and rewired readouts');
       expect(step.sentence).not.toContain('P\'s new wiring is used more than the biological wiring,');

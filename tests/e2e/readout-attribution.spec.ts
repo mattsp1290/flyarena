@@ -43,9 +43,10 @@ test.describe('Findings panel (readout attribution)', () => {
     await expect(sentenceEl).toContainText('(H1: inconclusive)');
     await expect(sentenceEl).toContainText('(H2: inconclusive)');
     await expect(sentenceEl).toContainText('(H3: inconclusive)');
-    await expect(sentenceEl).toContainText('inconclusive on whether it is consistent with routing around the missing wiring');
-    await expect(sentenceEl).toContainText('inconclusive on whether it is equivalent between biological and rewired readouts');
-    await expect(sentenceEl).toContainText("inconclusive on whether it is used more than the biological wiring");
+    await expect(sentenceEl).toContainText('the evidence is inconclusive on whether saliency is consistent with routing around the missing wiring');
+    await expect(sentenceEl).toContainText('the evidence is inconclusive on whether the constant-policy share is equivalent between biological and rewired readouts');
+    await expect(sentenceEl).toContainText("the evidence is inconclusive on whether P's new wiring is used more than the biological wiring");
+    await expect(sentenceEl).not.toContainText(/(saliency|share|wiring) is inconclusive/);
     await expect(sentenceEl).not.toContainText('not consistent with routing around');
     await expect(sentenceEl).not.toContainText('not equivalent between biological and rewired readouts');
 
