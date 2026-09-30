@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -25,11 +24,11 @@ import interventions  # noqa: E402
 import swap_ops  # noqa: E402
 from graph_io import build_dense_matrices  # noqa: E402
 from transfer import OBSERVATION_CHANNEL_INDEX, OUTPUT_POPULATION_INDEX, transfer_matrix  # noqa: E402
+from ts_cross_check import run_ts_cross_check  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_PATH = REPO_ROOT / "tests_python" / "fixtures" / "trace-graph-transfer.json"
 ROUNDTRIP_TS = REPO_ROOT / "tests_python" / "fixtures" / "graph_binary_roundtrip.ts"
-TSX_BIN = REPO_ROOT / "node_modules" / ".bin" / "tsx"
 
 RIGHT_IDX = OBSERVATION_CHANNEL_INDEX["rightClearance"]
 FORWARD_IDX = OBSERVATION_CHANNEL_INDEX["forwardClearance"]
@@ -707,43 +706,18 @@ def test_vectorized_delta_matches_scalar_first_order_delta(trace_graph, trace_gr
 # ---------------------------------------------------------------------------
 
 
-def _find_node_bin_dir() -> "str | None":
-    if shutil.which("node") is not None:
-        return None
-    candidate = Path.home() / ".nvm" / "versions" / "node" / "v22.22.3" / "bin"
-    if (candidate / "node").exists():
-        return str(candidate)
-    return None
+def _run_ts_roundtrip(paths: "list[Path]") -> "list[dict]":
+    """Runs `graph_binary_roundtrip.ts` on `paths` via the shared
+    `run_ts_cross_check` helper (`tests_python/ts_cross_check.py`) and
+    returns its parsed JSON stdout (a list of per-path summaries).
 
-
-def _run_ts_roundtrip(paths: "list[Path]") -> "list[dict] | None":
-    """Returns the TS-side summaries, or `None` (with a `pytest.skip`) if
-    Node/tsx is unavailable -- mirrors `test_null_stats_cross_check.py`'s
-    skip-not-fail convention for this repo's Python suite running standalone
-    without a JS toolchain."""
-    if not TSX_BIN.exists():
-        pytest.skip(f"tests_python: {TSX_BIN} not found (run npm ci first) -- skipping TS round-trip check")
-    env = dict(os.environ)
-    extra_dir = _find_node_bin_dir()
-    if extra_dir is not None:
-        env["PATH"] = f"{extra_dir}:{env.get('PATH', '')}"
-    elif shutil.which("node") is None:
-        pytest.skip("tests_python: node not found on PATH (and not under ~/.nvm) -- skipping TS round-trip check")
-    try:
-        result = subprocess.run(
-            [str(TSX_BIN), str(ROUNDTRIP_TS)],
-            input=json.dumps({"paths": [str(p) for p in paths]}),
-            capture_output=True,
-            text=True,
-            cwd=REPO_ROOT,
-            env=env,
-            timeout=60,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        pytest.skip(f"tests_python: could not run tsx ({error}) -- skipping TS round-trip check")
-    if result.returncode != 0:
-        pytest.skip(f"tests_python: tsx round-trip check failed to run: {result.stderr} -- skipping")
-    return json.loads(result.stdout)
+    This used to be its own copy of the find-node / run-tsx / skip-locally
+    -fail-in-CI logic; that pattern now lives in one place
+    (`ts_cross_check.run_ts_cross_check`), shared with
+    `test_null_stats_cross_check.py`,
+    `test_ts_import_graph_cross_check.py`, and
+    `test_arena_config_fingerprint_cross_check.py`."""
+    return run_ts_cross_check(ROUNDTRIP_TS, {"paths": [str(p) for p in paths]})
 
 
 def _write_cli_inputs(root: Path, trace_graph: "binfmt.GraphArrays") -> "tuple[Path, Path, Path]":

@@ -1,13 +1,15 @@
 """Shared helper for this repo's "run the REAL TypeScript implementation via
 `npx tsx` (no build step) and assert Python's output matches it exactly"
 test pattern, used by `test_null_stats_cross_check.py`,
-`test_ts_import_graph_cross_check.py`, and
-`test_arena_config_fingerprint_cross_check.py`.
+`test_ts_import_graph_cross_check.py`,
+`test_arena_config_fingerprint_cross_check.py`, and
+`test_interventions.py` (its `_run_ts_roundtrip`).
 
 A dual thermo review on an earlier revision flagged that the "find node,
 invoke tsx, skip cleanly on a missing/broken JS toolchain" logic had
 drifted into three near-identical copies across those files. This module
-holds the one copy.
+holds the one copy; `test_interventions.py`'s own copy (a fourth) was folded
+in afterward.
 
 Local runs SKIP (not fail) when Node/tsx is unavailable -- this repo's
 Python test suite must still run standalone without a JS toolchain. In CI
