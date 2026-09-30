@@ -83,10 +83,10 @@ if (!deployUrl) {
 }
 
 const here = dirname(fileURLToPath(import.meta.url));
-const allowlist = parseAllowlist(readFileSync(resolve(here, 'smoke-allow-missing.json'), 'utf-8'));
 
 /** Every step id `FindingsPanel.svelte` is expected to render, in `FINDING_SECTIONS`' own declared order -- never a hard-coded list (this file's own doc comment explains why this import, not DOM-scraping, is the source of truth). */
 const expectedStepIds = FINDING_SECTIONS.flatMap((section) => section.stepIds);
+const allowlist = parseAllowlist(readFileSync(resolve(here, 'smoke-allow-missing.json'), 'utf-8'), expectedStepIds);
 
 /** Polls `check` until it returns true or `timeoutMs` elapses; throws `message` on timeout. Never logs `check`'s inputs. */
 const waitUntil = async (check: () => Promise<boolean>, timeoutMs: number, message: string): Promise<void> => {

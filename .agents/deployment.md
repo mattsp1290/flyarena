@@ -68,8 +68,15 @@ guarded against directly by `--deploy` mode's own lock (see "Deploy lock and
 The script then fetches the public HTML and every emitted asset and compares
 them with the local build. It then runs a live Chromium smoke check
 (`scripts/verify/live-smoke.ts`, via `node_modules/.bin/tsx`) against
-`DEPLOY_URL`: it waits for the app to reach ready, expands the Findings panel,
-and confirms step 1's sentence and the model ledger both render. This
+`DEPLOY_URL`. It waits for the app to reach ready and expands the Findings
+panel. It then polls every step in `FINDING_SECTIONS` (by `data-step-id` and
+`data-step-status`) until it settles, and requires `ok`. An `unavailable` step
+gets one reload and recheck after 10 s. An `invalid` step fails immediately.
+Only ids listed in the committed `scripts/verify/smoke-allow-missing.json`
+(default `[]`, printed on every run, unknown or duplicate ids rejected) may be
+`missing`. It also confirms step 1's sentence and the model ledger render, and
+that `#graph-lab` loads with no console errors and shows its idle text. It
+never clicks Connect. This
 requires a Chromium browser installed on the machine running `deploy.sh`
 (`npx playwright install chromium` -- a one-time setup step, not run by
 `deploy.sh` itself). A failed asset check or smoke check triggers the

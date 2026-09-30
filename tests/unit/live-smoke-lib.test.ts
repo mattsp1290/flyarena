@@ -86,30 +86,44 @@ describe('isSettledStepStatus', () => {
 });
 
 describe('parseAllowlist', () => {
+  const KNOWN = ['task-generality', 'readout-attribution', 'selection-robustness'] as const;
+
   it('parses the committed default: an empty array', () => {
-    expect(parseAllowlist('[]')).toEqual([]);
+    expect(parseAllowlist('[]', KNOWN)).toEqual([]);
   });
 
   it('parses a populated array of step-id strings', () => {
-    expect(parseAllowlist('["task-generality", "readout-attribution"]')).toEqual(['task-generality', 'readout-attribution']);
+    expect(parseAllowlist('["task-generality", "readout-attribution"]', KNOWN)).toEqual(['task-generality', 'readout-attribution']);
   });
 
   it('rejects invalid JSON', () => {
-    expect(() => parseAllowlist('not valid json')).toThrow('live-smoke: smoke-allow-missing.json is not valid JSON.');
+    expect(() => parseAllowlist('not valid json', KNOWN)).toThrow('live-smoke: smoke-allow-missing.json is not valid JSON.');
   });
 
   it('rejects a JSON value that is not an array', () => {
-    expect(() => parseAllowlist('{"task-generality": true}')).toThrow(
+    expect(() => parseAllowlist('{"task-generality": true}', KNOWN)).toThrow(
       'live-smoke: smoke-allow-missing.json must be a JSON array of step-id strings.'
     );
-    expect(() => parseAllowlist('"task-generality"')).toThrow(
+    expect(() => parseAllowlist('"task-generality"', KNOWN)).toThrow(
       'live-smoke: smoke-allow-missing.json must be a JSON array of step-id strings.'
     );
-    expect(() => parseAllowlist('null')).toThrow('live-smoke: smoke-allow-missing.json must be a JSON array of step-id strings.');
+    expect(() => parseAllowlist('null', KNOWN)).toThrow('live-smoke: smoke-allow-missing.json must be a JSON array of step-id strings.');
+  });
+
+  it('rejects a duplicate step id', () => {
+    expect(() => parseAllowlist('["task-generality", "task-generality"]', KNOWN)).toThrow(
+      'live-smoke: smoke-allow-missing.json lists a step id more than once.'
+    );
+  });
+
+  it('rejects a step id that is not a real Findings step', () => {
+    expect(() => parseAllowlist('["task-generality", "task-generalty"]', KNOWN)).toThrow(
+      'live-smoke: smoke-allow-missing.json lists unknown step ids: ["task-generalty"].'
+    );
   });
 
   it('rejects an array containing a non-string entry', () => {
-    expect(() => parseAllowlist('["task-generality", 1]')).toThrow(
+    expect(() => parseAllowlist('["task-generality", 1]', KNOWN)).toThrow(
       'live-smoke: smoke-allow-missing.json must be a JSON array of step-id strings.'
     );
   });

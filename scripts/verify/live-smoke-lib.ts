@@ -98,8 +98,11 @@ export const decideStep = (id: string, status: string, allowlist: readonly strin
  * should fail the smoke check loudly rather than silently allow every step
  * to be missing (a non-array/non-string entry could otherwise coerce into
  * an always-true or always-false `includes` check depending on the bug).
+ * It also rejects duplicate entries and any id not in `knownStepIds` (the
+ * real Findings step ids), so a typo'd or stale entry fails the check
+ * instead of sitting in a reviewed file while allowing nothing.
  */
-export const parseAllowlist = (raw: string): readonly string[] => {
+export const parseAllowlist = (raw: string, knownStepIds: readonly string[]): readonly string[] => {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -108,6 +111,13 @@ export const parseAllowlist = (raw: string): readonly string[] => {
   }
   if (!Array.isArray(parsed) || !parsed.every((entry): entry is string => typeof entry === 'string')) {
     throw new Error('live-smoke: smoke-allow-missing.json must be a JSON array of step-id strings.');
+  }
+  if (new Set(parsed).size !== parsed.length) {
+    throw new Error('live-smoke: smoke-allow-missing.json lists a step id more than once.');
+  }
+  const unknown = parsed.filter((id) => !knownStepIds.includes(id));
+  if (unknown.length > 0) {
+    throw new Error(`live-smoke: smoke-allow-missing.json lists unknown step ids: ${JSON.stringify(unknown)}.`);
   }
   return parsed;
 };
