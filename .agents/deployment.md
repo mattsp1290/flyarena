@@ -470,3 +470,23 @@ anchor matches the live `current` target.
 
 Release: 20260927T175738Z-174655b8df27
 Commit: c5f8a32
+
+## Readout-attribution release
+
+On 2026-09-30, main revision `f639fa3` was deployed as
+`20260930T015008Z-b8a67a485195`. The release publishes the
+readout-attribution artifact (`readout-attribution-v1.json`), its report, and
+its Findings step, where all three hypotheses are inconclusive under this
+model. It also includes the task-generality and selection-robustness Findings
+steps, the grouped Findings sections, and the TypeScript↔Python cross-check CI
+changes merged since the 2026-09-27 release. `deploy.sh` held the deploy lock,
+passed the `Release:` marker check against the backfilled 2026-09-27 marker,
+ran `npm ci`, `check`, and `build --base`, uploaded, and switched `current`
+atomically. It verified public HTML and every emitted asset byte for byte. The
+live Chromium smoke check passed: the app reached ready, Findings step 1
+rendered, and the ledger rendered. No rollback was needed. The deploy log
+contained no connection values. The extended per-step smoke check is
+`flyarena-ko6t`, which is still in progress.
+
+Release: 20260930T015008Z-b8a67a485195
+Commit: f639fa3
