@@ -240,24 +240,44 @@
        `role="img"` — this gives keyboard/screen-reader users the same
        per-bin data (bin range, count) sighted-mouse users get, using data
        the component already computes (`bars`). Visually hidden via `.sr-only`
-       (clipped, not `display:none`), never rendered on screen. -->
-  <table class="sr-only">
-    <caption>Per-bin counts of the {data.null.n} rewired graphs shown in the histogram above</caption>
-    <thead>
-      <tr>
-        <th scope="col">Bin range</th>
-        <th scope="col">Count</th>
-      </tr>
-    </thead>
-    <tbody>
-      {#each bars as bar (bar.index)}
+       (clipped, not `display:none`), never rendered on screen.
+
+       flyarena-1tbx: `.sr-only` is applied to this wrapping `<div>`, never
+       directly to the `<table>` below. A `<table>` under Chromium (verified
+       directly; this repo's Playwright suite only exercises Chromium)
+       ignores an explicit `width` narrower than its content's own
+       layout-computed width — even with `table-layout: fixed` and
+       `overflow: hidden` on every cell, the table's own used width still
+       came out content-sized (~450-600px for this table's "0.00 to
+       1.00"-style cell text) instead of the declared 1px, so nothing was
+       ever actually clipped. A plain block-level `<div>`
+       has no such quirk: its `width: 1px`/`overflow: hidden` are honored
+       exactly, and an oversized table nested inside it is fully clipped —
+       confirmed by measuring both the wrapper's and the table's own
+       `getBoundingClientRect()` and `document.documentElement.scrollWidth`
+       before and after this change. The table itself is otherwise
+       unstyled, so its full structure and content (which is what actually
+       matters — screen readers read the accessibility tree, not visual
+       layout) stay exactly as reachable as before. -->
+  <div class="sr-only">
+    <table>
+      <caption>Per-bin counts of the {data.null.n} rewired graphs shown in the histogram above</caption>
+      <thead>
         <tr>
-          <td>{bar.rangeLabel}</td>
-          <td>{bar.count}</td>
+          <th scope="col">Bin range</th>
+          <th scope="col">Count</th>
         </tr>
-      {/each}
-    </tbody>
-  </table>
+      </thead>
+      <tbody>
+        {#each bars as bar (bar.index)}
+          <tr>
+            <td>{bar.rangeLabel}</td>
+            <td>{bar.count}</td>
+          </tr>
+        {/each}
+      </tbody>
+    </table>
+  </div>
 
   {#if data.null.degenerate}
     <!-- Placed before the figcaption, so "the percentile below" (not
@@ -296,7 +316,26 @@
 
   /* Visually hidden, never `display:none` — keeps the per-bin data table
      reachable by keyboard/screen-reader navigation while invisible on
-     screen (standard "sr-only" clip pattern). */
+     screen (standard "sr-only" clip pattern, same rule
+     `FindingsPanel.svelte`/`LesionColorMode.svelte` duplicate for their own
+     `<p>`/`<div>` elements). This rule is applied to the wrapping `<div>`
+     around the `<table>` below, never to the `<table>` itself (flyarena-1tbx):
+     a `<table>`'s own used width ignores an explicit `width` narrower than
+     its content's layout-computed width — confirmed by testing that even
+     `table-layout: fixed` plus `overflow: hidden` on every cell still left
+     the table's own box content-sized (~450-600px for this table's "0.00
+     to 1.00"-style cell text) rather than the declared 1px, so nothing was
+     ever actually clipped. That grown, absolutely-positioned table then
+     widened `document.documentElement.scrollWidth` past a 390px phone
+     viewport once the Findings panel exposed it, causing horizontal page
+     scroll. A plain block-level element has no such quirk: `width`/
+     `overflow: hidden` apply exactly as declared, so putting `.sr-only` on
+     the `<div>` wrapper clips the (still content-sized) table nested inside
+     it completely — verified directly against both `getBoundingClientRect()`
+     and `document.documentElement.scrollWidth` before and after. The table
+     itself is otherwise unstyled, so its full structure/content stays
+     exactly as reachable to a screen reader as before (which reads the
+     accessibility tree, not visual layout). */
   .sr-only {
     position: absolute;
     width: 1px;

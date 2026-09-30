@@ -203,13 +203,10 @@ test.describe('Findings panel — question sections', () => {
 
   test('the Findings panel itself stays within the phone-width viewport with every section expanded', async ({ page }) => {
     // Scoped to `section.findings`'s own box, not `document.documentElement`'s
-    // full `scrollWidth` (already covered, in a different route/state
-    // combination, by `tests/e2e/subpath.spec.ts`'s own phone-width check) --
-    // a pre-existing, unrelated `sr-only` table in `NullHistogram.svelte`
-    // (a sibling panel this WP does not touch) can widen the *document's*
-    // scrollWidth regardless of the Findings panel's own layout, so
-    // asserting against the whole document here would fail on a defect
-    // outside this change's scope. This test's own job is only to confirm
+    // full `scrollWidth` -- that whole-document check now lives in the test
+    // below, which used to be unable to make this same assertion because of
+    // the `NullHistogram.svelte` `sr-only` table overflow bug it now guards
+    // against (`flyarena-1tbx`). This test's own job stays narrower: confirm
     // the accordion sections this WP adds do not themselves cause overflow.
     await page.setViewportSize({ width: 390, height: 844 });
     await page.goto('/');
@@ -218,5 +215,48 @@ test.describe('Findings panel — question sections', () => {
     const panelBox = await page.locator('section.findings').boundingBox();
     expect(panelBox).not.toBeNull();
     expect(panelBox!.x + panelBox!.width).toBeLessThanOrEqual(390 + 1);
+  });
+
+  test('the whole document stays within the phone-width viewport with the Findings panel expanded (flyarena-1tbx)', async ({
+    page
+  }) => {
+    // Regression guard for flyarena-1tbx: `NullHistogram.svelte` (rendered
+    // inside `section.findings` once the "Is the measured wiring special?"
+    // question section's rewiring-null step is showing) used to render its
+    // per-bin data table with the bare `.sr-only` clip pattern applied
+    // directly to a `<table>`. A `<table>` under the default (auto) table
+    // layout ignores a `width` narrower than its content's min-content
+    // width, so the box itself grew to fit "0.00 to 1.00"-style cell text
+    // instead of clipping to 1px — widening `document.documentElement`'s
+    // `scrollWidth` past the 390px viewport and causing horizontal page
+    // scroll on phones, independent of `section.findings`'s own layout
+    // (which is why the test above alone did not catch this).
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.goto('/');
+    await waitForReady(page);
+    await expandFindingsPanel(page);
+    // The rewiring-null step (which mounts `LedgerPanel.svelte` ->
+    // `NullHistogram.svelte`) loads its own artifact asynchronously; wait
+    // for the histogram's sr-only table to actually be in the DOM before
+    // measuring, so this test cannot pass merely because the offending
+    // element had not mounted yet.
+    await expect(page.locator('.null-histogram table')).toBeAttached({ timeout: 20_000 });
+    const overflow = await page.evaluate(() => {
+      const doc = document.documentElement;
+      const offenders: Array<{ selector: string; right: number }> = [];
+      if (doc.scrollWidth > doc.clientWidth) {
+        for (const el of document.querySelectorAll<HTMLElement>('body *')) {
+          const rect = el.getBoundingClientRect();
+          if (rect.right > doc.clientWidth + 1) {
+            const id = el.id ? `#${el.id}` : '';
+            const cls = typeof el.className === 'string' && el.className ? `.${el.className.split(' ').join('.')}` : '';
+            offenders.push({ selector: `${el.tagName.toLowerCase()}${id}${cls}`, right: rect.right });
+          }
+        }
+      }
+      return { scrollWidth: doc.scrollWidth, clientWidth: doc.clientWidth, offenders };
+    });
+    expect(overflow.offenders, JSON.stringify(overflow.offenders)).toEqual([]);
+    expect(overflow.scrollWidth).toBeLessThanOrEqual(overflow.clientWidth);
   });
 });

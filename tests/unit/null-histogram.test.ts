@@ -232,7 +232,12 @@ describe('NullHistogram', () => {
    */
   it('exposes a visually-hidden table of per-bin ranges and counts (keyboard/screen-reader path to the histogram data)', () => {
     const { container } = render(NullHistogram, { data: fixture });
-    const table = container.querySelector('table.sr-only');
+    // `.sr-only` lives on the wrapping `<div>`, not the `<table>` itself
+    // (flyarena-1tbx: a `<table>`'s own `width` ignores the clip pattern's
+    // 1px constraint, widening `document.documentElement.scrollWidth` past
+    // a phone viewport -- see `NullHistogram.svelte`'s doc comment on this
+    // markup). The table itself stays fully present and unstyled inside it.
+    const table = container.querySelector('div.sr-only > table');
     expect(table).toBeTruthy();
     const rows = table?.querySelectorAll('tbody tr') ?? [];
     expect(rows.length).toBe(fixture.bins.counts.length);
