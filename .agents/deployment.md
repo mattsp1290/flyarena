@@ -497,3 +497,28 @@ contained no connection values. The extended per-step smoke check is
 
 Release: 20260930T015008Z-b8a67a485195
 Commit: f639fa3
+
+## Consolidated findings release
+
+On 2026-09-30, main revision `c67e299` was deployed as
+`20260930T022522Z-ee9d2d4b6970` (`flyarena-ko6t`). This release puts the
+extended live smoke check into production. The Findings panel now has ten
+steps, grouped into question sections: the task-generality,
+selection-robustness, and readout-attribution steps and artifacts
+(`task-generality-v1.json`, `selection-robustness-v1.json`,
+`readout-attribution-v1.json`) are live alongside the earlier studies. CI was
+green on this exact commit. It covers `check`, unit, build, e2e, and the
+strict subpath journey. `deploy.sh` held the deploy lock and passed the
+`Release:` marker check. It then ran `npm ci`, `check`, and `build --base`,
+uploaded, and switched `current` atomically. It verified public HTML and every
+emitted asset byte for byte. The extended live smoke check passed:
+- The allowlist printed as `(none)`.
+- All 10 Findings steps settled `ok`, with no reload retry needed.
+- Step 1 and the ledger rendered.
+- `#graph-lab` showed its idle text with no page or console errors, and
+  Connect was never clicked.
+
+No rollback was needed. The deploy log contained no connection values.
+
+Release: 20260930T022522Z-ee9d2d4b6970
+Commit: c67e299
