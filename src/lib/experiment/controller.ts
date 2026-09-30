@@ -16,6 +16,7 @@ import { loadPathwayInterventions, type PathwayInterventionsLoadResult } from '.
 import { loadRepertoireNull, type RepertoireNullLoadResult } from './repertoireNull';
 import { loadTaskGenerality, type TaskGeneralityLoadResult } from './taskGenerality';
 import { loadSelectionRobustness, type SelectionRobustnessLoadResult } from './selectionRobustness';
+import { loadReadoutAttribution, type ReadoutAttributionLoadResult } from './readoutAttribution';
 import { buildGraphBufferForMode, createWorkerAgentBinding } from './bindings';
 import { ExperimentRunner, isNotInitializedRejection, type ExperimentTelemetry } from './runner';
 import { transition, type ExperimentStatus } from './state';
@@ -147,6 +148,16 @@ export interface ExperimentControllerCallbacks {
    */
   onSelectionRobustness: (result: SelectionRobustnessLoadResult) => void;
   /**
+   * Fired once `loadReadoutAttribution` resolves (WP3 of
+   * `.agents/plans/readout-attribution`) — fired in parallel with every
+   * fork above (this artifact's own cross-checks need only `manifest`, not
+   * any other resolved load result), and independently of
+   * `onSelectionRobustness` itself. Never blocks reaching `ready`. The
+   * host's hook for the Findings panel's "Readout attribution" step, placed
+   * after the "Trained interventions" step.
+   */
+  onReadoutAttribution: (result: ReadoutAttributionLoadResult) => void;
+  /**
    * Fired once per agent right after `setDecoder()` has successfully applied
    * a decoder switch to both arms' Workers and reset the run to tick 0 —
    * mirrors `onTopologyApplied`'s "never speculatively before a switch is
@@ -202,6 +213,12 @@ export interface ExperimentControllerOptions {
    * seam-for-testability reasoning as `loadTaskGenerality` above.
    */
   loadSelectionRobustness?: typeof loadSelectionRobustness;
+  /**
+   * Injectable for tests; defaults to
+   * `./readoutAttribution.ts#loadReadoutAttribution`. Same
+   * seam-for-testability reasoning as `loadSelectionRobustness` above.
+   */
+  loadReadoutAttribution?: typeof loadReadoutAttribution;
   /** Passed straight through to the constructed `ExperimentRunner` (see `ExperimentRunnerOptions.targetTickIntervalMs`); `0` disables real-time pacing entirely, which unit tests use to run a many-tick determinism check without waiting out real seconds. Omitted in production, matching the runner's own real-time default. */
   targetTickIntervalMs?: number;
 }
@@ -508,6 +525,7 @@ export class ExperimentController {
     const loadRepertoire = this.options.loadRepertoireNull ?? loadRepertoireNull;
     const loadTaskGeneralityFn = this.options.loadTaskGenerality ?? loadTaskGenerality;
     const loadSelectionRobustnessFn = this.options.loadSelectionRobustness ?? loadSelectionRobustness;
+    const loadReadoutAttributionFn = this.options.loadReadoutAttribution ?? loadReadoutAttribution;
     const dataBaseUrl = `${import.meta.env.BASE_URL}data`;
     let artifacts: LoadedArenaArtifacts;
     try {
@@ -525,7 +543,7 @@ export class ExperimentController {
     this.rewiredGraphBuffer = artifacts.rewired;
     this.options.callbacks.onManifest(artifacts.manifest, artifacts.parsedBiological);
 
-    // Five independent sidecar loads, fired in parallel directly off
+    // Seven independent sidecar loads, fired in parallel directly off
     // `artifacts.manifest`/`dataBaseUrl` — none needs another's *result*,
     // only the manifest already in scope here (thermo-maintainability
     // review, Important: see `runSidecarLoad`'s own doc comment for why an
@@ -580,6 +598,11 @@ export class ExperimentController {
       'the selection-robustness study',
       () => loadSelectionRobustnessFn(artifacts.manifest, dataBaseUrl),
       (result) => this.options.callbacks.onSelectionRobustness(result)
+    );
+    this.registerSidecar<ReadoutAttributionLoadResult>(
+      'the readout-attribution study',
+      () => loadReadoutAttributionFn(artifacts.manifest, dataBaseUrl),
+      (result) => this.options.callbacks.onReadoutAttribution(result)
     );
 
     // Trained-readout artifact: optional relative to the required arena

@@ -1,7 +1,7 @@
 /**
  * WP1 of `.agents/plans/findings-tour` (`01-findings-panel.md`): pure
- * builder for the Findings panel's (now nine-step, since selection-
- * robustness WP3) evidence chain (`src/lib/ui/FindingsPanel.svelte`).
+ * builder for the Findings panel's (now ten-step, since readout-
+ * attribution WP3) evidence chain (`src/lib/ui/FindingsPanel.svelte`).
  * Every sentence is templated exclusively from fields on the already
  * fetched, sha256-verified, shape-validated artifacts
  * `ExperimentController#initialize()` already loads (`rewiringNull`,
@@ -29,15 +29,18 @@
  * `./steps/shared.ts`, and each study's own `buildXStep` function (plus its
  * private per-step helpers) lives in its own `./steps/<study>.ts` file. A
  * thermo-maintainability review (Important, I2) found this file had grown
- * to 808 lines at ~65-115 lines per study, with a second in-flight step
- * (`flyarena-hd0j`, readout attribution -- see `./sections.ts`'s own doc
- * comment) already queued to land here next; splitting now, before that
- * PR lands, avoids a merge conflict on the exact file both changes would
- * otherwise touch most. This split changes no behavior: every import path
- * outside this directory is unchanged (`buildFindingSteps`,
- * `findingStepStatusLabel`, `FindingStep`, `BuildFindingStepsInputs` are
- * all still exported from this same `./steps` path), and every
- * `buildXStep` function's own body is a byte-identical move.
+ * to 808 lines at ~65-115 lines per study, before a second in-flight step
+ * (`flyarena-hd0j`, readout attribution) landed here next; splitting first
+ * avoided a merge conflict on the exact file both changes would otherwise
+ * touch most. That split changed no behavior: every import path outside
+ * this directory is unchanged (`buildFindingSteps`, `findingStepStatusLabel`,
+ * `FindingStep`, `BuildFindingStepsInputs` are all still exported from this
+ * same `./steps` path), and every `buildXStep` function's own body was a
+ * byte-identical move. `flyarena-hd0j`'s own `buildReadoutAttributionStep`
+ * (`./steps/readoutAttribution.ts`) is placed directly after
+ * `buildTrainedInterventionsStep` in the array below, per
+ * `.agents/plans/readout-attribution/03-artifact-and-findings.md`'s "Add a
+ * step after the trained-interventions step".
  */
 
 import { buildRewiringNullStep } from './steps/rewiringNull';
@@ -49,6 +52,7 @@ import { buildTrainedInterventionsStep } from './steps/trainedInterventions';
 import { buildTaskGeneralityStep } from './steps/taskGenerality';
 import { buildBehaviorRepertoireStep } from './steps/behaviorRepertoire';
 import { buildSelectionRobustnessStep } from './steps/selectionRobustness';
+import { buildReadoutAttributionStep } from './steps/readoutAttribution';
 import type { BuildFindingStepsInputs, FindingStep } from './steps/shared';
 
 export type { FindingStep, FindingStepProvenance, FindingStepStatus, BuildFindingStepsInputs } from './steps/shared';
@@ -70,6 +74,7 @@ export const buildFindingSteps = (inputs: BuildFindingStepsInputs): readonly Fin
   buildInterventionStep(inputs),
   buildTrainedNullStep(inputs),
   buildTrainedInterventionsStep(inputs),
+  buildReadoutAttributionStep(inputs),
   buildTaskGeneralityStep(inputs),
   buildBehaviorRepertoireStep(inputs),
   buildSelectionRobustnessStep(inputs)

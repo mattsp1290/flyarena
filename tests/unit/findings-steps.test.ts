@@ -18,6 +18,11 @@ import {
   type SelectionRobustnessArtifact,
   type SelectionRobustnessLoadResult
 } from '../../src/lib/experiment/selectionRobustness';
+import {
+  loadReadoutAttribution,
+  type ReadoutAttributionArtifact,
+  type ReadoutAttributionLoadResult
+} from '../../src/lib/experiment/readoutAttribution';
 import { createPublicDataFetch } from '../helpers/fake-worker';
 
 /**
@@ -49,6 +54,7 @@ let realPathwayInterventions: PathwayInterventionsArtifact;
 let realRepertoireNull: RepertoireNullArtifact;
 let realTaskGenerality: TaskGeneralityArtifact;
 let realSelectionRobustness: SelectionRobustnessArtifact;
+let realReadoutAttribution: ReadoutAttributionArtifact;
 
 beforeAll(async () => {
   vi.stubGlobal('fetch', createPublicDataFetch());
@@ -58,6 +64,7 @@ beforeAll(async () => {
   const repertoireNullResult = await loadRepertoireNull(manifest, '/data');
   const taskGeneralityResult = await loadTaskGenerality(manifest, '/data');
   const selectionRobustnessResult = await loadSelectionRobustness(manifest, '/data');
+  const readoutAttributionResult = await loadReadoutAttribution(manifest, '/data');
   if (rewiringNullResult.status !== 'ok') throw new Error(`Fixture setup: rewiringNull is "${rewiringNullResult.status}"`);
   if (nullExplanationResult.status !== 'ok') throw new Error(`Fixture setup: nullExplanation is "${nullExplanationResult.status}"`);
   if (pathwayInterventionsResult.status !== 'ok') {
@@ -68,12 +75,16 @@ beforeAll(async () => {
   if (selectionRobustnessResult.status !== 'ok') {
     throw new Error(`Fixture setup: selectionRobustness is "${selectionRobustnessResult.status}"`);
   }
+  if (readoutAttributionResult.status !== 'ok') {
+    throw new Error(`Fixture setup: readoutAttribution is "${readoutAttributionResult.status}"`);
+  }
   realRewiringNull = rewiringNullResult.data;
   realNullExplanation = nullExplanationResult.data;
   realPathwayInterventions = pathwayInterventionsResult.data;
   realRepertoireNull = repertoireNullResult.data;
   realTaskGenerality = taskGeneralityResult.data;
   realSelectionRobustness = selectionRobustnessResult.data;
+  realReadoutAttribution = readoutAttributionResult.data;
   vi.unstubAllGlobals();
 });
 
@@ -100,6 +111,10 @@ const selectionRobustnessOk = (data: SelectionRobustnessArtifact = realSelection
   status: 'ok',
   data
 });
+const readoutAttributionOk = (data: ReadoutAttributionArtifact = realReadoutAttribution): ReadoutAttributionLoadResult => ({
+  status: 'ok',
+  data
+});
 
 const baseInputs = (): BuildFindingStepsInputs => ({
   manifest,
@@ -109,7 +124,8 @@ const baseInputs = (): BuildFindingStepsInputs => ({
   pathwayInterventions: pathwayInterventionsOk(),
   repertoireNull: repertoireNullOk(),
   taskGenerality: taskGeneralityOk(),
-  selectionRobustness: selectionRobustnessOk()
+  selectionRobustness: selectionRobustnessOk(),
+  readoutAttribution: readoutAttributionOk()
 });
 
 const findStep = (steps: readonly FindingStep[], id: string): FindingStep => {
@@ -119,7 +135,7 @@ const findStep = (steps: readonly FindingStep[], id: string): FindingStep => {
 };
 
 describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
-  it('builds exactly nine steps, in evidence-chain order', () => {
+  it('builds exactly ten steps, in evidence-chain order', () => {
     const steps = buildFindingSteps(baseInputs());
     expect(steps.map((step) => step.id)).toEqual([
       'rewiring-null',
@@ -128,6 +144,7 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
       'intervention',
       'trained-null',
       'trained-interventions',
+      'readout-attribution',
       'task-generality',
       'behavior-repertoire',
       'selection-robustness'
@@ -644,6 +661,101 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     });
   });
 
+  describe('readout-attribution step (against the real committed WP3 artifact)', () => {
+    it('states the trained decoder, "under this model", and the real H1-H3 outcomes, hedged, with per-hypothesis detail', () => {
+      const step = findStep(buildFindingSteps(baseInputs()), 'readout-attribution');
+      expect(step.status).toBe('ok');
+      expect(step.condition).toBe('trained');
+      expect(step.sentence).toContain('trained decoder');
+      expect(step.sentence).toMatch(/under this model\.$/);
+      expect(step.sentence).toContain(`(H1: ${realReadoutAttribution.hypotheses.H1.outcome})`);
+      expect(step.sentence).toContain(`(H2: ${realReadoutAttribution.hypotheses.H2.outcome})`);
+      expect(step.sentence).toContain(`(H3: ${realReadoutAttribution.hypotheses.H3.outcome})`);
+      expect(step.details).toHaveLength(4);
+      expect(step.details?.map((d) => d.id)).toEqual(['h1', 'h2', 'h3', 'coverage']);
+      expect(step.provenance).toHaveLength(1);
+      expect(step.provenance[0].artifactPath).toContain('readout-attribution-v1.json');
+      expect(step.provenance[0].reportPath).toContain('readout-attribution-report.md');
+    });
+
+    /**
+     * The real committed artifact's H1-H3 are all `'inconclusive'` (WP2's
+     * actual results — `00-overview.md`'s H1/H2/H3 rules never came back
+     * `'supported'`/`'not-supported'` on this model's real data). This test
+     * asserts that honestly, and — the task's own explicit requirement —
+     * that an inconclusive outcome always reads as "inconclusive", never as
+     * "not consistent"/"different"/"used more than" (a stronger, false-
+     * shaped claim the predeclared rules never license from an inconclusive
+     * result).
+     */
+    it('renders the real committed artifact\'s inconclusive H1-H3 as "inconclusive", never as "not consistent"/"different"/"used more than"', () => {
+      expect(realReadoutAttribution.hypotheses.H1.outcome).toBe('inconclusive');
+      expect(realReadoutAttribution.hypotheses.H2.outcome).toBe('inconclusive');
+      expect(realReadoutAttribution.hypotheses.H3.outcome).toBe('inconclusive');
+      const step = findStep(buildFindingSteps(baseInputs()), 'readout-attribution');
+      expect(step.sentence).toContain('saliency is inconclusive on whether it is consistent with routing around the missing wiring');
+      expect(step.sentence).toContain('the constant-policy share is inconclusive');
+      expect(step.sentence).toContain("P's new wiring is inconclusive");
+      expect(step.sentence).not.toContain('not consistent with routing around');
+      expect(step.sentence).not.toContain('is different between');
+      expect(step.sentence).not.toContain("is used more than biological's");
+    });
+
+    /**
+     * Synthetic `'supported'`/`'not-supported'` fixtures for every
+     * hypothesis, so the clause-mapping table itself is exercised end to
+     * end, not merely the real (always-inconclusive) data.
+     */
+    it('renders "supported"/"not-supported" clauses correctly when synthetically forced', () => {
+      const synthetic: ReadoutAttributionArtifact = {
+        ...realReadoutAttribution,
+        hypotheses: {
+          ...realReadoutAttribution.hypotheses,
+          H1: { outcome: 'supported', evidence: {} },
+          H2: { outcome: 'not-supported', evidence: {} },
+          H3: { outcome: 'supported', evidence: {} }
+        }
+      };
+      const step = findStep(buildFindingSteps({ ...baseInputs(), readoutAttribution: readoutAttributionOk(synthetic) }), 'readout-attribution');
+      expect(step.sentence).toContain('saliency is consistent with routing around the missing wiring (H1: supported)');
+      expect(step.sentence).toContain('the constant-policy share is different between biological and rewired (H2: not-supported)');
+      expect(step.sentence).toContain("P's new wiring is not used more than biological's (H3: supported)");
+    });
+
+    it('includes the reason in the per-hypothesis detail line when the outcome carries one', () => {
+      const synthetic: ReadoutAttributionArtifact = {
+        ...realReadoutAttribution,
+        hypotheses: {
+          ...realReadoutAttribution.hypotheses,
+          H1: { outcome: 'inconclusive', reason: 'regime-invalid', evidence: {} }
+        }
+      };
+      const step = findStep(buildFindingSteps({ ...baseInputs(), readoutAttribution: readoutAttributionOk(synthetic) }), 'readout-attribution');
+      const h1 = step.details?.find((item) => item.id === 'h1');
+      expect(h1?.text).toContain('regime-invalid');
+    });
+
+    it('is "missing" with no sentence when the readout-attribution artifact has not been published', () => {
+      const steps = buildFindingSteps({
+        ...baseInputs(),
+        readoutAttribution: { status: 'missing', reason: 'The manifest has no readoutAttribution artifact entry.' }
+      });
+      const step = findStep(steps, 'readout-attribution');
+      expect(step.status).toBe('missing');
+      expect(step.sentence).toBeUndefined();
+    });
+
+    it('is "invalid" with the loader\'s own reason when the artifact fails verification', () => {
+      const steps = buildFindingSteps({
+        ...baseInputs(),
+        readoutAttribution: { status: 'invalid', reason: 'sha256 mismatch' }
+      });
+      const step = findStep(steps, 'readout-attribution');
+      expect(step.status).toBe('invalid');
+      expect(step.reason).toBe('sha256 mismatch');
+    });
+  });
+
   it('every step is "loading" when its inputs are undefined (the controller has not resolved yet)', () => {
     const steps = buildFindingSteps({
       manifest: undefined,
@@ -653,7 +765,8 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
       pathwayInterventions: undefined,
       repertoireNull: undefined,
       taskGenerality: undefined,
-      selectionRobustness: undefined
+      selectionRobustness: undefined,
+      readoutAttribution: undefined
     });
     expect(findStep(steps, 'rewiring-null').status).toBe('loading');
     expect(findStep(steps, 'mirrored-decoder').status).toBe('loading');
@@ -661,6 +774,7 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
     expect(findStep(steps, 'intervention').status).toBe('loading');
     expect(findStep(steps, 'trained-null').status).toBe('loading');
     expect(findStep(steps, 'trained-interventions').status).toBe('loading');
+    expect(findStep(steps, 'readout-attribution').status).toBe('loading');
     expect(findStep(steps, 'task-generality').status).toBe('loading');
     expect(findStep(steps, 'behavior-repertoire').status).toBe('loading');
     expect(findStep(steps, 'selection-robustness').status).toBe('loading');

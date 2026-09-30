@@ -41,6 +41,10 @@
     },
     "sha256": "b91b750d41905b324a63a795984192f8d93bae7a3ee5f45fe27b9ce2d9aca2fb"
   },
+  "readoutAttribution": {
+    "artifact": "readout-attribution-v1.json",
+    "sha256": "5386794572f3d1a246b6e0104d28b8f8986488d3cb5b7689f32172781b2e98f9"
+  },
   "rewiredArms": {
     "seed0": {
       "artifact": "malecns-arena-v1-rewired-seed0.bin.gz",

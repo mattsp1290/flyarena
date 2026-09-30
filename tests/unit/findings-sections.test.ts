@@ -11,6 +11,7 @@ import { loadPathwayInterventions, type PathwayInterventionsArtifact } from '../
 import { loadRepertoireNull, type RepertoireNullArtifact } from '../../src/lib/experiment/repertoireNull';
 import { loadTaskGenerality, type TaskGeneralityArtifact } from '../../src/lib/experiment/taskGenerality';
 import { loadSelectionRobustness, type SelectionRobustnessArtifact } from '../../src/lib/experiment/selectionRobustness';
+import { loadReadoutAttribution, type ReadoutAttributionArtifact } from '../../src/lib/experiment/readoutAttribution';
 import { createPublicDataFetch } from '../helpers/fake-worker';
 
 /**
@@ -38,12 +39,14 @@ beforeAll(async () => {
   const repertoireNull = await loadRepertoireNull(manifest, '/data');
   const taskGenerality = await loadTaskGenerality(manifest, '/data');
   const selectionRobustness = await loadSelectionRobustness(manifest, '/data');
+  const readoutAttribution = await loadReadoutAttribution(manifest, '/data');
   if (rewiringNull.status !== 'ok') throw new Error(`Fixture setup: rewiringNull is "${rewiringNull.status}"`);
   if (nullExplanation.status !== 'ok') throw new Error(`Fixture setup: nullExplanation is "${nullExplanation.status}"`);
   if (pathwayInterventions.status !== 'ok') throw new Error(`Fixture setup: pathwayInterventions is "${pathwayInterventions.status}"`);
   if (repertoireNull.status !== 'ok') throw new Error(`Fixture setup: repertoireNull is "${repertoireNull.status}"`);
   if (taskGenerality.status !== 'ok') throw new Error(`Fixture setup: taskGenerality is "${taskGenerality.status}"`);
   if (selectionRobustness.status !== 'ok') throw new Error(`Fixture setup: selectionRobustness is "${selectionRobustness.status}"`);
+  if (readoutAttribution.status !== 'ok') throw new Error(`Fixture setup: readoutAttribution is "${readoutAttribution.status}"`);
   realInputs = {
     manifest,
     dataBaseUrl: '/data',
@@ -52,7 +55,8 @@ beforeAll(async () => {
     pathwayInterventions: { status: 'ok', data: pathwayInterventions.data as PathwayInterventionsArtifact },
     repertoireNull: { status: 'ok', data: repertoireNull.data as RepertoireNullArtifact },
     taskGenerality: { status: 'ok', data: taskGenerality.data as TaskGeneralityArtifact },
-    selectionRobustness: { status: 'ok', data: selectionRobustness.data as SelectionRobustnessArtifact }
+    selectionRobustness: { status: 'ok', data: selectionRobustness.data as SelectionRobustnessArtifact },
+    readoutAttribution: { status: 'ok', data: readoutAttribution.data as ReadoutAttributionArtifact }
   };
   vi.unstubAllGlobals();
 });

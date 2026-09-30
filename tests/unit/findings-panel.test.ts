@@ -19,6 +19,11 @@ import {
   type SelectionRobustnessArtifact,
   type SelectionRobustnessLoadResult
 } from '../../src/lib/experiment/selectionRobustness';
+import {
+  loadReadoutAttribution,
+  type ReadoutAttributionArtifact,
+  type ReadoutAttributionLoadResult
+} from '../../src/lib/experiment/readoutAttribution';
 import { buildFindingSteps } from '../../src/lib/findings/steps';
 import { groupSteps } from '../../src/lib/findings/sections';
 import { createPublicDataFetch } from '../helpers/fake-worker';
@@ -63,6 +68,7 @@ let realPathwayInterventions: PathwayInterventionsArtifact;
 let realRepertoireNull: RepertoireNullArtifact;
 let realTaskGenerality: TaskGeneralityArtifact;
 let realSelectionRobustness: SelectionRobustnessArtifact;
+let realReadoutAttribution: ReadoutAttributionArtifact;
 
 beforeAll(async () => {
   vi.stubGlobal('fetch', createPublicDataFetch());
@@ -72,6 +78,7 @@ beforeAll(async () => {
   const repertoireNullResult = await loadRepertoireNull(manifest, '/data');
   const taskGeneralityResult = await loadTaskGenerality(manifest, '/data');
   const selectionRobustnessResult = await loadSelectionRobustness(manifest, '/data');
+  const readoutAttributionResult = await loadReadoutAttribution(manifest, '/data');
   if (rewiringNullResult.status !== 'ok') throw new Error(`Fixture setup: rewiringNull is "${rewiringNullResult.status}"`);
   if (nullExplanationResult.status !== 'ok') throw new Error(`Fixture setup: nullExplanation is "${nullExplanationResult.status}"`);
   if (pathwayInterventionsResult.status !== 'ok') {
@@ -82,12 +89,16 @@ beforeAll(async () => {
   if (selectionRobustnessResult.status !== 'ok') {
     throw new Error(`Fixture setup: selectionRobustness is "${selectionRobustnessResult.status}"`);
   }
+  if (readoutAttributionResult.status !== 'ok') {
+    throw new Error(`Fixture setup: readoutAttribution is "${readoutAttributionResult.status}"`);
+  }
   realRewiringNull = rewiringNullResult.data;
   realNullExplanation = nullExplanationResult.data;
   realPathwayInterventions = pathwayInterventionsResult.data;
   realRepertoireNull = repertoireNullResult.data;
   realTaskGenerality = taskGeneralityResult.data;
   realSelectionRobustness = selectionRobustnessResult.data;
+  realReadoutAttribution = readoutAttributionResult.data;
   vi.unstubAllGlobals();
 });
 
@@ -98,7 +109,8 @@ const okProps = () => ({
   pathwayInterventions: { status: 'ok', data: realPathwayInterventions } as PathwayInterventionsLoadResult,
   repertoireNull: { status: 'ok', data: realRepertoireNull } as RepertoireNullLoadResult,
   taskGenerality: { status: 'ok', data: realTaskGenerality } as TaskGeneralityLoadResult,
-  selectionRobustness: { status: 'ok', data: realSelectionRobustness } as SelectionRobustnessLoadResult
+  selectionRobustness: { status: 'ok', data: realSelectionRobustness } as SelectionRobustnessLoadResult,
+  readoutAttribution: { status: 'ok', data: realReadoutAttribution } as ReadoutAttributionLoadResult
 });
 
 /**

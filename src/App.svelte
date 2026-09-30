@@ -15,6 +15,7 @@
   import type { RepertoireNullLoadResult } from './lib/experiment/repertoireNull';
   import type { TaskGeneralityLoadResult } from './lib/experiment/taskGenerality';
   import type { SelectionRobustnessLoadResult } from './lib/experiment/selectionRobustness';
+  import type { ReadoutAttributionLoadResult } from './lib/experiment/readoutAttribution';
   import { ExperimentController } from './lib/experiment/controller';
   import type { ExperimentRunner, ExperimentTelemetry } from './lib/experiment/runner';
   import type { ExperimentStatus } from './lib/experiment/state';
@@ -98,6 +99,8 @@
   let taskGeneralityStatus = $state<TaskGeneralityLoadResult | undefined>(undefined);
   /** `undefined` until `initialize()`'s selection-robustness load resolves (WP3 of `.agents/plans/selection-robustness`); feeds the Findings panel's "Selection robustness" step. Loading it never blocks Start, and never blocks reaching a settled `taskGeneralityStatus` either — see `ExperimentController#initialize`'s doc comment. */
   let selectionRobustnessStatus = $state<SelectionRobustnessLoadResult | undefined>(undefined);
+  /** `undefined` until `initialize()`'s readout-attribution load resolves (WP3 of `.agents/plans/readout-attribution`); feeds the Findings panel's "Readout attribution" step. Loading it never blocks Start, and never blocks reaching a settled `selectionRobustnessStatus` either — see `ExperimentController#initialize`'s doc comment. */
+  let readoutAttributionStatus = $state<ReadoutAttributionLoadResult | undefined>(undefined);
   /** True for the duration of an in-flight `controller.setDecoder()` call — set/cleared locally around that call (there is only ever one decoder shared by both arms, unlike per-arm topology switches, so a single flag suffices). */
   let decoderSwitchPending = $state(false);
 
@@ -357,6 +360,9 @@
         onSelectionRobustness: (result) => {
           if (!destroyed) selectionRobustnessStatus = result;
         },
+        onReadoutAttribution: (result) => {
+          if (!destroyed) readoutAttributionStatus = result;
+        },
         onDecoderApplied: (next) => {
           if (!destroyed) decoder = next;
         }
@@ -525,6 +531,7 @@
       repertoireNull={repertoireNullStatus}
       taskGenerality={taskGeneralityStatus}
       selectionRobustness={selectionRobustnessStatus}
+      readoutAttribution={readoutAttributionStatus}
     />
 
     <LedgerPanel

@@ -7,6 +7,7 @@
   import type { RepertoireNullLoadResult } from '../experiment/repertoireNull';
   import type { TaskGeneralityLoadResult } from '../experiment/taskGenerality';
   import type { SelectionRobustnessLoadResult } from '../experiment/selectionRobustness';
+  import type { ReadoutAttributionLoadResult } from '../experiment/readoutAttribution';
   import { buildFindingSteps, findingStepStatusLabel, type FindingStep } from '../findings/steps';
   import { groupSteps } from '../findings/sections';
   import { hasAnyVisibleStep, nearestVisibleIndex } from '../findings/navigation';
@@ -82,10 +83,20 @@
     taskGenerality: TaskGeneralityLoadResult | undefined;
     /** WP3 of `.agents/plans/selection-robustness`. `undefined` while `App.svelte`'s selection-robustness load has not yet resolved. */
     selectionRobustness: SelectionRobustnessLoadResult | undefined;
+    /** WP3 of `.agents/plans/readout-attribution`. `undefined` while `App.svelte`'s readout-attribution load has not yet resolved. */
+    readoutAttribution: ReadoutAttributionLoadResult | undefined;
   }
 
-  let { manifest, rewiringNull, nullExplanation, pathwayInterventions, repertoireNull, taskGenerality, selectionRobustness }: Props =
-    $props();
+  let {
+    manifest,
+    rewiringNull,
+    nullExplanation,
+    pathwayInterventions,
+    repertoireNull,
+    taskGenerality,
+    selectionRobustness,
+    readoutAttribution
+  }: Props = $props();
 
   let expanded = $state(false);
   let currentIndex = $state(0);
@@ -112,7 +123,8 @@
       pathwayInterventions,
       repertoireNull,
       taskGenerality,
-      selectionRobustness
+      selectionRobustness,
+      readoutAttribution
     })
   );
 

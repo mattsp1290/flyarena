@@ -253,6 +253,35 @@ export interface ArenaManifest {
    * pretending it exists.
    */
   selectionRobustness?: SidecarManifestEntry;
+  /**
+   * WP1c of `.agents/plans/readout-attribution`: the descending-neuron
+   * cell-type sidecar (`scripts/data/descending_types.py`), joining the
+   * pinned MaleCNS annotations' `type`/`class`/`instance`/`group`/`somaSide`
+   * columns onto the compiled graph's 48 descending (output-assigned)
+   * neurons, in graph index order — names for the readout's D = 48 input
+   * neurons, never a claim about fly descending-neuron function. Read
+   * directly by `scripts/attribution/attribution-report.ts` (a Node-only
+   * report generator, not part of the browser bundle) for the readout-
+   * attribution report's saliency tables; `readoutAttribution.ts#loadReadoutAttribution`
+   * below cross-checks its sha256 against this entry too. Optional: a
+   * manifest produced before that WP (or a hand-built test fixture) simply
+   * has no cell-type names to show.
+   */
+  descendingTypes?: SidecarManifestEntry;
+  /**
+   * WP3 of `.agents/plans/readout-attribution`: whether saliency, readout-
+   * input ablation, input-independence share, and pathway linkage explain
+   * why CEM-retrained readouts erase the biological graph's deficit.
+   * `scripts/attribution/attribution-report.ts` writes this once
+   * `readout-attribution-v1.json` exists — see
+   * `./readoutAttribution.ts#loadReadoutAttribution`. Optional: a manifest
+   * produced before that WP (or a hand-built test fixture) simply has no
+   * readout-attribution study to show — `loadReadoutAttribution` reports
+   * that as `status: 'missing'` rather than throwing, and the Findings
+   * panel's readout-attribution step simply omits its sentence rather than
+   * pretending it exists.
+   */
+  readoutAttribution?: SidecarManifestEntry;
   sourceDataset: string;
   rewiredArms: Record<
     string,
@@ -287,7 +316,8 @@ export interface ArenaManifest {
   >;
 }
 
-const fetchJson = async <T>(url: string): Promise<T> => {
+/** Exported for `readoutAttribution.ts#loadReadoutAttribution` below (fetching the separate `trained-readout-v1.manifest.json` for its `sources.trainedReadoutSha` cross-check — the same non-`ArenaManifest` sidecar `loadTrainedReadoutArtifact` already fetches) and for tests. */
+export const fetchJson = async <T>(url: string): Promise<T> => {
   const response = await fetch(url);
   if (!response.ok) throw new Error(`Failed to fetch ${url}: ${response.status} ${response.statusText}`);
   return (await response.json()) as T;

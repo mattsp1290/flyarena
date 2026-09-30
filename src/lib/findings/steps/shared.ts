@@ -25,6 +25,7 @@ import type { PathwayInterventionsLoadResult } from '../../experiment/pathwayInt
 import type { RepertoireNullLoadResult } from '../../experiment/repertoireNull';
 import type { TaskGeneralityLoadResult } from '../../experiment/taskGenerality';
 import type { SelectionRobustnessLoadResult } from '../../experiment/selectionRobustness';
+import type { ReadoutAttributionLoadResult } from '../../experiment/readoutAttribution';
 import { githubDocUrl } from '../../ui/links';
 
 /**
@@ -96,6 +97,8 @@ export interface BuildFindingStepsInputs {
   readonly taskGenerality: TaskGeneralityLoadResult | undefined;
   /** WP3 of `.agents/plans/selection-robustness`. `undefined` while the selection-robustness load has not yet resolved -- the same `'loading'` convention every other step's `undefined` input already uses. */
   readonly selectionRobustness: SelectionRobustnessLoadResult | undefined;
+  /** WP3 of `.agents/plans/readout-attribution`. `undefined` while the readout-attribution load has not yet resolved -- the same `'loading'` convention every other step's `undefined` input already uses. */
+  readonly readoutAttribution: ReadoutAttributionLoadResult | undefined;
 }
 
 const STATUS_LABEL: Record<Exclude<FindingStepStatus, 'ok'>, string> = {
@@ -142,6 +145,7 @@ export const sidecarStepStatus = (
     | RepertoireNullLoadResult
     | TaskGeneralityLoadResult
     | SelectionRobustnessLoadResult
+    | ReadoutAttributionLoadResult
     | undefined
 ): Exclude<FindingStepStatus, 'ok'> | 'ok' => {
   if (result === undefined) return 'loading';

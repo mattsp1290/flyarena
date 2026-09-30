@@ -49,6 +49,15 @@ test('all views work beneath /fly/ with root asset routes deliberately unavailab
   const selectionRobustnessJsonLink=selectionRobustnessStep.getByRole('link',{name:'Pinned JSON'});
   await expect(selectionRobustnessJsonLink).toHaveAttribute('href','/fly/data/selection-robustness-v1.json');
   expect((await request.get(await selectionRobustnessJsonLink.getAttribute('href')as string)).status()).toBe(200);
+  // WP3 of `.agents/plans/readout-attribution`: `loadReadoutAttribution`
+  // (fired independently, same /fly/-prefixed `dataBaseUrl`) must resolve
+  // to its real "ok" readout-attribution-step sentence here too, not
+  // silently 404 against the deliberately-unavailable root /data/ path.
+  const readoutAttributionStep=page.locator('section.findings ol.steps li.step[data-step-id="readout-attribution"]');
+  await expect(readoutAttributionStep).toContainText(/\(H1: inconclusive\)/,{timeout:20000});
+  const readoutAttributionJsonLink=readoutAttributionStep.getByRole('link',{name:'Pinned JSON'});
+  await expect(readoutAttributionJsonLink).toHaveAttribute('href','/fly/data/readout-attribution-v1.json');
+  expect((await request.get(await readoutAttributionJsonLink.getAttribute('href')as string)).status()).toBe(200);
   // Collapsed again so the rest of this test's unscoped `getByRole('button',
   // {name:/^collapse$/i})` (the activity panel's own toggle, below) keeps
   // resolving to exactly one match.
@@ -185,4 +194,18 @@ test('a tampered selection-robustness-v1.json under /fly/ shows an honest verifi
   const selectionRobustnessStep=page.locator('section.findings ol.steps li.step[data-step-id="selection-robustness"]');
   await expect(selectionRobustnessStep).toContainText(/failed verification/i,{timeout:20000});
   await expect(page.locator('body')).not.toContainText(/robust to size is true/);
+});
+
+test('a tampered readout-attribution-v1.json under /fly/ shows an honest verification-failure line on the readout-attribution step, while the rest of the Findings panel and the app keep working', async ({page}) => {
+  await page.route('**/data/readout-attribution-v1.json', async route => {
+    const bytes = await readFile('public/data/readout-attribution-v1.json');
+    bytes[10] ^= 0xff;
+    await route.fulfill({status:200, contentType:'application/json', body:bytes});
+  });
+  await page.goto('/fly/');
+  await expect(page.getByRole('status')).toHaveText('ready');
+  await page.locator('section.findings button').first().click();
+  const readoutAttributionStep=page.locator('section.findings ol.steps li.step[data-step-id="readout-attribution"]');
+  await expect(readoutAttributionStep).toContainText(/failed verification/i,{timeout:20000});
+  await expect(page.locator('body')).not.toContainText(/\(H1: inconclusive\)/);
 });

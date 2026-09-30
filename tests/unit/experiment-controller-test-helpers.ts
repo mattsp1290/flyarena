@@ -9,6 +9,7 @@ import type { PathwayInterventionsLoadResult } from '../../src/lib/experiment/pa
 import type { RepertoireNullLoadResult } from '../../src/lib/experiment/repertoireNull';
 import type { TaskGeneralityLoadResult } from '../../src/lib/experiment/taskGenerality';
 import type { SelectionRobustnessLoadResult } from '../../src/lib/experiment/selectionRobustness';
+import type { ReadoutAttributionLoadResult } from '../../src/lib/experiment/readoutAttribution';
 import type { ExperimentStatus } from '../../src/lib/experiment/state';
 import type { DecoderKind } from '../../src/lib/worker/protocol';
 import { createPublicDataFetch, FakeNeuralWorker } from '../helpers/fake-worker';
@@ -38,6 +39,7 @@ export type TestControllerCallbacks = ExperimentControllerCallbacks & {
   repertoireNullResults: RepertoireNullLoadResult[];
   taskGeneralityResults: TaskGeneralityLoadResult[];
   selectionRobustnessResults: SelectionRobustnessLoadResult[];
+  readoutAttributionResults: ReadoutAttributionLoadResult[];
   decodersApplied: DecoderKind[];
 };
 
@@ -53,6 +55,7 @@ export const createCallbacks = (): TestControllerCallbacks => {
   const repertoireNullResults: RepertoireNullLoadResult[] = [];
   const taskGeneralityResults: TaskGeneralityLoadResult[] = [];
   const selectionRobustnessResults: SelectionRobustnessLoadResult[] = [];
+  const readoutAttributionResults: ReadoutAttributionLoadResult[] = [];
   const decodersApplied: DecoderKind[] = [];
   return {
     statuses,
@@ -66,6 +69,7 @@ export const createCallbacks = (): TestControllerCallbacks => {
     repertoireNullResults,
     taskGeneralityResults,
     selectionRobustnessResults,
+    readoutAttributionResults,
     decodersApplied,
     onStatusChange: (status) => statuses.push(status),
     onTelemetry: vi.fn(),
@@ -80,6 +84,7 @@ export const createCallbacks = (): TestControllerCallbacks => {
     onRepertoireNull: (result) => repertoireNullResults.push(result),
     onTaskGenerality: (result) => taskGeneralityResults.push(result),
     onSelectionRobustness: (result) => selectionRobustnessResults.push(result),
+    onReadoutAttribution: (result) => readoutAttributionResults.push(result),
     onDecoderApplied: (decoder) => decodersApplied.push(decoder)
   };
 };
