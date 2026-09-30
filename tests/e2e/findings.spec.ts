@@ -38,6 +38,11 @@ test.describe('Findings panel', () => {
 
     // Rewiring null -- the real shipped bioPercentile/null.n.
     const rewiringNull = step('rewiring-null');
+    // WP2 of `.agents/plans/consolidated-release` (`02-release.md`):
+    // `data-step-status` is what `scripts/verify/live-smoke.ts` polls --
+    // confirmed here against a real "ok" step, not just in the component
+    // unit tests.
+    await expect(rewiringNull).toHaveAttribute('data-step-status', 'ok');
     await expect(rewiringNull).toContainText(/rewiring null/i);
     await expect(rewiringNull).toContainText(/authored \(hand-written\) decoder/i);
     await expect(rewiringNull).toContainText(/0\.0th percentile/);
@@ -158,12 +163,19 @@ test.describe('Findings panel', () => {
     const trainedInterventions = step('trained-interventions');
     await expect(intervention).toContainText(/failed verification/i);
     await expect(trainedInterventions).toContainText(/failed verification/i);
+    // WP2 of `.agents/plans/consolidated-release`: the machine-readable
+    // status attribute must degrade to "invalid" alongside the human-facing
+    // "failed verification" text -- this is the exact case
+    // `scripts/verify/live-smoke.ts` fails immediately on, never retries.
+    await expect(intervention).toHaveAttribute('data-step-status', 'invalid');
+    await expect(trainedInterventions).toHaveAttribute('data-step-status', 'invalid');
 
     // Every other step is unaffected -- still its own real templated sentence.
     const rewiringNull = step('rewiring-null');
     const explanation = step('explanation');
     await expect(rewiringNull.locator('p.sentence')).toHaveText(/under this model\.$/);
     await expect(rewiringNull).not.toContainText(/failed verification/i);
+    await expect(rewiringNull).toHaveAttribute('data-step-status', 'ok');
     await expect(explanation.locator('p.sentence')).toHaveText(/under this model\.$/);
     await expect(explanation).not.toContainText(/failed verification/i);
 

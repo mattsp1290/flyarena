@@ -151,6 +151,31 @@ describe('FindingsPanel', () => {
     }
   });
 
+  it('every step also carries data-step-status matching its own FindingStep.status -- "ok" for every real fixture step here', async () => {
+    // WP2 of `.agents/plans/consolidated-release` (`02-release.md`):
+    // `scripts/verify/live-smoke.ts` polls this attribute rather than
+    // scraping the human-facing status text, so it must always reflect the
+    // real `step.status`, not just render for `'ok'` steps.
+    render(FindingsPanel, okProps());
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    for (const { id } of expectedFlatSteps()) {
+      expect(stepLocator(id)).toHaveAttribute('data-step-status', 'ok');
+    }
+  });
+
+  it('data-step-status reflects a degraded status ("missing") for the affected step only', async () => {
+    render(FindingsPanel, {
+      ...okProps(),
+      selectionRobustness: {
+        status: 'missing',
+        reason: 'The manifest has no selectionRobustness artifact entry.'
+      } as SelectionRobustnessLoadResult
+    });
+    await fireEvent.click(screen.getByRole('button', { name: /^expand$/i }));
+    expect(stepLocator('selection-robustness')).toHaveAttribute('data-step-status', 'missing');
+    expect(stepLocator('rewiring-null')).toHaveAttribute('data-step-status', 'ok');
+  });
+
   it('the header names the model framing constraint verbatim', async () => {
     render(FindingsPanel, okProps());
     expect(

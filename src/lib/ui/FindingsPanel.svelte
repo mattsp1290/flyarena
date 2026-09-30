@@ -299,8 +299,16 @@
           <ol class="steps" id={sectionStepsId} data-section-id={group.section.id}>
             {#each group.steps as step (step.id)}
               {@const index = stepIndexById.get(step.id) ?? 0}
+              <!-- WP2 of `.agents/plans/consolidated-release` (`02-release.md`):
+                   `data-step-status` exposes `step.status` (`FindingStepStatus`)
+                   directly, so `scripts/verify/live-smoke.ts` can poll a step's
+                   real status attribute instead of scraping/pattern-matching
+                   the human-facing status text (`findingStepStatusLabel`),
+                   which is prose meant to change independently of this
+                   contract. -->
               <li
                 data-step-id={step.id}
+                data-step-status={step.status}
                 aria-current={index === currentIndex ? 'step' : undefined}
                 class="step"
                 class:current={index === currentIndex}
