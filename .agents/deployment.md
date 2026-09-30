@@ -522,3 +522,25 @@ No rollback was needed. The deploy log contained no connection values.
 
 Release: 20260930T022522Z-ee9d2d4b6970
 Commit: c67e299
+
+## Phone-width overflow fix release
+
+On 2026-09-30, main revision `69aaeb7` was deployed as
+`20260930T025211Z-30122924c37b` (`flyarena-1tbx`). The release fixes
+horizontal page scroll at phone width once Findings is expanded. The null
+histogram's screen-reader-only data table had the `sr-only` clip applied
+directly to the `<table>`, which auto table layout sized to its content. The
+clip now sits on a wrapping `<div>`, and an e2e test at 390px guards against
+regressions. CI was green on this exact commit. `deploy.sh` held the lock,
+passed the `Release:` marker check, built, uploaded, switched `current`
+atomically, and verified HTML and every asset byte for byte. The extended live
+smoke check passed:
+- The allowlist printed as `(none)`.
+- All 10 Findings steps settled `ok`.
+- Step 1 and the ledger rendered.
+- `#graph-lab` showed its idle text with no errors.
+
+No rollback was needed. The deploy log contained no connection values.
+
+Release: 20260930T025211Z-30122924c37b
+Commit: 69aaeb7
