@@ -43,7 +43,7 @@
   },
   "readoutAttribution": {
     "artifact": "readout-attribution-v1.json",
-    "sha256": "5386794572f3d1a246b6e0104d28b8f8986488d3cb5b7689f32172781b2e98f9"
+    "sha256": "6d07947b00100f5f7b51d910ab9f9b91918e4e1cdb85267d5eda2880280adbf3"
   },
   "rewiredArms": {
     "seed0": {
