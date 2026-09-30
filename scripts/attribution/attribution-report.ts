@@ -215,7 +215,14 @@ const requireEntry = <T>(map: ReadonlyMap<string, T>, id: string, label: string)
   return entry;
 };
 
-interface SaliencyJsonEntry {
+// Exported (not just module-local) so tests/unit/attribution-report.test.ts
+// can type its own synthetic WP2 fixtures against these exact shapes,
+// rather than hand-duplicating them untyped -- these five shapes are what
+// scripts/attribution/{saliency,independence,linkage,regime,ablation}.ts
+// actually write, so a fixture that satisfies these interfaces exercises
+// this file's own real parsing, not a stand-in shape that could silently
+// drift from the real one.
+export interface SaliencyJsonEntry {
   readonly id: string;
   readonly thrust: readonly number[];
   readonly yaw: readonly number[];
@@ -224,14 +231,14 @@ interface SaliencyJsonEntry {
   readonly inputMean: readonly number[];
   readonly inputStd: readonly number[];
 }
-interface IndependenceJsonEntry {
+export interface IndependenceJsonEntry {
   readonly id: string;
   readonly trainedMean: number;
   readonly silencedMean: number;
   readonly defined: boolean;
   readonly ratio: number | null;
 }
-interface LinkageJsonEntry {
+export interface LinkageJsonEntry {
   readonly id: string;
   readonly degenerate?: boolean;
   readonly rhoThrust: number | null;
@@ -241,13 +248,13 @@ interface LinkageJsonEntry {
   readonly clusterCount: number;
   readonly clusterSizes: readonly number[];
 }
-interface RegimeJsonEntry {
+export interface RegimeJsonEntry {
   readonly id: string;
   readonly clampFraction: number;
   readonly steadyStateDistance: number;
   readonly valid: boolean;
 }
-interface AblationJsonEntry {
+export interface AblationJsonEntry {
   readonly id: string;
   readonly n: number;
   readonly baselineMean: number;
