@@ -14,84 +14,25 @@ here.
 
 Skipped (not failed) with a clear message if Node/tsx isn't available in
 this environment -- this repo's Python test suite must still run standalone
-without a JS toolchain.
+without a JS toolchain (see `tests_python/ts_cross_check.py`'s module doc
+comment for the CI-vs-local distinction).
 """
 
 from __future__ import annotations
 
-import json
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
 
 import explain_stats
+from ts_cross_check import run_ts_cross_check
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_SCRIPT = Path(__file__).resolve().parent / "fixtures" / "null_stats_cross_check.ts"
-TSX_BIN = REPO_ROOT / "node_modules" / ".bin" / "tsx"
-
-#: A handful of candidate Node install locations, tried in order, beyond
-#: whatever `node`/`npx` already resolve to on `PATH` -- this repo's own
-#: documented dev environment (`.agents/rules/nim.md`'s sibling conventions;
-#: see this task's own "Node 22: export PATH=~/.nvm/versions/node/v22.22.3/
-#: bin:$PATH" instruction) does not always have Node on the Python-run's
-#: inherited `PATH`, so this test looks a little harder before giving up and
-#: skipping.
-_CANDIDATE_NODE_DIRS = (
-    Path.home() / ".nvm" / "versions" / "node" / "v22.22.3" / "bin",
-)
-
-
-def _find_node_bin_dir() -> str | None:
-    if shutil.which("node") is not None:
-        return None  # already on PATH, no extra dir needed
-    for candidate in _CANDIDATE_NODE_DIRS:
-        if (candidate / "node").exists():
-            return str(candidate)
-    return None
 
 
 def _run_ts_cross_check(payload: dict) -> dict:
-    """Runs `null_stats_cross_check.ts` via `node_modules/.bin/tsx` with the
-    given JSON payload on stdin, returning its parsed JSON stdout. Skips the
-    whole module (via `pytest.skip`, not a failure) if Node cannot be found
-    at all, or if invoking it fails for an environmental reason (no network
-    for a first-time tsx fetch, sandboxed `/proc` access, etc.) -- a missing
-    JS toolchain is a skip, not a Python-side test failure."""
-    if not TSX_BIN.exists():
-        pytest.skip(f"tests_python: {TSX_BIN} not found (run `npm install` first) -- skipping TS cross-check")
-
-    env = None
-    extra_dir = _find_node_bin_dir()
-    if extra_dir is not None:
-        import os
-
-        env = dict(os.environ)
-        env["PATH"] = f"{extra_dir}:{env.get('PATH', '')}"
-    elif shutil.which("node") is None:
-        pytest.skip("tests_python: node not found on PATH (and not under ~/.nvm) -- skipping TS cross-check")
-
-    try:
-        result = subprocess.run(
-            [str(TSX_BIN), str(FIXTURE_SCRIPT)],
-            input=json.dumps(payload),
-            capture_output=True,
-            text=True,
-            cwd=REPO_ROOT,
-            env=env,
-            timeout=60,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        pytest.skip(f"tests_python: could not run tsx ({error}) -- skipping TS cross-check")
-
-    if result.returncode != 0:
-        pytest.skip(
-            "tests_python: `tsx null_stats_cross_check.ts` exited non-zero, environment likely cannot run the "
-            f"TS toolchain here -- skipping TS cross-check (stderr: {result.stderr[:500]})"
-        )
-    return json.loads(result.stdout)
+    return run_ts_cross_check(FIXTURE_SCRIPT, payload)
 
 
 #: Shared fixture cases -- deliberately include odd/even n, ties, and a

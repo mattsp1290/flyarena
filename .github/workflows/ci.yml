@@ -104,6 +104,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Set up Node.js
+        # `tests_python/`'s TS<->Python cross-check tests (e.g.
+        # test_null_stats_cross_check.py, test_ts_import_graph_cross_check.py,
+        # test_arena_config_fingerprint_cross_check.py) shell out to the real
+        # TypeScript via `node_modules/.bin/tsx` and otherwise SKIP without a
+        # JS toolchain -- this job previously had no Node at all, so every
+        # one of those cross-checks silently skipped in CI, every run.
+        # `tests_python/ts_cross_check.py` turns a missing toolchain into a
+        # hard failure when `CI` is set (GitHub Actions sets it by default),
+        # so this step existing is also what keeps that guard meaningful.
+        # Same action version/node-version source/cache settings as the
+        # `web` job above.
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
       - name: Set up uv
         # astral-sh/setup-uv publishes only exact patch tags (no floating
         # "v10" major tag, unlike actions/checkout, actions/setup-node, and

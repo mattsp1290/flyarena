@@ -19,71 +19,23 @@ the first place.
 
 Skipped (not failed) with a clear message if Node/tsx isn't available in
 this environment -- this repo's Python test suite must still run standalone
-without a JS toolchain."""
+without a JS toolchain (see `tests_python/ts_cross_check.py`'s module doc
+comment for the CI-vs-local distinction)."""
 
 from __future__ import annotations
 
-import json
-import os
-import shutil
-import subprocess
 from pathlib import Path
 
-import pytest
-
 import ts_import_graph
+from ts_cross_check import run_ts_cross_check
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_SCRIPT = Path(__file__).resolve().parent / "fixtures" / "import_graph_cross_check.ts"
-TSX_BIN = REPO_ROOT / "node_modules" / ".bin" / "tsx"
-
-#: See `test_null_stats_cross_check.py`'s identical constant's doc comment.
-_CANDIDATE_NODE_DIRS = (
-    Path.home() / ".nvm" / "versions" / "node" / "v22.22.3" / "bin",
-)
-
-
-def _find_node_bin_dir() -> str | None:
-    if shutil.which("node") is not None:
-        return None
-    for candidate in _CANDIDATE_NODE_DIRS:
-        if (candidate / "node").exists():
-            return str(candidate)
-    return None
 
 
 def _run_ts_cross_check(entry_file: Path) -> dict:
-    if not TSX_BIN.exists():
-        pytest.skip(f"tests_python: {TSX_BIN} not found (run `npm install` first) -- skipping TS cross-check")
-
-    env = None
-    extra_dir = _find_node_bin_dir()
-    if extra_dir is not None:
-        env = dict(os.environ)
-        env["PATH"] = f"{extra_dir}:{env.get('PATH', '')}"
-    elif shutil.which("node") is None:
-        pytest.skip("tests_python: node not found on PATH (and not under ~/.nvm) -- skipping TS cross-check")
-
     payload = {"entryFile": str(entry_file), "repoRoot": str(REPO_ROOT)}
-    try:
-        result = subprocess.run(
-            [str(TSX_BIN), str(FIXTURE_SCRIPT)],
-            input=json.dumps(payload),
-            capture_output=True,
-            text=True,
-            cwd=REPO_ROOT,
-            env=env,
-            timeout=60,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        pytest.skip(f"tests_python: could not run tsx ({error}) -- skipping TS cross-check")
-
-    if result.returncode != 0:
-        pytest.skip(
-            "tests_python: `tsx import_graph_cross_check.ts` exited non-zero, environment likely cannot run the "
-            f"TS toolchain here -- skipping TS cross-check (stderr: {result.stderr[:1000]})"
-        )
-    return json.loads(result.stdout)
+    return run_ts_cross_check(FIXTURE_SCRIPT, payload)
 
 
 def test_python_and_typescript_walkers_agree_on_regime_check_closure():
