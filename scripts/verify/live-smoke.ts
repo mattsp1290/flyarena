@@ -30,12 +30,13 @@
  * standalone data module with zero runtime imports of its own (unlike
  * `src/lib/findings/steps.ts`, which pulls in every study's own
  * browser-`fetch`-based loader) -- safe for a plain `tsx` script to import
- * the same way `tests/unit/findings-sections.test.ts` does. The DOM step
- * count is still cross-checked against that import below, so a step that
- * somehow lands unclassified in a fifth "Other findings" section (which
- * `main`'s own unit test already forbids, but a smoke check should never
- * silently trust a unit test it isn't running) fails loudly instead of
- * simply not being checked.
+ * the same way `tests/unit/findings-sections.test.ts` does. The DOM's own
+ * rendered `data-step-id` set is still cross-checked against that import
+ * below, so a step that somehow lands unclassified in a fifth "Other
+ * findings" section (which `main`'s own unit test already forbids, but a
+ * smoke check should never silently trust a unit test it isn't running),
+ * or is renamed/duplicated, fails loudly instead of simply not being
+ * checked.
  *
  * Also asserts `#graph-lab` loads its default idle state, "Connect to a
  * running graph-lab backend to submit jobs." (`src/lib/graphlab/GraphLab.svelte`),
@@ -61,10 +62,10 @@
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { chromium, type Page } from '@playwright/test';
+import { chromium, type Browser, type Page } from '@playwright/test';
 import { findingsToggle, statusRegion } from '../../tests/e2e/arena-test-helpers';
 import { FINDING_SECTIONS } from '../../src/lib/findings/sections';
-import { decideStep, parseAllowlist, type StepStatus } from './live-smoke-lib';
+import { decideStep, parseAllowlist } from './live-smoke-lib';
 
 const READY_TIMEOUT_MS = 20_000;
 const STEP_TIMEOUT_MS = 10_000;
@@ -121,7 +122,18 @@ const waitForReadyAndExpandFindings = async (page: Page): Promise<void> => {
     STEP_TIMEOUT_MS,
     'live-smoke: Findings toggle never became enabled.'
   );
-  await toggle.click();
+  // (dual review, Important) `.catch(() => { throw ... })`: an unwrapped
+  // `.click()` failure (e.g. the toggle detaching mid-click during a Svelte
+  // re-render) would otherwise propagate Playwright's own thrown error
+  // verbatim out of `main()` -- which this file's own doc comment promises
+  // never happens, since that error's text isn't guaranteed free of
+  // page/selector context. Every throw site in this file goes through a
+  // fixed, `live-smoke:`-prefixed message for exactly this reason; `main`'s
+  // own top-level `catch` is a second, defense-in-depth layer for any site
+  // that isn't.
+  await toggle.click().catch(() => {
+    throw new Error('live-smoke: could not click the Findings toggle.');
+  });
   // (thermo review, Important I3/ops-safety) `.catch(() => null)`, matching
   // every other DOM read in this file: without it, a transient exception
   // right after `.click()` (e.g. the toggle briefly detaching during a
@@ -138,38 +150,50 @@ const waitForReadyAndExpandFindings = async (page: Page): Promise<void> => {
 
 const stepLocator = (page: Page, id: string) => page.locator(`section.findings li.step[data-step-id="${id}"]`);
 
-/** Polls one step's `data-step-status` until it leaves `'loading'` (`STEP_STATUS_TIMEOUT_MS` budget), then returns the settled status. */
-const waitForStepSettled = async (page: Page, id: string): Promise<Exclude<StepStatus, 'loading'>> => {
+/**
+ * Polls one step's `data-step-status` until it leaves `'loading'`
+ * (`STEP_STATUS_TIMEOUT_MS` budget), then returns the settled value
+ * verbatim, as a plain `string` -- deliberately *not* cast to a status
+ * union here. Whether that string is actually one of the four statuses
+ * `decideStep` knows how to classify (as opposed to, say, an entirely
+ * missing attribute misread some other way, or a future status value this
+ * script hasn't been taught yet) is `decideStep`'s own job
+ * (`./live-smoke-lib.ts#isSettledStepStatus`) -- a dual review flagged the
+ * previous version's bare `as unknown as` cast here as exactly the kind of
+ * "trust the DOM" assumption that turns a real-world drift into an opaque
+ * crash instead of a clear smoke failure.
+ */
+const waitForStepSettled = async (page: Page, id: string): Promise<string> => {
   const locator = stepLocator(page, id);
-  let settled: Exclude<StepStatus, 'loading'> | null = null;
+  let settled = '';
   await waitUntil(
     async () => {
       const value = await locator.getAttribute('data-step-status').catch(() => null);
       if (value !== null && value !== 'loading') {
-        settled = value as Exclude<StepStatus, 'loading'>;
+        settled = value;
         return true;
       }
       return false;
     },
     STEP_STATUS_TIMEOUT_MS,
-    `live-smoke: Findings step "${id}" never left "loading".`
+    // An older release deployed before this attribute existed (e.g. a
+    // best-effort post-rollback recheck -- `scripts/deploy.sh`'s own
+    // `report_failure_and_roll_back` -- against a pre-`data-step-status`
+    // release) would also read `null` forever and land here; the message
+    // says so rather than implying every step is stuck genuinely loading.
+    `live-smoke: Findings step "${id}" never left "loading" (or its data-step-status attribute never appeared -- e.g. a release deployed before this attribute existed).`
   );
-  // `waitUntil` only resolves (rather than throwing) once `settled` above
-  // has actually been assigned inside its polling callback -- see its own
-  // contract at the top of this file -- so this is never really `null`
-  // here. TS's control-flow narrowing can't see across that callback
-  // boundary (it only sees the literal `null` from the initial
-  // declaration), so the cast goes through `unknown` rather than directly,
-  // per TS's own suggestion for this exact "narrows don't cross a closure"
-  // shape.
-  return settled as unknown as Exclude<StepStatus, 'loading'>;
+  return settled;
 };
 
-/** Checks one step against `decideStep`'s rules, performing the one allowed reload-and-recheck for an `'unavailable'` status. Throws on any other failure. */
-const checkStep = async (page: Page, id: string): Promise<void> => {
+/** One step's outcome, once `checkStep` has finished with it -- `main()` uses this to decide whether the legacy step-1 sentence check (below) may still assert a real rendered sentence. */
+type StepOutcome = 'ok' | 'missing-allowed';
+
+/** Checks one step against `decideStep`'s rules, performing the one allowed reload-and-recheck for an `'unavailable'` status. Throws on any other failure; otherwise returns the step's final outcome. */
+const checkStep = async (page: Page, id: string): Promise<StepOutcome> => {
   const status = await waitForStepSettled(page, id);
   const decision = decideStep(id, status, allowlist, false);
-  if (decision.kind === 'ok' || decision.kind === 'missing-allowed') return;
+  if (decision.kind === 'ok' || decision.kind === 'missing-allowed') return decision.kind;
   if (decision.kind === 'fail') throw new Error(`live-smoke: ${decision.reason}`);
 
   // `decision.kind === 'retry-unavailable'`: a network-fetch failure
@@ -187,40 +211,63 @@ const checkStep = async (page: Page, id: string): Promise<void> => {
 
   const retryStatus = await waitForStepSettled(page, id);
   const retryDecision = decideStep(id, retryStatus, allowlist, true);
-  if (retryDecision.kind === 'ok' || retryDecision.kind === 'missing-allowed') return;
+  if (retryDecision.kind === 'ok' || retryDecision.kind === 'missing-allowed') return retryDecision.kind;
   // `retryDecision.kind` is always `'fail'` here (`decideStep` never
   // returns `'retry-unavailable'` when `isRetry` is `true`).
   throw new Error(`live-smoke: ${(retryDecision as { reason: string }).reason}`);
 };
 
-/** `#graph-lab`: loads without a page/console error and shows its default idle text, never clicking Connect (no network call). */
-const checkGraphLabRoute = async (page: Page): Promise<void> => {
-  let errorCount = 0;
-  page.on('pageerror', () => {
-    errorCount += 1;
-  });
-  page.on('console', (message) => {
-    if (message.type() === 'error') errorCount += 1;
-  });
+/**
+ * `#graph-lab`: loads without a page/console error and shows its default
+ * idle text, never clicking Connect (no network call).
+ *
+ * (dual review, Important) Opens its own fresh `browser.newPage()` rather
+ * than reusing the page the Findings checks already ran on. A same-page
+ * `page.goto(url + '#graph-lab')` right after that page already loaded the
+ * same origin is a same-document hash navigation, not a real one -- no
+ * document request is sent, `Shell.svelte`'s own `hashchange` listener just
+ * swaps which lazy-loaded view is mounted in place. Two problems with that:
+ * a bug that only breaks a real, direct load of the route (a bookmark, a
+ * shared link) would never be exercised; and the error listeners below
+ * would also be live for the *teardown* of whatever view was previously
+ * mounted (the Arena view's own Worker/subscription cleanup), which could
+ * miscount a benign teardown message against `#graph-lab`. A brand-new page
+ * makes `page.goto` a real top-level navigation regardless of the fragment
+ * (there is no prior document to compare against), and its error listeners
+ * see only this page's own lifetime.
+ */
+const checkGraphLabRoute = async (browser: Browser): Promise<void> => {
+  const page = await browser.newPage();
+  try {
+    let errorCount = 0;
+    page.on('pageerror', () => {
+      errorCount += 1;
+    });
+    page.on('console', (message) => {
+      if (message.type() === 'error') errorCount += 1;
+    });
 
-  // Never build this URL by string-concatenating anything printable
-  // (nothing here is logged), and never navigate through `expect`/
-  // `page.goto`'s own thrown-error text, which can embed the URL verbatim
-  // -- same discipline as the initial `deployUrl` navigation below.
-  const withTrailingSlash = deployUrl.endsWith('/') ? deployUrl : `${deployUrl}/`;
-  await page.goto(`${withTrailingSlash}#graph-lab`, { waitUntil: 'domcontentloaded', timeout: READY_TIMEOUT_MS }).catch(() => {
-    throw new Error('live-smoke: failed to load the #graph-lab route.');
-  });
+    // Never build this URL by string-concatenating anything printable
+    // (nothing here is logged), and never navigate through `expect`/
+    // `page.goto`'s own thrown-error text, which can embed the URL verbatim
+    // -- same discipline as the initial `deployUrl` navigation below.
+    const withTrailingSlash = deployUrl.endsWith('/') ? deployUrl : `${deployUrl}/`;
+    await page.goto(`${withTrailingSlash}#graph-lab`, { waitUntil: 'domcontentloaded', timeout: READY_TIMEOUT_MS }).catch(() => {
+      throw new Error('live-smoke: failed to load the #graph-lab route.');
+    });
 
-  const idle = page.locator('.graph-lab section.panel.empty p.subtle');
-  await waitUntil(
-    async () => ((await idle.textContent().catch(() => null)) ?? '').trim() === GRAPH_LAB_IDLE_TEXT,
-    STEP_TIMEOUT_MS,
-    'live-smoke: #graph-lab did not show its default idle text.'
-  );
+    const idle = page.locator('.graph-lab section.panel.empty p.subtle');
+    await waitUntil(
+      async () => ((await idle.textContent().catch(() => null)) ?? '').trim() === GRAPH_LAB_IDLE_TEXT,
+      STEP_TIMEOUT_MS,
+      'live-smoke: #graph-lab did not show its default idle text.'
+    );
 
-  if (errorCount > 0) {
-    throw new Error(`live-smoke: #graph-lab reported ${errorCount} page/console error(s).`);
+    if (errorCount > 0) {
+      throw new Error(`live-smoke: #graph-lab reported ${errorCount} page/console error(s).`);
+    }
+  } finally {
+    await page.close();
   }
 };
 
@@ -242,19 +289,10 @@ const main = async (): Promise<void> => {
 
     await waitForReadyAndExpandFindings(page);
 
-    // Step 1's sentence (`findings.spec.ts`'s own invariant: every rendered
-    // step sentence is templated from the artifact and ends "under this
-    // model.", never hard-coded copy).
-    const step1Sentence = page.locator('section.findings li.step').nth(0).locator('p.sentence');
-    await waitUntil(
-      async () => /under this model\.\s*$/i.test(((await step1Sentence.textContent().catch(() => null)) ?? '').trim()),
-      STEP_TIMEOUT_MS,
-      'live-smoke: Findings step 1 sentence did not render (or did not match the expected "under this model." pattern).'
-    );
-
     // The model ledger render (`arena.spec.ts`'s `.ledger` locator; "Graph
     // topology" / "Measured" is a static row, present regardless of the
-    // live manifest's own counts).
+    // live manifest's own counts). Independent of any Findings step's own
+    // status, so it runs here rather than after the per-step loop below.
     const ledger = page.locator('section.ledger');
     await waitUntil(
       async () => /graph topology/i.test((await ledger.textContent().catch(() => null)) ?? ''),
@@ -263,24 +301,60 @@ const main = async (): Promise<void> => {
     );
 
     // `02-release.md`'s extension: every Findings step, by id, until each
-    // settles and passes `decideStep`'s rules. The DOM's real `li.step`
-    // count is cross-checked against `expectedStepIds` first -- a step
-    // landing unclassified in "Other findings" (which `main`'s own unit
-    // test already forbids -- `tests/unit/findings-sections.test.ts`) would
-    // otherwise silently never be checked here, since it has no
+    // settles and passes `decideStep`'s rules. The DOM's real, rendered
+    // `data-step-id` set is cross-checked against `expectedStepIds` first --
+    // a same-*count* rename/duplication would slip past a count-only check,
+    // and a step landing unclassified in "Other findings" (which `main`'s
+    // own unit test already forbids -- `tests/unit/findings-sections.test.ts`)
+    // would otherwise silently never be checked here, since it has no
     // `FINDING_SECTIONS` entry to derive its id from.
-    const domStepCount = await page.locator('section.findings li.step').count();
-    if (domStepCount !== expectedStepIds.length) {
+    const domStepIds = await page
+      .locator('section.findings li.step')
+      .evaluateAll((elements) => elements.map((element) => element.getAttribute('data-step-id') ?? ''))
+      .catch(() => {
+        throw new Error('live-smoke: could not read the Findings step ids from the DOM.');
+      });
+    const expectedStepIdSet = new Set(expectedStepIds);
+    const domStepIdSet = new Set(domStepIds);
+    const idsMatch =
+      domStepIds.length === expectedStepIds.length &&
+      expectedStepIds.every((id) => domStepIdSet.has(id)) &&
+      domStepIds.every((id) => expectedStepIdSet.has(id));
+    if (!idsMatch) {
       throw new Error(
-        `live-smoke: Findings rendered ${domStepCount} step(s) but FINDING_SECTIONS declares ${expectedStepIds.length}; an unclassified step may have landed in "Other findings".`
+        `live-smoke: Findings rendered step ids ${JSON.stringify(domStepIds)} but FINDING_SECTIONS declares ${JSON.stringify(expectedStepIds)}; a step may be unclassified ("Other findings"), renamed, or duplicated.`
       );
     }
+
+    const outcomes = new Map<string, StepOutcome>();
     for (const id of expectedStepIds) {
-      await checkStep(page, id);
+      outcomes.set(id, await checkStep(page, id));
     }
     console.log(`live-smoke: all ${expectedStepIds.length} Findings steps settled ok (or allowlisted missing).`);
 
-    await checkGraphLabRoute(page);
+    // Step 1's sentence (`findings.spec.ts`'s own invariant: every rendered
+    // step sentence is templated from the artifact and ends "under this
+    // model.", never hard-coded copy). Runs *after* the per-step loop above
+    // so it benefits from that loop's own 30s-per-step budget and one
+    // allowed unavailable-retry, rather than racing it with its own
+    // separate, shorter 10s window and no retry (a dual review, Important:
+    // step 1 is `expectedStepIds[0]`, so without this ordering it was the
+    // one step in the whole panel that never actually got the "every step"
+    // contract this file's own doc comment promises). By now step 1 has
+    // already settled `'ok'` or `'missing-allowed'` per `outcomes` above; a
+    // sentence only ever renders for `'ok'` (`FindingsPanel.svelte`), so the
+    // check is skipped, not failed, on an allowlisted-missing step 1.
+    const step1Id = expectedStepIds[0];
+    if (step1Id !== undefined && outcomes.get(step1Id) === 'ok') {
+      const step1Sentence = stepLocator(page, step1Id).locator('p.sentence');
+      await waitUntil(
+        async () => /under this model\.\s*$/i.test(((await step1Sentence.textContent().catch(() => null)) ?? '').trim()),
+        STEP_TIMEOUT_MS,
+        `live-smoke: Findings step "${step1Id}" is "ok" but its sentence did not render (or did not match the expected "under this model." pattern).`
+      );
+    }
+
+    await checkGraphLabRoute(browser);
     console.log('live-smoke: #graph-lab idle state OK, no page/console errors.');
 
     console.log('live-smoke: passed (ready, Findings step 1, ledger, every Findings step, #graph-lab).');
@@ -290,6 +364,14 @@ const main = async (): Promise<void> => {
 };
 
 main().catch((error: unknown) => {
-  console.error(error instanceof Error ? error.message : 'live-smoke: failed.');
+  const message = error instanceof Error ? error.message : '';
+  // (dual review, Important) Defense-in-depth on top of every individual
+  // throw site above already using a fixed, `live-smoke:`-prefixed message:
+  // an error this catch doesn't otherwise recognize (a Playwright API this
+  // file calls directly without its own `.catch(() => throw ...)` wrapper,
+  // today or in a future edit) is never printed verbatim -- some
+  // Playwright-thrown errors embed page/selector context that isn't
+  // guaranteed free of the deploy URL.
+  console.error(message.startsWith('live-smoke:') ? message : 'live-smoke: failed (error details withheld).');
   process.exit(1);
 });

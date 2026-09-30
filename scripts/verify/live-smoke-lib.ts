@@ -34,6 +34,26 @@
  */
 export type StepStatus = 'loading' | 'ok' | 'missing' | 'unavailable' | 'invalid';
 
+/** The four values `decideStep` can classify -- every `StepStatus` except `'loading'`, which the caller (`live-smoke.ts#waitForStepSettled`) polls away before ever calling `decideStep`. */
+export type SettledStepStatus = Exclude<StepStatus, 'loading'>;
+
+const KNOWN_SETTLED_STATUSES: ReadonlySet<string> = new Set<SettledStepStatus>(['ok', 'missing', 'unavailable', 'invalid']);
+
+/**
+ * Whether `value` (an already-`'loading'`-filtered string read straight off
+ * a live page's `data-step-status` attribute -- not a value this codebase
+ * controls the shape of at the point it's read) is one of the four settled
+ * statuses `decideStep` knows how to classify. `decideStep` itself calls
+ * this first and fails closed on anything else (a dual review, both
+ * independent reviewers: a bare cast here used to let an unrecognized value
+ * -- a genuinely missing attribute misread as a status string, or a future
+ * `FindingStepStatus` value this file's restated `StepStatus` hasn't been
+ * updated to include -- fall through `decideStep`'s switch with no default
+ * case, throwing an opaque `TypeError` instead of a clear, actionable smoke
+ * failure), so exported and tested on its own too.
+ */
+export const isSettledStepStatus = (value: string): value is SettledStepStatus => KNOWN_SETTLED_STATUSES.has(value);
+
 export type StepDecision =
   | { readonly kind: 'ok' }
   | { readonly kind: 'missing-allowed' }
@@ -41,18 +61,19 @@ export type StepDecision =
   | { readonly kind: 'fail'; readonly reason: string };
 
 /**
- * Classifies one step's already-settled (non-`'loading'`) status.
- * `isRetry` must be `true` only on the second look at a step that was
- * `'unavailable'` on its first look (after the one allowed reload) -- it
+ * Classifies one step's already-settled (non-`'loading'`) status, read
+ * as a plain `string` -- never assumed to already be a valid
+ * `SettledStepStatus` -- so an unrecognized value (see `isSettledStepStatus`'s
+ * own doc comment) fails with a clear, step-id-carrying reason instead of
+ * crashing. `isRetry` must be `true` only on the second look at a step that
+ * was `'unavailable'` on its first look (after the one allowed reload) -- it
  * never grants a second retry, regardless of how many times the caller
  * passes `true`.
  */
-export const decideStep = (
-  id: string,
-  status: Exclude<StepStatus, 'loading'>,
-  allowlist: readonly string[],
-  isRetry: boolean
-): StepDecision => {
+export const decideStep = (id: string, status: string, allowlist: readonly string[], isRetry: boolean): StepDecision => {
+  if (!isSettledStepStatus(status)) {
+    return { kind: 'fail', reason: `Findings step "${id}" has an unrecognized status ("${status}").` };
+  }
   switch (status) {
     case 'ok':
       return { kind: 'ok' };

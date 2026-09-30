@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { decideStep, parseAllowlist } from '../../scripts/verify/live-smoke-lib';
+import { decideStep, isSettledStepStatus, parseAllowlist } from '../../scripts/verify/live-smoke-lib';
 
 /**
  * WP2 of `.agents/plans/consolidated-release` (`02-release.md`): unit
@@ -46,6 +46,42 @@ describe('decideStep', () => {
     // Allowlisting is irrelevant to "unavailable" -- it is a retryable
     // fetch failure, not the "never published" case the allowlist covers.
     expect(decideStep('trained-null', 'unavailable', ['trained-null'], true).kind).toBe('fail');
+  });
+
+  it('an unrecognized status string fails with a clear, step-id-carrying reason instead of crashing', () => {
+    // (dual review, both reviewers independently) `decideStep` is called
+    // with the raw string read off a live page's `data-step-status`
+    // attribute (`live-smoke.ts#waitForStepSettled`), never a value this
+    // codebase controls the shape of at that point -- an entirely missing
+    // attribute, a future `FindingStepStatus` value this file's restated
+    // `StepStatus` hasn't been taught yet, or simple DOM corruption must
+    // all fail loudly and clearly here, not throw an opaque `TypeError`.
+    expect(decideStep('rewiring-null', 'degraded', [], false)).toEqual({
+      kind: 'fail',
+      reason: 'Findings step "rewiring-null" has an unrecognized status ("degraded").'
+    });
+    expect(decideStep('rewiring-null', '', [], false).kind).toBe('fail');
+    // Even allowlisted -- the allowlist only ever covers a real "missing" status.
+    expect(decideStep('rewiring-null', 'degraded', ['rewiring-null'], false).kind).toBe('fail');
+    // Unrecognized also fails on a retry look, same as "invalid" -- there is
+    // no status value for which `isRetry` should ever turn a fail into a pass.
+    expect(decideStep('rewiring-null', 'degraded', [], true).kind).toBe('fail');
+  });
+});
+
+describe('isSettledStepStatus', () => {
+  it('accepts exactly the four settled status values', () => {
+    expect(isSettledStepStatus('ok')).toBe(true);
+    expect(isSettledStepStatus('missing')).toBe(true);
+    expect(isSettledStepStatus('unavailable')).toBe(true);
+    expect(isSettledStepStatus('invalid')).toBe(true);
+  });
+
+  it('rejects "loading" (the caller polls this away before calling decideStep) and any other string', () => {
+    expect(isSettledStepStatus('loading')).toBe(false);
+    expect(isSettledStepStatus('')).toBe(false);
+    expect(isSettledStepStatus('OK')).toBe(false);
+    expect(isSettledStepStatus('degraded')).toBe(false);
   });
 });
 
