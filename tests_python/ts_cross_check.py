@@ -60,7 +60,7 @@ def _unavailable(message: str) -> None:
     pytest.skip(message)
 
 
-def run_ts_cross_check(fixture_script: Path, payload: dict | None = None, *, timeout: int = 60) -> dict:
+def run_ts_cross_check(fixture_script: Path, payload: dict | None = None, *, timeout: int = 60) -> dict | list:
     """Runs `fixture_script` via `node_modules/.bin/tsx`, piping `payload` as
     JSON on stdin when given (omitted entirely for a fixture that reads no
     stdin), and returns its parsed JSON stdout.
