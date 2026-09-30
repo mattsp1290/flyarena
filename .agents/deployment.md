@@ -455,3 +455,18 @@ was needed. The deploy log contained no connection values.
 
 Release: 20260926T171536Z-affff96d5f16
 Commit: 5708d47
+
+## Graph-lab docs release (backfilled marker)
+
+On 2026-09-27 at 17:57 UTC, a release `20260927T175738Z-174655b8df27` was
+deployed outside the bean loop and never recorded here. The guard's run on
+2026-09-30 found it live and aborted with no changes. Release suffixes are
+random, so the commit was identified by content instead. The live index serves
+`assets/index-5CsnoF9V.js` and `assets/index-BIB6rqdh.css`, and a clean build
+of main revision `c5f8a32` with `npm run build -- --base /fly/` emits exactly
+those two filenames. `c5f8a32` was main's head at 17:57 UTC, and no front-end
+source changed again until after the deploy. This entry records it so the
+anchor matches the live `current` target.
+
+Release: 20260927T175738Z-174655b8df27
+Commit: c5f8a32
