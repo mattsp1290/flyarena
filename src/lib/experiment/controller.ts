@@ -543,9 +543,9 @@ export class ExperimentController {
     this.rewiredGraphBuffer = artifacts.rewired;
     this.options.callbacks.onManifest(artifacts.manifest, artifacts.parsedBiological);
 
-    // Seven independent sidecar loads, fired in parallel directly off
-    // `artifacts.manifest`/`dataBaseUrl` — none needs another's *result*,
-    // only the manifest already in scope here (thermo-maintainability
+    // One independent sidecar load per registerSidecar call below, fired in
+    // parallel directly off `artifacts.manifest`/`dataBaseUrl` — none needs
+    // another's *result*, only the manifest already in scope here (thermo-maintainability
     // review, Important: see `runSidecarLoad`'s own doc comment for why an
     // earlier version chained these in sequence instead, and why that made
     // the wall-clock cost of loading all four the *sum*, not the *max*, of
@@ -568,7 +568,7 @@ export class ExperimentController {
     // Suggestion): that status is reserved for an actual hash/shape/
     // cross-check failure, which each panel renders as "failed
     // verification" — a plain thrown error is not that claim. None of these
-    // five is "sequenced after" any other; each fires the instant
+    // sidecar loads is "sequenced after" any other; each fires the instant
     // `artifacts.manifest` is available, independent of whether any sibling
     // fork has started, run, or settled yet.
     this.registerSidecar<RewiringNullLoadResult>('the rewiring null', () => loadNull(artifacts.manifest, dataBaseUrl), (result) =>

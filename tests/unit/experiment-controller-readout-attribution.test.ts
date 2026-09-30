@@ -10,9 +10,13 @@ import { createCallbacks, createWorker, SEED, TOTAL_TICKS, useControllerTestLife
  * fork, isolated from a throwing host callback, and a loader throw mapped
  * to `'unavailable'` rather than an unhandled rejection.
  *
- * This is the seventh fork off `artifacts.manifest`/`dataBaseUrl`, fired in
+ * This is one more fork off `artifacts.manifest`/`dataBaseUrl`, fired in
  * parallel with (not sequenced behind) every other sidecar load -- see
- * `runSidecarLoad`'s own doc comment.
+ * `runSidecarLoad`'s own doc comment and
+ * `tests/unit/experiment-controller-sidecar-parallel.test.ts`, which
+ * exercises that parallelism across every registered sidecar at once
+ * rather than restating a count here that would go stale the next time one
+ * is added.
  */
 
 const { trackController } = useControllerTestLifecycle();
@@ -151,9 +155,9 @@ describe('ExperimentController readout-attribution loading (WP3 of .agents/plans
   });
 
   /**
-   * Parallelism: the seven sidecar loads are each invoked immediately, off
-   * the same manifest, never gated behind another fork's settled promise --
-   * see `runSidecarLoad`'s own doc comment.
+   * Parallelism: every sidecar load is invoked immediately, off the same
+   * manifest, never gated behind another fork's settled promise -- see
+   * `runSidecarLoad`'s own doc comment.
    */
   it('invokes loadReadoutAttribution immediately, without waiting for the selection-robustness load to settle', async () => {
     let readoutAttributionStarted = false;

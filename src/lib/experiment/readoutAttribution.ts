@@ -20,7 +20,7 @@
  * outcomes, not from any individual readout's own numbers.
  */
 
-import { fetchAndVerifySidecarJson, fetchJson, type ArenaManifest } from './assets';
+import { fetchAndVerifySidecarJson, fetchJson, type ArenaManifest, type TrainedReadoutManifest } from './assets';
 import type { SidecarLoadResult } from './sidecarResult';
 
 export type HypothesisOutcome = 'supported' | 'not-supported' | 'inconclusive';
@@ -159,10 +159,6 @@ const validateShape = (value: unknown): { ok: true; data: ReadoutAttributionArti
 // see `assets.ts#loadTrainedReadoutArtifact`)
 // ---------------------------------------------------------------------------
 
-interface TrainedReadoutManifestSha {
-  readonly artifactSha256: string;
-}
-
 /**
  * Fetch, sha256-verify, and structurally validate `readout-attribution-v1.json`
  * (`manifest.readoutAttribution`), then cross-check it against the
@@ -218,9 +214,9 @@ export const loadReadoutAttribution = async (
     };
   }
 
-  let trainedReadoutManifest: TrainedReadoutManifestSha;
+  let trainedReadoutManifest: TrainedReadoutManifest;
   try {
-    trainedReadoutManifest = await fetchJson<TrainedReadoutManifestSha>(`${dataBaseUrl}/trained-readout-v1.manifest.json`);
+    trainedReadoutManifest = await fetchJson<TrainedReadoutManifest>(`${dataBaseUrl}/trained-readout-v1.manifest.json`);
   } catch (error) {
     return {
       status: 'unavailable',

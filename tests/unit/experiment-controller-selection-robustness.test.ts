@@ -10,7 +10,7 @@ import { createCallbacks, createWorker, SEED, TOTAL_TICKS, useControllerTestLife
  * fork, isolated from a throwing host callback, and a loader throw mapped
  * to `'unavailable'` rather than an unhandled rejection.
  *
- * This is the sixth fork off `artifacts.manifest`/`dataBaseUrl`, fired in
+ * This is one more fork off `artifacts.manifest`/`dataBaseUrl`, fired in
  * parallel with (not sequenced behind) every other sidecar load -- see
  * `runSidecarLoad`'s own doc comment.
  */
@@ -238,9 +238,9 @@ describe('ExperimentController selection-robustness loading (WP3 of .agents/plan
   });
 
   /**
-   * Parallelism: the six sidecar loads are each invoked immediately, off
-   * the same manifest, never gated behind another fork's settled promise --
-   * see `runSidecarLoad`'s own doc comment.
+   * Parallelism: every sidecar load is invoked immediately, off the same
+   * manifest, never gated behind another fork's settled promise -- see
+   * `runSidecarLoad`'s own doc comment.
    */
   it('invokes loadSelectionRobustness immediately, without waiting for the task-generality load to settle', async () => {
     let selectionRobustnessStarted = false;

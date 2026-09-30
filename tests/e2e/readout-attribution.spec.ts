@@ -32,17 +32,22 @@ test.describe('Findings panel (readout attribution)', () => {
     // The real shipped WP2 results (`docs/readout-attribution-report.md`):
     // every hypothesis came back inconclusive on this model's real data --
     // asserted here, not a hardcoded placeholder, and the sentence must read
-    // as honestly "inconclusive", never a stronger "not consistent"/
-    // "different"/"used more than" claim an inconclusive result never
-    // licenses (the task's own explicit hedging requirement).
+    // as honestly "inconclusive on whether ...", framed the same way for
+    // all three hypotheses, never the flat, unhedged `not-supported`
+    // assertion a stronger, false-shaped claim would make (the task's own
+    // explicit hedging requirement; a dual thermo review caught an earlier
+    // "P's new wiring is inconclusive" as a category error).
     const sentenceEl = step.locator('p.sentence');
     await expect(sentenceEl).toHaveText(/under this model\.$/);
-    await expect(sentenceEl).toContainText('trained decoder');
+    await expect(sentenceEl).toContainText('(trained decoder)');
     await expect(sentenceEl).toContainText('(H1: inconclusive)');
     await expect(sentenceEl).toContainText('(H2: inconclusive)');
     await expect(sentenceEl).toContainText('(H3: inconclusive)');
+    await expect(sentenceEl).toContainText('inconclusive on whether it is consistent with routing around the missing wiring');
+    await expect(sentenceEl).toContainText('inconclusive on whether it is equivalent between biological and rewired readouts');
+    await expect(sentenceEl).toContainText("inconclusive on whether it is used more than the biological wiring");
     await expect(sentenceEl).not.toContainText('not consistent with routing around');
-    await expect(sentenceEl).not.toContainText('is different between');
+    await expect(sentenceEl).not.toContainText('not equivalent between biological and rewired readouts');
 
     // Per-hypothesis detail lives in its own screen-reader-friendly
     // <ul>/<li> list -- three hypotheses plus a coverage line.

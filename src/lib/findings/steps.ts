@@ -1,7 +1,7 @@
 /**
  * WP1 of `.agents/plans/findings-tour` (`01-findings-panel.md`): pure
- * builder for the Findings panel's (now ten-step, since readout-
- * attribution WP3) evidence chain (`src/lib/ui/FindingsPanel.svelte`).
+ * builder for the Findings panel's (grown since, most recently by
+ * readout-attribution WP3) evidence chain (`src/lib/ui/FindingsPanel.svelte`).
  * Every sentence is templated exclusively from fields on the already
  * fetched, sha256-verified, shape-validated artifacts
  * `ExperimentController#initialize()` already loads (`rewiringNull`,
@@ -59,13 +59,17 @@ export type { FindingStep, FindingStepProvenance, FindingStepStatus, BuildFindin
 export { findingStepStatusLabel } from './steps/shared';
 
 /**
- * Builds all nine Findings-panel steps, in evidence-chain order
+ * Builds every Findings-panel step, in evidence-chain order
  * (`01-findings-panel.md`'s step list, extended by task-generality WP4's
- * "before Behavior repertoire" placement, and by selection-robustness WP3's
- * own "Append the step at the end of the step list present at
- * implementation time"). Pure and synchronous: every input is a value the
- * caller already has in scope (controller callback mirrors), never a fetch
- * performed here.
+ * "before Behavior repertoire" placement, by selection-robustness WP3's own
+ * "Append the step at the end of the step list present at implementation
+ * time", and by readout-attribution WP3's own "after the trained-
+ * interventions step" placement). The step count is never stated here as a
+ * number -- it is exactly `buildFindingSteps(...).length`, i.e. the length
+ * of the array literal below, so a future bean adding or removing a step
+ * cannot leave a stale count in this doc comment. Pure and synchronous:
+ * every input is a value the caller already has in scope (controller
+ * callback mirrors), never a fetch performed here.
  */
 export const buildFindingSteps = (inputs: BuildFindingStepsInputs): readonly FindingStep[] => [
   buildRewiringNullStep(inputs),

@@ -682,29 +682,33 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
      * The real committed artifact's H1-H3 are all `'inconclusive'` (WP2's
      * actual results — `00-overview.md`'s H1/H2/H3 rules never came back
      * `'supported'`/`'not-supported'` on this model's real data). This test
-     * asserts that honestly, and — the task's own explicit requirement —
-     * that an inconclusive outcome always reads as "inconclusive", never as
-     * "not consistent"/"different"/"used more than" (a stronger, false-
-     * shaped claim the predeclared rules never license from an inconclusive
-     * result).
+     * asserts that honestly, and — the task's own explicit requirement,
+     * reinforced by a dual thermo review that caught an earlier "P's new
+     * wiring is inconclusive" as a category error — that an inconclusive
+     * outcome always reads as "inconclusive on whether ...", framed the
+     * same way for all three hypotheses, never as the flat, unhedged
+     * `'not-supported'` assertion a stronger, false-shaped claim would make.
      */
-    it('renders the real committed artifact\'s inconclusive H1-H3 as "inconclusive", never as "not consistent"/"different"/"used more than"', () => {
+    it('renders the real committed artifact\'s inconclusive H1-H3 as "inconclusive on whether ...", never as the flat not-supported assertion', () => {
       expect(realReadoutAttribution.hypotheses.H1.outcome).toBe('inconclusive');
       expect(realReadoutAttribution.hypotheses.H2.outcome).toBe('inconclusive');
       expect(realReadoutAttribution.hypotheses.H3.outcome).toBe('inconclusive');
       const step = findStep(buildFindingSteps(baseInputs()), 'readout-attribution');
       expect(step.sentence).toContain('saliency is inconclusive on whether it is consistent with routing around the missing wiring');
-      expect(step.sentence).toContain('the constant-policy share is inconclusive');
-      expect(step.sentence).toContain("P's new wiring is inconclusive");
+      expect(step.sentence).toContain('the constant-policy share is inconclusive on whether it is equivalent between biological and rewired readouts');
+      expect(step.sentence).toContain("P's new wiring is inconclusive on whether it is used more than the biological wiring");
       expect(step.sentence).not.toContain('not consistent with routing around');
-      expect(step.sentence).not.toContain('is different between');
-      expect(step.sentence).not.toContain("is used more than biological's");
+      expect(step.sentence).not.toContain('not equivalent between biological and rewired readouts');
+      expect(step.sentence).not.toContain('P\'s new wiring is used more than the biological wiring,');
     });
 
     /**
      * Synthetic `'supported'`/`'not-supported'` fixtures for every
      * hypothesis, so the clause-mapping table itself is exercised end to
-     * end, not merely the real (always-inconclusive) data.
+     * end, not merely the real (always-inconclusive) data. Every clause
+     * (including `'supported'`/`'not-supported'`) states the predeclared
+     * bound each rule actually compares against, never a bare category
+     * label.
      */
     it('renders "supported"/"not-supported" clauses correctly when synthetically forced', () => {
       const synthetic: ReadoutAttributionArtifact = {
@@ -718,8 +722,12 @@ describe('buildFindingSteps (against the real committed WP1 artifacts)', () => {
       };
       const step = findStep(buildFindingSteps({ ...baseInputs(), readoutAttribution: readoutAttributionOk(synthetic) }), 'readout-attribution');
       expect(step.sentence).toContain('saliency is consistent with routing around the missing wiring (H1: supported)');
-      expect(step.sentence).toContain('the constant-policy share is different between biological and rewired (H2: not-supported)');
-      expect(step.sentence).toContain("P's new wiring is not used more than biological's (H3: supported)");
+      expect(step.sentence).toContain(
+        'the constant-policy share is not equivalent between biological and rewired readouts, outside the predeclared bound (H2: not-supported)'
+      );
+      expect(step.sentence).toContain(
+        "P's new wiring is not used more than the biological wiring, within the predeclared bound (H3: supported)"
+      );
     });
 
     it('includes the reason in the per-hypothesis detail line when the outcome carries one', () => {

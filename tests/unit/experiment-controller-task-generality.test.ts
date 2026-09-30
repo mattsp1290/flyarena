@@ -13,7 +13,7 @@ import { createCallbacks, createWorker, SEED, TOTAL_TICKS, useControllerTestLife
  * rejection -- but shipped with none of its own beyond the two coarse
  * assertions in `experiment-controller-sidecar-parallel.test.ts`).
  *
- * This is the fifth fork off `artifacts.manifest`/`dataBaseUrl`, fired in
+ * This is one more fork off `artifacts.manifest`/`dataBaseUrl`, fired in
  * parallel with (not sequenced behind) every other sidecar load -- see
  * `runSidecarLoad`'s own doc comment.
  */
@@ -240,9 +240,9 @@ describe('ExperimentController task-generality loading (WP4 of .agents/plans/tas
   });
 
   /**
-   * Parallelism: the five sidecar loads are each invoked immediately, off
-   * the same manifest, never gated behind another fork's settled promise --
-   * see `runSidecarLoad`'s own doc comment.
+   * Parallelism: every sidecar load is invoked immediately, off the same
+   * manifest, never gated behind another fork's settled promise -- see
+   * `runSidecarLoad`'s own doc comment.
    */
   it('invokes loadTaskGenerality immediately, without waiting for the repertoire-null load to settle', async () => {
     let taskGeneralityStarted = false;

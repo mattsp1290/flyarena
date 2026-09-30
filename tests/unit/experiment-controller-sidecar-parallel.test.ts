@@ -5,13 +5,13 @@ import { createCallbacks, createWorker, SEED, TOTAL_TICKS, useControllerTestLife
 /**
  * Thermo-maintainability review (Important, I1): `ExperimentController#initialize()`
  * used to chain its sidecar loads (rewiring-null, null-explanation,
- * pathway-interventions, repertoire-null, task-generality since WP4, and —
- * since selection-robustness WP3 — selection-robustness) in sequence, each
- * waiting on the previous one's settled promise, even though every one of
- * them only needs `artifacts.manifest`/`dataBaseUrl` -- already available
- * the instant the arena artifacts load, not the *result* of any other
- * sidecar load. Fixed by firing all six directly off the manifest in
- * parallel (see
+ * pathway-interventions, repertoire-null, task-generality since WP4,
+ * selection-robustness since WP3, and readout-attribution since
+ * readout-attribution WP3) in sequence, each waiting on the previous one's
+ * settled promise, even though every one of them only needs
+ * `artifacts.manifest`/`dataBaseUrl` -- already available the instant the
+ * arena artifacts load, not the *result* of any other sidecar load. Fixed
+ * by firing every one of them directly off the manifest in parallel (see
  * `controller.ts`'s `runSidecarLoad` doc comment and each fork's own
  * comment). The per-sidecar test files
  * (`experiment-controller-null-explanation.test.ts`,
@@ -20,14 +20,14 @@ import { createCallbacks, createWorker, SEED, TOTAL_TICKS, useControllerTestLife
  * one loader still fires when the *specific* loader immediately before it
  * in the old chain fails" -- this file adds the one thing none of those
  * pairwise tests covers: that a single loader failing (throwing) does not
- * block *any* of the other four from firing, all five wired up in the same
- * `initialize()` call at once.
+ * block *any* of the others from firing, every one of them wired up in the
+ * same `initialize()` call at once.
  */
 
 const { trackController } = useControllerTestLifecycle();
 
-describe('ExperimentController: one sidecar loader failing does not block the other four', () => {
-  it('still dispatches onRewiringNull/onNullExplanation/onRepertoireNull/onTaskGenerality as "ok" (or their real committed-artifact result) when loadPathwayInterventions throws synchronously', async () => {
+describe('ExperimentController: one sidecar loader failing does not block the others', () => {
+  it('still dispatches onRewiringNull/onNullExplanation/onRepertoireNull/onTaskGenerality/onSelectionRobustness/onReadoutAttribution as "ok" (or their real committed-artifact result) when loadPathwayInterventions throws synchronously', async () => {
     const callbacks = createCallbacks();
     const controller = new ExperimentController({
       seed: SEED,
@@ -48,24 +48,26 @@ describe('ExperimentController: one sidecar loader failing does not block the ot
     await vi.waitFor(() => expect(callbacks.pathwayInterventionsResults).toHaveLength(1));
     expect(callbacks.pathwayInterventionsResults[0].status).toBe('unavailable');
 
-    // The other four loaders -- fired in parallel, off the same manifest,
-    // never chained through the failing one -- all still resolve.
-    // `taskGenerality` itself cross-checks against the (now unavailable, not
-    // merely absent) `pathwayInterventions` artifact only via the manifest's
-    // *pinned* sha, never the failed load result, so it still resolves `ok`.
+    // The other loaders -- fired in parallel, off the same manifest, never
+    // chained through the failing one -- all still resolve. `taskGenerality`
+    // itself cross-checks against the (now unavailable, not merely absent)
+    // `pathwayInterventions` artifact only via the manifest's *pinned* sha,
+    // never the failed load result, so it still resolves `ok`.
     await vi.waitFor(() => expect(callbacks.rewiringNullResults).toHaveLength(1));
     await vi.waitFor(() => expect(callbacks.nullExplanationResults).toHaveLength(1));
     await vi.waitFor(() => expect(callbacks.repertoireNullResults).toHaveLength(1));
     await vi.waitFor(() => expect(callbacks.taskGeneralityResults).toHaveLength(1));
     await vi.waitFor(() => expect(callbacks.selectionRobustnessResults).toHaveLength(1));
+    await vi.waitFor(() => expect(callbacks.readoutAttributionResults).toHaveLength(1));
     expect(callbacks.rewiringNullResults[0].status).toBe('ok');
     expect(callbacks.nullExplanationResults[0].status).toBe('ok');
     expect(callbacks.repertoireNullResults[0].status).toBe('ok');
     expect(callbacks.taskGeneralityResults[0].status).toBe('ok');
     expect(callbacks.selectionRobustnessResults[0].status).toBe('ok');
+    expect(callbacks.readoutAttributionResults[0].status).toBe('ok');
   });
 
-  it('all six sidecar loaders are invoked in the same microtask turn (no fork waits on another to even start)', async () => {
+  it('every sidecar loader is invoked in the same microtask turn (no fork waits on another to even start)', async () => {
     const started: string[] = [];
     const callbacks = createCallbacks();
     const controller = new ExperimentController({
@@ -103,21 +105,29 @@ describe('ExperimentController: one sidecar loader failing does not block the ot
         started.push('selectionRobustness');
         const { loadSelectionRobustness } = await import('../../src/lib/experiment/selectionRobustness');
         return loadSelectionRobustness(manifest, dataBaseUrl);
+      },
+      loadReadoutAttribution: async (manifest, dataBaseUrl) => {
+        started.push('readoutAttribution');
+        const { loadReadoutAttribution } = await import('../../src/lib/experiment/readoutAttribution');
+        return loadReadoutAttribution(manifest, dataBaseUrl);
       }
     });
     trackController(controller);
 
     await controller.initialize();
 
-    // All six were already invoked by the time `initialize()`'s own
-    // returned promise resolves -- if any fork were still chained behind
-    // another (the old sequential shape), the later ones would not have
-    // started yet at this point (they only would have after that earlier
-    // fork's own fetch/verify round trip settled, well after `initialize()`
-    // itself returns).
+    // Every one of them was already invoked by the time `initialize()`'s
+    // own returned promise resolves -- if any fork were still chained
+    // behind another (the old sequential shape), the later ones would not
+    // have started yet at this point (they only would have after that
+    // earlier fork's own fetch/verify round trip settled, well after
+    // `initialize()` itself returns). The exact list this asserts against
+    // is every `loadX` stub passed above, so a future sidecar added here
+    // without a matching entry in this list fails loudly, not silently.
     expect(started.sort()).toEqual([
       'nullExplanation',
       'pathwayInterventions',
+      'readoutAttribution',
       'repertoireNull',
       'rewiringNull',
       'selectionRobustness',
